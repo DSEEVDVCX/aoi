@@ -1,0 +1,477 @@
+"""الحلقة الرئيسية لمسجّل البيانات التاريخي.
+
+يقرأ الخام من fomo عبر FomoClient._get/_post مباشرة (قبل أي تعيين، لأن التعيين
+يُسقط أثمن الحقول)، ويكتب إلى recorder.db. كل نداء upstream داخل try/except:
+الفشل (502...) يُسجَّل في meta ويُتخطّى — الحلقة لا تموت أبداً.
+
+read-only (FR-012): كل النداءات GET/POST قراءة فقط (feed، trending، verified،
+leaderboard). لا نداء يكتب حالة حساب أو تداول.
+"""
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+import traceback
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from typing import Any
+
+import config
+import extract
+from db import RecorderDB, utcnow_iso
+from leaderboard_cache import LeaderboardCache
+
+
+def _load_access_token() -> str:
+    """يقرأ session_token (access_token) من CredentialStore على القرص.
+
+    لا يطبع قيمة التوكن إطلاقاً (FR-013). يرفع خطأً واضحاً إن غاب الاعتماد.
+    القرص هو مصدر الحقيقة: خادم الـ api (TokenRefresher) يكتب توكناً طازجاً هنا
+    قبل انتهائه، فيلتقطه المسجّل كل دورة بلا أي تسجيل دخول يدوي.
+    """
+    from fomo_api.auth.credential_store import CredentialStore
+
+    creds = CredentialStore(config.credential_state_path()).load()
+    if creds is None or not creds.access_token:
+        raise RuntimeError(
+            "لا يوجد اعتماد صالح في ملف الحالة — شغّل خدمة الـ api أولاً لتوليده."
+        )
+    return creds.access_token
+
+
+def _build_client(access_token: str) -> Any:
+    """يُنشئ FomoClient من توكن معطى (لا يقرأ القرص، لا يطبع التوكن)."""
+    from fomo_api.clients.fomo_client import FomoClient
+
+    return FomoClient(session_token=access_token)
+
+
+def _load_client() -> Any:
+    """يحمّل session_token من القرص ويُنشئ FomoClient.
+
+    لا يطبع قيمة التوكن إطلاقاً (FR-013). يرفع خطأً واضحاً إن غاب الاعتماد.
+    """
+    return _build_client(_load_access_token())
+
+
+async def _fetch_feed_raw(client: Any) -> Any:
+    """خام GET /feed — نتجاوز get_feed (تُعيّن وتُسقط topTraders/body الكامل)."""
+    from fomo_api.config import settings
+
+    params = {"feedTypes": list(config.FEED_TYPES), "limit": config.FEED_LIMIT}
+    return await client._get(settings.upstream_feed_path, params)
+
+
+async def _fetch_trending_raw(client: Any) -> Any:
+    from fomo_api.config import settings
+
+    return await client._post(settings.upstream_trending_tokens_path, {})
+
+
+async def _fetch_verified_raw(client: Any) -> Any:
+    from fomo_api.config import settings
+
+    return await client._get(settings.upstream_verified_tokens_path)
+
+
+async def _fetch_bars_raw(
+    client: Any, token_address: str, network_id: str, from_ts: int, to_ts: int
+) -> Any:
+    """خام POST /proxy/getBarsNew.
+
+    نتجاوز get_token_bars لأنّها تُعيّن؛ نريد المغلّف الخام لنستخرجه بأنفسنا.
+    symbol = "address:networkId" و from/to إلزاميان — كلاهما مؤكَّد حيّاً
+    (العنوان المجرّد → 502، وغياب from/to → 400).
+    """
+    from fomo_api.config import settings
+
+    body = {
+        "symbol": f"{token_address}:{network_id}",
+        "resolution": config.BARS_RESOLUTION,
+        "from": from_ts,
+        "to": to_ts,
+        "countBack": config.BARS_COUNT_BACK,
+    }
+    return await client._post(settings.upstream_get_bars_path, body)
+
+
+async def run_bars_cycle(
+    client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
+) -> dict[str, int]:
+    """يسحب شموع شريحة من العملات المراقَبة (جدولة دوّارة).
+
+    كل عملة على حدة داخل try: فشل واحدة لا يمنع البقيّة ولا يُسقط الدورة.
+    نطلب دائماً النافذة الكاملة منذ (أول ظهور - سياق) لا منذ آخر شمعة: الشمعة
+    الأخيرة تكون قيد التكوّن فتُراجَع، والسحب الكامل يشفي أي ثغرة سابقة.
+    """
+    stats = {"bars_tokens": 0, "bars_rows": 0, "bars_no_data": 0, "bars_errors": 0}
+    now_dt = datetime.fromisoformat(recorded_at)
+    stale_before = (now_dt - timedelta(seconds=config.BARS_REFRESH_SECONDS)).isoformat()
+    due = db.bars_fetch_due(
+        limit=config.BARS_PER_CYCLE,
+        stale_before_iso=stale_before,
+        max_no_data_attempts=config.BARS_MAX_NO_DATA_ATTEMPTS,
+    )
+    to_ts = int(now_dt.timestamp())
+
+    for i, w in enumerate(due):
+        addr = w["token_address"]
+        net = str(w["network_id"] or "")
+        try:
+            first_seen = datetime.fromisoformat(w["first_seen_at"])
+            from_dt = first_seen - timedelta(hours=config.BARS_PRE_SIGNAL_HOURS)
+            # لا نتجاوز سقف النافذة (تفادي طلب مدى أوسع ممّا يعيده fomo أصلاً).
+            earliest = now_dt - timedelta(hours=config.BARS_MAX_SPAN_HOURS)
+            from_ts = int(max(from_dt, earliest).timestamp())
+
+            raw = await _fetch_bars_raw(client, addr, net, from_ts, to_ts)
+            status = extract.bars_status(raw) or "no_data"
+            rows = extract.extract_bars(
+                raw, addr, net, config.BARS_RESOLUTION, recorded_at
+            )
+            if rows:
+                stats["bars_rows"] += db.insert_bars(rows)
+                stats["bars_tokens"] += 1
+            else:
+                stats["bars_no_data"] += 1
+            db.set_bars_state(addr, net, status if rows else "no_data", len(rows), recorded_at)
+        except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الشريحة
+            stats["bars_errors"] += 1
+            db.set_bars_state(addr, net, "error", 0, recorded_at)
+            db.set_meta("last_error_bars", f"{recorded_at}: {type(exc).__name__}: {exc}")
+        if i + 1 < len(due):
+            await sleep(config.BARS_PACING_SECONDS)
+    return stats
+
+
+def admit_control_sample(
+    db: RecorderDB,
+    candidates: Sequence[tuple[str, str]],
+    recorded_at: str,
+    rng: random.Random | None = None,
+) -> int:
+    """يُدخل عملات ضابطة مختارة **عشوائياً** من نفس كون العملات. يعيد كم أُدخلت.
+
+    شروط سلامة المقارنة (كلّها مقصودة):
+    - **عشوائيّ لا حسب الترتيب**: الأخذ من رأس قائمة الرواج يختار الأعلى حجماً
+      فيصير الفرق عن المُشار إليها فرقَ حجمٍ لا فرقَ إشارة.
+    - **بلا نظر إلى المستقبل**: الاختيار يعتمد على ما هو معروف الآن فقط؛ لا
+      يُستشار أداء لاحق (وإلّا كان تسرّباً صريحاً).
+    - **يُستبعد كل ما أُشير إليه** ولو لم يدخل المراقبة — وإلّا لم يعد ضابطاً.
+    - **بالتقسيط** (`CONTROL_PER_CYCLE`): أخذ الأربعين دفعةً واحدة يجعلها كلّها
+      عيّنة من لحظة سوقية واحدة، فيختلط أثر الإشارة بأثر تلك اللحظة.
+    """
+    need = config.CONTROL_GROUP_SIZE - db.active_watch_count(is_control=1)
+    if need <= 0 or not candidates:
+        return 0
+
+    known = db.known_tokens()
+    signalled = db.signalled_tokens()
+    pool = sorted({
+        (addr, net) for addr, net in candidates
+        if (addr, net) not in known and addr not in signalled
+    })
+    if not pool:
+        return 0
+
+    rng = rng or random.Random()
+    picks = rng.sample(pool, min(len(pool), config.CONTROL_PER_CYCLE, need))
+    added = 0
+    for addr, net in picks:
+        if db.admit_control(addr, net, config.CONTROL_WATCH_HOURS, recorded_at):
+            added += 1
+    return added
+
+
+async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) -> Any:
+    """خام GET /feed/token/thesis — نتجاوز get_token_thesis_feed لأنّها تُعيّن."""
+    from fomo_api.config import settings
+
+    params = {
+        "tokenAddress": token_address,
+        "networkId": int(network_id) if str(network_id).isdigit() else network_id,
+        "threshold": config.SOCIAL_THRESHOLD,
+    }
+    return await client._get(settings.upstream_feed_token_thesis_path, params)
+
+
+async def run_social_cycle(
+    client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
+) -> dict[str, int]:
+    """يلتقط الطبقة الاجتماعية لشريحة من المراقَبات (جدولة دوّارة كالشموع).
+
+    العملة بلا نقاش تُسجَّل بأصفار لا تُتخطّى: **الصمت إشارة**، وسلسلة الأصفار
+    ثمّ الارتفاع المفاجئ هي بالضبط ما نريد التقاطه.
+    """
+    stats = {"social_tokens": 0, "social_items": 0, "social_errors": 0}
+    now_dt = datetime.fromisoformat(recorded_at)
+    stale_before = (now_dt - timedelta(seconds=config.SOCIAL_REFRESH_SECONDS)).isoformat()
+    due = db.social_fetch_due(limit=config.SOCIAL_PER_CYCLE, stale_before_iso=stale_before)
+
+    for i, w in enumerate(due):
+        addr = w["token_address"]
+        net = str(w["network_id"] or "")
+        try:
+            raw = await _fetch_thesis_raw(client, addr, net)
+            row = extract.extract_social(raw, addr, net, recorded_at)
+            db.insert_social(row)
+            stats["social_tokens"] += 1
+            stats["social_items"] += row["thesis_total"]
+            db.set_social_state(
+                addr, net, "ok" if row["thesis_sampled"] else "empty",
+                row["thesis_total"], recorded_at,
+            )
+        except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الشريحة
+            stats["social_errors"] += 1
+            db.set_social_state(addr, net, "error", 0, recorded_at)
+            db.set_meta("last_error_social", f"{recorded_at}: {type(exc).__name__}: {exc}")
+        if i + 1 < len(due):
+            await sleep(config.SOCIAL_PACING_SECONDS)
+    return stats
+
+
+async def run_cycle(
+    client: Any,
+    db: RecorderDB,
+    lb: LeaderboardCache,
+    now_mono: float | None = None,
+) -> dict[str, int]:
+    """دورة واحدة. يعيد عدّادات ملخّصة. يبتلع أخطاء كل مصدر على حدة."""
+    now_mono = now_mono if now_mono is not None else time.monotonic()
+    recorded_at = utcnow_iso()
+    stats = {
+        "signals": 0, "watch_added": 0, "control_added": 0, "ticks": 0, "static": 0,
+        "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
+        "errors": 0,
+    }
+
+    def _fail(where: str, exc: Exception) -> None:
+        stats["errors"] += 1
+        db.bump_counter("errors_total")
+        db.set_meta(f"last_error_{where}", f"{recorded_at}: {type(exc).__name__}: {exc}")
+
+    # 0) تحديث صدارة المتصدّرين (كل ساعة).
+    try:
+        await lb.maybe_refresh(now_mono)
+    except Exception as exc:  # noqa: BLE001 — لا نُفشل الدورة
+        _fail("leaderboard", exc)
+
+    # 1) الـ feed الخام → signal_events + watchlist للمُشغّلات.
+    try:
+        raw_feed = await _fetch_feed_raw(client)
+        if raw_feed is not None:
+            with db.batch():  # تثبيت واحد للقطة + كل إشارات الدورة
+                db.insert_snapshot("feed", raw_feed, recorded_at)
+                events = extract.unwrap_feed(raw_feed)
+                # ختم أحدث حدث في الـ feed. بدونه لا يمكن تمييز "السوق هادئ"
+                # عن "feed المصدر متجمّد" — وقد شوهد متجمّداً 3 ساعات بينما
+                # المسجّل يعمل بلا خطأ. الفرق حاسم لأي تحليل زمنيّ لاحق.
+                newest = max(
+                    (str(e.get("createdAt")) for e in events if e.get("createdAt")),
+                    default=None,
+                )
+                if newest:
+                    db.set_meta("last_feed_event_at", newest)
+                for ev in events:
+                    row = extract.extract_signal_event(ev, recorded_at, lb.lookup)
+                    if row is None:
+                        continue
+                    if db.insert_signal(row):
+                        stats["signals"] += 1
+                    # المُشغّلات فقط تُدخل المراقبة؛ sell سياق لا يُشغّل.
+                    # السقف يخصّ المُشار إليها وحدها — الضابطة لا تزاحمها عليه.
+                    if (
+                        row["signal_type"] in config.TRIGGER_SIGNAL_TYPES
+                        and db.active_watch_count(is_control=0) < config.WATCHLIST_CAP
+                    ):
+                        added = db.upsert_watch(
+                            token_address=row["token_address"],
+                            network_id=row["network_id"] or "",
+                            source=row["signal_type"],
+                            entry_signal_id=row["id"],
+                            watch_hours=config.WATCH_HOURS,
+                            now_iso=recorded_at,
+                        )
+                        if added:
+                            stats["watch_added"] += 1
+    except Exception as exc:  # noqa: BLE001
+        _fail("feed", exc)
+
+    # 2) trending + verified الخام → snapshots + market_ticks + token_static.
+    watched = {(w["token_address"], str(w["network_id"] or "")) for w in db.active_watches()}
+    # مرشّحو المجموعة الضابطة: كل عملة نراها في هذه الدورة ولم تدخل من قبل.
+    # نجمعها هنا مجّاناً — البيانات في اليد أصلاً، فلا نداء شبكة إضافيّ.
+    control_candidates: list[tuple[str, str]] = []
+    for source, fetch in (("trending", _fetch_trending_raw), ("verified", _fetch_verified_raw)):
+        try:
+            raw = await fetch(client)
+            if raw is None:
+                continue
+            with db.batch():  # ~65 tick في الدورة → تثبيت واحد بدل 65
+                db.insert_snapshot(source, raw, recorded_at)
+                items = extract.unwrap_token_list(raw)
+                for item in items:
+                    tick = extract.extract_market_tick(item, recorded_at, source)
+                    if tick is None:
+                        continue
+                    key = (tick["token_address"], str(tick["network_id"] or ""))
+                    control_candidates.append(key)
+                    # نسجّل tick لكل عملة مراقَبة (المصدر الأساسي للسلسلة الزمنية).
+                    # نسجّل أيضاً الثوابت لكل عملة نراها لأول مرّة إن كانت مراقَبة.
+                    if key in watched:
+                        if db.insert_tick(tick):
+                            stats["ticks"] += 1
+                        if not db.static_exists(
+                            tick["token_address"], str(tick["network_id"] or "")
+                        ):
+                            st = extract.extract_token_static(item, recorded_at)
+                            if st is not None:
+                                db.upsert_static(st)
+                                stats["static"] += 1
+        except Exception as exc:  # noqa: BLE001
+            _fail(source, exc)
+
+    # 2.25) تجديد المجموعة الضابطة (الصنف السالب).
+    try:
+        stats["control_added"] = admit_control_sample(db, control_candidates, recorded_at)
+    except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
+        _fail("control", exc)
+
+    # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
+    try:
+        bars = await run_bars_cycle(client, db, recorded_at)
+        stats["bars_tokens"] = bars["bars_tokens"]
+        stats["bars_rows"] = bars["bars_rows"]
+        if bars["bars_errors"]:
+            stats["errors"] += bars["bars_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("bars", exc)
+
+    # 2.75) الطبقة الاجتماعية لشريحة من المراقَبات.
+    try:
+        soc = await run_social_cycle(client, db, recorded_at)
+        stats["social_tokens"] = soc["social_tokens"]
+        stats["social_items"] = soc["social_items"]
+        if soc["social_errors"]:
+            stats["errors"] += soc["social_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("social", exc)
+
+    # 3) تنظيف watchlist: تعطيل ما تجاوز 48 ساعة.
+    try:
+        db.deactivate_expired(recorded_at)
+        # حذف اللقطات القديمة — معطّل افتراضياً (0 = احتفاظ أبديّ).
+        if config.SNAPSHOT_RETENTION_DAYS > 0:
+            cutoff = (
+                datetime.fromisoformat(recorded_at)
+                - timedelta(days=config.SNAPSHOT_RETENTION_DAYS)
+            ).isoformat()
+            pruned = db.prune_snapshots(cutoff)
+            if pruned:
+                db.bump_counter("snapshots_pruned_total", pruned)
+    except Exception as exc:  # noqa: BLE001
+        _fail("cleanup", exc)
+
+    db.set_meta("last_cycle_at", recorded_at)
+    db.set_meta("last_cycle_stats", str(stats))
+    # دورة نجحت كلياً (بلا أي خطأ مصدر) → ختم يُبطل أخطاء meta الأقدم منه في اللوحة.
+    if stats["errors"] == 0:
+        db.set_meta("last_ok_cycle_at", recorded_at)
+    db.bump_counter("cycles_total")
+    return stats
+
+
+async def _maybe_rotate_client(
+    client: Any, current_token: str, lb: LeaderboardCache, db: RecorderDB
+) -> tuple[Any, str]:
+    """يلتقط التوكن المتجدّد من القرص كل دورة.
+
+    توكن fomo عمره 60 دقيقة؛ خادم الـ api يكتب توكناً طازجاً إلى القرص قبل انتهائه.
+    نقرأ القرص، فإن تغيّر التوكن أعدنا بناء FomoClient (وأغلقنا القديم) ووجّهنا
+    الكاش إلى العميل الجديد. فشل القراءة لا يُسقط الدورة — نُكمل بالعميل الحالي.
+    لا يُطبع أي قيمة توكن إطلاقاً (FR-013).
+
+    يعيد (client, token) المستعملَين للدورة القادمة.
+    """
+    try:
+        disk_token = _load_access_token()
+    except Exception as exc:  # noqa: BLE001 — قراءة القرص فشلت؛ نكمل بالحالي
+        db.set_meta("last_error_token_reload", f"{utcnow_iso()}: {type(exc).__name__}")
+        return client, current_token
+    if disk_token == current_token:
+        return client, current_token
+    # تدوّر التوكن: أنشئ عميلاً جديداً وأغلق القديم بنظافة.
+    new_client = _build_client(disk_token)
+    try:
+        await client.aclose()
+    except Exception:  # noqa: BLE001 — إغلاق العميل القديم لا يُسقط المسجّل
+        pass
+    lb.set_client(new_client)
+    db.set_meta("last_token_refresh_at", utcnow_iso())
+    _log("token rotated → client rebuilt")  # بلا أي قيمة سرّية
+    return new_client, disk_token
+
+
+async def main_loop(cycles: int | None = None) -> None:
+    """يشغّل الحلقة إلى ما لا نهاية (cycles=None) أو عدداً محدّداً (للتحقّق)."""
+    db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
+    current_token = _load_access_token()
+    client = _build_client(current_token)
+    lb = LeaderboardCache(
+        client, size=config.LEADERBOARD_SIZE, refresh_seconds=config.LEADERBOARD_REFRESH_SECONDS
+    )
+    db.set_meta("schema_version", "1")
+    # يوثّق أنّ raw_json يُكتب مضغوطاً — أي قارئ لاحق يمرّ عبر db.decode_raw.
+    db.set_meta("raw_encoding", "zlib")
+    db.set_meta("started_at", utcnow_iso())
+    n = 0
+    try:
+        while cycles is None or n < cycles:
+            started = time.monotonic()
+            # التقط التوكن المتجدّد على القرص قبل الدورة (يمنع 401 بعد الساعة).
+            client, current_token = await _maybe_rotate_client(client, current_token, lb, db)
+            try:
+                stats = await run_cycle(client, db, lb, now_mono=started)
+                _log(f"cycle {n}: {stats}")
+            except Exception:  # noqa: BLE001 — درع أخير حول الدورة كلها
+                _log("cycle crashed:\n" + traceback.format_exc())
+                db.bump_counter("cycle_crashes")
+            n += 1
+            if cycles is not None and n >= cycles:
+                break
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0.0, config.CYCLE_SECONDS - elapsed))
+    finally:
+        await client.aclose()
+        db.close()
+
+
+def _log(msg: str) -> None:
+    """يكتب سطراً للسجلّ مع ختم زمني. الفشل في الكتابة لا يُسقط المسجّل.
+
+    يُدوّر الملف عند تجاوز LOG_MAX_BYTES (سطر/دقيقة يعني نموّاً أبدياً بلا ذلك)؛
+    نحتفظ بنسخة واحدة `.1` فقط — السجلّ تشخيصيّ لا أرشيفيّ.
+    """
+    line = f"{utcnow_iso()} {msg}\n"
+    try:
+        import os
+
+        if config.LOG_MAX_BYTES > 0 and os.path.getsize(config.LOG_PATH) > config.LOG_MAX_BYTES:
+            os.replace(config.LOG_PATH, config.LOG_PATH + ".1")
+    except OSError:
+        pass  # الملف غير موجود بعد أو مقفل — الكتابة أدناه تتكفّل
+    try:
+        with open(config.LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    import sys
+
+    _cycles = None
+    if len(sys.argv) > 1 and sys.argv[1].isdigit():
+        _cycles = int(sys.argv[1])
+    asyncio.run(main_loop(cycles=_cycles))

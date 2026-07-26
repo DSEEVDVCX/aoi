@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>لوحة المسجّل — Fomo Recorder</title>
+<style>
+/* ---------------------------------------------------------------------------
+   نظام الألوان. القيم مأخوذة من لوحة تمّ التحقّق منها آلياً (validate_palette):
+   الفئوية على السطح الداكن #141416 والفاتح #fbfbf9 تجتاز كل البوابات
+   (فصل عمى الألوان، أرضية الرؤية الطبيعية، التباين). لا تُبدّل لوناً بالحدس —
+   أعِد تشغيل المدقّق. ألوان الحالة (جيّد/تحذير/حرج) محجوزة ولا تُستعمل كسلسلة،
+   وتُشفَع دائماً بعلامة ونصّ فلا يحمل اللون المعنى وحده.
+--------------------------------------------------------------------------- */
+:root {
+  color-scheme: dark;
+  --page: #0b0b0c;
+  --surface: #141416;
+  --surface-2: #1b1b1f;
+  --line: #26262b;
+  --grid: #202024;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #8b8a84;
+  /* فئوية — الترتيب ثابت: اللون يتبع نوع الإشارة لا رتبتها */
+  --s1: #3987e5;   /* multi_user_buy  */
+  --s2: #d95926;   /* large_buy       */
+  --s3: #199e70;   /* multi_user_sell */
+  --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --crit: #d03b3b;
+  --up: #0ca30c; --down: #d03b3b;
+  --radius: 12px;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+}
+@media (prefers-color-scheme: light) {
+  :root:where(:not([data-theme="dark"])) {
+    color-scheme: light;
+    --page: #f4f4f1; --surface: #fbfbf9; --surface-2: #f1f1ed;
+    --line: #e1e0d9; --grid: #e8e7e1;
+    --ink: #0b0b0b; --ink-2: #52514e; --muted: #6f6e69;
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+    --up: #006300; --down: #c22a2a;
+    --shadow: 0 1px 2px rgba(11,11,11,.06), 0 8px 24px -14px rgba(11,11,11,.18);
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f4f4f1; --surface: #fbfbf9; --surface-2: #f1f1ed;
+  --line: #e1e0d9; --grid: #e8e7e1;
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #6f6e69;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --up: #006300; --down: #c22a2a;
+  --shadow: 0 1px 2px rgba(11,11,11,.06), 0 8px 24px -14px rgba(11,11,11,.18);
+}
+
+* { box-sizing: border-box; }
+html, body { overflow-x: hidden; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+  font-size: 14px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- شريط علوي --- */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 22px; background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: baseline; gap: 10px; margin-inline-end: 4px; }
+.brand h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+.brand .sub { color: var(--muted); font-size: 12px; }
+.status {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 5px 11px 5px 9px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--line);
+  font-size: 12.5px; font-weight: 550; color: var(--ink-2);
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.on   { background: var(--good); }
+.dot.warn { background: var(--warn); }
+.dot.off  { background: var(--crit); }
+.dot.on.live { animation: pulse 2.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+@media (prefers-reduced-motion: reduce) { .dot.on.live { animation: none } }
+.spacer { margin-inline-start: auto; }
+.meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.btn {
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 5px 11px; font-size: 12.5px; font-family: inherit;
+  cursor: pointer;
+}
+.btn:hover { color: var(--ink); border-color: var(--muted); }
+.btn[aria-pressed="true"] { color: var(--ink); border-color: var(--muted); }
+
+main { padding: 22px; max-width: 1320px; margin: 0 auto; }
+.stale { opacity: .55; transition: opacity .2s; }   /* تحديث جارٍ: لا وميض هيكل */
+
+/* --- بطاقات --- */
+.card {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 18px;
+}
+.card > header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 13px 18px; border-bottom: 1px solid var(--line);
+}
+.card > header h2 { font-size: 13.5px; margin: 0; font-weight: 620; letter-spacing: -.005em; }
+.card > header .note { color: var(--muted); font-size: 12px; font-weight: 400; }
+.card > .body { padding: 18px; }
+.card > .body.flush { padding: 0; }
+
+/* --- شبكة النظرة العامة --- */
+.overview { display: grid; grid-template-columns: minmax(210px, 1fr) 3fr; gap: 18px; margin-bottom: 18px; }
+@media (max-width: 900px) { .overview { grid-template-columns: 1fr } }
+.hero { display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+.hero .label { color: var(--muted); font-size: 12.5px; }
+/* أرقام كبيرة: أرقام متناسبة لا tabular — الأخيرة تجعل 121 يبدو مفكّكاً */
+.hero .value { font-size: 52px; font-weight: 620; letter-spacing: -.03em; line-height: 1.05; }
+.hero .delta { font-size: 12.5px; color: var(--ink-2); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 1px; background: var(--line); border-radius: var(--radius); overflow: hidden; }
+.tile { background: var(--surface); padding: 14px 16px; }
+.tile .l { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+.tile .v { font-size: 21px; font-weight: 600; letter-spacing: -.02em; }
+.tile .d { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+/* --- شارات --- */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 8px; border-radius: 6px; font-size: 11.5px; font-weight: 550;
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.badge .key { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.badge.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
+.badge.bad  { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
+.badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+
+/* --- جداول --- */
+.tablewrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td {
+  padding: 9px 16px; text-align: right; border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+th { color: var(--muted); font-weight: 600; font-size: 11.5px; letter-spacing: .01em; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--surface-2); }
+.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11.5px; color: var(--muted); }
+
+/* --- روابط خارجية إلى fomo.family --- */
+a.ext { color: inherit; text-decoration: none; border-bottom: 1px solid transparent; }
+a.ext:hover { color: var(--s1); border-bottom-color: color-mix(in srgb, var(--s1) 45%, transparent); }
+a.ext:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 3px; }
+a.ext .ico { font-size: 9px; margin-inline-start: 3px; opacity: 0; transition: opacity .12s; }
+a.ext:hover .ico, a.ext:focus-visible .ico { opacity: .75; }
+@media (prefers-reduced-motion: reduce) { a.ext .ico { transition: none } }
+.num { font-variant-numeric: tabular-nums; }
+.up { color: var(--up); } .down { color: var(--down); }
+.empty { padding: 26px 18px; color: var(--muted); text-align: center; }
+
+/* --- مقياس (meter) --- */
+.meter { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; min-width: 60px; }
+.meter > i { display: block; height: 100%; border-radius: 3px; background: var(--s1); }
+
+/* --- رسوم --- */
+.chart { direction: ltr; }          /* السلاسل الزمنية تسير يساراً→يميناً */
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+.legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
+.legend .key { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.axis { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.gridline { stroke: var(--grid); stroke-width: 1; }        /* خطّ شعري مصمت، لا متقطّع */
+.baseline { stroke: var(--line); stroke-width: 1; }
+
+/* --- تلميح --- */
+#tip {
+  position: fixed; z-index: 60; pointer-events: none; opacity: 0;
+  transition: opacity .1s; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 9px; box-shadow: var(--shadow);
+  padding: 9px 12px; font-size: 12.5px; max-width: 280px;
+}
+#tip .t { font-weight: 620; margin-bottom: 5px; }
+#tip .r { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+#tip .r .k { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
+#tip .r .key { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+#tip .r .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr } }
+/* --- شريط الحصيلة --- */
+.summary { display: flex; flex-wrap: wrap; gap: 0; border-bottom: 1px solid var(--line); }
+.summary .cell { padding: 12px 18px; border-inline-start: 1px solid var(--line); flex: 1 1 auto; min-width: 130px; }
+.summary .cell:first-child { border-inline-start: none; }
+.summary .cell .l { color: var(--muted); font-size: 11.5px; margin-bottom: 2px; }
+.summary .cell .v { font-size: 19px; font-weight: 600; letter-spacing: -.015em; }
+.summary .cell .d { color: var(--muted); font-size: 11px; margin-top: 1px; }
+/* شريط نسبة الرابح/الخاسر — الفصل بفجوة 2px بلون السطح لا بحدّ مرسوم */
+.split { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin-top: 6px; gap: 2px; background: var(--surface-2); }
+.split i { display: block; height: 100%; }
+.opennote { padding: 8px 18px; color: var(--muted); font-size: 11.5px; border-bottom: 1px solid var(--line); background: var(--surface-2); }
+
+/* --- ترويسة قابلة للترتيب --- */
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover { color: var(--ink); }
+th.sortable .arrow { opacity: .35; margin-inline-start: 3px; }
+th.sortable[aria-sort] { color: var(--ink); }
+th.sortable[aria-sort] .arrow { opacity: 1; }
+
+.errline { padding: 10px 18px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.errline:last-child { border-bottom: none; }
+.errline.resolved { opacity: .5; }
+.banner { padding: 10px 14px; border-radius: 9px; background: color-mix(in srgb, var(--crit) 14%, transparent); border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent); color: var(--ink); font-size: 12.5px; margin-bottom: 18px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <h1>لوحة المسجّل</h1>
+    <span class="sub">fomo.family</span>
+  </div>
+  <span class="status"><span id="rec-dot" class="dot"></span><span id="rec-txt">المسجّل…</span></span>
+  <span class="status"><span id="api-dot" class="dot"></span><span id="api-txt">الـ API…</span></span>
+  <span class="spacer"></span>
+  <span class="meta" id="updated">—</span>
+  <button class="btn" id="pause" aria-pressed="false" title="إيقاف/استئناف التحديث التلقائي">إيقاف مؤقّت</button>
+  <button class="btn" id="theme" title="تبديل السمة">◐</button>
+</div>
+
+<main>
+  <div id="alert"></div>
+
+  <!-- نظرة عامة: رقم رئيسي واحد + بطاقات -->
+  <div class="overview">
+    <div class="card" style="margin:0">
+      <div class="body hero">
+        <div class="label">إشارات مسجّلة</div>
+        <div class="value" id="hero-value">—</div>
+        <div class="delta" id="hero-delta">—</div>
+        <div class="chart" id="hero-spark" style="margin-top:10px"></div>
+      </div>
+    </div>
+    <div class="tiles" id="tiles"></div>
+  </div>
+
+  <!-- الرسم الأهمّ: هل الإشارة تنفع؟ -->
+  <div class="card">
+    <header>
+      <h2>أداء الإشارات منذ الدخول</h2>
+      <span class="note">اضغط عنوان أي عمود للترتيب — يشمل كل العملات لا المعروضة فقط</span>
+      <span class="spacer"></span>
+      <label class="note" for="perf-limit">عرض</label>
+      <select class="btn" id="perf-limit">
+        <option value="12">12</option><option value="25">25</option>
+        <option value="50">50</option><option value="100">الكل</option>
+      </select>
+      <button class="btn" data-toggle="perf" aria-pressed="false">عرض كجدول</button>
+    </header>
+    <div id="perf-summary"></div>
+    <div class="body flush" id="perf"></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <header>
+        <h2>تدفّق الإشارات</h2>
+        <span class="note">آخر 24 ساعة</span>
+        <span class="spacer"></span>
+        <button class="btn" data-toggle="timeline" aria-pressed="false">عرض كجدول</button>
+      </header>
+      <div class="body" id="timeline"></div>
+    </div>
+
+    <div class="card">
+      <header><h2>صحّة الجمع</h2></header>
+      <div class="body" id="health"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <header>
+      <h2>الإشارة مقابل المجموعة الضابطة</h2>
+      <span class="note">هل الإشارة تتفوّق على عملات دخلت بالاختيار العشوائي؟</span>
+    </header>
+    <div class="body flush" id="comparison"></div>
+  </div>
+
+  <div class="card">
+    <header>
+      <h2>قائمة المراقبة</h2>
+      <span class="note">نافذة 48 ساعة لكل عملة</span>
+    </header>
+    <div class="body flush tablewrap" id="watchlist"></div>
+  </div>
+
+  <div class="card">
+    <header><h2>أحدث الإشارات</h2></header>
+    <div class="body flush tablewrap" id="signals"></div>
+  </div>
+
+  <div class="card">
+    <header><h2>الأخطاء حسب المصدر</h2></header>
+    <div class="body flush" id="errors"></div>
+  </div>
+</main>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+const REFRESH_MS = 10000;
+
+/* ألوان السلاسل تُقرأ من CSS فتتبع السمة تلقائياً. اللون يتبع **نوع الإشارة**
+   لا ترتيبها — وإلّا أعادت الفلترة طلاء السلاسل الباقية وضلّل القارئ. */
+const TYPE_META = {
+  multi_user_buy:  { css: "--s1", label: "شراء متعدّد" },
+  large_buy:       { css: "--s2", label: "شراء كبير" },
+  multi_user_sell: { css: "--s3", label: "بيع متعدّد" },
+};
+/* ---------- روابط fomo.family ----------
+   مسار صفحة العملة `/tokens/:chain/:tokenAddress` حيث `:chain` **اسم مختصر لا
+   معرّف رقميّ**: كود الموقع يقرأه كمفتاح في خريطة (`chain ? map[chain] : undefined`).
+   الخريطة أدناه منسوخة حرفياً من حزمة الموقع (chains-*.js):
+       se = {solana:1399811149, base:8453, monad:143, bnb:56,
+             ethereum:1, hyperliquid:1337, robinhood:4663}
+   شبكة غير معروفة ⇒ **لا رابط** بدل رابط مُخمَّن يقود إلى صفحة معطوبة. */
+const CHAIN_SLUG = {
+  "1399811149": "solana", "8453": "base", "143": "monad",
+  "56": "bnb", "1": "ethereum", "1337": "hyperliquid", "4663": "robinhood",
+};
+const FOMO = "https://fomo.family";
+
+function fomoTokenUrl(address, networkId) {
+  const slug = CHAIN_SLUG[String(networkId ?? "")];
+  if (!slug || !address) return null;
+  return `${FOMO}/tokens/${slug}/${encodeURIComponent(address)}`;
+}
+function fomoUserUrl(handle) {
+  return handle ? `${FOMO}/u/${encodeURIComponent(handle)}` : null;
+}
+
+/** نصّ مرتبط بصفحة fomo، أو النصّ وحده إن تعذّر بناء الرابط. */
+function extLink(url, html, title) {
+  if (!url) return html;
+  return `<a class="ext" href="${esc(url)}" target="_blank" rel="noopener noreferrer"
+    title="${esc(title || "فتح في fomo.family")}">${html}<span class="ico" aria-hidden="true">↗</span></a>`;
+}
+
+const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const typeColor = (t) => cssVar(TYPE_META[t]?.css || "--muted");
+const typeLabel = (t) => TYPE_META[t]?.label || t;
+
+/* ---------- أدوات ---------- */
+const esc = (s) => s == null ? "—" : String(s).replace(/[&<>"']/g,
+  c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+
+function num(n, d = 0) {
+  if (n == null || !isFinite(n)) return "—";
+  return Number(n).toLocaleString("en-US", { maximumFractionDigits: d });
+}
+function compact(n) {
+  if (n == null || !isFinite(n)) return "—";
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, "") + "B";
+  if (a >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
+  if (a >= 1e4) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
+  return num(n);
+}
+/* أسعار العملات الصغيرة تحتاج أرقاماً معنوية لا منازل عشرية ثابتة */
+function price(p) {
+  if (p == null || !isFinite(p)) return "—";
+  if (p === 0) return "0";
+  if (p >= 1) return "$" + num(p, 2);
+  return "$" + Number(p).toPrecision(3);
+}
+function pct(v, { sign = true, digits = 1 } = {}) {
+  if (v == null || !isFinite(v)) return "—";
+  return (sign && v > 0 ? "+" : "") + v.toFixed(digits) + "%";
+}
+/* الاتجاه يُشفَع بعلامة ونصّ، فلا يحمل اللون المعنى وحده */
+function signed(v, digits = 1) {
+  if (v == null || !isFinite(v)) return `<span class="num">—</span>`;
+  const cls = v > 0 ? "up" : v < 0 ? "down" : "";
+  return `<span class="num ${cls}">${pct(v, { digits })}</span>`;
+}
+const shortAddr = (a) => !a ? "—" : (a.length > 14 ? a.slice(0, 6) + "…" + a.slice(-4) : a);
+
+function ago(iso) {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (isNaN(t)) return esc(iso);
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return Math.round(s) + " ث";
+  if (s < 3600) return Math.round(s / 60) + " د";
+  if (s < 86400) return Math.round(s / 3600) + " س";
+  return Math.round(s / 86400) + " ي";
+}
+function remaining(iso) {
+  const t = Date.parse(iso);
+  if (isNaN(t)) return { txt: "—", frac: 0 };
+  const s = (t - Date.now()) / 1000;
+  if (s <= 0) return { txt: "انتهى", frac: 0 };
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return { txt: `${h}س ${m}د`, frac: Math.max(0, Math.min(1, s / (48 * 3600))) };
+}
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " → " + r.status);
+  return r.json();
+}
+
+/* ---------- تلميح مشترك ---------- */
+const tip = document.getElementById("tip");
+function showTip(evt, html) {
+  tip.innerHTML = html;
+  tip.style.opacity = "1";
+  const pad = 14, r = tip.getBoundingClientRect();
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + r.width > innerWidth - 8) x = evt.clientX - r.width - pad;
+  if (y + r.height > innerHeight - 8) y = evt.clientY - r.height - pad;
+  tip.style.left = Math.max(8, x) + "px";
+  tip.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { tip.style.opacity = "0"; };
+addEventListener("scroll", hideTip, { passive: true });
+
+/* ---------- رسوم SVG (بلا أي مكتبة خارجية) ---------- */
+const NS = "http://www.w3.org/2000/svg";
+const el = (n, attrs = {}) => {
+  const e = document.createElementNS(NS, n);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+};
+
+/** خطّ صغير بلا محاور — يرافق رقماً، لا يحلّ محلّه. */
+function sparkline(values, { w = 240, h = 44, color = "var(--s1)" } = {}) {
+  const svg = el("svg", { viewBox: `0 0 ${w} ${h}`, role: "img", preserveAspectRatio: "none" });
+  if (!values || values.length < 2) return svg;
+  const lo = Math.min(...values), hi = Math.max(...values), span = hi - lo || 1;
+  const x = (i) => (i / (values.length - 1)) * w;
+  const y = (v) => h - 3 - ((v - lo) / span) * (h - 6);
+  const d = values.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  svg.append(el("path", {
+    d: `${d} L${w},${h} L0,${h} Z`, fill: color, "fill-opacity": ".10", stroke: "none",
+  }));
+  svg.append(el("path", {
+    d, fill: "none", stroke: color, "stroke-width": 2,
+    "stroke-linejoin": "round", "stroke-linecap": "round",
+  }));
+  return svg;
+}
+
+/**
+ * أعمدة مكدّسة: الإشارات لكل ساعة حسب النوع.
+ * مواصفات مفروضة: سُمك العمود ≤24px، طرف علويّ مستدير 4px وقاعدة مربّعة،
+ * فجوة 2px بلون السطح بين المقاطع (الفصل بالفراغ لا بحدّ مرسوم).
+ */
+function stackedColumns(data, { height = 190 } = {}) {
+  const box = document.createElement("div");
+  box.className = "chart";
+  const { hours, types, series } = data;
+  if (!hours.length || !types.length) {
+    box.innerHTML = `<div class="empty">لا إشارات في هذه المدّة.</div>`;
+    return box;
+  }
+  const W = 720, H = height, m = { t: 10, r: 8, b: 22, l: 34 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const totals = hours.map((_, i) => types.reduce((s, t) => s + (series[t][i] || 0), 0));
+  const max = Math.max(1, ...totals);
+  const step = niceStep(max);
+  const top = Math.ceil(max / step) * step;
+  const band = pw / hours.length;
+  const bw = Math.min(24, band * 0.68);
+  const y = (v) => m.t + ph - (v / top) * ph;
+
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  // append() يعيد undefined — لا تُسلسل .textContent عليه
+  const title = el("title", {});
+  title.textContent = "الإشارات لكل ساعة حسب النوع";
+  svg.append(title);
+
+  for (let g = 0; g <= top; g += step) {
+    svg.append(el("line", { x1: m.l, x2: W - m.r, y1: y(g), y2: y(g), class: g === 0 ? "baseline" : "gridline" }));
+    const tx = el("text", { x: m.l - 7, y: y(g) + 3.5, class: "axis", "text-anchor": "end" });
+    tx.textContent = num(g);
+    svg.append(tx);
+  }
+
+  hours.forEach((hIso, i) => {
+    const cx = m.l + band * i + band / 2;
+    let acc = 0;
+    const parts = [];
+    types.forEach((t) => {
+      const v = series[t][i] || 0;
+      if (!v) return;
+      const y0 = y(acc), y1 = y(acc + v);
+      // فجوة 2px تفصل المقاطع، وتُقتطع فقط إن كان المقطع يحتملها
+      const gap = acc > 0 ? 2 : 0;
+      const hgt = Math.max(1, y0 - y1 - gap);
+      const isTop = acc + v >= totals[i] - 1e-9;
+      svg.append(el("path", {
+        d: roundedTop(cx - bw / 2, y1, bw, hgt, isTop ? 4 : 0),
+        fill: typeColor(t),
+      }));
+      parts.push({ t, v });
+      acc += v;
+    });
+    // منطقة التقاط عريضة: الهدف أكبر من العمود نفسه
+    const hit = el("rect", { x: m.l + band * i, y: m.t, width: band, height: ph, fill: "transparent" });
+    hit.style.cursor = "crosshair";
+    const label = new Date(hIso + "Z").toLocaleString("ar-EG", { hour: "2-digit", day: "numeric", month: "short" });
+    hit.addEventListener("mousemove", (e) => showTip(e, tipHtml(label, parts, totals[i])));
+    hit.addEventListener("mouseleave", hideTip);
+    svg.append(hit);
+
+    if (i % Math.ceil(hours.length / 6) === 0) {
+      const tx = el("text", { x: cx, y: H - 6, class: "axis", "text-anchor": "middle" });
+      tx.textContent = new Date(hIso + "Z").toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+      svg.append(tx);
+    }
+  });
+
+  box.append(svg);
+  return box;
+
+  function tipHtml(label, parts, total) {
+    const rows = parts.map(p =>
+      `<div class="r"><span class="k"><i class="key" style="background:${typeColor(p.t)}"></i>${esc(typeLabel(p.t))}</span><span class="v">${p.v}</span></div>`
+    ).join("");
+    return `<div class="t">${esc(label)}</div>${rows}<div class="r" style="margin-top:5px;border-top:1px solid var(--line);padding-top:5px"><span class="k">المجموع</span><span class="v">${total}</span></div>`;
+  }
+}
+
+/** مسار مستطيل بطرف علويّ مستدير وقاعدة مربّعة (ينمو من خطّ أساس واحد). */
+function roundedTop(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h));
+  return `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h} Z`;
+}
+function niceStep(max) {
+  const raw = max / 4, mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  return Math.max(1, [1, 2, 5, 10].find(m => m * mag >= raw) * mag);
+}
+
+/* ---------- عرض الحالة ---------- */
+function renderStatus(st) {
+  const dot = document.getElementById("rec-dot"), txt = document.getElementById("rec-txt");
+  if (st.alive) {
+    // تجمّد الـ feed المصدر لا يعني توقّف المسجّل — ولا يجوز خلطهما: الأرشيف
+    // في الحالتين "بلا إشارات"، والفرق بين سوق هادئ ومصدر منقطع حاسم.
+    if (st.feed_stale) {
+      // نذكر الواقعة لا الحكم: 17 دقيقة قد تكون سوقاً هادئاً وقد تكون انقطاعاً،
+      // والتمييز للقارئ. الادّعاء بـ"متجمّد" عند 15 دقيقة إنذار كاذب متكرّر.
+      dot.className = "dot warn";
+      txt.textContent = `المسجّل يعمل · آخر حدث في الـ feed قبل ${ago(st.last_feed_event_at)}`;
+    } else {
+      dot.className = "dot on live";
+      txt.textContent = `المسجّل يعمل · ${num(st.cycles_total)} دورة`;
+    }
+  } else {
+    dot.className = "dot off";
+    const s = st.seconds_since_last_cycle;
+    txt.textContent = "المسجّل متوقّف" + (s != null ? ` · آخر دورة قبل ${ago(st.last_cycle_at)}` : "");
+  }
+}
+function renderApi(h) {
+  const dot = document.getElementById("api-dot"), txt = document.getElementById("api-txt");
+  if (h.connected && !h.degraded) { dot.className = "dot on"; txt.textContent = `الـ API متصل · ${h.latency_ms ?? "?"}ms`; }
+  else if (h.connected) { dot.className = "dot warn"; txt.textContent = `الـ API معطوب (${esc(h.status ?? h.http_status)})`; }
+  else { dot.className = "dot off"; txt.textContent = `الـ API منقطع${h.detail ? " · " + esc(h.detail) : ""}`; }
+}
+
+function renderHero(counts, timeline) {
+  document.getElementById("hero-value").textContent = compact(counts.signal_events);
+  const series = timeline.types.length
+    ? timeline.hours.map((_, i) => timeline.types.reduce((s, t) => s + (timeline.series[t][i] || 0), 0))
+    : [];
+  const last24 = series.reduce((a, b) => a + b, 0);
+  document.getElementById("hero-delta").textContent =
+    series.length ? `${num(last24)} إشارة في آخر 24 ساعة` : "لا بيانات بعد";
+  const host = document.getElementById("hero-spark");
+  host.replaceChildren(sparkline(series, { w: 240, h: 40 }));
+}
+
+function renderTiles(st, counts, bars, storage, api) {
+  const size = storage.mb == null ? "—"
+    : storage.mb >= 1000 ? (storage.mb / 1000).toFixed(1) + " GB" : storage.mb + " MB";
+  const items = [
+    { l: "عملات مراقَبة", v: num(st.active_watch_count), d: "نافذة 48 ساعة" },
+    { l: "تغطية الشموع", v: bars.coverage_pct != null ? bars.coverage_pct + "%" : "—",
+      d: `${num(bars.with_bars)} من ${num(bars.active)} لها سلسلة سعرية` },
+    { l: "شموع OHLCV", v: compact(bars.candles), d: "مصدر التوسيم" },
+    { l: "لقطات سوق", v: compact(counts.market_ticks), d: "من trending/verified" },
+    { l: "نتائج موسومة", v: num(counts.outcomes), d: "نوافذ 48 ساعة مكتملة" },
+    { l: "حجم القاعدة", v: size, d: storage.mb_per_day != null ? `+${storage.mb_per_day} MB/يوم` : "—" },
+    { l: "زمن الـ API", v: api.latency_ms != null ? api.latency_ms + " ms" : "—",
+      d: st.cycle_crashes ? `${st.cycle_crashes} انهيار دورة` : "بلا انهيارات" },
+  ];
+  document.getElementById("tiles").innerHTML = items.map(i =>
+    `<div class="tile"><div class="l">${esc(i.l)}</div><div class="v">${i.v}</div><div class="d">${esc(i.d)}</div></div>`
+  ).join("");
+}
+
+/* --- أداء الإشارات: أشرطة أفقية + sparkline لكل صفّ --- */
+const asTable = { perf: false, timeline: false };
+/* حالة الترتيب تُرسل إلى الخادم: الترتيب يجب أن يجري على المجموعة كاملة قبل
+   الاقتطاع، وإلّا أعطى العكسُ «أفضل N مقلوبة» لا الأسوأ فعلاً. */
+const perfSort = { key: "peak_pct", dir: "desc" };
+let perfLimit = 12;
+
+const PERF_COLS = [
+  { key: "symbol",        label: "العملة" },
+  { key: null,            label: "النوع" },
+  { key: "peak_pct",      label: "أعلى ارتفاع بعد الإشارة", width: "30%" },
+  { key: "change_pct",    label: "الآن" },
+  { key: "from_peak_pct", label: "من القمّة" },
+  { key: null,            label: "المسار" },
+  { key: "first_seen_at", label: "دخول" },
+];
+
+function sortableTh(c) {
+  if (!c.key) return `<th${c.width ? ` style="width:${c.width}"` : ""}>${esc(c.label)}</th>`;
+  const active = perfSort.key === c.key;
+  const arrow = active ? (perfSort.dir === "desc" ? "▼" : "▲") : "↕";
+  return `<th class="sortable" data-sort="${c.key}"${c.width ? ` style="width:${c.width}"` : ""}
+    ${active ? `aria-sort="${perfSort.dir === "desc" ? "descending" : "ascending"}"` : ""}
+    title="ترتيب حسب ${esc(c.label)}">${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
+}
+
+function renderPerf(rows) {
+  const host = document.getElementById("perf");
+  if (!rows.length) {
+    host.innerHTML = `<div class="empty">لا عملة مراقَبة لها سلسلة سعرية بعد.<br>
+      <span class="mono">تُسحب الشموع بالتناوب — انتظر اكتمال المسح.</span></div>`;
+    return;
+  }
+  if (asTable.perf) { host.innerHTML = perfTable(rows); bindSortHeaders(host); return; }
+
+  const max = Math.max(...rows.map(r => Math.abs(r.peak_pct ?? 0)), 1);
+  host.innerHTML = `<div class="tablewrap"><table>
+    <thead><tr>${PERF_COLS.map(sortableTh).join("")}</tr></thead>
+    <tbody>${rows.map(r => perfRow(r, max)).join("")}</tbody></table></div>`;
+
+  // sparklines تُحقن بعد بناء الجدول (SVG لا يُبنى بالنصّ هنا)
+  host.querySelectorAll("[data-spark]").forEach((cell) => {
+    const r = rows[Number(cell.dataset.spark)];
+    const rising = (r.change_pct ?? 0) >= 0;
+    cell.replaceChildren(sparkline(r.spark, {
+      w: 120, h: 30, color: rising ? "var(--up)" : "var(--down)",
+    }));
+  });
+  bindSortHeaders(host);
+}
+
+function bindSortHeaders(host) {
+  host.querySelectorAll("th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      // نفس العمود يقلب الاتجاه؛ عمود جديد يبدأ تنازلياً (الأكبر أوّلاً)
+      if (perfSort.key === key) perfSort.dir = perfSort.dir === "desc" ? "asc" : "desc";
+      else { perfSort.key = key; perfSort.dir = "desc"; }
+      refreshPerf();
+    });
+  });
+}
+
+/** يعيد جلب لوحة الأداء وحدها (ترتيب/حدّ) دون انتظار الدورة التالية. */
+async function refreshPerf() {
+  try {
+    const p = await getJSON(
+      `/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`
+    );
+    const rows = (p.performance || []).map((r, i) => ({ ...r, _i: i }));
+    lastRows.perf = rows;
+    paint("perf", () => renderPerf(rows));
+    paint("perf-summary", () => renderPerfSummary(p.summary));
+    paint("comparison", () => renderComparison(p.comparison));
+  } catch (e) {
+    console.error("refreshPerf", e);
+  }
+}
+
+/** حصيلة الأرباح والخسائر — محسوبة على كل العملات لا على الشريحة المعروضة. */
+function renderPerfSummary(s) {
+  const host = document.getElementById("perf-summary");
+  if (!s || !s.count) { host.innerHTML = ""; return; }
+  const winPct = s.win_rate_pct ?? 0;
+  const cells = [
+    { l: "رابحة / خاسرة", v: `${num(s.winners)} / ${num(s.losers)}`,
+      d: `${pct(winPct, { sign: false })} نسبة الرابح`, split: true },
+    { l: "متوسّط العائد", v: signed(s.avg_pct), d: "بوزن متساوٍ لكل إشارة" },
+    { l: "الوسيط", v: signed(s.median_pct), d: "أمتن أمام القيم الشاذّة" },
+    { l: "مجموع الأرباح", v: signed(s.gross_gain_pct), d: `من ${num(s.winners)} عملة` },
+    { l: "مجموع الخسائر", v: signed(s.gross_loss_pct), d: `من ${num(s.losers)} عملة` },
+    { l: "الصافي", v: signed(s.net_pct), d: `عبر ${num(s.count)} عملة` },
+    { l: "الأفضل", v: signed(s.best?.change_pct),
+      d: extLink(fomoTokenUrl(s.best?.token_address, s.best?.network_id),
+                 esc(s.best?.symbol || shortAddr(s.best?.token_address))) },
+    { l: "الأسوأ", v: signed(s.worst?.change_pct),
+      d: extLink(fomoTokenUrl(s.worst?.token_address, s.worst?.network_id),
+                 esc(s.worst?.symbol || shortAddr(s.worst?.token_address))) },
+  ];
+  host.innerHTML = `
+    <div class="summary">${cells.map(c => `
+      <div class="cell">
+        <div class="l">${esc(c.l)}</div>
+        <div class="v">${c.v}</div>
+        ${c.split ? `<div class="split">
+            <i style="width:${winPct}%;background:var(--up)"></i>
+            <i style="width:${100 - winPct}%;background:var(--down)"></i>
+          </div>` : `<div class="d">${c.d}</div>`}
+      </div>`).join("")}</div>
+    <div class="opennote">
+      هذه <b>مراكز مفتوحة في نافذة جارية</b>، لا نتائج محقّقة: تُقاس بالسعر الآن
+      مقابل سعر الدخول، ولم تُكمل أي إشارة نافذة الـ48 ساعة بعد. «أعلى ارتفاع»
+      لا يُحقَّق إلّا ببيع في لحظة القمّة.
+    </div>`;
+}
+
+function perfRow(r, max) {
+  const peak = r.peak_pct ?? 0;
+  const w = Math.max(1.5, (Math.abs(peak) / max) * 100);
+  const label = pct(r.peak_pct, { digits: peak >= 100 ? 0 : 1 });
+  const url = fomoTokenUrl(r.token_address, r.network_id);
+  return `<tr>
+    <td>${extLink(url, `<b>${esc(r.symbol || shortAddr(r.token_address))}</b>
+        <div class="mono">${esc(shortAddr(r.token_address))}</div>`,
+        `فتح ${r.symbol || "العملة"} في fomo.family`)}</td>
+    <td><span class="badge"><i class="key" style="background:${typeColor(r.source)}"></i>${esc(typeLabel(r.source))}</span></td>
+    <td>
+      <div style="display:flex;align-items:center;gap:9px">
+        <div style="flex:1;min-width:60px;height:10px;background:var(--surface-2);border-radius:3px">
+          <div style="width:${w}%;height:100%;background:var(--s1);border-radius:0 3px 3px 0"></div>
+        </div>
+        <span class="num" style="min-width:56px">${label}</span>
+      </div>
+    </td>
+    <td>${signed(r.change_pct)}</td>
+    <td>${signed(r.from_peak_pct)}</td>
+    <td data-spark="${r._i}" style="width:120px"></td>
+    <td class="mono">${price(r.entry_px)} · ${ago(r.first_seen_at)}</td>
+  </tr>`;
+}
+
+/* جدول مكافئ لكل رسم — القيمة لا تُحجب خلف تلميح */
+const PERF_TABLE_COLS = [
+  { key: "symbol", label: "العملة" }, { key: null, label: "النوع" },
+  { key: "entry_px", label: "سعر الدخول" }, { key: "last_px", label: "السعر الآن" },
+  { key: null, label: "القمّة" }, { key: "peak_pct", label: "أعلى ارتفاع" },
+  { key: "change_pct", label: "التغيّر" }, { key: "from_peak_pct", label: "من القمّة" },
+  { key: "candles", label: "شموع" },
+];
+
+function perfTable(rows) {
+  return `<div class="tablewrap"><table>
+    <thead><tr>${PERF_TABLE_COLS.map(sortableTh).join("")}</tr></thead>
+    <tbody>${rows.map(r => `<tr>
+      <td>${extLink(fomoTokenUrl(r.token_address, r.network_id),
+            `<b>${esc(r.symbol || shortAddr(r.token_address))}</b>`)}</td>
+      <td>${esc(typeLabel(r.source))}</td>
+      <td class="mono">${price(r.entry_px)}</td>
+      <td class="mono">${price(r.last_px)}</td>
+      <td class="mono">${price(r.peak_px)}</td>
+      <td>${signed(r.peak_pct)}</td>
+      <td>${signed(r.change_pct)}</td>
+      <td>${signed(r.from_peak_pct)}</td>
+      <td class="num">${num(r.candles)}</td>
+    </tr>`).join("")}</tbody></table></div>`;
+}
+
+function renderTimeline(data) {
+  const host = document.getElementById("timeline");
+  host.replaceChildren();
+  if (!data.types.length) { host.innerHTML = `<div class="empty">لا إشارات في آخر 24 ساعة.</div>`; return; }
+
+  if (asTable.timeline) {
+    const totals = data.types.map(t => ({ t, n: data.series[t].reduce((a, b) => a + b, 0) }));
+    host.innerHTML = `<table><thead><tr><th>النوع</th><th>عدد (24س)</th><th>الذروة/ساعة</th></tr></thead>
+      <tbody>${totals.map(x => `<tr>
+        <td><span class="badge"><i class="key" style="background:${typeColor(x.t)}"></i>${esc(typeLabel(x.t))}</span></td>
+        <td class="num">${num(x.n)}</td>
+        <td class="num">${num(Math.max(...data.series[x.t]))}</td></tr>`).join("")}</tbody></table>`;
+    return;
+  }
+
+  // وسيلة إيضاح حاضرة دائماً لسلسلتين فأكثر — الهوية لا تُترك للّون وحده
+  const legend = document.createElement("div");
+  legend.className = "legend";
+  legend.style.marginBottom = "12px";
+  legend.innerHTML = data.types.map(t =>
+    `<span class="item"><i class="key" style="background:${typeColor(t)}"></i>${esc(typeLabel(t))}</span>`
+  ).join("");
+  host.append(legend, stackedColumns(data));
+}
+
+/** مقارنة الإشارة بالضابطة — السؤال الذي لا تجيبه بقيّة اللوحة. */
+function renderComparison(cmp) {
+  const host = document.getElementById("comparison");
+  if (!cmp) { host.innerHTML = ""; return; }
+  const { signal: s, control: c, delta: d, sufficient } = cmp;
+
+  if (!c.count) {
+    host.innerHTML = `<div class="empty">
+      المجموعة الضابطة تُبنى تدريجياً — لا عملة ضابطة لها سلسلة سعرية بعد.<br>
+      <span class="mono">تُضاف بضع عملات في كل دورة عمداً، حتى لا تكون العيّنة
+      كلّها من لحظة سوقية واحدة؛ ثمّ ينتظر دورها في مسح الشموع.</span>
+    </div>`;
+    return;
+  }
+
+  const rows = [
+    ["نسبة الرابح", "win_rate_pct", true],
+    ["متوسّط العائد", "avg_pct", false],
+    ["الوسيط", "median_pct", false],
+    ["متوسّط أعلى ارتفاع", "avg_peak_pct", false],
+  ];
+  host.innerHTML = `
+    ${sufficient ? "" : `<div class="opennote">
+      العيّنة ما تزال صغيرة (إشارة ${num(s.count)} · ضابطة ${num(c.count)}).
+      <b>لا تُقرأ الفروق أدناه كنتيجة بعد</b> — تحتاج ≥20 لكل جانب على الأقلّ،
+      ونافذة 48 ساعة مكتملة.</div>`}
+    <div class="tablewrap"><table>
+      <thead><tr>
+        <th>المقياس</th>
+        <th>الإشارة (${num(s.count)})</th>
+        <th>الضابطة (${num(c.count)})</th>
+        <th>الفرق</th>
+      </tr></thead>
+      <tbody>${rows.map(([label, key, plain]) => {
+        const sv = s[key], cv = c[key], dv = d[key];
+        const fmt = (v) => v == null ? "—" : (plain ? pct(v, { sign: false }) : pct(v));
+        return `<tr>
+          <td>${esc(label)}</td>
+          <td class="num">${fmt(sv)}</td>
+          <td class="num">${fmt(cv)}</td>
+          <td>${signed(dv)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table></div>
+    <div class="opennote">
+      الضابطة = عملات من نفس كون trending/verified دخلت <b>بالاختيار العشوائي لا
+      بإشارة</b>، وتُسجَّل بنفس النافذة والطريقة. «الفرق» موجب يعني تفوّق الإشارة.
+    </div>`;
+}
+
+function renderHealth(bars, storage, st) {
+  const cov = bars.coverage_pct ?? 0;
+  const sev = cov >= 90 ? "good" : cov >= 60 ? "warn" : "bad";
+  const sevColor = cov >= 90 ? "var(--good)" : cov >= 60 ? "var(--warn)" : "var(--crit)";
+  // `errors_total` عدّاد مدى الحياة لا يُصفَّر أبداً، فنسبته إلى عدد الدورات
+  // ليست "صحّة حاليّة" — كانت تعرض 40% بينما المسجّل يعمل بصفر أخطاء منذ ساعات.
+  // الصادق: عدّاد تراكميّ موسوم بوضوح + حالة آخر دورة (وهي المؤشّر الحيّ).
+  const lastErrs = (() => {
+    const m = /'errors':\s*(\d+)/.exec(st.last_cycle_stats || "");
+    return m ? Number(m[1]) : null;
+  })();
+  document.getElementById("health").innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px">
+      <span style="font-size:30px;font-weight:620;letter-spacing:-.02em">${cov}%</span>
+      <span class="badge ${sev}">${cov >= 90 ? "✓ تغطية شبه كاملة" : cov >= 60 ? "⚠ المسح جارٍ" : "✕ تغطية ناقصة"}</span>
+    </div>
+    <div class="meter" style="height:8px"><i style="width:${cov}%;background:${sevColor}"></i></div>
+    <div style="color:var(--muted);font-size:12px;margin-top:7px">
+      ${num(bars.with_bars)} عملة لها سلسلة سعرية · ${num(bars.pending)} بانتظار الدور ·
+      ${num(bars.no_data)} بلا بيانات لدى fomo
+    </div>
+    <table style="margin-top:16px">
+      <tbody>
+        <tr><td style="padding-inline-start:0">آخر دورة</td>
+            <td style="text-align:left;padding-inline-end:0">${
+              lastErrs == null ? "—"
+              : lastErrs === 0 ? `<span class="badge good">✓ بلا أخطاء</span>`
+              : `<span class="badge bad">✕ ${num(lastErrs)} خطأ</span>`}</td></tr>
+        <tr><td style="padding-inline-start:0">أخطاء تراكمية
+              <span class="mono" style="font-size:10.5px">(منذ أوّل تشغيل، لا تُصفَّر)</span></td>
+            <td style="text-align:left;padding-inline-end:0" class="num">${num(st.errors_total)}</td></tr>
+        <tr><td style="padding-inline-start:0">حجم الأرشيف</td>
+            <td style="text-align:left;padding-inline-end:0" class="mono">${storage.mb ?? "—"} MB · ${esc(storage.raw_encoding)}</td></tr>
+        <tr><td style="padding-inline-start:0">مدى الأرشيف</td>
+            <td style="text-align:left;padding-inline-end:0" class="mono">${storage.span_days ?? "—"} يوم</td></tr>
+        <tr><td style="padding-inline-start:0;border-bottom:none">انهيارات الدورة</td>
+            <td style="text-align:left;padding-inline-end:0;border-bottom:none" class="num">${num(st.cycle_crashes)}</td></tr>
+      </tbody>
+    </table>`;
+}
+
+function renderWatchlist(rows) {
+  const host = document.getElementById("watchlist");
+  if (!rows.length) { host.innerHTML = `<div class="empty">لا عملات مراقَبة نشطة.</div>`; return; }
+  host.innerHTML = `<table><thead><tr>
+      <th>العنوان</th><th>المصدر</th><th>أوّل ظهور</th><th style="width:22%">المتبقّي من 48 ساعة</th><th>لقطات</th>
+    </tr></thead><tbody>${rows.map(w => {
+      const r = remaining(w.watch_until);
+      const low = r.frac < 0.15;
+      return `<tr>
+        <td class="mono">${extLink(fomoTokenUrl(w.token_address, w.network_id),
+              esc(shortAddr(w.token_address)))}</td>
+        <td><span class="badge"><i class="key" style="background:${typeColor(w.source)}"></i>${esc(typeLabel(w.source))}</span></td>
+        <td>${ago(w.first_seen_at)}</td>
+        <td><div style="display:flex;align-items:center;gap:9px">
+          <div class="meter" style="flex:1"><i style="width:${(r.frac * 100).toFixed(0)}%;background:${low ? "var(--warn)" : "var(--s1)"}"></i></div>
+          <span class="num" style="min-width:52px;color:${low ? "var(--warn)" : "inherit"}">${esc(r.txt)}</span>
+        </div></td>
+        <td class="num">${num(w.tick_count)}</td></tr>`;
+    }).join("")}</tbody></table>`;
+}
+
+function renderSignals(rows) {
+  const host = document.getElementById("signals");
+  if (!rows.length) { host.innerHTML = `<div class="empty">لا إشارات بعد.</div>`; return; }
+  host.innerHTML = `<table><thead><tr>
+      <th>الوقت</th><th>النوع</th><th>الرمز</th><th>العنوان</th>
+      <th>السعر</th><th>القيمة السوقية</th><th>المشتري</th><th>مطابقة الصدارة</th>
+    </tr></thead><tbody>${rows.map(s => {
+      const strong = (s.top_trader_match_count > 0) || (s.buyers_best_rank != null && s.buyers_best_rank <= 50);
+      const tag = strong
+        ? `<span class="badge good">★ متصدّر${s.buyers_best_rank != null ? " #" + s.buyers_best_rank : ""}</span>`
+        : `<span class="mono">—</span>`;
+      const url = fomoTokenUrl(s.token_address, s.network_id);
+      return `<tr>
+        <td>${ago(s.recorded_at)}</td>
+        <td><span class="badge"><i class="key" style="background:${typeColor(s.signal_type)}"></i>${esc(typeLabel(s.signal_type))}</span></td>
+        <td>${extLink(url, `<b>${esc(s.ticker)}</b>`, `فتح ${s.ticker || "العملة"} في fomo.family`)}</td>
+        <td class="mono">${extLink(url, esc(shortAddr(s.token_address)))}</td>
+        <td class="mono">${price(s.price_usd)}</td>
+        <td class="num">${s.market_cap != null ? "$" + compact(s.market_cap) : "—"}</td>
+        <td>${extLink(fomoUserUrl(s.buyer_handle), esc(s.buyer_handle),
+              s.buyer_handle ? `فتح صفحة ${s.buyer_handle}` : "")}</td>
+        <td>${tag}</td></tr>`;
+    }).join("")}</tbody></table>`;
+}
+
+function renderErrors(rows) {
+  const host = document.getElementById("errors");
+  const active = rows.filter(r => r.last_error && !r.stale);
+  const healed = rows.filter(r => r.last_error && r.stale);
+  let html = active.length
+    ? active.map(r => `<div class="errline"><span class="badge bad">✕ ${esc(r.source)}</span>
+        <span class="mono" style="margin-inline-start:8px">${esc(r.last_error)}</span></div>`).join("")
+    : `<div class="errline"><span class="badge good">✓ سليم</span>
+        <span style="margin-inline-start:8px;color:var(--muted)">كل المصادر تعمل بلا أخطاء حاليّة.</span></div>`;
+  // أخطاء أقدم من آخر دورة ناجحة: سياق تاريخي لا إنذار قائم
+  html += healed.map(r => `<div class="errline resolved"><span class="badge good">✓ تعافى</span>
+      <span class="mono" style="margin-inline-start:8px">${esc(r.source)} — ${esc(r.last_error)}</span></div>`).join("");
+  host.innerHTML = html;
+}
+
+/* ---------- الحلقة ---------- */
+let paused = false, inflight = false;
+
+/** ينفّذ رسم لوحة واحدة معزولاً؛ الفشل يُبلَّغ في مكانها ولا يوقف البقيّة. */
+function paint(id, fn) {
+  try {
+    fn();
+  } catch (err) {
+    console.error("render failed:", id, err);
+    const host = document.getElementById(id);
+    if (host) {
+      host.innerHTML = `<div class="empty">تعذّر عرض هذه اللوحة —
+        <span class="mono">${esc(err.message)}</span></div>`;
+    }
+  }
+}
+
+async function tick() {
+  if (paused || inflight) return;
+  inflight = true;
+  const main = document.querySelector("main");
+  const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
+  try {
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl] = await Promise.all([
+      getJSON("/api/status"),
+      getJSON("/api/api-health"),
+      getJSON("/api/signals?limit=40"),
+      getJSON("/api/watchlist"),
+      getJSON("/api/counts"),
+      getJSON("/api/errors"),
+      getJSON("/api/storage"),
+      getJSON("/api/bars"),
+      getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
+      getJSON("/api/signal-timeline?hours=24"),
+    ]);
+    const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
+
+    // كل لوحة تُرسم مستقلّة: عطبٌ في واحدة يُفرغ تلك وحدها لا اللوحة كلّها.
+    // (بلا هذا العزل، خطأ واحد في رسم الأعمدة أفرغ أربع لوحات دفعةً واحدة.)
+    paint("hero",      () => renderHero(cnt, tl));
+    paint("tiles",     () => renderTiles(st, cnt, bars, storage, api));
+    paint("perf",         () => renderPerf(rows));
+    paint("perf-summary", () => renderPerfSummary(perf.summary));
+    paint("comparison",   () => renderComparison(perf.comparison));
+    paint("timeline",     () => renderTimeline(tl));
+    paint("health",    () => renderHealth(bars, storage, st));
+    paint("watchlist", () => renderWatchlist(wl.watchlist || []));
+    paint("signals",   () => renderSignals(sig.signals || []));
+    paint("errors",    () => renderErrors(errs.errors || []));
+    renderStatus(st);
+    renderApi(api);
+    lastRows.perf = rows; lastRows.tl = tl;
+
+    document.getElementById("alert").innerHTML = "";
+    document.getElementById("updated").textContent =
+      "آخر تحديث " + new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch (e) {
+    document.getElementById("alert").innerHTML =
+      `<div class="banner">تعذّر تحديث اللوحة: <span class="mono">${esc(e.message)}</span> — يُعاد المحاولة تلقائياً.</div>`;
+  } finally {
+    clearTimeout(slow);
+    main.classList.remove("stale");
+    inflight = false;
+  }
+}
+const lastRows = { perf: [], tl: null };
+
+/* أزرار عرض الجدول: كل رسم له مكافئ جدوليّ */
+document.querySelectorAll("[data-toggle]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const k = btn.dataset.toggle;
+    asTable[k] = !asTable[k];
+    btn.setAttribute("aria-pressed", String(asTable[k]));
+    btn.textContent = asTable[k] ? "عرض كرسم" : "عرض كجدول";
+    if (k === "perf") renderPerf(lastRows.perf);
+    if (k === "timeline" && lastRows.tl) renderTimeline(lastRows.tl);
+  });
+});
+
+document.getElementById("perf-limit").addEventListener("change", (e) => {
+  perfLimit = Number(e.target.value) || 12;
+  refreshPerf();
+});
+
+document.getElementById("pause").addEventListener("click", (e) => {
+  paused = !paused;
+  e.target.setAttribute("aria-pressed", String(paused));
+  e.target.textContent = paused ? "استئناف" : "إيقاف مؤقّت";
+  if (!paused) tick();
+});
+
+document.getElementById("theme").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const next = cur === "light" ? "dark" : cur === "dark" ? "" : "light";
+  if (next) document.documentElement.setAttribute("data-theme", next);
+  else document.documentElement.removeAttribute("data-theme");
+  // الرسوم تقرأ ألوانها من CSS، فتُعاد بناؤها لتلتقط السمة الجديدة
+  renderPerf(lastRows.perf);
+  if (lastRows.tl) renderTimeline(lastRows.tl);
+});
+
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.env
+.env.*
+
+# Live Privy credentials and session material — NEVER commit these.
+# .privy_state.json holds the rotating refresh_token + pat; the .consumer_key
+# file next to it is a bearer token for this API; the storage dump is the raw
+# browser capture that seeded them.
+.privy_state.json
+.privy_state.json.*
+*.consumer_key
+privy_storage_dump.json
+privy_refresh_call.json
+captured_endpoints.json
+
+# Runtime artefacts
+*.log
+*.db
+*.db-shm
+*.db-wal
+test_output.txt
+lint_output.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+playwright/.cache/
