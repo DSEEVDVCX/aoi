@@ -49,12 +49,31 @@ def main() -> None:
             (t["bars"][-1]["ts"] - t["entry_ts"]) / 3600 for t in trades
         )
         print(f"صفقات: {len(trades)} · وسيط المتابعة المتاحة: {holds[len(holds) // 2]:.1f} ساعة")
-        if holds[-1] < config.LABEL_WINDOW_HOURS:
-            print(
-                f"⚠ لا نافذة اكتملت بعد (أقصى متابعة {holds[-1]:.1f}س من "
-                f"{config.LABEL_WINDOW_HOURS}س) — الأهداف البعيدة مُبخَّسة."
+
+        # حالة النضج تُطبع **قبل** الأرقام لا بعدها: الجدول أدناه استطلاعيّ ما
+        # لم تكتمل النوافذ وتنضج الضابطة، ولا يجوز أن يُقرأ كنتيجة.
+        mature = sum(1 for h in holds if h >= config.LABEL_WINDOW_HOURS)
+        db_controls = db._conn.execute(
+            "SELECT COUNT(*) FROM watchlist WHERE is_control=1 AND active=1"
+        ).fetchone()[0]
+        blockers = []
+        if mature == 0:
+            blockers.append(
+                f"لا نافذة اكتملت (أقصى متابعة {holds[-1]:.1f}س من "
+                f"{config.LABEL_WINDOW_HOURS}س) ⇒ الأهداف البعيدة مُبخَّسة بنيوياً"
             )
-        print(f"تكلفة الدورة المفترضة: {cost * 100:.1f}%\n")
+        if len(trades) < 1000:
+            blockers.append(f"العيّنة {len(trades)} صفقة، دون عتبة النضج (1000)")
+        blockers.append(
+            f"لا مقارنة ضابطة في هذا التقرير ({db_controls} عملة ضابطة متاحة) "
+            "⇒ الفرق قد يكون خاصية سوق لا استراتيجية"
+        )
+        print()
+        print("┌─ استطلاعيّ — لا تُبنَ عليه قرارات " + "─" * 36)
+        for b in blockers:
+            print(f"│ • {b}")
+        print("└" + "─" * 70)
+        print(f"\nتكلفة الدورة المفترضة: {cost * 100:.1f}%\n")
 
         hdr = f"{'القاعدة':<34}{'متوسّط':>9}{'وسيط':>9}{'فوز':>8}{'أسوأ':>10}{'حيازة':>8}"
         print(hdr)
