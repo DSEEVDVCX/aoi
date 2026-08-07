@@ -70,10 +70,49 @@ class RecorderDB:
         # الترحيل **قبل** المخطّط: schema.sql ينشئ فهرساً على is_control، وهو
         # يفشل على جدول قديم لا يملك العمود بعد. على قاعدة جديدة الترحيل بلا أثر
         # (لا جداول بعد)، فالترتيب آمن في الحالتين.
-        self._migrate()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._migrate()
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         with open(schema_path, "r", encoding="utf-8") as fh:
             self._conn.executescript(fh.read())
+        self._backfill_watch_windows()
+        self._quarantine_legacy_outcomes()
         self._conn.commit()
+
+    def _quarantine_legacy_outcomes(self) -> None:
+        """يعزل كل نتيجة watch أقدم من تصميم المقارنة الحالي."""
+        from config import CONTROL_DESIGN_VERSION
+
+        self._conn.execute(
+            """UPDATE outcomes
+                  SET analysis_eligible=0,
+                      exclusion_reason='superseded_comparison_design'
+                WHERE kind='watch'
+                  AND (design_version IS NULL OR design_version < ?)""",
+            (CONTROL_DESIGN_VERSION,),
+        )
+
+    def _backfill_watch_windows(self) -> None:
+        """يحفظ نوافذ الإشارات القديمة فقط قبل اعتماد السجلّ immutable.
+
+        الضابطة v1 حُذفت بقرار المشروع ولا يجوز إعادتها من watchlist قديمة؛
+        وحدها نوافذ الإشارة غير الضابطة تُرحّل لأغراض التشغيل التاريخيّ.
+        """
+        self._conn.execute(
+            """INSERT OR IGNORE INTO watch_windows(
+                   token_address, network_id, first_seen_at, source,
+                   watch_until, entry_signal_id, is_control, admission_price_usd,
+                   design_version
+               )
+               SELECT token_address, network_id, first_seen_at, source,
+                      watch_until, entry_signal_id, is_control, NULL, 1
+                 FROM watchlist
+                WHERE is_control=0"""
+        )
 
     def _migrate(self) -> None:
         """يضيف الأعمدة الناقصة إلى قاعدة قائمة.
@@ -161,6 +200,15 @@ class RecorderDB:
             f"INSERT OR IGNORE INTO signal_events({', '.join(cols)}) "
             f"VALUES({', '.join(f':{c}' for c in cols)})"
         )
+        duplicate = self._conn.execute(
+            """SELECT 1 FROM signal_events
+                WHERE token_address=? AND COALESCE(network_id, '')=COALESCE(?, '')
+                  AND ts=? AND signal_type=? LIMIT 1""",
+            (row.get("token_address"), row.get("network_id"),
+             row.get("ts"), row.get("signal_type")),
+        ).fetchone()
+        if duplicate:
+            return False
         cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
         self._commit()
         return cur.rowcount > 0
@@ -243,6 +291,39 @@ class RecorderDB:
         with self.batch():
             self._conn.executemany(sql, [{c: r.get(c) for c in cols} for r in rows])
         return len(rows)
+
+    def recompute_bar_flags(
+        self, token_address: str, network_id: str, resolution: str = "5"
+    ) -> int:
+        """يعيد حساب أعلام التشوّه لسلسلة عملة كاملة. يعيد عدد الصفوف المحدَّثة.
+
+        لازم بعد كل إدراج: حكم الجار (`bar_context_flags`) يحتاج الشمعة التالية،
+        والشمعة الأخيرة في أيّ دفعة بلا تالية بعد — فتُحكم عند وصولها. القيم
+        الخام لا تُلمس، الأعلام فقط.
+        """
+        from extract import bar_context_flags  # استيراد موضعيّ: db لا يعتمد extract
+
+        rows = self._conn.execute(
+            "SELECT ts, o, h, l, c, h_suspect, l_suspect, c_suspect FROM token_bars "
+            "WHERE token_address=? AND network_id=? AND resolution=? ORDER BY ts",
+            (token_address, network_id, resolution),
+        ).fetchall()
+        if not rows:
+            return 0
+        series = [dict(r) for r in rows]
+        changes = [
+            (h, low, c, token_address, network_id, resolution, b["ts"])
+            for b, (h, low, c) in zip(series, bar_context_flags(series))
+            if (h, low, c) != (b["h_suspect"], b["l_suspect"], b["c_suspect"])
+        ]
+        if changes:
+            with self.batch():
+                self._conn.executemany(
+                    "UPDATE token_bars SET h_suspect=?, l_suspect=?, c_suspect=? "
+                    "WHERE token_address=? AND network_id=? AND resolution=? AND ts=?",
+                    changes,
+                )
+        return len(changes)
 
     def bars_count(self, token_address: str, network_id: str) -> int:
         row = self._conn.execute(
@@ -336,6 +417,103 @@ class RecorderDB:
         ).fetchone()
         return int(row["n"])
 
+    # --- activity_events (يكتبها backfill_activity.py فقط، بأثر رجعيّ) ---
+    def insert_activity_events(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """يُدرج أحداث tradingActivity. idempotent حسب id — إعادة المشيّاط من
+        نقطة الاستئناف تمرّ على المدرَج بلا أثر. يعيد عدد المُدرَج فعلاً."""
+        if not rows:
+            return 0
+        cols = _ACTIVITY_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO activity_events({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        added = 0
+        with self.batch():
+            for r in rows:
+                cur = self._conn.execute(
+                    sql, _with_compressed_raw({c: r.get(c) for c in cols})
+                )
+                added += cur.rowcount
+        return added
+
+    def activity_count(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM activity_events").fetchone()
+        return int(row["n"])
+
+    def activity_event_tokens(self) -> list[dict[str, Any]]:
+        """العملات ذات الأحداث القابلة للتوسيم مع مدى أزمنتها — لسحب الشموع."""
+        rows = self._conn.execute(
+            """SELECT token_address, network_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts,
+                      COUNT(*) AS n
+                 FROM activity_events
+                WHERE token_address IS NOT NULL AND ts IS NOT NULL
+                GROUP BY token_address, network_id
+                ORDER BY n DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def activity_events_for_token(self, token_address: str, network_id: str) -> list[dict[str, Any]]:
+        """أحداث عملة مرتّبة زمنياً (لعناقيد سحب الشموع)."""
+        rows = self._conn.execute(
+            """SELECT id, ts FROM activity_events
+                WHERE token_address=? AND network_id=? AND ts IS NOT NULL
+                ORDER BY ts""",
+            (token_address, network_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_activity_bars_state(
+        self, token_address: str, network_id: str, status: str, candles: int, now_iso: str
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO activity_bars_state(
+                   token_address, network_id, last_fetch_at, last_status, candles, attempts)
+               VALUES(?, ?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_fetch_at = excluded.last_fetch_at,
+                   last_status   = excluded.last_status,
+                   candles       = excluded.candles,
+                   attempts      = activity_bars_state.attempts + 1""",
+            (token_address, network_id, now_iso, status, candles),
+        )
+        self._commit()
+
+    def activity_bars_state(self, token_address: str, network_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM activity_bars_state WHERE token_address=? AND network_id=?",
+            (token_address, network_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def activities_pending_label(self, mature_before_epoch: int, limit: int) -> list[dict[str, Any]]:
+        """أحداث نشاط نضجت ولم تُوسَم وشموع عملتها مسحوبة (status='ok').
+
+        البوّابة الأخيرة حاسمة: التوسيم idempotent لا يُراجَع، فتوسيم حدث قبل
+        وصول شموع عملته يكتب no_entry أبديّاً. `prev_ts` = ختم حدث النشاط
+        السابق على نفس العملة (لعلم الاستقلال بنفس قاعدة الإشارات).
+        """
+        rows = self._conn.execute(
+            """SELECT a.id, a.event_type, a.token_address, a.network_id, a.ts,
+                      CAST(strftime('%s', a.ts) AS INTEGER) AS entry_epoch,
+                      (SELECT MAX(p.ts) FROM activity_events p
+                        WHERE p.token_address = a.token_address AND p.ts < a.ts)
+                        AS prev_ts
+                 FROM activity_events a
+                WHERE a.ts IS NOT NULL
+                  AND a.token_address IS NOT NULL
+                  AND CAST(strftime('%s', a.ts) AS INTEGER) <= ?
+                  AND NOT EXISTS (SELECT 1 FROM outcomes o
+                                   WHERE o.kind = 'activity' AND o.key = a.id)
+                  AND EXISTS (SELECT 1 FROM activity_bars_state s
+                               WHERE s.token_address = a.token_address
+                                 AND s.network_id = a.network_id
+                                 AND s.last_status = 'ok')
+                ORDER BY a.ts LIMIT ?""",
+            (mature_before_epoch, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def set_social_state(
         self, token_address: str, network_id: str, status: str, items: int, now_iso: str
     ) -> None:
@@ -387,6 +565,7 @@ class RecorderDB:
         entry_signal_id: str | None,
         watch_hours: int,
         now_iso: str | None = None,
+        admission_price_usd: float | None = None,
     ) -> bool:
         """يُدخل عملة للمراقبة، أو يُعيد تنشيط عملة انتهت مدّتها.
 
@@ -414,6 +593,17 @@ class RecorderDB:
             WHERE watchlist.active = 0 OR watchlist.is_control = 1""",
             (token_address, network_id, now, source, until, entry_signal_id),
         )
+        if cur.rowcount > 0:
+            # نافذة جديدة تحتاج دورة سحب جديدة؛ حالة no_data/طزاجة النافذة
+            # السابقة لا يجوز أن تمنعها من الجدولة.
+            self._conn.execute(
+                "DELETE FROM bars_fetch_state WHERE token_address=? AND network_id=?",
+                (token_address, network_id),
+            )
+            self._insert_watch_window(
+                token_address, network_id, now, source, until, entry_signal_id, 0,
+                admission_price_usd,
+            )
         self._commit()
         return cur.rowcount > 0
 
@@ -423,6 +613,10 @@ class RecorderDB:
         network_id: str,
         watch_hours: int,
         now_iso: str | None = None,
+        admission_price_usd: float | None = None,
+        source: str = "control",
+        design_version: int = 2,
+        admission_source: str | None = None,
     ) -> bool:
         """يُدخل عملة **ضابطة** (بلا إشارة). يعيد True إن أُضيفت.
 
@@ -436,11 +630,79 @@ class RecorderDB:
             """INSERT OR IGNORE INTO watchlist(
                 token_address, network_id, first_seen_at, source,
                 watch_until, entry_signal_id, active, is_control
-            ) VALUES(?, ?, ?, 'control', ?, NULL, 1, 1)""",
-            (token_address, network_id, now, until),
+            ) VALUES(?, ?, ?, ?, ?, NULL, 1, 1)""",
+            (token_address, network_id, now, source, until),
         )
+        if cur.rowcount > 0:
+            self._insert_watch_window(
+                token_address, network_id, now, source, until, None, 1,
+                admission_price_usd, design_version, admission_source,
+            )
         self._commit()
         return cur.rowcount > 0
+
+    def add_signal_comparison_window(
+        self,
+        token_address: str,
+        network_id: str,
+        source: str,
+        entry_signal_id: str,
+        watch_hours: int,
+        now_iso: str,
+        admission_price_usd: float,
+        design_version: int,
+        admission_source: str | None = None,
+    ) -> bool:
+        """يضيف نافذة مقارنة مستقلة لإشارة من نفس كون الضابطة.
+
+        لا يغيّر `watchlist`: التسجيل التشغيلي بدأ عند وصول الإشارة، أما هذه
+        النافذة فتوثق لحظة ظهور العملة في trending/verified وسعرها القابل للرصد.
+        """
+        until = (
+            datetime.fromisoformat(now_iso) + timedelta(hours=watch_hours)
+        ).isoformat()
+        existing = self._conn.execute(
+            """SELECT token_address, network_id, first_seen_at
+                 FROM watch_windows
+                WHERE token_address=? AND network_id=? AND first_seen_at=?""",
+            (token_address, network_id, now_iso),
+        ).fetchone()
+        if existing is not None:
+            self._conn.execute(
+                """DELETE FROM watch_windows
+                    WHERE token_address=? AND network_id=? AND first_seen_at=?""",
+                (token_address, network_id, now_iso),
+            )
+        self._insert_watch_window(
+            token_address, network_id, now_iso, source, until, entry_signal_id,
+            0, admission_price_usd, design_version, admission_source,
+        )
+        self._commit()
+        return True
+
+    def _insert_watch_window(
+        self,
+        token_address: str,
+        network_id: str,
+        first_seen_at: str,
+        source: str,
+        watch_until: str,
+        entry_signal_id: str | None,
+        is_control: int,
+        admission_price_usd: float | None,
+        design_version: int = 2,
+        admission_source: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR IGNORE INTO watch_windows(
+                   token_address, network_id, first_seen_at, source,
+                   watch_until, entry_signal_id, is_control, admission_price_usd,
+                   design_version, admission_source
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (token_address, network_id, first_seen_at, source,
+             watch_until, entry_signal_id, is_control, admission_price_usd,
+             design_version, admission_source),
+        )
 
     def known_tokens(self) -> set[tuple[str, str]]:
         """كل عملة سبق أن دخلت (مُشار إليها أو ضابطة، نشطة أو منتهية).
@@ -487,10 +749,18 @@ class RecorderDB:
         return [dict(r) for r in rows]
 
     def deactivate_expired(self, now_iso: str | None = None) -> int:
-        """يعطّل كل عملة تجاوزت watch_until. يعيد عدد المعطّلة."""
+        """يعطّل النافذة بعد اكتمال سحب شموعها النهائيّ، لا عند الساعة 48 فوراً."""
         now = now_iso or utcnow_iso()
         cur = self._conn.execute(
-            "UPDATE watchlist SET active=0 WHERE active=1 AND watch_until <= ?",
+            """UPDATE watchlist SET active=0
+                WHERE active=1 AND watch_until <= ?
+                  AND EXISTS (
+                      SELECT 1 FROM bars_fetch_state s
+                       WHERE s.token_address = watchlist.token_address
+                         AND s.network_id = watchlist.network_id
+                         AND ((s.last_status='ok' AND s.last_fetch_at >= watchlist.watch_until)
+                              OR (s.last_status='no_data' AND s.attempts >= 3))
+                  )""",
             (now,),
         )
         self._commit()
@@ -506,28 +776,39 @@ class RecorderDB:
             f"INSERT OR IGNORE INTO outcomes({', '.join(cols)}) "
             f"VALUES({', '.join(f':{c}' for c in cols)})"
         )
-        cur = self._conn.execute(sql, {c: row.get(c) for c in cols})
+        values = {c: row.get(c) for c in cols}
+        if values["design_version"] is None:
+            values["design_version"] = 1
+        if values["analysis_eligible"] is None:
+            values["analysis_eligible"] = 0
+        if values["exclusion_reason"] is None and values["analysis_eligible"] == 0:
+            values["exclusion_reason"] = "legacy_or_non_phase1_outcome"
+        cur = self._conn.execute(sql, values)
         self._commit()
         return cur.rowcount > 0
 
     def signals_pending_label(self, mature_before_epoch: int, limit: int) -> list[dict[str, Any]]:
         """إشارات نضجت نافذتها ولم تُوسَم بعد — الأقدم أوّلاً.
 
-        `prev_ts` = ختم الإشارة السابقة على نفس العملة (لحساب علم الاستقلال).
-        strftime يقبل صيغتَي fomo (Z) والمسجّل (+00:00) على السواء (مُتحقَّق).
+        زمن القرار هو `recorded_at`: أول لحظة صارت فيها الإشارة متاحة للنظام.
+        استعمال `ts` الأصلي يجعل دخولاً متخيلاً قبل وصول حدث متأخر إلى ساعتين.
+        `prev_ts` = وقت وصول القرار السابق على نفس العملة لحساب الاستقلال.
         """
         rows = self._conn.execute(
-            """SELECT s.id, s.token_address, s.network_id, s.signal_type, s.ts,
-                      CAST(strftime('%s', s.ts) AS INTEGER) AS entry_epoch,
-                      (SELECT MAX(p.ts) FROM signal_events p
-                        WHERE p.token_address = s.token_address AND p.ts < s.ts)
+            """SELECT s.id, s.token_address, s.network_id, s.signal_type,
+                      s.ts AS source_ts, s.recorded_at,
+                      CAST(strftime('%s', s.recorded_at) AS INTEGER) AS entry_epoch,
+                      (SELECT MAX(p.recorded_at) FROM signal_events p
+                        WHERE p.token_address = s.token_address
+                          AND p.network_id = s.network_id
+                          AND p.recorded_at < s.recorded_at)
                         AS prev_ts
                FROM signal_events s
-               WHERE s.ts IS NOT NULL
-                 AND CAST(strftime('%s', s.ts) AS INTEGER) <= ?
-                 AND NOT EXISTS (SELECT 1 FROM outcomes o
-                                  WHERE o.kind = 'signal' AND o.key = s.id)
-               ORDER BY s.ts LIMIT ?""",
+               WHERE s.recorded_at IS NOT NULL
+                  AND CAST(strftime('%s', s.recorded_at) AS INTEGER) <= ?
+                  AND NOT EXISTS (SELECT 1 FROM outcomes o
+                                   WHERE o.kind = 'signal' AND o.key = s.id)
+               ORDER BY s.recorded_at LIMIT ?""",
             (mature_before_epoch, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -537,16 +818,23 @@ class RecorderDB:
         على نوافذ مكتملة بدل النافذة الجارية."""
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, w.source, w.is_control,
-                      w.first_seen_at,
+                      w.first_seen_at, w.admission_price_usd, w.design_version,
                       CAST(strftime('%s', w.first_seen_at) AS INTEGER) AS entry_epoch,
                       w.token_address || ':' || w.network_id || ':' || w.first_seen_at
                         AS key
-               FROM watchlist w
-               WHERE CAST(strftime('%s', w.first_seen_at) AS INTEGER) <= ?
-                 AND NOT EXISTS (SELECT 1 FROM outcomes o
-                                  WHERE o.kind = 'watch' AND o.key =
-                                    w.token_address || ':' || w.network_id || ':' || w.first_seen_at)
-               ORDER BY w.first_seen_at LIMIT ?""",
+                 FROM watch_windows w
+                WHERE CAST(strftime('%s', w.first_seen_at) AS INTEGER) <= ?
+                  AND EXISTS (
+                      SELECT 1 FROM bars_fetch_state s
+                       WHERE s.token_address = w.token_address
+                         AND s.network_id = w.network_id
+                         AND ((s.last_status = 'ok' AND s.last_fetch_at >= w.watch_until)
+                              OR (s.last_status = 'no_data' AND s.attempts >= 3))
+                  )
+                  AND NOT EXISTS (SELECT 1 FROM outcomes o
+                                   WHERE o.kind = 'watch' AND o.key =
+                                     w.token_address || ':' || w.network_id || ':' || w.first_seen_at)
+                ORDER BY w.first_seen_at LIMIT ?""",
             (mature_before_epoch, limit),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -556,9 +844,14 @@ class RecorderDB:
         resolution: str = "5",
     ) -> list[dict[str, Any]]:
         """شموع عملة داخل مدى زمنيّ، مرتّبة. الحقول الناقصة تُسقط صفّها —
-        شمعة بلا h/l/c لا تفيد التوسيم ولا نفبرك لها قيماً."""
+        شمعة بلا h/l/c لا تفيد التوسيم ولا نفبرك لها قيماً.
+
+        `h_suspect`/`l_suspect` تُمرَّر كما هي: الموسِّم يستبعد الذيل المعلَّم من
+        القمّة/القاع ويبقي جسم الشمعة (o/c) صالحاً — ذيل مستحيل من المنبع
+        (شوهد ×119 مليون) كان يسمّم max_gain بمليارات النسب المئوية.
+        """
         rows = self._conn.execute(
-            """SELECT ts, o, h, l, c FROM token_bars
+            """SELECT ts, o, h, l, c, h_suspect, l_suspect, c_suspect FROM token_bars
                WHERE token_address = ? AND network_id = ? AND resolution = ?
                  AND ts >= ? AND ts <= ?
                ORDER BY ts""",
@@ -608,10 +901,27 @@ _COLUMN_MIGRATIONS = (
     ("token_social", "thesis_total", "thesis_total INTEGER"),
     ("token_social", "thesis_sampled", "thesis_sampled INTEGER"),
     ("token_social", "has_next_page", "has_next_page INTEGER"),
+    # أعلام الذيول المستحيلة — تُحسب رجعياً من o/h/l/c المخزّنة عبر
+    # backfill_bar_flags.py (لا شبكة: الخام يكفي).
+    ("token_bars", "h_suspect", "h_suspect INTEGER NOT NULL DEFAULT 0"),
+    ("token_bars", "l_suspect", "l_suspect INTEGER NOT NULL DEFAULT 0"),
+    ("token_bars", "c_suspect", "c_suspect INTEGER NOT NULL DEFAULT 0"),
+    ("outcomes", "suspect_bars", "suspect_bars INTEGER"),
+    # راية الحيّ/الرجعيّ — تفصل حِقبة البيانات بوضوح للتدريب (قرار المشروع:
+    # الحيّ وحده)، لا تسريب حِقبة من نمط الغياب.
+    ("training_rows", "is_live", "is_live INTEGER NOT NULL DEFAULT 0"),
+    ("training_rows", "feature_version", "feature_version INTEGER NOT NULL DEFAULT 1"),
+    ("watch_windows", "admission_price_usd", "admission_price_usd REAL"),
+    ("watch_windows", "admission_source", "admission_source TEXT"),
+    ("watch_windows", "design_version", "design_version INTEGER NOT NULL DEFAULT 1"),
+    ("outcomes", "design_version", "design_version INTEGER NOT NULL DEFAULT 1"),
+    ("outcomes", "analysis_eligible", "analysis_eligible INTEGER NOT NULL DEFAULT 0"),
+    ("outcomes", "exclusion_reason", "exclusion_reason TEXT"),
 )
 
 _BAR_COLUMNS = (
-    "token_address", "network_id", "resolution", "ts", "o", "h", "l", "c", "v", "fetched_at",
+    "token_address", "network_id", "resolution", "ts", "o", "h", "l", "c", "v",
+    "h_suspect", "l_suspect", "c_suspect", "fetched_at",
 )
 
 _SIGNAL_COLUMNS = (
@@ -629,14 +939,23 @@ _OUTCOME_COLUMNS = (
     "is_independent", "entry_ts", "entry_px", "entry_lag_s",
     "max_gain_1h", "max_gain_4h", "max_gain_24h", "max_gain_48h",
     "max_drawdown_48h", "final_return_48h", "time_to_peak_h",
-    "candles_48h", "last_bar_lag_h", "bars_truncated", "is_rug",
+    "candles_48h", "suspect_bars", "last_bar_lag_h", "bars_truncated", "is_rug",
     "split", "status", "labeled_at",
+    "design_version", "analysis_eligible", "exclusion_reason",
 )
 
 _THESIS_COLUMNS = (
     "id", "token_address", "network_id", "created_at", "user_handle", "user_id",
     "num_likes", "num_replies", "equity", "trade_id", "comment", "fetched_at",
     "raw_json",
+)
+
+_ACTIVITY_COLUMNS = (
+    "id", "event_type", "token_address", "network_id", "ts", "recorded_at",
+    "user_id", "user_handle", "trade_id", "usd_amount", "price_usd",
+    "market_cap", "fdv", "equity", "num_trades", "unique_traders", "minutes",
+    "price_change_pct", "total_volume", "are_top_traders", "top_trader_ids_json",
+    "ticker", "raw_json",
 )
 
 _SOCIAL_COLUMNS = (

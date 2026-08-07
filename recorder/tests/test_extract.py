@@ -229,6 +229,51 @@ def test_multi_buy_still_has_no_single_buyer_fields():
     assert row["buyer_pnl_pct"] is None
 
 
+# --- شكل large_sell المؤكّد حيّاً (2026-07-28): نفس body باتجاه معاكس ---
+LARGE_SELL_EVENT = {
+    "id": "ls_1",
+    "userId": "seller_top",
+    "tokenAddress": "0xDAHOOD",
+    "networkId": 4663,
+    "createdAt": "2026-07-28T10:38:09.910Z",
+    "type": "large_sell",
+    "body": {
+        "fdv": 509830.15,
+        "price": 0.000505,
+        "ticker": "DAHOOD",
+        "userId": "seller_top",
+        "avgCost": 0.000669,
+        "numSwaps": 6,
+        "isFirstBuy": False,
+        "percentPnl": -21.82,
+        "userHandle": "3pink10sss",
+        "displayName": "Rando",
+        "currentSizeUsd": 2441.0,
+        "inHumanAmount": 4835754.15,     # العملة المباعة (باتجاه البيع)
+        "outHumanAmount": 2440.9,        # ما استلمه مقابلها
+        "realizedPnlUsd": -680.5,
+    },
+}
+
+
+def test_large_sell_extracts_like_large_buy():
+    """large_sell = نفس شكل large_buy: البائع المفرد يُلتقط ويُطابَق بالصدارة."""
+    row = extract.extract_signal_event(LARGE_SELL_EVENT, "t")
+    assert row["signal_type"] == "large_sell"
+    assert row["buyer_id"] == "seller_top"   # الحقل اسمه buyer_* لكنه «الفاعل» هنا
+    assert row["buyer_handle"] == "3pink10sss"
+    assert row["size_usd"] == 2441.0
+    assert row["in_amount"] == 4835754.15
+    assert row["realized_pnl_usd"] == -680.5
+
+
+def test_large_sell_seller_matched_by_leaderboard():
+    """تصريف متصدّر: البائع المفرد يُطابَق بالصدارة كالمشتري تماماً."""
+    row = extract.extract_signal_event(LARGE_SELL_EVENT, "t", {"seller_top": 5})
+    assert row["top_trader_match_count"] == 1
+    assert row["buyers_best_rank"] == 5
+
+
 
 # --- شموع OHLCV (getBarsNew) ---
 def _bars_envelope(**over):
@@ -251,6 +296,7 @@ def test_extract_bars_maps_parallel_arrays_to_rows():
     assert rows[0] == {
         "token_address": "0xtok", "network_id": "56", "resolution": "5", "ts": 1000,
         "o": 1.0, "h": 1.5, "l": 0.9, "c": 1.1, "v": 100.0,
+        "h_suspect": 0, "l_suspect": 0, "c_suspect": 0,
         "fetched_at": "2026-07-26T00:00:00Z",
     }
     assert [r["ts"] for r in rows] == [1000, 1300, 1600]

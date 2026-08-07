@@ -16,7 +16,7 @@ class AlertPubSub:
     consumers to them. Decouples upstream ingestion from consumer streams
     (research.md Decision 3)."""
 
-    def __init__(self, redis=None) -> None:
+    def __init__(self, redis: Any | None = None) -> None:
         self._redis = redis or get_redis()
 
     async def publish(self, alert: dict[str, Any]) -> int:
@@ -27,7 +27,7 @@ class AlertPubSub:
             logger.warning("Failed to publish alert %s", alert.get("id"))
             return 0
 
-    async def subscribe(self):
+    async def subscribe(self) -> Any:
         pubsub = self._redis.pubsub()
         await pubsub.subscribe(ALERT_CHANNEL)
         return pubsub

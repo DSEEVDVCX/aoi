@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from fastapi import Request
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
@@ -18,12 +19,16 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     Checks BEFORE invoking downstream so rate-limited requests never hit the upstream.
     Fails closed (503) when Redis is unavailable."""
 
-    def __init__(self, app: ASGIApp, redis, limit_per_minute: int | None = None) -> None:
+    def __init__(
+        self, app: ASGIApp, redis: Any, limit_per_minute: int | None = None
+    ) -> None:
         super().__init__(app)
         self._redis = redis
         self._limit = limit_per_minute or settings.rate_limit_per_minute
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
         consumer_key = _consumer_key_from(request)
         bucket_id = consumer_key or _client_ip_from(request) or "anonymous"
         bucket = int(time.time() // 60)

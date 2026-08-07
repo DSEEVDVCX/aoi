@@ -88,6 +88,16 @@ def test_entry_with_nothing_after_is_no_bars():
     assert out["candles_48h"] == 0
 
 
+def test_admission_price_is_the_symmetric_watch_entry_price():
+    bars = [_bar(ENTRY + 300, c=1.4), _bar(ENTRY + H, h=2.2, c=2.0)]
+
+    out = labeler.compute_labels(bars, ENTRY, admission_price_usd=1.0)
+
+    assert out["entry_px"] == 1.0
+    assert out["entry_lag_s"] == 0
+    assert out["final_return_48h"] == pytest.approx(1.0)
+
+
 def test_truncated_series_is_flagged_not_dropped():
     """العملة الميّتة إشارة لا نقص — استبعادها يُدخل انحياز البقاء."""
     bars = [_bar(ENTRY, c=1.0), _bar(ENTRY + 2 * H, h=1.2, low=0.05, c=0.08)]
@@ -101,6 +111,13 @@ def test_truncated_series_is_flagged_not_dropped():
 def test_zero_entry_price_is_rejected_not_divided_by():
     bars = [_bar(ENTRY, c=0.0), _bar(ENTRY + H, c=1.0)]
     assert labeler.compute_labels(bars, ENTRY)["status"] == "no_entry"
+
+
+@pytest.mark.parametrize("price", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_admission_price_is_rejected(price):
+    assert labeler.compute_labels(
+        _series(), ENTRY, admission_price_usd=price
+    )["status"] == "no_entry"
 
 
 # ---------- التقسيم ----------
@@ -121,6 +138,25 @@ def _seed_signal(db, sid, token, ts_iso):
         "recorded_at": ts_iso, "signal_type": "large_buy", "raw_json": "{}",
         "top_trader_ids_json": "[]",
     })
+
+
+def test_signal_decision_time_is_when_the_event_was_observed(db):
+    source_ts = ENTRY
+    observed_ts = ENTRY + 2 * H
+    db.insert_signal({
+        "id": "late", "token_address": "tokA", "network_id": "56",
+        "ts": _iso(source_ts), "recorded_at": _iso(observed_ts),
+        "signal_type": "large_buy", "raw_json": "{}",
+        "top_trader_ids_json": "[]",
+    })
+    _seed_bars(db, "tokA", observed_ts)
+
+    labeler.label_pending(db, now_epoch=observed_ts + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT entry_ts FROM outcomes WHERE kind='signal' AND key='late'"
+    ).fetchone()
+    assert row["entry_ts"] == observed_ts
 
 
 def _seed_bars(db, token, entry, *, final=2.0):
@@ -194,6 +230,8 @@ def test_watch_entries_including_control_get_labeled(db):
     db.admit_control("tokC", "56", 48, _iso(ENTRY))
     _seed_bars(db, "tokA", ENTRY)
     _seed_bars(db, "tokC", ENTRY, final=0.05)                  # الضابطة انهارت
+    db.set_bars_state("tokA", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+    db.set_bars_state("tokC", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
 
     stats = labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
 
@@ -204,6 +242,51 @@ def test_watch_entries_including_control_get_labeled(db):
     assert rows["tokC"]["is_control"] == 1
     assert rows["tokC"]["is_rug"] == 1                         # -95%
     assert rows["tokC"]["is_independent"] is None              # لا يخصّ المراقبة
+    assert rows["tokC"]["design_version"] == 2
+    assert rows["tokC"]["analysis_eligible"] == 0
+    assert rows["tokC"]["exclusion_reason"] == "superseded_comparison_design"
+
+
+def test_mature_watch_waits_until_bars_fetch_is_finalized(db):
+    db.admit_control("tokC", "56", 48, _iso(ENTRY), admission_price_usd=1.0)
+
+    now = ENTRY + 49 * H
+    assert labeler.label_pending(db, now_epoch=now)["watches"] == 0
+
+    _seed_bars(db, "tokC", ENTRY)
+    db.set_bars_state("tokC", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+    assert labeler.label_pending(db, now_epoch=now)["watches"] == 1
+
+
+def test_phase1_view_exposes_only_eligible_v2_watch_outcomes(db):
+    db.admit_control("v2", "56", 48, _iso(ENTRY), admission_price_usd=1.0)
+    _seed_bars(db, "v2", ENTRY)
+    db.set_bars_state("v2", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    db._conn.execute(
+        """INSERT INTO outcomes(
+               kind,key,token_address,network_id,is_control,entry_ts,status,labeled_at,
+               design_version,analysis_eligible,exclusion_reason)
+           VALUES('watch','legacy','v1','56',1,?,'ok','t',1,0,
+                  'legacy_control_design_v1')""",
+        (ENTRY,),
+    )
+
+    rows = db._conn.execute("SELECT key FROM phase1_watch_outcomes").fetchall()
+    assert [row["key"] for row in rows] == []
+
+
+def test_phase1_view_exposes_only_v3_outcomes(db):
+    db.admit_control(
+        "v3", "56", 48, _iso(ENTRY), admission_price_usd=1.0,
+        design_version=config.CONTROL_DESIGN_VERSION,
+    )
+    _seed_bars(db, "v3", ENTRY)
+    db.set_bars_state("v3", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+    rows = db._conn.execute("SELECT key FROM phase1_watch_outcomes").fetchall()
+    assert [row["key"] for row in rows] == [f"v3:56:{_iso(ENTRY)}"]
 
 
 def test_signal_without_bars_gets_an_auditable_status_row(db):
@@ -229,7 +312,8 @@ def test_old_empty_outcomes_table_is_replaced(tmp_path):
             token_address TEXT NOT NULL, entry_ts TEXT NOT NULL,
             max_gain_1h REAL, PRIMARY KEY (token_address, entry_ts));
     """)
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
     d = RecorderDB(p, SCHEMA)
     try:
@@ -250,7 +334,8 @@ def test_old_outcomes_with_data_is_preserved_as_legacy(tmp_path):
             max_gain_1h REAL, PRIMARY KEY (token_address, entry_ts));
         INSERT INTO outcomes VALUES('tok','2026-01-01',1.5);
     """)
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
     d = RecorderDB(p, SCHEMA)
     try:

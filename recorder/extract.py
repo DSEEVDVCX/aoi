@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
+import config
+
 
 def _num(v: Any) -> float | None:
     """تحويل آمن إلى float؛ None/فارغ/غير رقمي → None (لا صفر مفبرك)."""
@@ -298,6 +300,137 @@ def extract_token_static(
 # المجرّد يجعل خادم fomo يرمي 502 من Cloudflare (يبدو عطلاً وهو طلب مشوّه)،
 # و from/to إلزاميان (بدونهما 400 "body.from - Required").
 # ---------------------------------------------------------------------------
+def bar_wick_flags(
+    o: float | None, h: float | None, low: float | None, c: float | None
+) -> tuple[int, int]:
+    """(h_suspect, l_suspect) لشمعة واحدة معزولة — ذيل يتجاوز جسمها بـ×K.
+
+    فحص احتياطيّ فقط (شمعة بلا جيران). الفحص الأقوى هو `bar_context_flags`
+    لأنّ التشوّه يصيب الإغلاق نفسه أحياناً فيتمدّد الجسم ويبدو الذيل معقولاً.
+    """
+    ratio = config.BAR_WICK_MAX_RATIO
+    body_hi = max((v for v in (o, c) if v is not None and v > 0), default=None)
+    body_lo = min((v for v in (o, c) if v is not None and v > 0), default=None)
+    h_bad = 1 if (h is not None and body_hi is not None and h > ratio * body_hi) else 0
+    l_bad = 1 if (
+        low is not None and low > 0 and body_lo is not None and body_lo > ratio * low
+    ) else 0
+    return h_bad, l_bad
+
+
+def bar_context_flags(
+    series: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, int, int]]:
+    """سلسلة شموع مرتّبة زمنياً → [(h_suspect, l_suspect, c_suspect)] لكلٍّ.
+
+    **مبدأ الحكم: السعر متّصل في المجمّع.** إغلاق الشمعة هو افتتاح تاليتها، فأيّ
+    قيمة تتجاوز جارتيها بـ×K ثمّ **لا تستمرّ** ليست سعراً قابلاً للتداول بل تشوّه
+    منبع. لهذا الجار هو المرجع لا الجسم:
+
+    - قفزة **مستمرّة** (MarsCoin: 0.0040 → 0.0219 وبقيت 0.0202) = سعر حقيقيّ ✅
+    - قفزة **لا تستمرّ** (0.000358 → 12052.5 → 0.000395) = تشوّه ❌
+
+    ثلاث درجات لأنّ التشوّه أصاب ثلاثة مواضع مقيسة حيّاً:
+    `h` وحده (2,626,092 بإغلاق 0.0219)، و`c` نفسه (12052.5)، و`l` (قاع مجهريّ).
+    `o` لا يُستعمل مرجعاً: هو إغلاق ما قبله فلا يحمل معلومة مستقلّة — وحين
+    يتشوّه الإغلاق يتشوّه معه فيُخفي العطب.
+
+    الترتيب: نحكم على الإغلاقات أوّلاً، ثمّ نستعمل **الإغلاقات السليمة وحدها**
+    مرجعاً للذيول — وإلّا حجب إغلاقٌ فاسد فساد ذيل شمعته.
+    """
+    ratio = config.BAR_WICK_MAX_RATIO
+    n = len(series)
+    closes = [
+        (b.get("c") if isinstance(b.get("c"), (int, float)) and (b.get("c") or 0) > 0 else None)
+        for b in series
+    ]
+
+    # 1) الإغلاقات: قمّة/قاع محليّ لا يُصدّقه **أيّ** من الجارين.
+    # الشرط أن يوجد جارٌ على الطرفين: بلا ذلك لا يمكن تمييز «قفزة عابرة» من
+    # «بداية اتجاه» — أوّل شمعة قبل rug حقيقيّ تعلو تاليتها بـ×100 وهي سليمة.
+    c_bad = [0] * n
+    for i in range(n):
+        ci = closes[i]
+        if ci is None or i == 0 or i == n - 1:
+            continue
+        prev_c, next_c = closes[i - 1], closes[i + 1]
+        if prev_c is None or next_c is None:
+            continue
+        hi_n, lo_n = max(prev_c, next_c), min(prev_c, next_c)
+        if ci > ratio * hi_n or lo_n > ratio * ci:
+            c_bad[i] = 1
+
+    # 2) الذيول: المرجع = إغلاق الشمعة (إن سلم) + إغلاقات الجيران السليمة.
+    out: list[tuple[int, int, int]] = []
+    for i, b in enumerate(series):
+        h, low = b.get("h"), b.get("l")
+        refs = [closes[i]] if closes[i] is not None and not c_bad[i] else []
+        refs += [
+            closes[j] for j in (i - 1, i + 1)
+            if 0 <= j < n and closes[j] is not None and not c_bad[j]
+        ]
+        if not refs:  # لا مرجع موثوق → الفحص المعزول احتياطاً
+            h_bad, l_bad = bar_wick_flags(b.get("o"), h, low, b.get("c"))
+            out.append((h_bad, l_bad, c_bad[i]))
+            continue
+        hi, lo = max(refs), min(refs)
+        h_bad = 1 if (isinstance(h, (int, float)) and h > ratio * hi) else 0
+        l_bad = 1 if (
+            isinstance(low, (int, float)) and low > 0 and lo > ratio * low
+        ) else 0
+        out.append((h_bad, l_bad, c_bad[i]))
+    return out
+
+
+def classify_asset(
+    symbol: str | None,
+    price_min: float | None,
+    price_max: float | None,
+    market_cap_max: float | None,
+) -> tuple[str, str]:
+    """(asset_class, reason) لعملة من مجموع مشاهداتها.
+
+    fomo منصّة **متعدّدة الأصول** لا سوق ميمات: مقيس في أرشيفنا BTC وETH وSOL
+    وUSDT وذهب PAXG وأسهم مرمّزة (AAPL, MSTR, HOOD, INTC, META, SNDK, MU).
+    خلطها بالميمات يفسد التدريب: أصل بتريليون أو سهم آبل لا يسلك سلوك عملة
+    عمرها ساعتان.
+
+    الترتيب مقصود ومقيس:
+    1. `stable` — كل المشاهدات داخل نطاق الدولار (USDT).
+    2. `major` — قيمة سوقية > $1B **إن كانت ذات مصداقية**: فوق $5T نتجاهل الرقم
+       (شوهد $69T لعملة بـ$0.0888 — حاصل سعر × معروض خرافيّ) ونحكم بالسعر.
+    3. `priced` — سعر > $5: الأسهم المرمّزة والسلع. **لا تكشفها القيمة السوقية**
+       (AAPL بـ$1.36M فقط لأنّ المرمَّز جزء ضئيل) — السعر وحده يكشفها.
+    4. `symbol` — شبكة أمان بالاسم لأصلٍ سعره تحت العتبة (XRP ~$1)، **مشروطة
+       بقيمة سوقية معتبرة**: الميمات تنتحل الرموز (مقيس: «BTC» بـ$3.5M).
+    5. `meme` — الباقي، وهو الأغلبية الساحقة وهدف المشروع.
+
+    الأصناف غير الميمية تبقى **مسجَّلة** ومصنَّفة: التصنيف للفصل عند التحليل
+    والتدريب، لا للحذف (الخام مقدَّس).
+    """
+    sym = (symbol or "").strip().upper()
+    lo, hi = config.ASSET_STABLE_PRICE_BAND
+    if price_min is not None and price_max is not None and price_min > 0:
+        if lo <= price_min and price_max <= hi:
+            return "stable", f"price pinned in [{lo}, {hi}]"
+    credible_mc = (
+        market_cap_max
+        if market_cap_max is not None
+        and market_cap_max <= config.ASSET_MAX_CREDIBLE_MARKET_CAP_USD
+        else None
+    )
+    if credible_mc is not None and credible_mc > config.MAJOR_ASSET_MARKET_CAP_USD:
+        return "major", f"market_cap {credible_mc:.3g} > {config.MAJOR_ASSET_MARKET_CAP_USD:.0e}"
+    if price_max is not None and price_max > config.ASSET_MEME_MAX_PRICE_USD:
+        return "priced", f"price {price_max:.4g} > {config.ASSET_MEME_MAX_PRICE_USD}"
+    if sym and sym in config.ASSET_NON_MEME_SYMBOLS and (
+        credible_mc is None
+        or credible_mc >= config.ASSET_SYMBOL_TRUST_MIN_MARKET_CAP_USD
+    ):
+        return "major", f"known symbol {sym}"
+    return "meme", "default"
+
+
 def extract_bars(
     raw_envelope: Any,
     token_address: str,
@@ -348,6 +481,11 @@ def extract_bars(
                 "fetched_at": fetched_at,
             }
         )
+    # الأعلام على الدفعة كسلسلة: الجار هو المرجع (انظر bar_context_flags).
+    # الشمعة الأخيرة بلا جار لاحق بعد، فيُعاد الحساب لاحقاً عبر
+    # db.recompute_bar_flags حين تصل تاليتها.
+    for row, (h_bad, l_bad, c_bad) in zip(rows, bar_context_flags(rows)):
+        row["h_suspect"], row["l_suspect"], row["c_suspect"] = h_bad, l_bad, c_bad
     return rows
 
 
@@ -488,6 +626,27 @@ def extract_social(
 # leaderboard: صفّ trader مُعيَّن (id, rank) → خريطة id→rank
 # get_leaderboard تعيد {"traders": [{id, rank, ...}], "total_items": N}
 # ---------------------------------------------------------------------------
+def leaderboard_items(raw_envelope: Any) -> list[dict[str, Any]]:
+    """مغلّف /v2/leaderboard الخام → قائمة المتداولين (dicts) بترتيب الصدارة.
+
+    الشكل الحيّ المؤكّد: responseObject.leaderboard[] بلا حقل rank — الرتبة هي
+    موضع العنصر (1-based)، لذا نحافظ على الترتيب ولا نعيد فرزه. نعمل على الخام
+    قبل أي تعيين: `_map_trader` يسقط حقولاً قد نحتاجها لاحقاً (سابقة موثّقة:
+    حقول التواصل الاجتماعي أُسقطت ثمّ أُعيدت)، والأرشيف الخام وحده يضمن
+    إعادة الاشتقاق.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return []
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, Mapping):
+        return []
+    for key in ("leaderboard", "traders", "data", "items"):
+        arr = ro.get(key)
+        if isinstance(arr, list):
+            return [e for e in arr if isinstance(e, Mapping)]
+    return []
+
+
 def build_rank_lookup(traders: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     """يبني خريطة trader_id → أفضل رتبة. غياب id أو rank → يُتخطّى."""
     lookup: dict[str, int] = {}
@@ -501,3 +660,87 @@ def build_rank_lookup(traders: Sequence[Mapping[str, Any]]) -> dict[str, int]:
         if tid not in lookup or rank < lookup[tid]:
             lookup[tid] = rank
     return lookup
+
+
+# ---------------------------------------------------------------------------
+# tradingActivity (GET /feed/tradingActivity) — التاريخ القابل للمشيّاط بـlastId.
+# الشكل الحيّ المؤكّد (2026-07-28): responseObject.items[] + hasNextPage.
+# شكلان للحدث:
+#   مسطّح (swap_buy/swap_sell/thesis): usdAmount/marketCap/price/userId في الأعلى.
+#   متداخٍ (multi_user_buy/multi_user_sell): body بنفس حقول /feed (numTrades,
+#   uniqueTraders, topTraders[]...) + حقول أعلى (likes/views/pinned).
+# ---------------------------------------------------------------------------
+def activity_page(raw_envelope: Any) -> tuple[list[dict[str, Any]], bool]:
+    """مغلّف tradingActivity → (الأحداث, هل توجد صفحة تالية).
+
+    صفحة فارغة تعني نهاية التاريخ (أو تغيّر شكل) — المشيّاط يتوقّف عليها.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return [], False
+    ro = raw_envelope.get("responseObject")
+    if isinstance(ro, list):  # مغلّف عارٍ بلا مفاتيح — لا hasNextPage متاح
+        return [e for e in ro if isinstance(e, Mapping)], False
+    if not isinstance(ro, Mapping):
+        return [], False
+    for key in ("items", "feed", "activities", "tradingActivity", "data"):
+        arr = ro.get(key)
+        if isinstance(arr, list):
+            return [e for e in arr if isinstance(e, Mapping)], bool(ro.get("hasNextPage"))
+    return [], bool(ro.get("hasNextPage"))
+
+
+def _coalesce(*vals: Any) -> Any:
+    """أوّل قيمة غير None — الدمج بين الشكل المسطّح وbody بلا فبركة (FR-007)."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def extract_activity_event(ev: Mapping[str, Any], recorded_at: str) -> dict[str, Any] | None:
+    """حدث tradingActivity خام → صفّ activity_events. يحتاج id (وإلّا None).
+
+    الحقول من الأعلى أوّلاً ثمّ body (الأعلى يخصّ الأحداث المسطّحة، وbody يخصّ
+    multi_user_*) — كلاهما قد يكون نصّاً رقميّاً و_num يتعامل معه.
+    """
+    if not isinstance(ev, Mapping):
+        return None
+    eid = _str(ev.get("id"))
+    if not eid:
+        return None  # FR-007: لا مفتاح → نُسقط، لا نفبرك
+    body = ev.get("body")
+    body = body if isinstance(body, Mapping) else {}
+    top_traders = body.get("topTraders")
+    top_traders = top_traders if isinstance(top_traders, list) else []
+    top_ids = [
+        _str(t.get("id"))
+        for t in top_traders
+        if isinstance(t, Mapping) and t.get("id") is not None
+    ]
+    top_ids = [t for t in top_ids if t]
+
+    return {
+        "id": eid,
+        "event_type": _str(ev.get("type")) or "unknown",
+        "token_address": _str(ev.get("tokenAddress")),
+        "network_id": _str(ev.get("networkId")),
+        "ts": _str(ev.get("createdAt")),
+        "recorded_at": recorded_at,
+        "user_id": _str(ev.get("userId")),
+        "user_handle": _str(ev.get("userHandle")),
+        "trade_id": _str(ev.get("tradeId")),
+        "usd_amount": _num(ev.get("usdAmount")),
+        "price_usd": _coalesce(_num(ev.get("price")), _num(body.get("price"))),
+        "market_cap": _coalesce(_num(ev.get("marketCap")), _num(body.get("marketCap"))),
+        "fdv": _coalesce(_num(ev.get("fdv")), _num(body.get("fdv"))),
+        "equity": _num(ev.get("equity")),
+        "num_trades": _int(body.get("numTrades")),
+        "unique_traders": _int(body.get("uniqueTraders")),
+        "minutes": _int(body.get("minutes")),
+        "price_change_pct": _num(body.get("priceChangePercent")),
+        "total_volume": _num(body.get("totalVolume")),
+        "are_top_traders": _bool_to_int(body.get("areTopTraders")),
+        "top_trader_ids_json": _dumps(top_ids),
+        "ticker": _coalesce(_str(ev.get("ticker")), _str(body.get("ticker"))),
+        "raw_json": _dumps(ev),
+    }

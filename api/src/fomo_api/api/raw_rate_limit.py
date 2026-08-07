@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import Any
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -15,12 +16,14 @@ class RawASGIRateLimiter:
     """Pure ASGI rate-limit middleware — no BaseHTTPMiddleware overhead.
     Checks BEFORE invoking downstream. Fails closed (503) on Redis error."""
 
-    def __init__(self, app: ASGIApp, redis=None, limit_per_minute: int | None = None) -> None:
+    def __init__(
+        self, app: ASGIApp, redis: Any | None = None, limit_per_minute: int | None = None
+    ) -> None:
         self._app = app
         self._redis = redis  # None = resolve lazily via get_redis() per request
         self._limit = limit_per_minute  # None = read from settings per-request
 
-    def _get_redis(self):
+    def _get_redis(self) -> Any:
         if self._redis is not None:
             return self._redis
         from fomo_api.redis_state import get_redis
@@ -85,7 +88,12 @@ class RawASGIRateLimiter:
         await self._app(scope, receive, send_wrapper)
 
 
-async def _send_json(send: Send, status: int, body: dict, extra_headers: dict[str, str] | None = None) -> None:
+async def _send_json(
+    send: Send,
+    status: int,
+    body: dict[str, Any],
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     payload = json.dumps(body).encode()
     headers: list[tuple[bytes, bytes]] = [
         (b"content-type", b"application/json"),

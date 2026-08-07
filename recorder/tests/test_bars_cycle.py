@@ -171,3 +171,104 @@ async def test_refetch_revises_in_progress_candle_without_duplicating(db):
     assert db.bars_count("tokA", "56") == 3       # لا تكرار
     row = db._conn.execute("SELECT c FROM token_bars WHERE ts=1600").fetchone()
     assert row["c"] == 9.9                        # القيمة المُراجَعة
+
+
+# --- شموع السوق الكلّي (macro) ---
+async def test_macro_cycle_fetches_all_assets_hourly_resolution(db):
+    """كل أصول config.MACRO_BARS تُسحب بالدقّة الساعية وتُخزَّن في token_bars."""
+    client = _BarsClient()
+
+    stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
+
+    assert stats["macro_errors"] == 0
+    assert len(client.bodies) == len(config.MACRO_BARS)
+    assert stats["macro_rows"] == 3 * len(config.MACRO_BARS)
+    for body in client.bodies:
+        assert body["resolution"] == config.MACRO_BARS_RESOLUTION
+        assert ":" in body["symbol"]
+    for _label, addr, net in config.MACRO_BARS:
+        assert db.bars_count(addr, net) == 3
+        # الدقّة الساعية لا تتصادم مع شموع المراقبة (5 دقائق)
+        row = db._conn.execute(
+            "SELECT DISTINCT resolution FROM token_bars WHERE token_address=?", (addr,)
+        ).fetchone()
+        assert row["resolution"] == config.MACRO_BARS_RESOLUTION
+
+
+async def test_macro_cycle_paces_itself_via_meta(db):
+    """دورة ضمن الساعة تخرج بلا نداء شبكة؛ بعد انتهاء الفاصل تسحب مجدّداً."""
+    client = _BarsClient()
+    await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
+
+    soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
+    stats = await recorder.run_macro_bars_cycle(client, db, soon, sleep=_noop)
+    assert len(client.bodies) == len(config.MACRO_BARS)   # لا سحب جديد
+    assert stats["macro_rows"] == 0
+
+    later = (datetime.fromisoformat(NOW)
+             + timedelta(seconds=config.MACRO_BARS_REFRESH_SECONDS + 60)).isoformat()
+    await recorder.run_macro_bars_cycle(client, db, later, sleep=_noop)
+    assert len(client.bodies) == 2 * len(config.MACRO_BARS)
+
+
+async def test_macro_one_failing_asset_does_not_stop_others(db):
+    victim = config.MACRO_BARS[0][1]
+    client = _BarsClient(fail_on={victim})
+
+    stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
+
+    assert stats["macro_errors"] == 1
+    assert stats["macro_rows"] == 3 * (len(config.MACRO_BARS) - 1)
+    assert "last_error_macro" in {
+        r["key"] for r in db._conn.execute("SELECT key FROM meta")
+    }
+
+
+async def test_macro_total_failure_retries_next_cycle_not_next_hour(db):
+    """انقطاع كامل لا يختم last_macro_bars_at — وإلّا أُرجئت الاستعادة ساعة
+    كاملة بسبب عابر (حدث فعلاً عند أول نشر)."""
+    all_addrs = {addr for _l, addr, _n in config.MACRO_BARS}
+    client = _BarsClient(fail_on=all_addrs)
+
+    stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
+
+    assert stats["macro_errors"] == len(config.MACRO_BARS)
+    assert db.get_meta("last_macro_bars_at") is None      # لا ختم بلا نجاح
+
+    client._fail_on = set()                                # fomo تعافى
+    soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
+    stats = await recorder.run_macro_bars_cycle(client, db, soon, sleep=_noop)
+    assert stats["macro_rows"] == 3 * len(config.MACRO_BARS)  # استعادة فورية
+
+
+async def test_macro_all_empty_replies_are_not_stamped_as_success(db):
+    """ردود «ناجحة» بلا شموع: بلا استثناء لكنها فشل. الختم عليها كان سيحوّل
+    تهيئة خاطئة إلى فجوة صامتة أبدية بلا أي خطأ مسجَّل."""
+    no_data = {addr: {"responseObject": {"s": "no_data", "t": []}}
+               for _l, addr, _n in config.MACRO_BARS}
+    client = _BarsClient(replies=no_data)
+
+    stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
+
+    assert stats["macro_rows"] == 0
+    assert stats["macro_errors"] == 0
+    assert stats["macro_no_data"] == len(config.MACRO_BARS)
+    assert db.get_meta("last_macro_bars_at") is None      # لا ختم على فراغ
+    assert "no data" in (db.get_meta("last_error_macro") or "")
+
+    soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
+    stats = await recorder.run_macro_bars_cycle(client, db, soon, sleep=_noop)
+    assert len(client.bodies) == 2 * len(config.MACRO_BARS)   # يعيد لا ينتظر ساعة
+
+
+async def test_macro_partial_success_still_stamps(db):
+    """أصل نجح وأصلان فارغان: الختم يُكتب (إعادة ساعية للفارغين) ولا خطأ كليّ."""
+    no_data = {config.MACRO_BARS[0][1]: {"responseObject": {"s": "no_data", "t": []}}}
+    client = _BarsClient(replies=no_data)
+
+    stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
+
+    assert stats["macro_rows"] == 3 * (len(config.MACRO_BARS) - 1)
+    assert stats["macro_no_data"] == 1
+    assert db.get_meta("last_macro_bars_at") == NOW
+    assert db.get_meta("last_error_macro") is None

@@ -159,7 +159,7 @@ class PrivyLoginService:
             refresh = (state or {}).get("refresh")
             if token and refresh:
                 # strip optional surrounding quotes Privy sometimes stores
-                return token.strip().strip('"')
+                return str(token).strip().strip('"')
             await asyncio.sleep(1.0)
 
         logger.info("Login not completed within timeout; trying localStorage fallback")

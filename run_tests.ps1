@@ -1,15 +1,18 @@
 #!/usr/bin/env pwsh
-# يشغّل كل مجموعات الاختبار الثلاث + الـ lint.
+# يشغّل كل مجموعات الاختبار الثلاث + lint + mypy strict، بلا تعديل تلقائي.
 # سابقاً كان يشغّل api/ وحدها، فبقيت اختبارات recorder/ و dashboard/ خارج التغطية
 # (واختبارات اللوحة كانت معطّلة أصلاً لغياب conftest يضيف مسارها).
 $ErrorActionPreference = "Continue"
-$root = "C:\Users\rr\Desktop\aoi"
+$root = $PSScriptRoot
 $failed = @()
+$pythonCommand = Get-Command py -ErrorAction SilentlyContinue
+if (-not $pythonCommand) { $pythonCommand = Get-Command python -ErrorAction Stop }
+$python = $pythonCommand.Source
 
 function Invoke-Suite($name, $dir, $paths) {
     Write-Output "`n=== TESTS: $name ==="
     Set-Location -LiteralPath $dir
-    py -m pytest $paths -q --tb=short
+    & $python -m pytest $paths -q --tb=short
     if ($LASTEXITCODE -ne 0) { $script:failed += $name }
 }
 
@@ -21,13 +24,17 @@ Invoke-Suite "dashboard" "$root\dashboard" "tests/"
 
 Write-Output "`n=== LINT ==="
 Set-Location -LiteralPath "$root\api"
-py -m ruff check src/ tests/ --fix
-py -m ruff check src/ tests/
+& $python -m ruff check src/ tests/
 if ($LASTEXITCODE -ne 0) { $failed += "lint(api)" }
 
 Set-Location -LiteralPath $root
-py -m ruff check recorder/ dashboard/ --exclude tests
+& $python -m ruff check recorder/ dashboard/ --exclude tests
 if ($LASTEXITCODE -ne 0) { $failed += "lint(recorder/dashboard)" }
+
+Write-Output "`n=== TYPES ==="
+Set-Location -LiteralPath "$root\api"
+& $python -m mypy src/fomo_api
+if ($LASTEXITCODE -ne 0) { $failed += "mypy(api)" }
 
 Write-Output "`n=== SUMMARY ==="
 if ($failed.Count -gt 0) {

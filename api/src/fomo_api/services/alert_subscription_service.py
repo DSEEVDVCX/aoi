@@ -14,7 +14,7 @@ class AlertSubscriptionService:
     """Manages alert subscriptions: tracked trader_ids per consumer.
     Stored in volatile Redis (no persistence — FR-013)."""
 
-    def __init__(self, redis=None) -> None:
+    def __init__(self, redis: Any | None = None) -> None:
         self._redis = redis or get_redis()
 
     async def create(self, consumer_key: str, trader_ids: list[str]) -> dict[str, Any]:

@@ -223,6 +223,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <span class="sub">fomo.family</span>
   </div>
   <span class="status"><span id="rec-dot" class="dot"></span><span id="rec-txt">المسجّل…</span></span>
+  <span class="status"><span id="lbl-dot" class="dot"></span><span id="lbl-txt">الموسِّم…</span></span>
   <span class="status"><span id="api-dot" class="dot"></span><span id="api-txt">الـ API…</span></span>
   <span class="spacer"></span>
   <span class="meta" id="updated">—</span>
@@ -285,6 +286,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       <h2>الإشارة مقابل المجموعة الضابطة</h2>
       <span class="note">هل الإشارة تتفوّق على عملات دخلت بالاختيار العشوائي؟</span>
     </header>
+    <div class="body" id="control-progress" aria-live="polite"></div>
     <div class="body flush" id="comparison"></div>
   </div>
 
@@ -565,6 +567,20 @@ function renderStatus(st) {
     const s = st.seconds_since_last_cycle;
     txt.textContent = "المسجّل متوقّف" + (s != null ? ` · آخر دورة قبل ${ago(st.last_cycle_at)}` : "");
   }
+  renderLabeler(st);
+}
+function renderLabeler(st) {
+  // موت الموسِّم صامت تماماً (لا أخطاء ولا انهيار دورات) بينما تتوقّف النتائج
+  // عن التراكم — لا ينكشف إلّا بمؤشّر مستقل كهذا.
+  const dot = document.getElementById("lbl-dot"), txt = document.getElementById("lbl-txt");
+  if (st.labeler_stale) {
+    dot.className = "dot off";
+    txt.textContent = "الموسِّم متوقّف" +
+      (st.labeler_last_run_at ? ` · آخر دورة قبل ${ago(st.labeler_last_run_at)}` : " · لم يعمل بعد");
+  } else {
+    dot.className = "dot on";
+    txt.textContent = `الموسِّم يعمل · قبل ${ago(st.labeler_last_run_at)}`;
+  }
 }
 function renderApi(h) {
   const dot = document.getElementById("api-dot"), txt = document.getElementById("api-txt");
@@ -595,7 +611,9 @@ function renderTiles(st, counts, bars, storage, api) {
     { l: "شموع OHLCV", v: compact(bars.candles), d: "مصدر التوسيم" },
     { l: "لقطات سوق", v: compact(counts.market_ticks), d: "من trending/verified" },
     { l: "نتائج موسومة", v: num(counts.outcomes), d: "نوافذ 48 ساعة مكتملة" },
-    { l: "حجم القاعدة", v: size, d: storage.mb_per_day != null ? `+${storage.mb_per_day} MB/يوم` : "—" },
+    { l: "حجم القاعدة", v: size, d: storage.disk_warning
+      ? `⚠ متبقّي ${storage.disk_free_gb} GB فقط`
+      : storage.mb_per_day != null ? `+${storage.mb_per_day} MB/يوم` : "—" },
     { l: "زمن الـ API", v: api.latency_ms != null ? api.latency_ms + " ms" : "—",
       d: st.cycle_crashes ? `${st.cycle_crashes} انهيار دورة` : "بلا انهيارات" },
   ];
@@ -846,6 +864,42 @@ function renderComparison(cmp) {
     </div>`;
 }
 
+function renderControlProgress(p) {
+  const host = document.getElementById("control-progress");
+  if (!p) { host.innerHTML = ""; return; }
+  const preliminaryColor = p.preliminary_ready ? "var(--good)" : "var(--s2)";
+  const decisionColor = p.decision_ready ? "var(--good)" : "var(--muted)";
+  const state = p.decision_ready
+    ? `<span class="badge good">✓ جاهزة لقرار المرحلة 1</span>`
+    : p.preliminary_ready
+      ? `<span class="badge warn">فحص أولي متاح · القرار عند ${num(p.decision_target)}</span>`
+      : `<span class="badge warn">جمع الضابطة v${p.design_version ?? 3} جارٍ</span>`;
+  host.innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+      <span style="font-size:30px;font-weight:620;letter-spacing:-.02em" class="num">${num(p.completed)}</span>
+      <span style="color:var(--muted);font-size:13px">ضابطة مكتملة من ${num(p.preliminary_target)} للفحص الأولي</span>
+      ${state}
+    </div>
+    <div style="margin-top:12px">
+      <div style="display:flex;justify-content:space-between;gap:12px;font-size:11.5px;color:var(--muted)">
+        <span>الفحص الأولي: ${num(p.completed)} / ${num(p.preliminary_target)}</span>
+        <span>${p.preliminary_ready ? "اكتمل" : `متبقّي ${num(p.preliminary_remaining)}`}</span>
+      </div>
+      <div class="meter" style="height:8px;margin-top:5px"><i style="width:${p.preliminary_pct}%;background:${preliminaryColor}"></i></div>
+    </div>
+    <div style="margin-top:11px">
+      <div style="display:flex;justify-content:space-between;gap:12px;font-size:11.5px;color:var(--muted)">
+        <span>القرار الأساسي: ${num(p.completed)} / ${num(p.decision_target)}</span>
+        <span>${p.decision_ready ? "اكتمل" : `متبقّي ${num(p.decision_remaining)}`}</span>
+      </div>
+      <div class="meter" style="height:6px;margin-top:5px"><i style="width:${p.decision_pct}%;background:${decisionColor}"></i></div>
+    </div>
+    <div style="color:var(--muted);font-size:11.5px;margin-top:9px">
+      تُحسب فقط نوافذ <span class="mono">v${p.design_version ?? 3}</span> المكتملة 48 ساعة وذات
+      <span class="mono">status=ok</span>. بلوغ 100 يسمح بفحص أولي، وليس اعتماد التدريب النهائي.
+    </div>`;
+}
+
 function renderHealth(bars, storage, st) {
   const cov = bars.coverage_pct ?? 0;
   const sev = cov >= 90 ? "good" : cov >= 60 ? "warn" : "bad";
@@ -881,6 +935,16 @@ function renderHealth(bars, storage, st) {
             <td style="text-align:left;padding-inline-end:0" class="mono">${storage.mb ?? "—"} MB · ${esc(storage.raw_encoding)}</td></tr>
         <tr><td style="padding-inline-start:0">مدى الأرشيف</td>
             <td style="text-align:left;padding-inline-end:0" class="mono">${storage.span_days ?? "—"} يوم</td></tr>
+        <tr><td style="padding-inline-start:0">مساحة القرص المتبقية</td>
+            <td style="text-align:left;padding-inline-end:0">${
+              storage.disk_warning
+              ? `<span class="badge bad">✕ ${storage.disk_free_gb ?? "—"} GB</span>`
+              : `<span class="badge good">✓ ${storage.disk_free_gb ?? "—"} GB</span>`}</td></tr>
+        <tr><td style="padding-inline-start:0">آخر نسخة احتياطية</td>
+            <td style="text-align:left;padding-inline-end:0">${
+              !storage.backup_configured ? `<span class="badge bad">✕ غير مهيأة</span>`
+              : storage.backup_warning ? `<span class="badge bad">✕ ${storage.latest_backup ? `منذ ${storage.backup_age_hours}س` : "لا توجد"}</span>`
+              : `<span class="badge good">✓ منذ ${storage.backup_age_hours}س</span>`}</td></tr>
         <tr><td style="padding-inline-start:0;border-bottom:none">انهيارات الدورة</td>
             <td style="text-align:left;padding-inline-end:0;border-bottom:none" class="num">${num(st.cycle_crashes)}</td></tr>
       </tbody>
@@ -971,7 +1035,7 @@ async function tick() {
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
   try {
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl] = await Promise.all([
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -982,6 +1046,7 @@ async function tick() {
       getJSON("/api/bars"),
       getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
       getJSON("/api/signal-timeline?hours=24"),
+      getJSON("/api/control-progress"),
     ]);
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
@@ -992,6 +1057,7 @@ async function tick() {
     paint("perf",         () => renderPerf(rows));
     paint("perf-summary", () => renderPerfSummary(perf.summary));
     paint("comparison",   () => renderComparison(perf.comparison));
+    paint("control-progress", () => renderControlProgress(controlProgress));
     paint("timeline",     () => renderTimeline(tl));
     paint("health",    () => renderHealth(bars, storage, st));
     paint("watchlist", () => renderWatchlist(wl.watchlist || []));

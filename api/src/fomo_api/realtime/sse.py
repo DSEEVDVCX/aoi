@@ -21,7 +21,7 @@ class SSEManager:
 
     HEARTBEAT_INTERVAL = 15
 
-    def __init__(self, pubsub) -> None:
+    def __init__(self, pubsub: Any) -> None:
         self._pubsub = pubsub
 
     async def stream(

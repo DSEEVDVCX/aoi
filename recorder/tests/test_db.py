@@ -60,6 +60,14 @@ def test_insert_signal_idempotent(db):
     assert n == 1
 
 
+def test_insert_signal_rejects_semantic_duplicate_with_new_id(db):
+    assert db.insert_signal(_signal(id_="event-1")) is True
+    duplicate = _signal(id_="event-2")
+    duplicate["recorded_at"] = "2026-07-25T00:00:02Z"
+    assert db.insert_signal(duplicate) is False
+    assert db._conn.execute("SELECT COUNT(*) FROM signal_events").fetchone()[0] == 1
+
+
 def test_insert_tick_idempotent_by_composite_key(db):
     assert db.insert_tick(_tick()) is True
     assert db.insert_tick(_tick()) is False           # نفس المفتاح المركّب
@@ -114,6 +122,7 @@ def test_expired_watch_is_readmitted_by_a_new_signal(db):
     لاحقة إلى الأبد، فتنزف قائمة المراقبة حتى الصفر وتتوقّف الـ ticks.
     """
     db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, "2026-07-25T00:00:00+00:00")
+    db.set_bars_state("tok1", "56", "ok", 3, "2026-07-27T00:00:00+00:00")
     assert db.deactivate_expired("2026-07-27T00:00:01+00:00") == 1
     assert db.active_watch_count() == 0
 
@@ -133,6 +142,21 @@ def test_expired_watch_is_readmitted_by_a_new_signal(db):
     assert db._conn.execute("SELECT COUNT(*) c FROM watchlist").fetchone()["c"] == 1
 
 
+def test_readmission_clears_terminal_no_data_fetch_state(db):
+    db.upsert_watch("tok1", "56", "large_buy", "s1", 48, "2026-07-25T00:00:00+00:00")
+    for _ in range(3):
+        db.set_bars_state("tok1", "56", "no_data", 0, "2026-07-27T00:00:00+00:00")
+    assert db.deactivate_expired("2026-07-27T00:00:01+00:00") == 1
+
+    db.upsert_watch("tok1", "56", "large_buy", "s2", 48, "2026-07-28T00:00:00+00:00")
+
+    state = db._conn.execute(
+        "SELECT * FROM bars_fetch_state WHERE token_address='tok1'"
+    ).fetchone()
+    assert state is None
+    assert len(db.bars_fetch_due(10, "2026-07-28T01:00:00+00:00", 3)) == 1
+
+
 def test_watchlist_watch_until_is_48h(db):
     now = "2026-07-25T00:00:00+00:00"
     db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, now)
@@ -147,6 +171,7 @@ def test_deactivate_expired(db):
     assert db.deactivate_expired("2026-07-26T00:00:00+00:00") == 0
     assert db.active_watch_count() == 1
     # بعد 48 ساعة يُعطّل
+    db.set_bars_state("tok1", "56", "ok", 3, "2026-07-27T00:00:00+00:00")
     assert db.deactivate_expired("2026-07-27T00:00:01+00:00") == 1
     assert db.active_watch_count() == 0
 
@@ -279,8 +304,20 @@ def test_bars_fetch_due_drops_tokens_with_repeated_no_data(db):
 
 def test_bars_fetch_due_ignores_inactive_watches(db):
     db.upsert_watch("gone", "56", "large_buy", "s", 48, "2026-07-24T00:00:00+00:00")
+    db.set_bars_state("gone", "56", "ok", 3, "2026-07-27T00:00:00+00:00")
     db.deactivate_expired("2026-07-27T00:00:00+00:00")
     assert db.bars_fetch_due(10, "2026-07-27T12:00:00+00:00", 3) == []
+
+
+def test_expired_watch_stays_active_until_final_bars_fetch(db):
+    db.upsert_watch("late", "56", "large_buy", "s", 48, "2026-07-25T00:00:00+00:00")
+
+    assert db.deactivate_expired("2026-07-27T01:00:00+00:00") == 0
+    assert db.active_watch_count() == 1
+
+    db.set_bars_state("late", "56", "ok", 3, "2026-07-27T01:00:00+00:00")
+    assert db.deactivate_expired("2026-07-27T01:01:00+00:00") == 1
+    assert db.active_watch_count() == 0
 
 
 def test_set_bars_state_accumulates_attempts(db):
@@ -311,7 +348,8 @@ def test_migration_adds_is_control_to_a_preexisting_watchlist(tmp_path):
             PRIMARY KEY (token_address, network_id));
         INSERT INTO watchlist VALUES('legacy','56','t','large_buy','t2','sig',1);
     """)
-    old.commit(); old.close()
+    old.commit()
+    old.close()
 
     db = RecorderDB(p, SCHEMA)
     try:
@@ -336,6 +374,54 @@ def test_migration_is_idempotent(tmp_path):
         assert cols.count("is_control") == 1
     finally:
         d.close()
+
+
+def test_migration_does_not_restore_deleted_legacy_controls(tmp_path):
+    p = str(tmp_path / "windows.db")
+    old = sqlite3.connect(p)
+    old.executescript("""
+        CREATE TABLE watchlist (
+            token_address TEXT NOT NULL, network_id TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL, source TEXT NOT NULL,
+            watch_until TEXT NOT NULL, entry_signal_id TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            is_control INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (token_address, network_id));
+        INSERT INTO watchlist VALUES
+            ('legacy','56','2026-07-26T00:00:00+00:00','control',
+             '2026-07-28T00:00:00+00:00',NULL,0,1);
+    """)
+    old.commit()
+    old.close()
+
+    db = RecorderDB(p, SCHEMA)
+    try:
+        assert db._conn.execute("SELECT COUNT(*) FROM watch_windows").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_migration_quarantines_legacy_watch_outcomes(tmp_path):
+    p = str(tmp_path / "legacy-outcomes.db")
+    db = RecorderDB(p, SCHEMA)
+    db._conn.execute(
+        """INSERT INTO outcomes(
+               kind,key,token_address,network_id,is_control,entry_ts,status,labeled_at)
+           VALUES('watch','old-control','ctl','56',1,1,'ok','t')"""
+    )
+    db._conn.commit()
+    db.close()
+
+    migrated = RecorderDB(p, SCHEMA)
+    try:
+        row = migrated._conn.execute(
+            "SELECT design_version,analysis_eligible,exclusion_reason FROM outcomes"
+        ).fetchone()
+        assert row["design_version"] == 1
+        assert row["analysis_eligible"] == 0
+        assert row["exclusion_reason"] == "superseded_comparison_design"
+    finally:
+        migrated.close()
 
 
 # --- إعادة بناء العدد التاريخي للأطروحات ---

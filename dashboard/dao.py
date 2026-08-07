@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -65,7 +66,7 @@ def all_meta(conn: sqlite3.Connection) -> dict[str, str]:
 
 # --- counts ---
 _TABLES = ("signal_events", "market_ticks", "token_static", "watchlist", "snapshots",
-           "outcomes", "token_bars")
+           "outcomes", "token_bars", "activity_events")
 
 
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -84,9 +85,56 @@ def active_watch_count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) AS n FROM watchlist WHERE active=1").fetchone()["n"]
 
 
+def control_maturity(
+    conn: sqlite3.Connection,
+    preliminary_target: int,
+    decision_target: int,
+    design_version: int = 3,
+) -> dict[str, Any]:
+    """تقدّم الضابطة المؤهلة؛ `ok` فقط هو نافذة 48س مكتملة قابلة للمقارنة."""
+    row = None
+    if _table_exists(conn, "outcomes"):
+        required = ("design_version", "analysis_eligible", "is_control", "entry_ts")
+        if all(_has_column(conn, "outcomes", column) for column in required):
+            row = conn.execute(
+                """SELECT COUNT(*) AS completed, MIN(entry_ts) AS first_entry_ts,
+                          MAX(entry_ts) AS last_entry_ts
+                     FROM outcomes
+                    WHERE kind='watch' AND is_control=1 AND status='ok'
+                      AND design_version>=? AND analysis_eligible=1""",
+                (design_version,),
+            ).fetchone()
+    completed = int(row["completed"]) if row else 0
+    preliminary_target = max(1, int(preliminary_target))
+    decision_target = max(preliminary_target, int(decision_target))
+    return {
+        "completed": completed,
+        "preliminary_target": preliminary_target,
+        "decision_target": decision_target,
+        "preliminary_remaining": max(0, preliminary_target - completed),
+        "decision_remaining": max(0, decision_target - completed),
+        "preliminary_pct": round(min(100, completed / preliminary_target * 100), 1),
+        "decision_pct": round(min(100, completed / decision_target * 100), 1),
+        "preliminary_ready": completed >= preliminary_target,
+        "decision_ready": completed >= decision_target,
+        "design_version": design_version,
+        "first_entry_ts": row["first_entry_ts"] if row else None,
+        "last_entry_ts": row["last_entry_ts"] if row else None,
+    }
+
+
 # --- recorder status ---
-def recorder_status(conn: sqlite3.Connection, alive_window_seconds: int, now: datetime | None = None) -> dict[str, Any]:
-    """حالة المسجّل: حيّ؟ عدد الدورات، آخر دورة، إحصاؤها، الأخطاء."""
+def recorder_status(
+    conn: sqlite3.Connection,
+    alive_window_seconds: int,
+    labeler_window_seconds: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """حالة المسجّل: حيّ؟ عدد الدورات، آخر دورة، إحصاؤها، الأخطاء.
+
+    `labeler_window_seconds` إلزاميّ بلا افتراضي: القيمة تعيش في config وحده،
+    وافتراضيّ مكرّر هنا ينجرف عنها بصمت عند أي ضبط لاحق.
+    """
     now = now or datetime.now(UTC)
     meta = all_meta(conn)
     last_cycle_at = meta.get("last_cycle_at")
@@ -106,6 +154,12 @@ def recorder_status(conn: sqlite3.Connection, alive_window_seconds: int, now: da
     feed_dt = _parse_iso(meta.get("last_feed_event_at"))
     feed_age = (now - feed_dt).total_seconds() if feed_dt else None
 
+    # حياة الموسِّم (FomoLabeler): يكتب labeler_last_run_at كل دورة (15 دقيقة)
+    # حتى حين لا يوسم شيئاً. موته صامت تماماً — لا أخطاء ولا انهيار دورات —
+    # بينما تتوقّف النتائج عن التراكم، ولا ينكشف ذلك إلّا عند بوّابة النضج.
+    labeler_dt = _parse_iso(meta.get("labeler_last_run_at"))
+    labeler_age = (now - labeler_dt).total_seconds() if labeler_dt else None
+
     return {
         "alive": alive,
         "seconds_since_last_cycle": seconds_since,
@@ -121,6 +175,11 @@ def recorder_status(conn: sqlite3.Connection, alive_window_seconds: int, now: da
         "started_at": meta.get("started_at"),
         "schema_version": meta.get("schema_version"),
         "active_watch_count": active_watch_count(conn),
+        # الموسِّم: None = لم يعمل قطّ — يُعامَل كمتوقّف (stale) في العرض.
+        "labeler_last_run_at": meta.get("labeler_last_run_at"),
+        "labeler_age_seconds": labeler_age,
+        "labeler_stale": bool(labeler_age is None or labeler_age > labeler_window_seconds),
+        "labeler_last_stats": meta.get("labeler_last_stats"),
     }
 
 
@@ -181,11 +240,16 @@ def active_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 # --- OHLCV bars ---
-def bars_coverage(conn: sqlite3.Connection) -> dict[str, Any]:
+def bars_coverage(conn: sqlite3.Connection, live_start_ts: int) -> dict[str, Any]:
     """تقدّم التقاط الشموع: كم عملة مراقَبة لها سلسلة سعرية فعلاً.
 
     هذا المقياس الحاسم للتوسيم: العملة بلا شموع لا يمكن حساب نتيجتها، فتُهدر
     عيّنتها. قبل جدول token_bars كان ربع المراقَبات بلا أي سعر إطلاقاً.
+
+    `live_start_ts` إلزاميّ بلا افتراضي: الحدّ يعيش في config وحده، وافتراضيّ
+    مكرّر هنا ينجرف عنه بصمت. عدّ الشموع يُقصر على الحِقبة الحيّة (`ts >= live`):
+    token_bars يحمل تاريخ سعر رجعيّاً سابقاً للإشارة (٤٦٦ ألف شمعة رجعيّة)، وهو
+    بيانات ليست من جمع البوت اللحظيّ فلا تُعرض كي لا تختلط ببيانات البوت.
     """
     if not _table_exists(conn, "token_bars") or not _table_exists(conn, "watchlist"):
         return {"active": 0, "with_bars": 0, "pending": 0, "no_data": 0,
@@ -198,7 +262,10 @@ def bars_coverage(conn: sqlite3.Connection) -> dict[str, Any]:
                           WHERE b.token_address = w.token_address
                             AND b.network_id = w.network_id)"""
     ).fetchone()["n"]
-    candles = conn.execute("SELECT COUNT(*) AS n FROM token_bars").fetchone()["n"]
+    # الحِقبة الحيّة فقط — الشموع الرجعيّة (ts < live) تاريخ سعر لا جمعه البوت.
+    candles = conn.execute(
+        "SELECT COUNT(*) AS n FROM token_bars WHERE ts >= ?", (live_start_ts,)
+    ).fetchone()["n"]
 
     no_data = 0
     if _table_exists(conn, "bars_fetch_state"):
@@ -235,6 +302,30 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         return []
     has_control = _has_column(conn, "watchlist", "is_control")
     control_sel = "w.is_control AS is_control," if has_control else "0 AS is_control,"
+    has_windows = _table_exists(conn, "watch_windows")
+    design_join = (
+        "LEFT JOIN watch_windows ww ON ww.token_address=w.token_address "
+        "AND ww.network_id=w.network_id AND ww.first_seen_at=w.first_seen_at"
+        if has_windows else ""
+    )
+    design_sel = "COALESCE(ww.design_version, 1) AS design_version," if has_windows else (
+        "1 AS design_version,"
+    )
+    # الذيول المستحيلة من المنبع تُستبعد من القمّة/القاع: شوهد h = 2,626,092
+    # لشمعة إغلاقها 0.0219 فعرضت اللوحة +62,570,743,609%. العلم يُحسب عند السحب
+    # (h_suspect/l_suspect) وهنا نحترمه فقط؛ القيمة الخام تبقى في القاعدة.
+    has_flags = _has_column(conn, "token_bars", "h_suspect")
+    peak_expr = ("MAX(CASE WHEN b.h_suspect = 1 THEN NULL ELSE b.h END)"
+                 if has_flags else "MAX(b.h)")
+    trough_expr = ("MIN(CASE WHEN b.l_suspect = 1 THEN NULL ELSE b.l END)"
+                   if has_flags else "MIN(b.l)")
+    # سعر الدخول/الأخير من إغلاق **سليم**: الإغلاق نفسه يتشوّه أحياناً (12,052.5)
+    # فيصير مقام النسبة فاسداً.
+    clean_c = "AND c_suspect = 0" if _has_column(conn, "token_bars", "c_suspect") else ""
+    t_expr = ("MIN(CASE WHEN b.c_suspect = 1 THEN NULL ELSE b.ts END)"
+              if has_flags else "MIN(b.ts)")
+    t1_expr = ("MAX(CASE WHEN b.c_suspect = 1 THEN NULL ELSE b.ts END)"
+               if has_flags else "MAX(b.ts)")
     rows = conn.execute(
         f"""WITH w AS (
                SELECT token_address, network_id, source, first_seen_at, watch_until,
@@ -245,10 +336,11 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
            agg AS (
                SELECT w.token_address AS a, w.network_id AS n, w.source AS src,
                       w.first_seen_at AS fs, w.watch_until AS wu, w.entry_ts AS ets,
-                      {control_sel}
-                      COUNT(*) AS candles, MIN(b.ts) AS t0, MAX(b.ts) AS t1,
-                      MAX(b.h) AS peak, MIN(b.l) AS trough
-                 FROM w JOIN token_bars b
+                       {control_sel}
+                       {design_sel}
+                      COUNT(*) AS candles, {t_expr} AS t0, {t1_expr} AS t1,
+                      {peak_expr} AS peak, {trough_expr} AS trough
+                 FROM w {design_join} JOIN token_bars b
                    ON b.token_address = w.token_address
                   AND b.network_id = w.network_id
                   AND b.ts >= w.entry_ts
@@ -257,10 +349,10 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
            SELECT agg.*,
                   (SELECT c FROM token_bars
                     WHERE token_address = agg.a AND network_id = agg.n AND ts = agg.t0
-                    LIMIT 1) AS entry_px,
+                    {clean_c} LIMIT 1) AS entry_px,
                   (SELECT c FROM token_bars
                     WHERE token_address = agg.a AND network_id = agg.n AND ts = agg.t1
-                    LIMIT 1) AS last_px,
+                    {clean_c} LIMIT 1) AS last_px,
                   (SELECT symbol FROM token_static
                     WHERE token_address = agg.a LIMIT 1) AS symbol
              FROM agg"""
@@ -277,6 +369,7 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "symbol": r["symbol"],
             "source": r["src"],
             "is_control": bool(r["is_control"]),
+            "design_version": r["design_version"],
             "first_seen_at": r["fs"],
             "watch_until": r["wu"],
             "candles": r["candles"],
@@ -339,7 +432,10 @@ def group_comparison(conn: sqlite3.Connection) -> dict[str, Any]:
     `sufficient` = هل حجم العيّنتين يكفي لأخذ الفرق على محمل الجدّ (لا اختبار
     إحصائيّ هنا؛ عتبة خام تمنع قراءة الضجيج كنتيجة).
     """
-    rows = [r for r in _performance_rows(conn) if r.get("change_pct") is not None]
+    rows = [
+        r for r in _performance_rows(conn)
+        if r.get("change_pct") is not None and r.get("design_version", 1) >= 2
+    ]
     signal = [r for r in rows if not r.get("is_control")]
     control = [r for r in rows if r.get("is_control")]
 
@@ -495,11 +591,19 @@ def signal_timeline(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]
 
 
 # ترتيب ثابت يضمن أنّ كل نوع إشارة يحتفظ بلونه مهما تغيّرت البيانات.
-_SIGNAL_TYPE_ORDER = ("multi_user_buy", "large_buy", "multi_user_sell")
+_SIGNAL_TYPE_ORDER = ("multi_user_buy", "large_buy", "multi_user_sell", "large_sell")
 
 
 # --- storage ---
-def storage_stats(db_path: str, conn: sqlite3.Connection) -> dict[str, Any]:
+def storage_stats(
+    db_path: str,
+    conn: sqlite3.Connection,
+    *,
+    backup_dir: str | None = None,
+    backup_max_age_hours: float = 36.0,
+    disk_free_warn_bytes: int = 25 * 1024**3,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """حجم القاعدة على القرص + معدّل النموّ اليوميّ المُقدَّر.
 
     أُضيف لأنّ النموّ غير المحدود بقي خفيّاً 20 ساعة حتى بلغت القاعدة 720 MB:
@@ -524,12 +628,47 @@ def storage_stats(db_path: str, conn: sqlite3.Connection) -> dict[str, Any]:
             span_days = (hi - lo).total_seconds() / 86400
 
     meta = all_meta(conn)
+    free_bytes = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path))).free
+
+    latest_backup = None
+    backup_age_hours = None
+    if backup_dir:
+        backup_path = os.path.abspath(os.path.expanduser(backup_dir))
+        try:
+            candidates = [
+                path for path in (
+                    os.path.join(backup_path, name)
+                    for name in os.listdir(backup_path)
+                    if name.startswith("recorder-") and name.endswith(".db")
+                )
+                if os.path.isfile(path)
+            ]
+        except OSError:
+            candidates = []
+        if candidates:
+            latest_backup = max(candidates, key=os.path.getmtime)
+            backup_dt = datetime.fromtimestamp(os.path.getmtime(latest_backup), UTC)
+            backup_age_hours = max(
+                0.0, ((now or datetime.now(UTC)) - backup_dt).total_seconds() / 3600
+            )
+
     return {
         "bytes": total_bytes,
         "mb": round(total_bytes / 1e6, 1),
         "span_days": round(span_days, 2) if span_days else None,
         "mb_per_day": round(total_bytes / 1e6 / span_days, 1) if span_days else None,
         "raw_encoding": meta.get("raw_encoding", "plain"),
+        "disk_free_bytes": free_bytes,
+        "disk_free_gb": round(free_bytes / 1024**3, 1),
+        "disk_warning": free_bytes < disk_free_warn_bytes,
+        "backup_configured": bool(backup_dir),
+        "backup_dir": os.path.abspath(os.path.expanduser(backup_dir)) if backup_dir else None,
+        "latest_backup": os.path.basename(latest_backup) if latest_backup else None,
+        "backup_age_hours": round(backup_age_hours, 1) if backup_age_hours is not None else None,
+        "backup_warning": bool(
+            backup_dir
+            and (backup_age_hours is None or backup_age_hours > backup_max_age_hours)
+        ),
     }
 
 

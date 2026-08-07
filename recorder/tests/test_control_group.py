@@ -5,6 +5,7 @@
 """
 import os
 import random
+import math
 
 import pytest
 
@@ -47,8 +48,8 @@ def test_control_admission_is_idempotent(db):
     assert row["first_seen_at"] == NOW          # النافذة لا تُعاد ضبطها
 
 
-def test_signal_promotes_a_control_coin_and_clears_the_flag(db):
-    """عملة ضابطة وردتها إشارة تصير مُشاراً إليها بنافذة جديدة."""
+def test_signal_promotes_a_control_coin_without_erasing_control_window(db):
+    """ترقية العملة لا تمحو نافذة الضابطة الأصلية من سجل المقارنة."""
     db.admit_control("c1", "56", 48, NOW)
     promoted = db.upsert_watch("c1", "56", "large_buy", "sig9", 48, "2026-07-27T05:00:00+00:00")
 
@@ -59,6 +60,33 @@ def test_signal_promotes_a_control_coin_and_clears_the_flag(db):
     assert row["entry_signal_id"] == "sig9"
     assert row["first_seen_at"].startswith("2026-07-27T05:00:00")
     assert db.active_watch_count(is_control=1) == 0
+    windows = db._conn.execute(
+        "SELECT source, is_control, first_seen_at, design_version FROM watch_windows "
+        "WHERE token_address='c1' ORDER BY first_seen_at"
+    ).fetchall()
+    assert [(w["source"], w["is_control"]) for w in windows] == [
+        ("control", 1),
+        ("large_buy", 0),
+    ]
+    assert [w["design_version"] for w in windows] == [2, 2]
+
+
+def test_reactivated_signal_creates_a_second_immutable_window(db):
+    db.upsert_watch("c1", "56", "large_buy", "sig1", 48, NOW)
+    db.set_bars_state("c1", "56", "ok", 3, "2026-07-29T00:00:00+00:00")
+    db.deactivate_expired("2026-07-30T00:00:00+00:00")
+    assert db.upsert_watch(
+        "c1", "56", "large_buy", "sig2", 48, "2026-07-30T01:00:00+00:00"
+    ) is True
+
+    windows = db._conn.execute(
+        "SELECT entry_signal_id, first_seen_at FROM watch_windows "
+        "WHERE token_address='c1' ORDER BY first_seen_at"
+    ).fetchall()
+    assert [(w["entry_signal_id"], w["first_seen_at"]) for w in windows] == [
+        ("sig1", NOW),
+        ("sig2", "2026-07-30T01:00:00+00:00"),
+    ]
 
 
 def test_control_never_downgrades_a_signalled_coin(db):
@@ -137,3 +165,117 @@ def test_sample_is_random_not_positional(db, tmp_path):
 
 def test_no_candidates_or_target_met_is_a_noop(db):
     assert recorder.admit_control_sample(db, [], NOW) == 0
+
+
+def test_control_sample_follows_signal_network_mix(db):
+    for i in range(3):
+        db.upsert_watch(f"sol{i}", "1399811149", "large_buy", f"s{i}", 48, NOW)
+    db.upsert_watch("base0", "8453", "large_buy", "sb", 48, NOW)
+
+    added = recorder.admit_control_sample(
+        db,
+        _cands(20, "1399811149") + _cands(20, "8453"),
+        NOW,
+        rng=random.Random(4),
+    )
+
+    assert added == config.CONTROL_PER_CYCLE
+    networks = {
+        row["network_id"] for row in db._conn.execute(
+            "SELECT network_id FROM watchlist WHERE is_control=1"
+        )
+    }
+    assert networks == {"1399811149"}
+
+
+def test_production_candidates_without_current_price_are_rejected(db):
+    candidates = [("priced", "56", None), ("valid", "56", 0.001)]
+
+    assert recorder.admit_control_sample(db, candidates, NOW, rng=random.Random(1)) == 1
+    row = db._conn.execute(
+        "SELECT token_address FROM watchlist WHERE is_control=1"
+    ).fetchone()
+    assert row["token_address"] == "valid"
+
+
+@pytest.mark.parametrize("price", [0.0, -1.0, math.nan, math.inf, -math.inf])
+def test_control_candidates_require_positive_finite_price(db, price):
+    assert recorder.admit_control_sample(
+        db, [("bad", "56", price)], NOW, rng=random.Random(1)
+    ) == 0
+
+
+def test_network_matching_converges_across_cycles(db):
+    for i in range(3):
+        db.upsert_watch(f"sol{i}", "1399811149", "large_buy", f"s{i}", 48, NOW)
+    db.upsert_watch("base", "8453", "large_buy", "sb", 48, NOW)
+    candidates = _cands(50, "1399811149") + _cands(50, "8453")
+
+    recorder.admit_control_sample(db, candidates, NOW, rng=random.Random(2))
+    recorder.admit_control_sample(db, candidates, NOW, rng=random.Random(3))
+
+    counts = {
+        row["network_id"]: row["n"] for row in db._conn.execute(
+            "SELECT network_id, COUNT(*) AS n FROM watchlist "
+            "WHERE is_control=1 GROUP BY network_id"
+        )
+    }
+    assert counts == {"1399811149": 3, "8453": 1}
+
+
+def test_signal_comparison_requires_same_cycle_market_candidate(db):
+    db.insert_signal({
+        "id": "eligible", "token_address": "tokA", "network_id": "56",
+        "ts": NOW, "recorded_at": NOW, "signal_type": "large_buy",
+        "raw_json": "{}",
+    })
+    db.insert_signal({
+        "id": "outside", "token_address": "tokB", "network_id": "56",
+        "ts": NOW, "recorded_at": NOW, "signal_type": "large_buy",
+        "raw_json": "{}",
+    })
+
+    added = recorder.admit_signal_comparison_windows(
+        db, [("tokA", "56", 0.002, "trending")], NOW
+    )
+
+    assert added == 1
+    row = db._conn.execute(
+        "SELECT * FROM watch_windows WHERE design_version=?",
+        (config.CONTROL_DESIGN_VERSION,),
+    ).fetchone()
+    assert row["token_address"] == "tokA"
+    assert row["admission_price_usd"] == pytest.approx(0.002)
+    assert row["admission_source"] == "trending"
+    assert row["is_control"] == 0
+
+
+def test_same_cycle_operational_window_is_finalized_as_v3(db):
+    db.insert_signal({
+        "id": "new", "token_address": "tokNew", "network_id": "56",
+        "ts": NOW, "recorded_at": NOW, "signal_type": "large_buy",
+        "raw_json": "{}",
+    })
+    db.upsert_watch(
+        "tokNew", "56", "large_buy", "new", 48, NOW,
+        admission_price_usd=0.001,
+    )
+
+    assert recorder.admit_signal_comparison_windows(
+        db, [("tokNew", "56", 0.002, "verified")], NOW
+    ) == 1
+    rows = db._conn.execute(
+        "SELECT design_version,admission_price_usd,admission_source "
+        "FROM watch_windows WHERE token_address='tokNew'"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(3, 0.002, "verified")]
+
+
+def test_new_controls_use_current_comparison_design(db):
+    recorder.admit_control_sample(
+        db, [("control", "56", 0.001)], NOW, rng=random.Random(1)
+    )
+    row = db._conn.execute(
+        "SELECT design_version FROM watch_windows WHERE is_control=1"
+    ).fetchone()
+    assert row["design_version"] == config.CONTROL_DESIGN_VERSION

@@ -10,6 +10,7 @@ leaderboard). لا نداء يكتب حالة حساب أو تداول.
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
 import traceback
@@ -76,7 +77,8 @@ async def _fetch_verified_raw(client: Any) -> Any:
 
 
 async def _fetch_bars_raw(
-    client: Any, token_address: str, network_id: str, from_ts: int, to_ts: int
+    client: Any, token_address: str, network_id: str, from_ts: int, to_ts: int,
+    resolution: str | None = None,
 ) -> Any:
     """خام POST /proxy/getBarsNew.
 
@@ -88,7 +90,7 @@ async def _fetch_bars_raw(
 
     body = {
         "symbol": f"{token_address}:{network_id}",
-        "resolution": config.BARS_RESOLUTION,
+        "resolution": resolution or config.BARS_RESOLUTION,
         "from": from_ts,
         "to": to_ts,
         "countBack": config.BARS_COUNT_BACK,
@@ -132,6 +134,8 @@ async def run_bars_cycle(
             )
             if rows:
                 stats["bars_rows"] += db.insert_bars(rows)
+                # حكم التشوّه يحتاج جار الشمعة الأخيرة — يُعاد بعد كل إدراج.
+                db.recompute_bar_flags(addr, net, config.BARS_RESOLUTION)
                 stats["bars_tokens"] += 1
             else:
                 stats["bars_no_data"] += 1
@@ -147,7 +151,11 @@ async def run_bars_cycle(
 
 def admit_control_sample(
     db: RecorderDB,
-    candidates: Sequence[tuple[str, str]],
+    candidates: Sequence[
+        tuple[str, str]
+        | tuple[str, str, float | None]
+        | tuple[str, str, float | None, str]
+    ],
     recorded_at: str,
     rng: random.Random | None = None,
 ) -> int:
@@ -168,18 +176,166 @@ def admit_control_sample(
 
     known = db.known_tokens()
     signalled = db.signalled_tokens()
-    pool = sorted({
-        (addr, net) for addr, net in candidates
-        if (addr, net) not in known and addr not in signalled
-    })
+    normalized: dict[tuple[str, str], tuple[float | None, str | None]] = {}
+    strict_comparison = any(len(candidate) == 4 for candidate in candidates)
+    for candidate in candidates:
+        if len(candidate) == 2:
+            addr, net = candidate
+            price_usd = None
+            admission_source = None
+            has_price = False
+        elif len(candidate) == 3:
+            addr, net, price_usd = candidate
+            admission_source = None
+            has_price = True
+        else:
+            addr, net, price_usd, admission_source = candidate
+            has_price = True
+        # Production candidates carry the current tick price. A missing price
+        # is not a valid entry point; legacy callers without a price remain
+        # supported for deterministic tests and offline tooling.
+        if has_price:
+            try:
+                price_usd = float(price_usd) if price_usd is not None else None
+            except (TypeError, ValueError):
+                continue
+            if price_usd is None or not math.isfinite(price_usd) or price_usd <= 0:
+                continue
+        normalized[(addr, net)] = (price_usd, admission_source)
+
+    pool = sorted(
+        key for key in normalized
+        if key not in known and key[0] not in signalled
+    )
     if not pool:
         return 0
 
     rng = rng or random.Random()
-    picks = rng.sample(pool, min(len(pool), config.CONTROL_PER_CYCLE, need))
+    pick_count = min(len(pool), config.CONTROL_PER_CYCLE, need)
+    if strict_comparison:
+        signal_networks = db._conn.execute(
+            """SELECT network_id, admission_source, COUNT(*) AS n
+                 FROM watch_windows
+                WHERE design_version=? AND is_control=0
+                GROUP BY network_id, admission_source""",
+            (config.CONTROL_DESIGN_VERSION,),
+        ).fetchall()
+        weights = {
+            (
+                str(row["network_id"] or ""),
+                str(row["admission_source"] or ""),
+            ): int(row["n"])
+            for row in signal_networks
+        }
+        if not weights:
+            return 0
+    else:
+        signal_networks = db._conn.execute(
+            """SELECT network_id, COUNT(*) AS n FROM watchlist
+               WHERE active=1 AND is_control=0 GROUP BY network_id"""
+        ).fetchall()
+        weights = {
+            (str(row["network_id"] or ""), ""): int(row["n"])
+            for row in signal_networks
+        }
+    eligible_by_network = {}
+    for key in pool:
+        source = normalized[key][1] if strict_comparison else ""
+        source = source or ""
+        eligible_by_network.setdefault((str(key[1] or ""), source), []).append(key)
+
+    if weights and any(group in weights for group in eligible_by_network):
+        eligible_networks = [group for group in eligible_by_network if group in weights]
+        total_weight = sum(weights[group] for group in eligible_networks)
+        if strict_comparison:
+            existing_rows = db._conn.execute(
+                """SELECT network_id, admission_source, COUNT(*) AS n
+                     FROM watch_windows
+                    WHERE design_version=? AND is_control=1
+                    GROUP BY network_id, admission_source""",
+                (config.CONTROL_DESIGN_VERSION,),
+            )
+            existing = {
+                (
+                    str(row["network_id"] or ""),
+                    str(row["admission_source"] or ""),
+                ): int(row["n"])
+                for row in existing_rows
+            }
+        else:
+            existing = {
+                (str(row["network_id"] or ""), ""): int(row["n"])
+                for row in db._conn.execute(
+                    """SELECT network_id, COUNT(*) AS n FROM watchlist
+                       WHERE active=1 AND is_control=1 GROUP BY network_id"""
+                )
+            }
+        picks = []
+        for _ in range(pick_count):
+            available = [network for network in eligible_networks
+                         if eligible_by_network[network]]
+            if not available:
+                break
+            target_total = sum(existing.values()) + 1
+            network = max(
+                available,
+                key=lambda item: (
+                    target_total * weights[item] / total_weight - existing.get(item, 0),
+                    weights[item],
+                ),
+            )
+            pick = rng.choice(eligible_by_network[network])
+            eligible_by_network[network].remove(pick)
+            picks.append(pick)
+            existing[network] = existing.get(network, 0) + 1
+    else:
+        picks = rng.sample(pool, pick_count)
     added = 0
     for addr, net in picks:
-        if db.admit_control(addr, net, config.CONTROL_WATCH_HOURS, recorded_at):
+        if db.admit_control(
+            addr, net, config.CONTROL_WATCH_HOURS, recorded_at,
+            admission_price_usd=normalized[(addr, net)][0],
+            design_version=config.CONTROL_DESIGN_VERSION,
+            admission_source=normalized[(addr, net)][1],
+        ):
+            added += 1
+    return added
+
+
+def admit_signal_comparison_windows(
+    db: RecorderDB,
+    candidates: Sequence[tuple[str, str, float | None, str]],
+    recorded_at: str,
+) -> int:
+    """يدخل إشارات v3 فقط عندما تظهر في نفس قائمة المرشحين المستخدمة للضابطة."""
+    candidate_prices: dict[tuple[str, str], tuple[float, str]] = {}
+    for addr, net, price, admission_source in candidates:
+        try:
+            value = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            continue
+        if value is not None and math.isfinite(value) and value > 0:
+            candidate_prices[(addr, str(net or ""))] = (value, admission_source)
+
+    added = 0
+    rows = db._conn.execute(
+        """SELECT s.id, s.token_address, s.network_id, s.signal_type
+             FROM signal_events s
+            WHERE s.signal_type IN (?, ?)
+              AND s.recorded_at = ?""",
+        (*config.TRIGGER_SIGNAL_TYPES, recorded_at),
+    ).fetchall()
+    for row in rows:
+        key = (row["token_address"], str(row["network_id"] or ""))
+        admission = candidate_prices.get(key)
+        if admission is None:
+            continue
+        price, admission_source = admission
+        if db.add_signal_comparison_window(
+            key[0], key[1], row["signal_type"], row["id"],
+            config.WATCH_HOURS, recorded_at, price,
+            config.CONTROL_DESIGN_VERSION, admission_source,
+        ):
             added += 1
     return added
 
@@ -194,6 +350,82 @@ async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) ->
         "threshold": config.SOCIAL_THRESHOLD,
     }
     return await client._get(settings.upstream_feed_token_thesis_path, params)
+
+
+async def refresh_leaderboard(
+    lb: LeaderboardCache, db: RecorderDB, now_mono: float, recorded_at: str
+) -> None:
+    """يحدّث الصدارة عند الاستحقاق، يؤرشف الخام، ويسجّل الفشل صراحةً.
+
+    بلا الأرشفة يضيع مسار كل متصدّر عبر الزمن إلى الأبد — الرتبة كانت تُقرأ
+    وتُرمى كل ساعة. وبلا تسجيل الفشل يبقى ركود الخريطة (تحديث فاشل أو مغلّف
+    فارغ ⇒ الخريطة القديمة) صامتاً إلى الأبد: `last_error_leaderboard` معروض
+    في اللوحة كبقيّة المصادر.
+    """
+    was_stale = lb.is_stale(now_mono)
+    refreshed = await lb.maybe_refresh(now_mono)
+    if refreshed and lb.last_raw is not None:
+        db.insert_snapshot("leaderboard", lb.last_raw, recorded_at)
+    elif was_stale and not refreshed:
+        db.set_meta(
+            "last_error_leaderboard",
+            f"{recorded_at}: refresh failed or empty — keeping previous lookup",
+        )
+
+
+async def run_macro_bars_cycle(
+    client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
+) -> dict[str, int]:
+    """يسحب شموع السوق الكلّي (SOL/WETH/WBTC) مرّة كل ساعة.
+
+    مرجع النظام السوقي: عائد أي عملة يُقرأ بمعزل عن السوق فيبدو أثر الإشارة
+    أثرَ يومٍ صاعد. لا تقودها watchlist — أصول ثابتة في config.MACRO_BARS.
+    التخزين في token_bars بدقّة ساعية فلا يتصادم مع شموع المراقبة (5 دقائق)،
+    والموسِّم لا يلمسها (لا إشارة ولا watch لها). الختم في meta يقود الإيقاع؛
+    دورة ضمن الساعة تخرج فوراً بلا نداء شبكة.
+    """
+    stats = {"macro_rows": 0, "macro_errors": 0, "macro_no_data": 0}
+    now_dt = datetime.fromisoformat(recorded_at)
+    last = db.get_meta("last_macro_bars_at")
+    if last is not None:
+        elapsed = (now_dt - datetime.fromisoformat(last)).total_seconds()
+        if elapsed < config.MACRO_BARS_REFRESH_SECONDS:
+            return stats
+
+    to_ts = int(now_dt.timestamp())
+    from_ts = to_ts - config.MACRO_BARS_SPAN_HOURS * 3600
+    for i, (label, addr, net) in enumerate(config.MACRO_BARS):
+        try:
+            raw = await _fetch_bars_raw(
+                client, addr, net, from_ts, to_ts, resolution=config.MACRO_BARS_RESOLUTION
+            )
+            rows = extract.extract_bars(
+                raw, addr, net, config.MACRO_BARS_RESOLUTION, recorded_at
+            )
+            # «نجاح بلا شموع» ليس نجاحاً: لو كان دائماً (تهيئة خاطئة) صار صمتاً
+            # أبدياً — نفس طراد no_data الموثّق في دورة الشموع.
+            if not rows:
+                stats["macro_no_data"] += 1
+            stats["macro_rows"] += db.insert_bars(rows)
+            if rows:
+                db.recompute_bar_flags(addr, net, config.MACRO_BARS_RESOLUTION)
+        except Exception as exc:  # noqa: BLE001 — أصل واحد لا يُسقط البقيّة
+            stats["macro_errors"] += 1
+            db.set_meta("last_error_macro", f"{recorded_at}: {label}: {type(exc).__name__}: {exc}")
+        if i + 1 < len(config.MACRO_BARS):
+            await sleep(config.BARS_PACING_SECONDS)
+    # الختم بصفوف مكتوبة فعلاً فقط: فشل كامل (انقطاع fomo) أو فراغ كامل
+    # (ردود بلا شموع) يُعاد في الدورة القادمة كبقيّة المصادر — لا نُرجئه
+    # ساعة كاملة، والفراغ الكليّ يُسجَّل خطأً لئلا يمرّ صامتاً.
+    if stats["macro_rows"] == 0:
+        if stats["macro_errors"] == 0:
+            db.set_meta(
+                "last_error_macro",
+                f"{recorded_at}: all {len(config.MACRO_BARS)} assets returned no data",
+            )
+        return stats
+    db.set_meta("last_macro_bars_at", recorded_at)
+    return stats
 
 
 async def run_social_cycle(
@@ -241,9 +473,10 @@ async def run_cycle(
     now_mono = now_mono if now_mono is not None else time.monotonic()
     recorded_at = utcnow_iso()
     stats = {
-        "signals": 0, "watch_added": 0, "control_added": 0, "ticks": 0, "static": 0,
+        "signals": 0, "watch_added": 0, "comparison_signal_added": 0,
+        "control_added": 0, "ticks": 0, "static": 0,
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
-        "errors": 0,
+        "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
 
     def _fail(where: str, exc: Exception) -> None:
@@ -251,9 +484,9 @@ async def run_cycle(
         db.bump_counter("errors_total")
         db.set_meta(f"last_error_{where}", f"{recorded_at}: {type(exc).__name__}: {exc}")
 
-    # 0) تحديث صدارة المتصدّرين (كل ساعة).
+    # 0) تحديث صدارة المتصدّرين (كل ساعة) + أرشفة الخام + تسجيل الفشل.
     try:
-        await lb.maybe_refresh(now_mono)
+        await refresh_leaderboard(lb, db, now_mono, recorded_at)
     except Exception as exc:  # noqa: BLE001 — لا نُفشل الدورة
         _fail("leaderboard", exc)
 
@@ -292,6 +525,7 @@ async def run_cycle(
                             entry_signal_id=row["id"],
                             watch_hours=config.WATCH_HOURS,
                             now_iso=recorded_at,
+                            admission_price_usd=row.get("price_usd"),
                         )
                         if added:
                             stats["watch_added"] += 1
@@ -302,7 +536,7 @@ async def run_cycle(
     watched = {(w["token_address"], str(w["network_id"] or "")) for w in db.active_watches()}
     # مرشّحو المجموعة الضابطة: كل عملة نراها في هذه الدورة ولم تدخل من قبل.
     # نجمعها هنا مجّاناً — البيانات في اليد أصلاً، فلا نداء شبكة إضافيّ.
-    control_candidates: list[tuple[str, str]] = []
+    control_candidates: list[tuple[str, str, float | None, str]] = []
     for source, fetch in (("trending", _fetch_trending_raw), ("verified", _fetch_verified_raw)):
         try:
             raw = await fetch(client)
@@ -316,7 +550,9 @@ async def run_cycle(
                     if tick is None:
                         continue
                     key = (tick["token_address"], str(tick["network_id"] or ""))
-                    control_candidates.append(key)
+                    control_candidates.append(
+                        (key[0], key[1], tick.get("price_usd"), source)
+                    )
                     # نسجّل tick لكل عملة مراقَبة (المصدر الأساسي للسلسلة الزمنية).
                     # نسجّل أيضاً الثوابت لكل عملة نراها لأول مرّة إن كانت مراقَبة.
                     if key in watched:
@@ -332,11 +568,23 @@ async def run_cycle(
         except Exception as exc:  # noqa: BLE001
             _fail(source, exc)
 
-    # 2.25) تجديد المجموعة الضابطة (الصنف السالب).
+    # 2.2) نوافذ إشارة من الكون نفسه وسعر السوق نفسه المستخدم للضابطة.
     try:
-        stats["control_added"] = admit_control_sample(db, control_candidates, recorded_at)
-    except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
-        _fail("control", exc)
+        stats["comparison_signal_added"] = admit_signal_comparison_windows(
+            db, control_candidates, recorded_at
+        )
+    except Exception as exc:  # noqa: BLE001
+        _fail("comparison_signal", exc)
+
+    # 2.25) الضابطة تُقبل في الدورة نفسها التي قبلت إشارة مقارنة فقط. السماح
+    # بملء 40 ضابطة بعد إشارة قديمة واحدة يعيد اختلال الزمن الذي نريد منعه.
+    if stats["comparison_signal_added"]:
+        try:
+            stats["control_added"] = admit_control_sample(
+                db, control_candidates, recorded_at
+            )
+        except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
+            _fail("control", exc)
 
     # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
     try:
@@ -357,6 +605,16 @@ async def run_cycle(
             stats["errors"] += soc["social_errors"]
     except Exception as exc:  # noqa: BLE001
         _fail("social", exc)
+
+    # 2.9) شموع السوق الكلّي (مرجع النظام السوقي — مرّة كل ساعة).
+    try:
+        mac = await run_macro_bars_cycle(client, db, recorded_at)
+        stats["macro_rows"] = mac["macro_rows"]
+        stats["macro_no_data"] = mac["macro_no_data"]
+        if mac["macro_errors"]:
+            stats["errors"] += mac["macro_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("macro", exc)
 
     # 3) تنظيف watchlist: تعطيل ما تجاوز 48 ساعة.
     try:

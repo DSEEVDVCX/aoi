@@ -33,7 +33,10 @@ def _with_conn(fn):
 @app.get("/api/status")
 def api_status() -> dict[str, Any]:
     return _with_conn(
-        lambda c: dao.recorder_status(c, config.RECORDER_ALIVE_WINDOW_SECONDS)
+        lambda c: dao.recorder_status(
+            c, config.RECORDER_ALIVE_WINDOW_SECONDS,
+            labeler_window_seconds=config.LABELER_ALIVE_WINDOW_SECONDS,
+        )
     )
 
 
@@ -101,6 +104,18 @@ def api_counts() -> dict[str, Any]:
     return _with_conn(dao.table_counts)
 
 
+@app.get("/api/control-progress")
+def api_control_progress() -> dict[str, Any]:
+    return _with_conn(
+        lambda c: dao.control_maturity(
+            c,
+            config.CONTROL_PRELIMINARY_TARGET,
+            config.CONTROL_DECISION_TARGET,
+            config.CONTROL_DESIGN_VERSION,
+        )
+    )
+
+
 @app.get("/api/performance")
 def api_performance(
     limit: int = 12, sort: str = "peak_pct", dir: str = "desc"
@@ -142,13 +157,21 @@ def api_signal_timeline(hours: int = 24) -> dict[str, Any]:
 @app.get("/api/bars")
 def api_bars() -> dict[str, Any]:
     """تغطية الشموع — المقياس الحاسم لجاهزية البيانات للتوسيم."""
-    return _with_conn(dao.bars_coverage)
+    return _with_conn(lambda c: dao.bars_coverage(c, config.LIVE_START_TS))
 
 
 @app.get("/api/storage")
 def api_storage() -> dict[str, Any]:
     """حجم القاعدة ومعدّل نموّها — رقابة على الانفجار الصامت للأرشيف."""
-    return _with_conn(lambda c: dao.storage_stats(config.DB_PATH, c))
+    return _with_conn(
+        lambda c: dao.storage_stats(
+            config.DB_PATH,
+            c,
+            backup_dir=config.BACKUP_DIR,
+            backup_max_age_hours=config.BACKUP_MAX_AGE_HOURS,
+            disk_free_warn_bytes=int(config.DISK_FREE_WARN_GB * 1024**3),
+        )
+    )
 
 
 @app.get("/api/errors")

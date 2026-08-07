@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import Any
 
 import httpx
 
@@ -17,13 +18,13 @@ class TokenRefresher:
     """Background task that renews the Privy access token using the stored
     refresh token, then updates all active sessions in Redis."""
 
-    def __init__(self, session_store, cred_store=None) -> None:
+    def __init__(self, session_store: Any, cred_store: Any | None = None) -> None:
         self._store = session_store
         # Optional CredentialStore: when present, every successful renewal is
         # also mirrored to disk so the ROTATED refresh_token + pat survive
         # restarts and the extractor keeps running with zero manual logins.
         self._cred_store = cred_store
-        self._task: asyncio.Task | None = None
+        self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._loop(), name="token-refresher")

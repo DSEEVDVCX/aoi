@@ -70,8 +70,11 @@ class Settings(BaseSettings):
     upstream_feed_path: str = Field(default="/feed")  # GET (global social feed)
     upstream_feed_token_path: str = Field(default="/feed/token")  # GET (per-token feed)
     # GET /feed requires a non-empty feedTypes[] array. CONFIRMED enum members
-    # (2026-07-25 live probe): multi_user_buy, multi_user_sell, large_buy. Unknown
-    # values are dropped upstream; an all-unknown list 400s, so this is the default.
+    # (2026-07-25 live probe): multi_user_buy, multi_user_sell, large_buy;
+    # large_sell confirmed 2026-07-28 (same body shape as large_buy, sell side).
+    # Unknown values are dropped upstream; an all-unknown list 400s, so this is
+    # the default. (large_sell kept out of the default to preserve API behavior;
+    # the recorder requests it explicitly via its own FEED_TYPES.)
     feed_default_types: list[str] = Field(
         default_factory=lambda: ["multi_user_buy", "multi_user_sell", "large_buy"]
     )

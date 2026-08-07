@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 
@@ -17,7 +18,7 @@ _state: dict[str, Any] = {"redis": None}
 def get_redis() -> aioredis.Redis:
     if _state["redis"] is None:
         _state["redis"] = aioredis.from_url(settings.redis_url, decode_responses=True)
-    return _state["redis"]
+    return cast(aioredis.Redis, _state["redis"])
 
 
 async def close_redis() -> None:
@@ -86,7 +87,7 @@ class FakeRedis:
                 delivered += 1
         return delivered
 
-    def pubsub(self):
+    def pubsub(self) -> _FakePubSub:
         sub = _FakePubSub(self)
         self._subscribers.append(sub)
         return sub
@@ -102,11 +103,15 @@ class FakeRedis:
         import fnmatch
         return [k for k in self._store if fnmatch.fnmatch(k, pattern)]
 
-    async def scan(self, cursor: int = 0, match: str | None = None, count: int | None = None):
+    async def scan(
+        self, cursor: int = 0, match: str | None = None, count: int | None = None
+    ) -> tuple[int, list[str]]:
         """Single-pass scan: returns (0, keys) since the store fits in memory."""
         return 0, await self.keys(match or "*")
 
-    async def scan_iter(self, match: str | None = None, count: int | None = None):
+    async def scan_iter(
+        self, match: str | None = None, count: int | None = None
+    ) -> AsyncIterator[str]:
         for key in await self.keys(match or "*"):
             yield key
 
@@ -135,7 +140,7 @@ class _FakePubSub:
         self._queue.put_nowait({"type": "message", "channel": channel, "data": message})
         return True
 
-    async def get_message(self, timeout: float | None = None):
+    async def get_message(self, timeout: float | None = None) -> dict[str, Any] | None:
         """Mirrors redis-py: returns None when nothing arrives within `timeout`."""
         if timeout is None:
             return await self._queue.get()
@@ -148,4 +153,3 @@ class _FakePubSub:
         if self._redis is not None:
             self._redis._drop_subscriber(self)
         self._channels.clear()
-

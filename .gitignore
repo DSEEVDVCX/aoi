@@ -25,8 +25,16 @@ captured_endpoints.json
 *.db
 *.db-shm
 *.db-wal
+*.db.bak*
+*.db-shm.bak*
+*.db-wal.bak*
+*.bak-pre-*
+*_before.json
+backups/
 test_output.txt
 lint_output.txt
+.coverage
+htmlcov/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

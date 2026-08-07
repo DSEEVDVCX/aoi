@@ -32,6 +32,25 @@ CREATE TABLE IF NOT EXISTS watchlist (
 CREATE INDEX IF NOT EXISTS idx_watchlist_active ON watchlist (active, watch_until);
 CREATE INDEX IF NOT EXISTS idx_watchlist_control ON watchlist (is_control, active);
 
+-- سجلّ immutable لكل نافذة مراقبة. `watchlist` حالة تشغيل قابلة للترقية وإعادة
+-- التنشيط، أما هذا الجدول فهو مصدر الحقيقة للمقارنة والتوسيم ولا تُحدَّث نافذته
+-- بعد الإدراج. الفصل يمنع ترقية الضابطة إلى إشارة من محو نافذتها الأصلية.
+CREATE TABLE IF NOT EXISTS watch_windows (
+    token_address    TEXT    NOT NULL,
+    network_id       TEXT    NOT NULL,
+    first_seen_at    TEXT    NOT NULL,
+    source           TEXT    NOT NULL,
+    watch_until      TEXT    NOT NULL,
+    entry_signal_id  TEXT,
+    is_control       INTEGER NOT NULL DEFAULT 0,
+    admission_price_usd REAL,
+    admission_source TEXT,
+    design_version   INTEGER NOT NULL DEFAULT 2,
+    PRIMARY KEY (token_address, network_id, first_seen_at)
+);
+CREATE INDEX IF NOT EXISTS idx_watch_windows_pending
+    ON watch_windows (first_seen_at, source, is_control);
+
 -- لحظة القرار t=0: حدث إشارة من الـ feed (شراء متعدد / شراء كبير).
 CREATE TABLE IF NOT EXISTS signal_events (
     id                     TEXT PRIMARY KEY,     -- feed event id (idempotent)
@@ -165,16 +184,21 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_source_ts ON snapshots (source, recorde
 -- الشمعة الأحدث قد تكون قيد التكوّن فتُراجَع في السحب التالي، لذا الإدراج
 -- OR REPLACE لا OR IGNORE: القيمة الأحدث لنفس الختم هي الصحيحة.
 CREATE TABLE IF NOT EXISTS token_bars (
-    token_address TEXT    NOT NULL,
-    network_id    TEXT    NOT NULL,
-    resolution    TEXT    NOT NULL,        -- "5" = خمس دقائق (الافتراضي)
-    ts            INTEGER NOT NULL,        -- epoch seconds، فتح الشمعة
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    resolution    TEXT NOT NULL,
+    ts            INTEGER NOT NULL,       -- ختم الشمعة (epoch ثوانٍ، UTC)
     o             REAL,
     h             REAL,
     l             REAL,
     c             REAL,
     v             REAL,
-    fetched_at    TEXT    NOT NULL,        -- متى سحبناها (ISO UTC)
+    -- تشوّه المنبع: قيمة تتجاوز جارتيها بـ×10 ولا تستمرّ (انظر bar_context_flags).
+    -- تُستبعد من الحساب فقط — القيمة الخام تبقى كما وردت: الخام لا يُصلَح.
+    h_suspect     INTEGER NOT NULL DEFAULT 0,   -- قمّة مستحيلة (شوهد ×119 مليون)
+    l_suspect     INTEGER NOT NULL DEFAULT 0,   -- قاع مستحيل
+    c_suspect     INTEGER NOT NULL DEFAULT 0,   -- الإغلاق نفسه مشوّه (شوهد 12,052.5)
+    fetched_at    TEXT NOT NULL,
     PRIMARY KEY (token_address, network_id, resolution, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_bars_token_ts ON token_bars (token_address, ts);
@@ -246,6 +270,79 @@ CREATE TABLE IF NOT EXISTS token_thesis (
 CREATE INDEX IF NOT EXISTS idx_thesis_token_created
     ON token_thesis (token_address, created_at);
 
+-- أحداث النشاط التاريخية من GET /feed/tradingActivity (مشيّاط lastId رجوعاً في
+-- الزمن — مُثبت 2026-07-28؛ الـ /feed الأماميّ «أحدث فقط» وترقيمه مُتجاهَل).
+-- مصدر مستقلّ عن signal_events: يجمع أحداث multi_user_* نفسها (تطابق مُثبت
+-- بالمعرّف حيّاً: 32/42) **و** أحداث swap_buy/swap_sell الفردية بـusd_amount
+-- التي لا يعرضها /feed إطلاقاً (0/42 تطابق). جدول منفصل حتى تبقى مجموعة الجمع
+-- الأماميّة نقيّة؛ يُملأ بأثر رجعيّ عبر backfill_activity.py فقط.
+-- شكلان: مسطّح (swap_*/thesis: usdAmount/marketCap/price في الأعلى) ومتداخٍ
+-- (multi_user_*: body بنفس حقول /feed). رتبة المتصدّر وقت الحدث غير متاحة
+-- تاريخياً — لا top_trader_match_count هنا (تُشتقّ لاحقاً من أرشيف الصدارة).
+CREATE TABLE IF NOT EXISTS activity_events (
+    id                  TEXT PRIMARY KEY,       -- معرّف الحدث (idempotent)
+    event_type          TEXT NOT NULL,          -- swap_buy/swap_sell/multi_user_buy/thesis/...
+    token_address       TEXT,
+    network_id          TEXT,
+    ts                  TEXT,                   -- createdAt الأصلي (ISO UTC)
+    recorded_at         TEXT NOT NULL,          -- متى سحبناه نحن (ISO UTC)
+    user_id             TEXT,
+    user_handle         TEXT,
+    trade_id            TEXT,
+    usd_amount          REAL,                   -- usdAmount (الأحداث المسطّحة)
+    price_usd           REAL,                   -- من الأعلى أو body حسب الشكل
+    market_cap          REAL,
+    fdv                 REAL,
+    equity              REAL,
+    num_trades          INTEGER,                -- حقول body لأحداث multi_user_*
+    unique_traders      INTEGER,
+    minutes             INTEGER,
+    price_change_pct    REAL,
+    total_volume        REAL,
+    are_top_traders     INTEGER,
+    top_trader_ids_json TEXT,
+    ticker              TEXT,
+    raw_json            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_token_ts ON activity_events (token_address, ts);
+CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_events (ts);
+
+-- تصنيف الأصل لكل عملة: fomo منصّة متعدّدة الأصول لا سوق ميمات.
+-- مقيس 2026-07-30: BTC/ETH/SOL/USDT وذهب PAXG وأسهم مرمّزة (AAPL/MSTR/HOOD/
+-- INTC/META/SNDK/MU) داخل أرشيفنا. أصلٌ بتريليون أو سهم آبل لا يسلك سلوك عملة
+-- عمرها ساعتان، فخلطهما يفسد التدريب وأيّ استنتاج عن أثر القيمة السوقية.
+-- مشتقّ بالكامل من المشاهدات (extract.classify_asset) ⇒ يُعاد بناؤه متى شئنا
+-- عبر classify_tokens.py، والقيم الخام لا تتغيّر.
+CREATE TABLE IF NOT EXISTS token_class (
+    token_address  TEXT NOT NULL,
+    network_id     TEXT NOT NULL,
+    asset_class    TEXT NOT NULL,   -- meme | major | stable | priced
+    reason         TEXT,            -- القاعدة التي حكمت (للتدقيق لا للتجميل)
+    symbol         TEXT,
+    price_min      REAL,
+    price_max      REAL,
+    market_cap_max REAL,
+    observations   INTEGER,
+    classified_at  TEXT NOT NULL,
+    PRIMARY KEY (token_address, network_id)
+);
+CREATE INDEX IF NOT EXISTS idx_token_class_class ON token_class (asset_class);
+
+-- حالة سحب الشموع الرجعية لأحداث activity_events (نفس نمط bars_fetch_state).
+-- يكتبها backfill_activity_bars.py فقط. الموسِّم لا يوسم حدث نشاط إلّا بعد
+-- status='ok' لعملته — وإلّا كتب no_entry أبديّاً قبل وصول الشموع (التوسيم
+-- idempotent لا يُراجَع). no_data بعد MAX_ATTEMPTS = العملة بلا سلسلة عند
+-- fomo (ميّتة/مُتآكلة) — تُقاس كنسبة انحياز بقاء في الرجعيّ، لا تُخفى.
+CREATE TABLE IF NOT EXISTS activity_bars_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                    -- ok / no_data / error
+    candles       INTEGER,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+
 -- حالة سحب الطبقة الاجتماعية (نفس نمط bars_fetch_state، بدورة أبطأ).
 CREATE TABLE IF NOT EXISTS social_fetch_state (
     token_address TEXT NOT NULL,
@@ -288,6 +385,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
     final_return_48h REAL,                      -- إغلاق نهاية النافذة / الدخول - 1
     time_to_peak_h   REAL,                      -- ساعات حتى القمّة
     candles_48h      INTEGER,                   -- شموع مرصودة داخل النافذة
+    suspect_bars     INTEGER,                   -- شموع بذيل مستحيل داخل النافذة
+                                                --   (استُبعدت ذيولها من القمّة/القاع)
     last_bar_lag_h   REAL,                      -- كم قبل نهاية النافذة انتهت السلسلة
     bars_truncated   INTEGER,                   -- 1 = السلسلة انتهت مبكراً (>1س)
                                                 --   غالباً موت العملة — إشارة لا نقص!
@@ -295,10 +394,195 @@ CREATE TABLE IF NOT EXISTS outcomes (
     split            TEXT,                      -- train/val/test (تجزئة ثابتة بالعملة)
     status           TEXT NOT NULL,             -- ok | no_entry | no_bars
     labeled_at       TEXT NOT NULL,
+    design_version   INTEGER NOT NULL DEFAULT 1,
+    analysis_eligible INTEGER NOT NULL DEFAULT 0,
+    exclusion_reason TEXT,
     PRIMARY KEY (kind, key)
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_token ON outcomes (token_address);
 CREATE INDEX IF NOT EXISTS idx_outcomes_split ON outcomes (split, kind, status);
+
+-- واجهة القراءة الآمنة للمرحلة 1: لا تُظهر الأرشيف القديم أو الصفوف غير المؤهلة.
+DROP VIEW IF EXISTS phase1_watch_outcomes;
+CREATE VIEW phase1_watch_outcomes AS
+SELECT o.*
+  FROM outcomes o
+ WHERE o.kind = 'watch'
+   AND o.analysis_eligible = 1
+   AND o.design_version >= 3;
+
+-- جدول التدريب: صفّ لكل قرار، عمود لكل ميزة معلومة **عند t=0 أو قبلها**،
+-- والليبل ملصوقاً من outcomes. يُبنى بـ features.py عبر build_training_rows.py.
+--
+-- مشتقّ بالكامل ⇒ يُحذف ويُعاد بناؤه في أيّ وقت بلا نداء شبكة. الأعمدة نصّية
+-- أو رقمية بحسب طبيعتها، والغائب NULL (FR-007: لا فبركة — الغياب معلومة).
+--
+-- ⚠️ لا تكتب فيه يدوياً ولا تُضِف عموداً محسوباً من بعد t=0: كل عمود هنا يجب
+-- أن يجيب «هل كان يُعرف لحظة القرار؟» بنعم. الاختبارات تزرع بيانات بعد t0
+-- وتتأكّد أنّها لا تظهر.
+CREATE TABLE IF NOT EXISTS training_rows (
+    -- وسم الصفّ
+    kind             TEXT NOT NULL,      -- signal | activity | watch
+    key              TEXT NOT NULL,      -- مفتاح القرار (= outcomes.key)
+    token_address    TEXT NOT NULL,
+    network_id       TEXT,
+    entry_ts         INTEGER NOT NULL,   -- t=0 (epoch)
+    asset_class      TEXT,               -- meme | major | priced | stable
+    split            TEXT,               -- train/val/test (بتجزئة العملة)
+    is_independent   INTEGER,
+    is_live          INTEGER NOT NULL DEFAULT 0,  -- 1 = حيّ (≥LIVE_START_TS)، 0 = رجعيّ
+    status           TEXT,
+    suspect_bars     INTEGER,
+    feature_version  INTEGER NOT NULL DEFAULT 1,
+    built_at         TEXT NOT NULL,
+    -- أ) الحدث المُشغِّل
+    signal_type      TEXT,
+    size_usd         REAL,
+    in_amount        REAL,
+    out_amount       REAL,
+    token_amount     REAL,
+    avg_cost         REAL,
+    price_to_avg_cost REAL,
+    realized_pnl_usd REAL,
+    num_swaps        INTEGER,
+    is_first_buy     INTEGER,
+    buyer_pnl_pct    REAL,
+    market_cap       REAL,
+    fdv              REAL,
+    price_usd        REAL,
+    log_market_cap   REAL,
+    log_size_usd     REAL,
+    size_to_mcap     REAL,
+    unique_traders   INTEGER,
+    num_trades       INTEGER,
+    minutes          INTEGER,
+    price_change_pct REAL,
+    total_volume     REAL,
+    volume_per_trader REAL,
+    are_top_traders  INTEGER,
+    top_trader_match_count INTEGER,
+    top_traders_listed INTEGER,
+    top_trader_match_ratio REAL,
+    buyers_best_rank INTEGER,
+    rank_le_10       INTEGER,
+    rank_le_50       INTEGER,
+    ticker_len       INTEGER,
+    ticker_has_digit INTEGER,
+    ticker_non_ascii INTEGER,
+    hour_utc         INTEGER,
+    dow              INTEGER,
+    -- ب) ثوابت العملة وبصمة المُنشئ
+    token_age_h      REAL,
+    launchpad_name   TEXT,
+    migrated         INTEGER,
+    graduation_percent REAL,
+    is_scam          INTEGER,
+    mintable         INTEGER,
+    freezable        INTEGER,
+    socials_count    INTEGER,
+    has_twitter      INTEGER,
+    creator_prior_tokens INTEGER,
+    name_len         INTEGER,
+    name_non_ascii   INTEGER,
+    decimals         INTEGER,
+    -- ج) الزخم الاجتماعيّ: عدّ تاريخيّ (عيّنة) + لقطة حقيقية قبل t0
+    -- (بلا إعجابات الأطروحات — ممنوعة: قيمتها وقت السحب لا الكتابة)
+    thesis_counted   INTEGER,
+    thesis_counted_capped INTEGER,
+    thesis_authors_before INTEGER,
+    thesis_1h        INTEGER,
+    thesis_24h       INTEGER,
+    thesis_accel     REAL,
+    hours_since_last_thesis REAL,
+    thesis_history_days REAL,
+    social_thesis_total INTEGER,
+    social_thesis_authors INTEGER,
+    social_holder_authors INTEGER,
+    social_holder_ratio REAL,
+    social_replies   INTEGER,
+    social_snapshot_age_min REAL,
+    social_total_delta_1h INTEGER,
+    social_total_growth_1h REAL,
+    social_authors_delta_1h INTEGER,
+    -- د) مسار السعر والحجم قبل الإشارة
+    ret_1h_before    REAL,
+    ret_4h_before    REAL,
+    ret_24h_before   REAL,
+    ret_7d_before    REAL,
+    vol_24h_before   REAL,
+    flat_ratio_24h   REAL,
+    up_candle_ratio_24h REAL,
+    dist_from_ath    REAL,
+    bars_history_h   REAL,
+    bars_count_24h   INTEGER,
+    bar_vol_1h       REAL,
+    bar_vol_24h      REAL,
+    vol_surge_1h     REAL,
+    -- هـ) لقطة السوق الأخيرة قبل t0
+    liquidity        REAL,
+    holders          INTEGER,
+    top10_holders_pct REAL,
+    volume_24h       REAL,
+    buy_count_24h    INTEGER,
+    sell_count_24h   INTEGER,
+    buy_sell_ratio_24h REAL,
+    unique_buys_24h  INTEGER,
+    unique_sells_24h INTEGER,
+    tick_age_min     REAL,
+    tick_change_1h   REAL,
+    tick_change_4h   REAL,
+    tick_change_24h  REAL,
+    tick_volume_1h   REAL,
+    tick_volume_4h   REAL,
+    tick_txn_1h      INTEGER,
+    tick_txn_24h     INTEGER,
+    volume_to_liquidity REAL,
+    liquidity_to_mcap REAL,
+    float_ratio      REAL,
+    -- و) النظام السوقيّ
+    sol_ret_4h       REAL,
+    sol_ret_24h      REAL,
+    eth_ret_24h      REAL,
+    -- ز) كثافة الإشارات
+    prior_signals_token INTEGER,
+    minutes_since_prior_signal REAL,
+    global_signals_1h INTEGER,
+    -- الليبل (من outcomes — ما بعد t0، هدفٌ لا ميزة)
+    final_return_48h REAL,
+    max_gain_1h      REAL,
+    max_gain_4h      REAL,
+    max_gain_24h     REAL,
+    max_gain_48h     REAL,
+    max_drawdown_48h REAL,
+    time_to_peak_h   REAL,
+    is_rug           INTEGER,
+    PRIMARY KEY (kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_training_split
+    ON training_rows (asset_class, split, status, is_independent);
+
+-- واجهة النموذج الآمنة: لا تعتمد على تذكّر ستة فلاتر عند كل تدريب.
+DROP VIEW IF EXISTS model_training_rows;
+CREATE VIEW model_training_rows AS
+SELECT * FROM training_rows
+ WHERE kind = 'signal'
+   AND is_live = 1
+   AND asset_class = 'meme'
+   AND status = 'ok'
+   AND is_independent = 1
+   AND feature_version >= 2
+   AND NOT EXISTS (
+       SELECT 1
+         FROM signal_events current_event
+         JOIN signal_events earlier_event
+           ON earlier_event.token_address = current_event.token_address
+          AND COALESCE(earlier_event.network_id, '') =
+              COALESCE(current_event.network_id, '')
+          AND earlier_event.ts = current_event.ts
+          AND earlier_event.signal_type = current_event.signal_type
+          AND earlier_event.id < current_event.id
+        WHERE current_event.id = training_rows.key
+   );
 
 -- حالة التشغيل: آخر تشغيل، عدّادات، حالة getBars، إصدار المخطّط.
 CREATE TABLE IF NOT EXISTS meta (

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from fastapi import FastAPI
@@ -12,6 +14,11 @@ from fomo_api.config import settings
 from fomo_api.redis_state import close_redis, get_redis
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from fomo_api.auth.credential_store import CredentialStore
+    from fomo_api.auth.session import SessionStore
+    from fomo_api.realtime.poller import AlertPoller
 
 
 def _redact_url(url: str) -> str:
@@ -25,7 +32,7 @@ def _redact_url(url: str) -> str:
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     redis = get_redis()
     try:
         await redis.ping()
@@ -73,7 +80,9 @@ async def lifespan(_app: FastAPI):
     await close_redis()
 
 
-def _build_alert_poller(session_store, cred_store):
+def _build_alert_poller(
+    session_store: SessionStore, cred_store: CredentialStore | None
+) -> AlertPoller:
     """Wire the AlertPoller to the live session token and live subscriptions."""
     from fomo_api.realtime.poller import AlertPoller
     from fomo_api.realtime.pubsub import AlertPubSub
@@ -88,10 +97,10 @@ def _build_alert_poller(session_store, cred_store):
             if stored and stored.access_token:
                 return stored.access_token
         keys = await get_redis().keys("session:*")
-        for k in keys:
-            k = k.decode() if isinstance(k, bytes) else k
-            if not k.endswith(":exp"):
-                return await session_store.verify(k.split(":", 1)[1])
+        for key in keys:
+            key_text = key.decode() if isinstance(key, bytes) else str(key)
+            if not key_text.endswith(":exp"):
+                return await session_store.verify(key_text.split(":", 1)[1])
         return None
 
     async def _tracked() -> set[str]:
@@ -122,8 +131,26 @@ def create_app() -> FastAPI:
         try:
             await get_redis().ping()
         except Exception:
-            return JSONResponse(status_code=503, content={"status": "degraded"})
-        return JSONResponse(status_code=200, content={"status": "ok"})
+            return JSONResponse(
+                status_code=503,
+                content={"status": "degraded", "redis": "unavailable", "credentials": "unknown"},
+            )
+
+        # A live FastAPI process with unusable Privy credentials cannot reach the
+        # upstream, yet the old health endpoint still reported "ok". Report only
+        # capability flags—never token values or credential contents.
+        from fomo_api.auth.credential_store import CredentialStore
+
+        creds = CredentialStore(settings.credential_state_file).load()
+        credential_ready = bool(creds and creds.access_token and creds.is_refreshable())
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok" if credential_ready else "degraded",
+                "redis": "ok",
+                "credentials": "ready" if credential_ready else "unavailable",
+            },
+        )
 
     return app
 

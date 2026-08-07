@@ -15,7 +15,7 @@ async def get_top_tokens(
     client: FomoClientDep,
     chain: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
-) -> Envelope[list[dict]]:
+) -> Envelope[list[dict[str, Any]]]:
     """CONFIRMED: POST /proxy/trendingTokens — trending tokens (chain filtered
     client-side). Replaces the former phantom /tokens/trending path."""
     tokens = await client.get_top_tokens(chain=chain, limit=limit)
@@ -26,7 +26,7 @@ async def get_top_tokens(
 async def get_trader_positions(
     client: FomoClientDep,
     trader_id: str,
-) -> Envelope[list[dict]]:
+) -> Envelope[list[dict[str, Any]]]:
     """CONFIRMED: /v2/users/{id}/balances — a trader's current holdings.
     Replaces the former phantom /profile/{id}/positions path."""
     positions = await client.get_trader_positions(trader_id)

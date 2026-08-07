@@ -132,12 +132,9 @@ def main() -> None:
             if dry_run:
                 added += 1
                 continue
-            if db.admit_control(addr, net, config.CONTROL_WATCH_HOURS, entry):
-                db._conn.execute(
-                    "UPDATE watchlist SET source='control_retro' "
-                    "WHERE token_address=? AND network_id=?",
-                    (addr, net),
-                )
+            if db.admit_control(
+                addr, net, config.CONTROL_WATCH_HOURS, entry, source="control_retro"
+            ):
                 added += 1
         if not dry_run:
             db._conn.commit()

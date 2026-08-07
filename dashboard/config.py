@@ -29,8 +29,39 @@ BOOT_LOG_PATH = os.path.join(HERE, "dashboard_boot.log")
 
 STATIC_DIR = os.path.join(HERE, "static")
 
+# حدّ الحِقبة الحيّة: أوّل إشارة جمعها البوت لحظياً (2026-07-25T22:35:27Z).
+# اللوحة تعرض **بيانات البوت فقط**؛ ما قبل هذا الختم بيانات رجعيّة (backfill)
+# تفتقر للعائلات اللحظية، وقد أُقصيت من التدريب وحُذفت صفوفُها من القاعدة. يبقى
+# جدول token_bars وحده يحمل شموعاً رجعيّة (تاريخ سعر سابق للإشارة)، فنقصر عدّ
+# الشموع المعروض على هذا الحدّ حتى لا تختلط الرجعيّة ببيانات البوت.
+# القيمة تطابق recorder/config.py:LIVE_START_TS (حدّ حِقبة واحد للمشروع كلّه).
+LIVE_START_TS = 1785018927
+
 # "حيّ" = آخر دورة مسجّل خلال هذه المهلة (الدورة كل 60ث، فنسمح بضعف + هامش).
 RECORDER_ALIVE_WINDOW_SECONDS = 150
 
+# "حيّ" للموسِّم = آخر دورة خلال هذه المهلة (دورته كل 900ث، فنسمح بضعف + هامش).
+# موته صامت تماماً — لا أخطاء ولا انهيار — بينما تتوقّف النتائج عن التراكم.
+LABELER_ALIVE_WINDOW_SECONDS = 2000
+
+# بوابات الضابطة v3 المثبتة في docs/PLAN.md: 100 فحص أولي، 500 قرار أساسي.
+CONTROL_PRELIMINARY_TARGET = 100
+CONTROL_DECISION_TARGET = 500
+CONTROL_DESIGN_VERSION = 3
+
+# التخزين والنسخ الاحتياطي. يطابق الافتراضي recorder/backup_db.py: وجهة
+# متزامنة خارج المستودع، مع إنذار إن مرّ أكثر من يوم ونصف بلا نسخة سليمة.
+BACKUP_DIR = os.environ.get("AOI_BACKUP_DIR") or (
+    os.path.join(os.environ["OneDrive"], "aoi-backups")
+    if os.environ.get("OneDrive")
+    else None
+)
+BACKUP_MAX_AGE_HOURS = 36.0
+DISK_FREE_WARN_GB = 25.0
+
 # مصادر المسجّل التي نعرض آخر خطأ لكلٍّ منها (تطابق مفاتيح meta: last_error_<src>).
-RECORDER_SOURCES = ("feed", "trending", "verified", "leaderboard", "cleanup")
+# القائمة تغطّي كل ما يكتبه المسجّل فعلاً؛ bars/social كانا يُسجَّلان بلا عرض.
+RECORDER_SOURCES = (
+    "feed", "trending", "verified", "leaderboard", "control",
+    "bars", "social", "macro", "cleanup",
+)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends
@@ -21,7 +22,7 @@ async def get_fomo_client(session_store: SessionStore, consumer_key: str) -> Fom
 async def fomo_client_dep(
     consumer_key: Annotated[str, Depends(require_consumer_key)],
     store: SessionStore = Depends(get_session_store),
-) -> FomoClient:
+) -> AsyncIterator[FomoClient]:
     client = await get_fomo_client(store, consumer_key)
     try:
         yield client

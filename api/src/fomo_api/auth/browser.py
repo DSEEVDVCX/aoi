@@ -17,7 +17,7 @@ async def default_browser_factory() -> Any:
         raise RuntimeError("playwright is not installed; run: playwright install chromium")
 
     class _PageCtx:
-        async def __aenter__(self):
+        async def __aenter__(self) -> Any:
             self._pw_cm = async_playwright()
             pw = await self._pw_cm.__aenter__()
             # Use real installed Chrome to avoid Google's bot detection.
@@ -47,7 +47,7 @@ async def default_browser_factory() -> Any:
             self.page = await self._context.new_page()
             return self
 
-        async def __aexit__(self, *_):
+        async def __aexit__(self, *_exc: Any) -> None:
             await self._browser.close()
             await self._pw_cm.__aexit__(None, None, None)
 

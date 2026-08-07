@@ -139,21 +139,43 @@ def _result(entry: float, gross: float, reason: str, hours: float, rule: ExitRul
     }
 
 
-def load_trades(db: RecorderDB, independent_only: bool = True) -> list[dict[str, Any]]:
+def load_trades(
+    db: RecorderDB, independent_only: bool = True, source: str = "signal"
+) -> list[dict[str, Any]]:
     """يحمّل نقاط الدخول وشموعها. افتراضياً أوّل إشارة لكل عملة فقط.
 
     `independent_only` يمنع التكرار الزائف: 14.2 إشارة لكل عملة، ووسيط الفاصل
     بينها 1.1 دقيقة — محاكاتها كصفقات منفصلة تضخّم النتيجة بلا معنى.
+
+    `source`: "signal" (الجمع الأماميّ، signal_events) أو "activity" (الرجعيّ،
+    activity_events بأحداث multi_user_buy — أطروحة الدخول الجماعيّ فقط، لا
+    البيع ولا الأطروحات). نفس منطق «أوّل حدث لكل عملة» في كليهما.
     """
-    sql = (
-        """WITH f AS (SELECT token_address a, network_id n, MIN(ts) mts
-                        FROM signal_events WHERE ts IS NOT NULL GROUP BY 1, 2)
-             SELECT a, n, CAST(strftime('%s', mts) AS INTEGER) e FROM f"""
-        if independent_only
-        else """SELECT token_address a, network_id n,
-                       CAST(strftime('%s', ts) AS INTEGER) e
-                  FROM signal_events WHERE ts IS NOT NULL"""
-    )
+    if source == "activity":
+        sql = (
+            """SELECT token_address a, network_id n,
+                      CAST(strftime('%s', MIN(ts)) AS INTEGER) e
+                 FROM activity_events
+                WHERE ts IS NOT NULL AND token_address IS NOT NULL
+                  AND event_type = 'multi_user_buy'
+                GROUP BY 1, 2"""
+            if independent_only
+            else """SELECT token_address a, network_id n,
+                           CAST(strftime('%s', ts) AS INTEGER) e
+                      FROM activity_events
+                     WHERE ts IS NOT NULL AND token_address IS NOT NULL
+                       AND event_type = 'multi_user_buy'"""
+        )
+    else:
+        sql = (
+            """WITH f AS (SELECT token_address a, network_id n, MIN(ts) mts
+                            FROM signal_events WHERE ts IS NOT NULL GROUP BY 1, 2)
+                 SELECT a, n, CAST(strftime('%s', mts) AS INTEGER) e FROM f"""
+            if independent_only
+            else """SELECT token_address a, network_id n,
+                           CAST(strftime('%s', ts) AS INTEGER) e
+                      FROM signal_events WHERE ts IS NOT NULL"""
+        )
     out = []
     for row in db._conn.execute(sql).fetchall():
         bars = db.bars_for(

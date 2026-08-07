@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fomo_api.config import settings
@@ -22,10 +23,10 @@ class AlertPoller:
 
     def __init__(
         self,
-        pubsub,
-        session_token_lookup,
+        pubsub: Any,
+        session_token_lookup: Callable[[str], Awaitable[str | None]],
         poll_interval: int | None = None,
-        tracked_source=None,
+        tracked_source: Callable[[], Awaitable[set[str]]] | None = None,
     ) -> None:
         self._pubsub = pubsub
         self._session_token_lookup = session_token_lookup
@@ -87,7 +88,7 @@ class AlertPoller:
                 )
             await asyncio.sleep(self._interval)
 
-    async def _fetch_and_publish(self, trader_id: str, redis) -> list[dict[str, Any]]:
+    async def _fetch_and_publish(self, trader_id: str, redis: Any) -> list[dict[str, Any]]:
         """Shared logic: fetch alerts, filter by watermark, publish new ones."""
         from fomo_api.clients.fomo_client import FomoClient
 
@@ -123,7 +124,7 @@ class AlertPoller:
 
         return published
 
-    async def _poll_trader(self, trader_id: str, redis) -> None:
+    async def _poll_trader(self, trader_id: str, redis: Any) -> None:
         try:
             await self._fetch_and_publish(trader_id, redis)
         except Exception:

@@ -1,0 +1,7 @@
+# Runtime dependencies for the complete workspace. The API package owns the
+# shared HTTP/auth stack; recorder and dashboard reuse it directly.
+-e ./api
+
+# Research/phase-1 analysis dependencies used outside api/.
+numpy>=1.26,<3
+scipy>=1.13,<2

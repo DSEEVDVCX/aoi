@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from fomo_api.config import settings
 
@@ -17,7 +18,7 @@ class SessionStore:
     """Volatile, Redis-backed session store. Holds consumer keys -> fomo
     session tokens with a short TTL. Nothing is persisted to disk (FR-013)."""
 
-    def __init__(self, redis) -> None:
+    def __init__(self, redis: Any) -> None:
         self._redis = redis
 
     async def create(self, fomo_session_token: str, ttl_seconds: int | None = None) -> str:
@@ -33,7 +34,7 @@ class SessionStore:
             return None
         if isinstance(token, bytes):
             token = token.decode()
-        return token
+        return str(token) if token else None
 
     async def revoke(self, consumer_key: str) -> None:
         await self._redis.delete(_key(consumer_key), f"{_key(consumer_key)}:exp")
@@ -79,7 +80,7 @@ class SessionStore:
             return None
         if isinstance(v, bytes):
             v = v.decode()
-        return v or None
+        return str(v) if v else None
 
     async def get_refresh_creds(self) -> tuple[str, str | None] | None:
         """Return (refresh_token, app_id) or None. Kept for backward compat."""

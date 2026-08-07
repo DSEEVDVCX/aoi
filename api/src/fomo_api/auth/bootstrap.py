@@ -79,6 +79,8 @@ async def _refresh_and_persist(
     """Do one browserless refresh and write the rotated secrets back to disk."""
     from fomo_api.auth.token_refresher import _call_privy_refresh
 
+    if not creds.refresh_token or not creds.app_id:
+        return None
     try:
         result = await _call_privy_refresh(
             refresh_token=creds.refresh_token,

@@ -1,4 +1,4 @@
-"""اختبارات dao على قاعدة مؤقّتة (بلا شبكة، بلا مسّ recorder.db الحقيقي).
+﻿"""اختبارات dao على قاعدة مؤقّتة (بلا شبكة، بلا مسّ recorder.db الحقيقي).
 
 نبني قاعدة صغيرة بنفس أعمدة recorder.db، نملؤها، ثم نتحقّق أن دوال القراءة
 الخالصة تعيد ما هو متوقّع — بما في ذلك منطق "حيّ خلال المهلة" ومطابقة meta.
@@ -31,6 +31,15 @@ CREATE TABLE watchlist (
   token_address TEXT, network_id TEXT, first_seen_at TEXT, source TEXT,
   watch_until TEXT, entry_signal_id TEXT, active INTEGER,
   is_control INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE watch_windows (
+  token_address TEXT, network_id TEXT, first_seen_at TEXT,
+  design_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE outcomes (
+  kind TEXT, key TEXT, token_address TEXT, network_id TEXT,
+  is_control INTEGER, status TEXT, design_version INTEGER,
+  analysis_eligible INTEGER, entry_ts INTEGER
 );
 CREATE TABLE snapshots (id INTEGER PRIMARY KEY, recorded_at TEXT, source TEXT, raw_json TEXT);
 """
@@ -77,7 +86,7 @@ def test_status_alive_when_recent(db_path):
     now = datetime.now(UTC)
     _seed_meta(db_path, cycles_total=12, last_cycle_at=(now - timedelta(seconds=30)).isoformat())
     conn = _conn(db_path)
-    st = dao.recorder_status(conn, 150, now=now)
+    st = dao.recorder_status(conn, 150, 2000, now=now)
     assert st["alive"] is True
     assert st["cycles_total"] == 12
     assert st["seconds_since_last_cycle"] < 150
@@ -88,14 +97,77 @@ def test_status_dead_when_stale(db_path):
     now = datetime.now(UTC)
     _seed_meta(db_path, cycles_total=5, last_cycle_at=(now - timedelta(seconds=600)).isoformat())
     conn = _conn(db_path)
-    st = dao.recorder_status(conn, 150, now=now)
+    st = dao.recorder_status(conn, 150, 2000, now=now)
     assert st["alive"] is False
     conn.close()
 
 
+def test_status_labeler_fresh_is_not_stale(db_path):
+    now = datetime.now(UTC)
+    _seed_meta(db_path, labeler_last_run_at=(now - timedelta(seconds=900)).isoformat())
+    conn = _conn(db_path)
+    st = dao.recorder_status(conn, 150, 2000, now=now)
+    assert st["labeler_stale"] is False
+    assert st["labeler_age_seconds"] == pytest.approx(900, abs=1)
+    conn.close()
+
+
+def test_status_labeler_dead_when_stale(db_path):
+    """موت الموسِّم صامت — لا ينكشف إلّا من قِدَم ختمه."""
+    now = datetime.now(UTC)
+    _seed_meta(db_path, labeler_last_run_at=(now - timedelta(seconds=7200)).isoformat())
+    conn = _conn(db_path)
+    st = dao.recorder_status(conn, 150, 2000, now=now)
+    assert st["labeler_stale"] is True
+    conn.close()
+
+
+def test_status_labeler_never_ran_is_stale(db_path):
+    conn = _conn(db_path)
+    st = dao.recorder_status(conn, 150, 2000, now=datetime.now(UTC))
+    assert st["labeler_stale"] is True
+    assert st["labeler_age_seconds"] is None
+    conn.close()
+
+
+def test_control_maturity_counts_only_completed_eligible_v3_controls(db_path):
+    c = sqlite3.connect(db_path)
+    c.executemany(
+        "INSERT INTO outcomes VALUES('watch',?,?,?,?,?,?,?,?)",
+        [
+            ("a", "a", "56", 1, "ok", 3, 1, 100),
+            ("b", "b", "56", 1, "ok", 3, 1, 200),
+            ("pending", "p", "56", 1, "no_entry", 3, 1, 300),
+            ("legacy", "l", "56", 1, "ok", 2, 0, 50),
+            ("signal", "s", "56", 0, "ok", 3, 1, 400),
+        ],
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    progress = dao.control_maturity(conn, preliminary_target=100, decision_target=500)
+    conn.close()
+
+    assert progress == {
+        "completed": 2,
+        "preliminary_target": 100,
+        "decision_target": 500,
+        "preliminary_remaining": 98,
+        "decision_remaining": 498,
+        "preliminary_pct": 2.0,
+        "decision_pct": 0.4,
+        "preliminary_ready": False,
+        "decision_ready": False,
+        "design_version": 3,
+        "first_entry_ts": 100,
+        "last_entry_ts": 200,
+    }
+
+
 def test_status_missing_meta_keys_default(db_path):
     conn = _conn(db_path)
-    st = dao.recorder_status(conn, 150)
+    st = dao.recorder_status(conn, 150, 2000)
     assert st["alive"] is False
     assert st["cycles_total"] == 0
     assert st["errors_total"] == 0          # المفتاح غائب → 0 لا استثناء
@@ -281,6 +353,41 @@ def test_storage_stats_without_span_returns_none_rate(db_path):
     conn.close()
 
 
+def test_storage_stats_reports_backup_freshness_and_disk_state(db_path, tmp_path):
+    backup_dir = tmp_path / "external-backups"
+    backup_dir.mkdir()
+    backup = backup_dir / "recorder-20260807-010000-000000.db"
+    backup.write_bytes(b"backup")
+    now = datetime.fromtimestamp(backup.stat().st_mtime, UTC) + timedelta(hours=2)
+    conn = _conn(db_path)
+
+    st = dao.storage_stats(
+        db_path,
+        conn,
+        backup_dir=str(backup_dir),
+        backup_max_age_hours=36,
+        disk_free_warn_bytes=0,
+        now=now,
+    )
+
+    assert st["backup_configured"] is True
+    assert st["latest_backup"] == backup.name
+    assert st["backup_age_hours"] == 2.0
+    assert st["backup_warning"] is False
+    assert st["disk_warning"] is False
+    assert st["disk_free_bytes"] > 0
+    conn.close()
+
+
+def test_storage_stats_warns_when_configured_backup_is_missing(db_path, tmp_path):
+    conn = _conn(db_path)
+    st = dao.storage_stats(db_path, conn, backup_dir=str(tmp_path / "missing"))
+    assert st["backup_configured"] is True
+    assert st["latest_backup"] is None
+    assert st["backup_warning"] is True
+    conn.close()
+
+
 # --- bars coverage ---
 def _bars_schema(db_path):
     c = sqlite3.connect(db_path)
@@ -308,7 +415,7 @@ def test_bars_coverage_counts_watched_tokens_with_series(db_path):
     c.commit(); c.close()
 
     conn = _conn(db_path)
-    cov = dao.bars_coverage(conn)
+    cov = dao.bars_coverage(conn, 0)    # live=0: عدّ كل الشموع (اختبار آلية التغطية لا الحِقبة)
     assert cov["active"] == 3
     assert cov["with_bars"] == 1
     assert cov["no_data"] == 1
@@ -318,10 +425,30 @@ def test_bars_coverage_counts_watched_tokens_with_series(db_path):
     conn.close()
 
 
+def test_bars_coverage_candles_excludes_pre_live_retro(db_path):
+    """عدّ الشموع يقصر على الحِقبة الحيّة: الشموع الرجعيّة (ts < live) تاريخ سعر
+    سابق للإشارة لا جمعه البوت لحظياً، فلا تُعرض كي لا تختلط ببيانات البوت."""
+    live = 1_785_018_927
+    c = _bars_schema(db_path)
+    c.execute("INSERT INTO watchlist(token_address, network_id, source, first_seen_at,"
+              " watch_until, active) VALUES('a','56','feed','t','t',1)")
+    # شمعتان رجعيّتان (قبل الحدّ) + شمعة حيّة واحدة (بعده)
+    c.execute("INSERT INTO token_bars VALUES('a','56','5',?,1,2,0.5,1.5,9,'t')", (live - 3600,))
+    c.execute("INSERT INTO token_bars VALUES('a','56','5',?,1,2,0.5,1.5,9,'t')", (live - 60,))
+    c.execute("INSERT INTO token_bars VALUES('a','56','5',?,1,2,0.5,1.5,9,'t')", (live + 60,))
+    c.commit(); c.close()
+
+    conn = _conn(db_path)
+    cov = dao.bars_coverage(conn, live)
+    assert cov["candles"] == 1          # الحيّة فقط — الرجعيّتان مُستبعدتان
+    assert cov["with_bars"] == 1        # العملة لها سلسلة (بصرف النظر عن الحِقبة)
+    conn.close()
+
+
 def test_bars_coverage_without_tables_is_zero_not_error(db_path):
     """قاعدة قديمة بلا جدول شموع → أصفار، لا استثناء."""
     conn = _conn(db_path)
-    cov = dao.bars_coverage(conn)
+    cov = dao.bars_coverage(conn, 0)
     assert cov == {"active": 0, "with_bars": 0, "pending": 0, "no_data": 0,
                    "candles": 0, "coverage_pct": None}
     conn.close()
@@ -458,14 +585,14 @@ def test_every_dao_read_runs_against_the_real_recorder_schema(tmp_path):
 
     c = _conn(p)
     try:
-        assert dao.recorder_status(c, 150)["alive"] is False
+        assert dao.recorder_status(c, 150, 2000)["alive"] is False
         assert dao.recorder_errors(c, ("feed", "bars")) is not None
         assert dao.table_counts(c)["token_bars"] == 0
         assert dao.active_watch_count(c) == 0
         assert dao.recent_signals(c, 10) == []
         assert dao.active_watchlist(c) == []
         assert dao.ticks_summary(c)["total"] == 0
-        assert dao.bars_coverage(c)["candles"] == 0
+        assert dao.bars_coverage(c, 0)["candles"] == 0
         assert dao.watch_performance(c, 10) == []
         assert dao.performance_summary(c)["count"] == 0
         assert dao.token_series(c, "x", "56", 0) == []
@@ -489,6 +616,10 @@ def _mixed_fixture(db_path):
         c.execute("INSERT INTO watchlist(token_address, network_id, source, first_seen_at,"
                   " watch_until, active, is_control) VALUES(?, '56',?,?,'t',1,?)",
                   (tok, "control" if ctl else "large_buy", iso, ctl))
+        c.execute(
+            "INSERT INTO watch_windows VALUES(?, '56', ?, 2)",
+            (tok, iso),
+        )
         for ts, px in ((entry, e), (entry + 300, peak), (entry + 600, last)):
             c.execute("INSERT INTO token_bars VALUES(?, '56','5',?,?,?,?,?,1,'t')",
                       (tok, ts, px, px, px, px))
@@ -576,7 +707,7 @@ def test_status_flags_a_frozen_upstream_feed(db_path):
         last_feed_event_at=(now - timedelta(hours=3)).isoformat(),
     )
     conn = _conn(db_path)
-    st = dao.recorder_status(conn, 150, now=now)
+    st = dao.recorder_status(conn, 150, 2000, now=now)
     assert st["alive"] is True            # المسجّل حيّ
     assert st["feed_stale"] is True       # لكنّ المصدر متجمّد
     assert st["feed_age_seconds"] == pytest.approx(10800, abs=5)
@@ -591,7 +722,7 @@ def test_status_fresh_feed_is_not_flagged(db_path):
         last_feed_event_at=(now - timedelta(minutes=2)).isoformat(),
     )
     conn = _conn(db_path)
-    st = dao.recorder_status(conn, 150, now=now)
+    st = dao.recorder_status(conn, 150, 2000, now=now)
     assert st["feed_stale"] is False
     conn.close()
 
@@ -599,7 +730,7 @@ def test_status_fresh_feed_is_not_flagged(db_path):
 def test_status_without_feed_stamp_does_not_claim_staleness(db_path):
     """غياب المفتاح ≠ تجمّد — لا ننذر بلا دليل."""
     conn = _conn(db_path)
-    st = dao.recorder_status(conn, 150)
+    st = dao.recorder_status(conn, 150, 2000)
     assert st["feed_age_seconds"] is None
     assert st["feed_stale"] is False
     conn.close()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from fomo_api.api.errors import UpstreamChangedError, UpstreamUnavailableError
 from fomo_api.config import settings
@@ -511,6 +511,11 @@ class FomoClient:
         return alerts
 
 
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    """Narrow an untyped upstream JSON value to a string-keyed object."""
+    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+
 def _map_balance_position(d: Any) -> dict[str, Any] | None:
     """Map a /v2/users/{id}/balances item (CONFIRMED 2026-07-25). Each item nests:
       - balance:          {tokenAddress, shiftedBalance, tokenId}
@@ -520,10 +525,10 @@ def _map_balance_position(d: Any) -> dict[str, Any] | None:
     We surface a position keyed on the token address; every field optional (FR-007)."""
     if not isinstance(d, dict):
         return None
-    bal = d.get("balance") if isinstance(d.get("balance"), dict) else {}
-    ut = d.get("userToken") if isinstance(d.get("userToken"), dict) else {}
-    tfr = d.get("tokenFilterResult") if isinstance(d.get("tokenFilterResult"), dict) else {}
-    tinfo = tfr.get("token") if isinstance(tfr.get("token"), dict) else {}
+    bal = _dict_or_empty(d.get("balance"))
+    ut = _dict_or_empty(d.get("userToken"))
+    tfr = _dict_or_empty(d.get("tokenFilterResult"))
+    tinfo = _dict_or_empty(tfr.get("token"))
 
     address = (
         _pick(bal, ("tokenAddress",), cast=str)
@@ -569,7 +574,7 @@ def _map_trending_token(d: Any) -> dict[str, Any] | None:
     name, symbol, isScam, socialLinks, launchpad). Everything optional (FR-007)."""
     if not isinstance(d, dict):
         return None
-    tok = d.get("token") if isinstance(d.get("token"), dict) else {}
+    tok = _dict_or_empty(d.get("token"))
     address = _pick(tok, ("address",), cast=str) or _pick(d, ("address", "tokenAddress"), cast=str)
     if address is None:
         return None
@@ -640,7 +645,7 @@ def _map_token_market_detail(data: Any, *, token_id: str) -> dict[str, Any] | No
     ro = _unwrap_obj(data)
     if not isinstance(ro, dict):
         raise UpstreamChangedError()
-    vol = ro.get("volume") if isinstance(ro.get("volume"), dict) else {}
+    vol = _dict_or_empty(ro.get("volume"))
     return {
         "token_id": token_id,
         "buy_count": _pick(ro, ("buyCount",), cast=int),
@@ -930,7 +935,7 @@ def _map_thesis_item(d: Any) -> dict[str, Any] | None:
     tid = _pick(d, ("id",), cast=str)
     if tid is None:
         return None
-    comment_obj = d.get("comment") if isinstance(d.get("comment"), dict) else {}
+    comment_obj = _dict_or_empty(d.get("comment"))
     # Fallback: some shapes may carry a plain-string comment inline.
     text = _pick(comment_obj, ("comment",), cast=str)
     if text is None and isinstance(d.get("comment"), str):
@@ -984,8 +989,8 @@ def _map_spotlight_item(d: Any) -> dict[str, Any] | None:
     lost and nothing is fabricated."""
     if not isinstance(d, dict):
         return None
-    trade = d.get("trade") if isinstance(d.get("trade"), dict) else {}
-    comment_obj = d.get("comment") if isinstance(d.get("comment"), dict) else {}
+    trade = _dict_or_empty(d.get("trade"))
+    comment_obj = _dict_or_empty(d.get("comment"))
     # trade id: prefer the trade object's id, then a top-level tradeId/id.
     trade_id = _pick(trade, ("id",), cast=str) or _pick(d, ("tradeId", "id"), cast=str)
     return {
