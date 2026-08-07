@@ -1,24 +1,107 @@
-"""خادم اللوحة (FastAPI). يقرأ recorder.db للقراءة فقط ويفحص صحّة الـ API المحلّي.
+"""خادم اللوحة: قاعدة البيانات read-only وإدارة محلية محمية لمفاتيح Helius.
 
-- لا كتابة إطلاقاً على القاعدة (dao يفتحها mode=ro).
+- لا كتابة إطلاقاً على القاعدة (dao يفتحها mode=ro)؛ الكتابة الوحيدة إلى مخزن
+  المفاتيح الذي اختاره المستخدم صراحةً عبر AOI_HELIUS_KEYS_PATH.
 - الاستماع على 127.0.0.1 فقط (محلّي).
-- JSON endpoints + صفحة HTML واحدة تُحدّث نفسها.
+- Host guard + CSRF لكل طلب يغيّر الحالة.
 """
 from __future__ import annotations
 
+import hmac
 import os
+import secrets
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 import config
 import dao
+import helius_keys
 
 app = FastAPI(title="Fomo Recorder Dashboard", docs_url=None, redoc_url=None)
+_DASHBOARD_TOKEN = secrets.token_hex(32)
+
+
+def _allowed_origins() -> tuple[str, str]:
+    port = config.DASHBOARD_PORT
+    return (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+
+
+@app.middleware("http")
+async def local_security_guard(request: Request, call_next):
+    """يمنع DNS rebinding وCSRF قبل وصول أي طلب يغيّر مخزن الأسرار."""
+    allowed_origins = _allowed_origins()
+    allowed_hosts = {origin.removeprefix("http://") for origin in allowed_origins}
+    host = request.headers.get("host", "").lower()
+    if host not in allowed_hosts:
+        return JSONResponse(
+            {"error": "مرفوض: Host ليس عنوان اللوحة المحلي"}, status_code=403
+        )
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        length = request.headers.get("content-length")
+        if length and length.isdigit() and int(length) > 8192:
+            return JSONResponse({"error": "الطلب كبير جداً"}, status_code=413)
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        if origin and origin not in allowed_origins:
+            return JSONResponse({"error": "أصل الطلب غير مسموح"}, status_code=403)
+        if referer and not any(
+            referer == allowed or referer.startswith(allowed + "/")
+            for allowed in allowed_origins
+        ):
+            return JSONResponse({"error": "مرجع الطلب غير مسموح"}, status_code=403)
+        sent = request.headers.get("x-dashboard-token", "")
+        if not sent or not hmac.compare_digest(sent, _DASHBOARD_TOKEN):
+            return JSONResponse({"error": "رمز حماية اللوحة مفقود أو خاطئ"}, status_code=403)
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/api/helius-keys"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+class KeyAddRequest(BaseModel):
+    username: str = ""
+    api_key: str = Field(alias="apiKey")
+
+
+class KeyActionRequest(BaseModel):
+    id: str
+
+
+class KeyDisableRequest(KeyActionRequest):
+    reason: str = "نفدت الحصّة"
+
+
+def _key_store_path() -> str:
+    if not config.HELIUS_KEYS_PATH:
+        raise HTTPException(503, "مسار مخزن مفاتيح Helius غير مضبوط")
+    return config.HELIUS_KEYS_PATH
+
+
+def _keys_payload(store: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    keys = helius_keys.list_masked(store, config.SOLANA_RPC_URL)
+    return {
+        "configured": True,
+        "keys": keys,
+        "enabled": sum(not item["disabled"] for item in keys),
+        "disabled": sum(item["disabled"] for item in keys),
+    }
+
+
+def _raise_store_error(exc: Exception) -> None:
+    if isinstance(exc, helius_keys.StoreLockTimeout):
+        raise HTTPException(503, str(exc)) from exc
+    if isinstance(exc, helius_keys.KeyStoreError):
+        raise HTTPException(500, str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(400, str(exc)) from exc
+    raise exc
 
 
 def _with_conn(fn):
@@ -97,6 +180,108 @@ def api_watchlist() -> dict[str, Any]:
 @app.get("/api/safety")
 def api_safety() -> dict[str, Any]:
     return _with_conn(dao.safety_summary)
+
+
+@app.get("/api/helius-keys")
+def api_helius_keys() -> dict[str, Any]:
+    if not config.HELIUS_KEYS_PATH:
+        return {"configured": False, "keys": [], "enabled": 0, "disabled": 0}
+    try:
+        return _keys_payload(helius_keys.load_store(config.HELIUS_KEYS_PATH))
+    except Exception as exc:  # noqa: BLE001 — نحوّل أخطاء المخزن إلى HTTP آمن
+        _raise_store_error(exc)
+        raise AssertionError("unreachable")
+
+
+@app.post("/api/helius-keys")
+def api_helius_key_add(body: KeyAddRequest) -> dict[str, Any]:
+    try:
+        store, _ = helius_keys.update_store(
+            _key_store_path(),
+            lambda current: helius_keys.add_key(
+                current, body.username, body.api_key
+            ),
+        )
+        return {
+            **_keys_payload(store),
+            "note": "أُضيف المفتاح؛ سيظهر في دورة الفحص التالية.",
+        }
+    except Exception as exc:  # noqa: BLE001
+        _raise_store_error(exc)
+        raise AssertionError("unreachable")
+
+
+@app.post("/api/helius-keys/delete")
+def api_helius_key_delete(body: KeyActionRequest) -> dict[str, Any]:
+    try:
+        store, removed = helius_keys.update_store(
+            _key_store_path(),
+            lambda current: helius_keys.remove_key(current, body.id),
+        )
+        if not removed:
+            raise HTTPException(404, "المفتاح غير موجود")
+        return {
+            **_keys_payload(store),
+            "note": "حُذف المفتاح من التدوير.",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _raise_store_error(exc)
+        raise AssertionError("unreachable")
+
+
+@app.post("/api/helius-keys/disable")
+def api_helius_key_disable(body: KeyDisableRequest) -> dict[str, Any]:
+    try:
+        store, changed = helius_keys.update_store(
+            _key_store_path(),
+            lambda current: helius_keys.set_key_disabled(
+                current, body.id, True, body.reason
+            ),
+        )
+        if not changed:
+            raise HTTPException(404, "المفتاح غير موجود")
+        return {**_keys_payload(store), "note": "عُطّل المفتاح واستُبعد من التدوير."}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _raise_store_error(exc)
+        raise AssertionError("unreachable")
+
+
+@app.post("/api/helius-keys/enable")
+def api_helius_key_enable(body: KeyActionRequest) -> dict[str, Any]:
+    try:
+        store, changed = helius_keys.update_store(
+            _key_store_path(),
+            lambda current: helius_keys.set_key_disabled(
+                current, body.id, False
+            ),
+        )
+        if not changed:
+            raise HTTPException(404, "المفتاح غير موجود")
+        return {**_keys_payload(store), "note": "أُعيد تفعيل المفتاح."}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _raise_store_error(exc)
+        raise AssertionError("unreachable")
+
+
+@app.post("/api/helius-keys/verify")
+async def api_helius_key_verify(body: KeyActionRequest) -> dict[str, Any]:
+    try:
+        store = helius_keys.load_store(_key_store_path())
+        key = helius_keys.find_key(store, body.id)
+        if key is None:
+            raise HTTPException(404, "المفتاح غير موجود")
+        return await helius_keys.verify_key(key["apiKey"])
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _raise_store_error(exc)
+        raise AssertionError("unreachable")
 
 
 @app.get("/api/ticks-summary")
@@ -186,16 +371,27 @@ def api_errors() -> dict[str, Any]:
 
 
 @app.get("/")
-def index() -> FileResponse:
+def index() -> HTMLResponse:
     """صفحة اللوحة — **بلا تخزين مؤقّت**.
 
     اللوحة تُحدّث بياناتها كل 10 ثوانٍ، لكنّ هيكلها (HTML+JS) كان يُخدَّم من كاش
     المتصفّح إلى أجل غير مسمّى: بعد أي تحديث للوحة يبقى المستخدم على النسخة
     القديمة بلا أي إشارة — بما في ذلك بعد إصلاح عطب فيها.
     """
-    return FileResponse(
-        os.path.join(config.STATIC_DIR, "index.html"),
-        headers={"Cache-Control": "no-cache, must-revalidate"},
+    html = Path(config.STATIC_DIR, "index.html").read_text(encoding="utf-8")
+    html = html.replace("__DASHBOARD_TOKEN__", _DASHBOARD_TOKEN)
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": (
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                "img-src 'self' data:; frame-ancestors 'none'; object-src 'none'"
+            ),
+        },
     )
 
 

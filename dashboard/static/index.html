@@ -212,6 +212,18 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .errline:last-child { border-bottom: none; }
 .errline.resolved { opacity: .5; }
 .banner { padding: 10px 14px; border-radius: 9px; background: color-mix(in srgb, var(--crit) 14%, transparent); border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent); color: var(--ink); font-size: 12.5px; margin-bottom: 18px; }
+.key-form { display: grid; grid-template-columns: minmax(220px,2fr) minmax(160px,1fr) auto; gap: 10px; align-items: end; }
+.key-field { display: grid; gap: 5px; color: var(--muted); font-size: 11.5px; }
+.key-field input { width: 100%; min-width: 0; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; }
+.key-field input:focus { outline: 2px solid color-mix(in srgb, var(--s1) 55%, transparent); border-color: var(--s1); }
+.key-summary { display: flex; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
+.key-message { min-height: 22px; margin-top: 9px; color: var(--muted); font-size: 12px; }
+.key-message.good { color: var(--good); } .key-message.bad { color: var(--crit); }
+.key-actions { display: flex; gap: 6px; }
+.key-actions .btn { padding: 3px 8px; }
+.key-actions .danger { color: var(--crit); }
+.key-disabled { opacity: .58; }
+@media (max-width: 760px) { .key-form { grid-template-columns: 1fr; } }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -298,6 +310,33 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="body" id="safety" aria-live="polite"></div>
   </div>
 
+  <div class="card" id="helius-card">
+    <header>
+      <h2>مفاتيح Helius</h2>
+      <span class="note">مقنّعة دائماً · الإضافة والتعطيل يسريان في دورة الفحص التالية</span>
+    </header>
+    <div class="body">
+      <div id="helius-summary" class="key-summary" aria-live="polite"></div>
+      <div class="key-form">
+        <label class="key-field">مفتاح Helius أو عنوان RPC
+          <input id="helius-api-key" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="UUID أو https://…?api-key=…" />
+        </label>
+        <label class="key-field">اسم مميّز (اختياري)
+          <input id="helius-username" maxlength="60" autocomplete="off" placeholder="مثلاً: الحساب الثاني" />
+        </label>
+        <button class="btn" id="helius-add" type="button">إضافة المفتاح</button>
+      </div>
+      <div id="helius-message" class="key-message" role="status" aria-live="polite"></div>
+    </div>
+    <div class="body flush tablewrap">
+      <table>
+        <thead><tr><th>#</th><th>الاسم</th><th>المفتاح</th><th>الحالة</th><th>الفحص</th><th>أُضيف</th><th>إجراءات</th></tr></thead>
+        <tbody id="helius-keys"><tr><td colspan="7" class="empty">جارٍ تحميل المفاتيح…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="card">
     <header>
       <h2>قائمة المراقبة</h2>
@@ -322,6 +361,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 <script>
 "use strict";
 const REFRESH_MS = 10000;
+const DASHBOARD_TOKEN = "__DASHBOARD_TOKEN__";
 
 /* ألوان السلاسل تُقرأ من CSS فتتبع السمة تلقائياً. اللون يتبع **نوع الإشارة**
    لا ترتيبها — وإلّا أعادت الفلترة طلاء السلاسل الباقية وضلّل القارئ. */
@@ -421,6 +461,18 @@ async function getJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) throw new Error(url + " → " + r.status);
   return r.json();
+}
+
+async function postJSON(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json", "X-Dashboard-Token": DASHBOARD_TOKEN },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || data.detail || `HTTP ${response.status}`);
+  return data;
 }
 
 /* ---------- تلميح مشترك ---------- */
@@ -1003,6 +1055,118 @@ function renderSafety(data) {
     <p class="note" style="margin:12px 0 0">الاجتياز ليس ضمان ربح ولا إثبات بيع DEX؛ هو غياب مانع معروف في الفحصين لحظة القياس.</p>`;
 }
 
+function keyDate(value) {
+  if (value == null) return "—";
+  const date = new Date(value);
+  return isNaN(date) ? "—" : date.toLocaleString("ar-EG", { dateStyle: "medium", timeStyle: "short" });
+}
+
+function keyMessage(text = "", state = "") {
+  const host = document.getElementById("helius-message");
+  host.className = `key-message ${state}`.trim();
+  host.textContent = text;
+}
+
+function renderHeliusKeys(data) {
+  const summary = document.getElementById("helius-summary");
+  const body = document.getElementById("helius-keys");
+  if (!data.configured) {
+    summary.innerHTML = `<span class="badge warn">! غير مهيّأ</span>`;
+    body.innerHTML = `<tr><td colspan="7" class="empty">اضبط AOI_HELIUS_KEYS_PATH محلياً لتفعيل الإدارة.</td></tr>`;
+    document.getElementById("helius-add").disabled = true;
+    return;
+  }
+  document.getElementById("helius-add").disabled = false;
+  summary.innerHTML = `<span class="badge good">✓ ${num(data.enabled)} مفعّل</span>
+    <span class="badge${data.disabled ? " warn" : ""}">${num(data.disabled)} معطّل</span>
+    <span class="badge">${num((data.keys || []).length)} إجمالي</span>`;
+  const keys = data.keys || [];
+  if (!keys.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">لا مفاتيح محفوظة.</td></tr>`;
+    return;
+  }
+  body.innerHTML = keys.map((key, index) => `<tr data-id="${esc(key.id)}" class="${key.disabled ? "key-disabled" : ""}">
+      <td class="num">${index + 1}${key.primary ? ` <span class="badge good">أساسي</span>` : ""}</td>
+      <td>${esc(key.username)}</td>
+      <td><code class="mono">${esc(key.apiKeyMasked)}</code></td>
+      <td>${key.disabled
+        ? `<span class="badge warn" title="${esc(key.disabledReason)}">! معطّل</span>`
+        : `<span class="badge good">✓ مفعّل</span>`}</td>
+      <td class="key-verify-result">—</td>
+      <td class="meta">${esc(keyDate(key.addedAt))}</td>
+      <td><div class="key-actions">
+        <button class="btn" type="button" data-key-action="verify" data-id="${esc(key.id)}">تحقّق</button>
+        <button class="btn" type="button" data-key-action="${key.disabled ? "enable" : "disable"}" data-id="${esc(key.id)}">${key.disabled ? "تفعيل" : "تعطيل"}</button>
+        <button class="btn danger" type="button" data-key-action="delete" data-id="${esc(key.id)}">حذف</button>
+      </div></td>
+    </tr>`).join("");
+}
+
+async function loadHeliusKeys() {
+  try {
+    renderHeliusKeys(await getJSON("/api/helius-keys"));
+  } catch (error) {
+    document.getElementById("helius-keys").innerHTML =
+      `<tr><td colspan="7" class="empty">تعذّر تحميل المفاتيح: ${esc(error.message)}</td></tr>`;
+  }
+}
+
+async function addHeliusKey() {
+  const button = document.getElementById("helius-add");
+  const keyInput = document.getElementById("helius-api-key");
+  const usernameInput = document.getElementById("helius-username");
+  const apiKey = keyInput.value.trim();
+  if (!apiKey) { keyMessage("أدخل مفتاح Helius أولاً.", "bad"); return; }
+  button.disabled = true;
+  keyMessage("جارٍ حفظ المفتاح…");
+  try {
+    const data = await postJSON("/api/helius-keys", {
+      apiKey, username: usernameInput.value.trim(),
+    });
+    keyInput.value = "";
+    usernameInput.value = "";
+    renderHeliusKeys(data);
+    keyMessage(`✓ ${data.note || "أُضيف المفتاح."}`, "good");
+  } catch (error) {
+    keyMessage(`✕ ${error.message}`, "bad");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function verifyHeliusKey(id, button) {
+  const row = [...document.querySelectorAll("#helius-keys tr")]
+    .find(item => item.dataset.id === id);
+  const cell = row?.querySelector(".key-verify-result");
+  button.disabled = true;
+  if (cell) cell.textContent = "جارٍ الفحص…";
+  try {
+    const data = await postJSON("/api/helius-keys/verify", { id });
+    if (cell) cell.innerHTML = data.ok
+      ? `<span class="badge good">✓ ${esc(data.message)}</span>`
+      : `<span class="badge ${data.status === "rate_limited" ? "warn" : "bad"}">! ${esc(data.message)}</span>`;
+  } catch (error) {
+    if (cell) cell.innerHTML = `<span class="badge bad">✕ ${esc(error.message)}</span>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function changeHeliusKey(action, id) {
+  if (action === "delete" && !confirm("حذف هذا المفتاح نهائياً من التدوير؟")) return;
+  if (action === "disable" && !confirm("تعطيل هذا المفتاح واستبعاده من التدوير؟")) return;
+  const endpoint = `/api/helius-keys/${action}`;
+  keyMessage(action === "enable" ? "جارٍ التفعيل…" : action === "disable" ? "جارٍ التعطيل…" : "جارٍ الحذف…");
+  try {
+    const payload = action === "disable" ? { id, reason: "معطّل من لوحة aoi" } : { id };
+    const data = await postJSON(endpoint, payload);
+    renderHeliusKeys(data);
+    keyMessage(`✓ ${data.note}`, "good");
+  } catch (error) {
+    keyMessage(`✕ ${error.message}`, "bad");
+  }
+}
+
 function renderSignals(rows) {
   const host = document.getElementById("signals");
   if (!rows.length) { host.innerHTML = `<div class="empty">لا إشارات بعد.</div>`; return; }
@@ -1148,8 +1312,22 @@ document.getElementById("theme").addEventListener("click", () => {
   if (lastRows.tl) renderTimeline(lastRows.tl);
 });
 
+document.getElementById("helius-add").addEventListener("click", addHeliusKey);
+document.getElementById("helius-api-key").addEventListener("keydown", event => {
+  if (event.key === "Enter") addHeliusKey();
+});
+document.getElementById("helius-keys").addEventListener("click", event => {
+  const button = event.target.closest("button[data-key-action]");
+  if (!button) return;
+  const { keyAction, id } = button.dataset;
+  if (keyAction === "verify") verifyHeliusKey(id, button);
+  else changeHeliusKey(keyAction, id);
+});
+
 tick();
 setInterval(tick, REFRESH_MS);
+loadHeliusKeys();
+setInterval(loadHeliusKeys, 60000);
 </script>
 </body>
 </html>

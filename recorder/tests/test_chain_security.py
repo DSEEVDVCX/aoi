@@ -85,7 +85,6 @@ def test_helius_store_adds_enabled_keys_without_leaking_path_defaults(
     urls = cs._solana_rpc_urls("https://fallback.invalid")
 
     assert urls == (
-        "https://fallback.invalid",
         cs.HELIUS_HTTP_BASE + "enabled-key-123456789",
     )
 
@@ -104,6 +103,32 @@ def test_helius_rotation_continues_after_selected_fallback(tmp_path, monkeypatch
         cs.HELIUS_HTTP_BASE + keys[2],
         cs.HELIUS_HTTP_BASE + keys[0],
     )
+
+
+def test_disabled_or_deleted_fallback_is_not_reintroduced(tmp_path, monkeypatch):
+    disabled = "store-key-disabled-1111"
+    enabled = "store-key-enabled-22222"
+    store = tmp_path / "helius-keys.json"
+    store.write_text(json.dumps({"keys": [
+        {"apiKey": disabled, "disabledAt": 123},
+        {"apiKey": enabled, "disabledAt": None},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("AOI_HELIUS_KEYS_PATH", str(store))
+
+    urls = cs._solana_rpc_urls(cs.HELIUS_HTTP_BASE + disabled)
+
+    assert urls == (cs.HELIUS_HTTP_BASE + enabled,)
+
+
+def test_all_disabled_helius_keys_return_no_rpc(tmp_path, monkeypatch):
+    key = "store-key-disabled-1111"
+    store = tmp_path / "helius-keys.json"
+    store.write_text(json.dumps({"keys": [
+        {"apiKey": key, "disabledAt": 123},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("AOI_HELIUS_KEYS_PATH", str(store))
+
+    assert cs._solana_rpc_urls(cs.HELIUS_HTTP_BASE + key) == ()
 
 
 async def test_json_rpc_rotates_endpoints_after_429_without_tracing_urls():

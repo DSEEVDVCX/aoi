@@ -29,6 +29,11 @@ BOOT_LOG_PATH = os.path.join(HERE, "dashboard_boot.log")
 
 STATIC_DIR = os.path.join(HERE, "static")
 
+# مخزن مفاتيح Helius المشترك مع crib. المسار والإعداد الأساسي محليان في بيئة
+# المستخدم ولا يُحفظان في Git. إن غاب المسار تبقى بطاقة الإدارة معطّلة بوضوح.
+HELIUS_KEYS_PATH = os.environ.get("AOI_HELIUS_KEYS_PATH")
+SOLANA_RPC_URL = os.environ.get("AOI_SOLANA_RPC_URL")
+
 # حدّ الحِقبة الحيّة: أوّل إشارة جمعها البوت لحظياً (2026-07-25T22:35:27Z).
 # اللوحة تعرض **بيانات البوت فقط**؛ ما قبل هذا الختم بيانات رجعيّة (backfill)
 # تفتقر للعائلات اللحظية، وقد أُقصيت من التدريب وحُذفت صفوفُها من القاعدة. يبقى
@@ -63,5 +68,5 @@ DISK_FREE_WARN_GB = 25.0
 # القائمة تغطّي كل ما يكتبه المسجّل فعلاً؛ bars/social كانا يُسجَّلان بلا عرض.
 RECORDER_SOURCES = (
     "feed", "trending", "verified", "leaderboard", "control",
-    "bars", "social", "macro", "cleanup",
+    "bars", "social", "chain_security", "macro", "cleanup",
 )

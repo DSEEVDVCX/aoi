@@ -184,15 +184,14 @@ def _solana_rpc_urls(fallback_url: str) -> tuple[str, ...]:
     لا تُخزّن العناوين في النتائج أو السجل؛ `JsonRpc.trace` يحفظ method/status فقط.
     المسار يضبط محلياً عبر AOI_HELIUS_KEYS_PATH ولا يُفترض داخل المستودع.
     """
-    urls = [fallback_url]
     store_path = os.getenv("AOI_HELIUS_KEYS_PATH", "").strip()
     if not store_path:
-        return tuple(urls)
+        return (fallback_url,)
     try:
         payload = json.loads(Path(store_path).read_text(encoding="utf-8"))
         keys = payload.get("keys") if isinstance(payload, dict) else None
         if not isinstance(keys, list):
-            return tuple(urls)
+            return (fallback_url,)
         store_urls: list[str] = []
         for item in keys:
             if not isinstance(item, dict) or item.get("disabled") or item.get("disabledAt"):
@@ -201,15 +200,18 @@ def _solana_rpc_urls(fallback_url: str) -> tuple[str, ...]:
             if not re.fullmatch(r"[A-Za-z0-9-]{16,}", api_key):
                 continue
             store_urls.append(HELIUS_HTTP_BASE + api_key)
-        # إن كان fallback واحداً من المخزن، نكمل من المفتاح الذي يليه بدلاً من
-        # الرجوع إلى أول القائمة (قد يكون مستنفداً وقد اختير fallback بعد مسبار).
+        # المخزن المضبوط هو مصدر الحقيقة: الحذف/التعطيل في اللوحة يسري في الدورة
+        # التالية حتى لو بقي المفتاح القديم داخل AOI_SOLANA_RPC_URL.
+        if not store_urls:
+            return ()
+        # إن كان fallback ما زال مفعّلاً نبدأ به ثم نكمل دائرياً؛ وإلّا نبدأ بأول
+        # مفتاح مفعّل، فلا يبقى مفتاح حُذف أو عُطّل مستخدماً من البيئة القديمة.
         if fallback_url in store_urls:
             index = store_urls.index(fallback_url)
-            store_urls = store_urls[index + 1:] + store_urls[:index]
-        urls.extend(store_urls)
+            store_urls = store_urls[index:] + store_urls[:index]
     except (OSError, ValueError, TypeError):
-        return tuple(urls)
-    return tuple(dict.fromkeys(urls))
+        return (fallback_url,)
+    return tuple(dict.fromkeys(store_urls))
 
 
 async def _optional(rpc: JsonRpc, method: str, params: list[Any]) -> Any | None:
@@ -271,11 +273,16 @@ async def scan_chain_token(
         out["raw"] = {"rpc": []}
         return out
 
-    owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0))
     rpc_urls = (
         _solana_rpc_urls(spec.rpc_url) if spec.kind == "solana" else (spec.rpc_url,)
     )
+    if not rpc_urls:
+        out = _result_base(spec.kind, str(spec.rpc_chain_id) if spec.rpc_chain_id else None)
+        out.update(gate_status="unknown", reason_codes=["no_active_rpc_keys"])
+        out["raw"] = {"rpc": []}
+        return out
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0))
     rpc = JsonRpc(rpc_urls, http)
     try:
         if spec.kind == "solana":
