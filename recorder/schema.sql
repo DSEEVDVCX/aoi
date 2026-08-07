@@ -216,6 +216,23 @@ CREATE TABLE IF NOT EXISTS bars_fetch_state (
     PRIMARY KEY (token_address, network_id)
 );
 
+-- استرجاع التاريخ الطويل بدقّة يومية لحساب ATH الحقيقي قبل t0.
+-- تبقى الحالة `partial` حتى نصل إلى بداية السلسلة؛ لا يجوز للمستخرج استعمال
+-- الشموع اليومية قبل `ok` لأنّ أقدم (وربما أعلى) جزء قد يكون لم يُسحب بعد.
+CREATE TABLE IF NOT EXISTS historical_bars_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    resolution    TEXT NOT NULL,
+    cursor_to     INTEGER,
+    oldest_ts     INTEGER,
+    last_status   TEXT NOT NULL,       -- partial / ok / empty_retry / no_data / error
+    candles       INTEGER NOT NULL DEFAULT 0,
+    calls         INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (token_address, network_id, resolution)
+);
+
 -- الطبقة الاجتماعية لكل عملة مراقَبة (POST/GET /feed/token/thesis).
 --
 -- عملات الميم تحرّكها الحشود لا الأساسيات، وهذا البُعد كان غائباً كلياً: نسجّل
@@ -641,6 +658,8 @@ CREATE TABLE IF NOT EXISTS training_rows (
     flat_ratio_24h   REAL,
     up_candle_ratio_24h REAL,
     dist_from_ath    REAL,
+    ath_history_complete INTEGER,
+    ath_history_days REAL,
     bars_history_h   REAL,
     bars_count_24h   INTEGER,
     bar_vol_1h       REAL,

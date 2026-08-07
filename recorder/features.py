@@ -28,7 +28,7 @@ from extract import classify_asset
 # فيتوقّف العدّ عند ~400 لعملة قد تحمل 29,595 أطروحة حقيقية. الصفوف عند السقف
 # تُعلَّم بـ`thesis_counted_capped` كي لا يقرأ النموذج عدداً مشبَّعاً كأنّه قياس.
 _THESIS_PAGE_CAP = 380
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +350,8 @@ def price_history_features(
     out: dict[str, Any] = {
         "ret_1h_before": None, "ret_4h_before": None, "ret_24h_before": None,
         "ret_7d_before": None, "vol_24h_before": None, "flat_ratio_24h": None,
-        "dist_from_ath": None, "bars_history_h": None, "bars_count_24h": None,
+        "dist_from_ath": None, "ath_history_complete": 0,
+        "ath_history_days": None, "bars_history_h": None, "bars_count_24h": None,
         "bar_vol_1h": None, "bar_vol_24h": None, "vol_surge_1h": None,
         "up_candle_ratio_24h": None,
     }
@@ -402,6 +403,25 @@ def price_history_features(
         b["h"] for b in bars
         if isinstance(b["h"], (int, float)) and not b["h_suspect"]
     ]
+    # شموع 1D تُسحب رجوعاً حتى نفاد تاريخ المنبع. لا نستعمل الصفحة الجزئية:
+    # غياب القسم الأقدم قد يخفض ATH بصمت ويحوّل الميزة إلى «قمّة محلية».
+    daily = db._conn.execute(
+        """SELECT MIN(b.ts) AS first_ts, MAX(b.h) AS ath
+             FROM token_bars b
+             JOIN historical_bars_state s
+               ON s.token_address=b.token_address
+              AND s.network_id=b.network_id
+              AND s.resolution=b.resolution
+              AND s.last_status='ok'
+            WHERE b.token_address=? AND b.network_id=? AND b.resolution='1D'
+              AND b.ts + 86400 <= ? AND b.h_suspect=0""",
+        (token, network, t0),
+    ).fetchone()
+    if daily and isinstance(daily["ath"], (int, float)):
+        highs.append(daily["ath"])
+        out["ath_history_complete"] = 1
+        if daily["first_ts"] is not None:
+            out["ath_history_days"] = (t0 - daily["first_ts"]) / 86400
     if highs and last_c:
         ath = max(highs)
         out["dist_from_ath"] = _ret(last_c, ath)  # سالبة = دون القمّة
@@ -570,6 +590,7 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     # د — مسار السعر والحجم قبل الإشارة
     "ret_1h_before", "ret_4h_before", "ret_24h_before", "ret_7d_before",
     "vol_24h_before", "flat_ratio_24h", "up_candle_ratio_24h", "dist_from_ath",
+    "ath_history_complete", "ath_history_days",
     "bars_history_h", "bars_count_24h", "bar_vol_1h", "bar_vol_24h",
     "vol_surge_1h",
     # هـ — لقطة السوق

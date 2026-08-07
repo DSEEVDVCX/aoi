@@ -536,6 +536,8 @@ Start-ScheduledTask -TaskName FomoRecorder
 | `backfill_bar_flags.py` | إعادة حساب أعلام تشوّه الشموع من الخام |
 | `relabel_suspect.py` | حذف نتائج نافذتها مشوّهة ليعيد الموسِّم حسابها (بنسخة احتياطية) |
 | `backfill_activity.py` / `_bars.py` | استرجاع تاريخ tradingActivity + شموع أزمنته |
+| `backfill_bars.py` | استرجاع شموع 1D لكل العملات لحساب ATH كامل وقابل للاستئناف |
+| `backfill_training_ath.py` | ترقية ATH في صفوف التدريب القديمة بعد اكتمال التاريخ اليومي |
 | `exit_sim.py` / `run_exit_sim.py` | محاكي قواعد الخروج (`--source activity` للرجعيّ) |
 | `run_recorder.py` | نقطة إطلاق المهمّة المجدولة (نمط `serve.py`) |
 | `tests/` | اختبارات على أشكال خام حقيقية ومنطق db (بلا شبكة) — منها **34 اختبار حرس** |
@@ -553,7 +555,7 @@ python run_recorder.py 1      # دورة واحدة (تحقّق حيّ)
 ## الاختبارات
 
 ```
-python -m pytest recorder/tests -q      # 225 اختباراً، بلا شبكة
+python -m pytest recorder/tests -q      # 331 اختباراً، بلا شبكة
 ```
 
 أهمّها للنمذجة: `test_features.py` (**34 اختبار حرس** — يزرع بيانات بعد t0 ويثبّت
@@ -568,4 +570,3 @@ python -m pytest recorder/tests -q      # 225 اختباراً، بلا شبكة
   محفّز · تردّد} — ميزة رجعية صالحة لأنّ النصّ ثابت منذ الكتابة.
 - **فحوص السلسلة**: سلطات mint/freeze وحرق LP عبر RPC مباشر (المنبع يعيدها
   null في 266/266 عملة) — نواة نموذج «تجنّب الكارثة».
-- `backfill_bars.py`: سدّ فجوات `market_ticks` بأثر رجعي (source='getBars').

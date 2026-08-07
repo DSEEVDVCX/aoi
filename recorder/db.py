@@ -342,9 +342,16 @@ class RecorderDB:
         if not rows:
             return 0
         series = [dict(r) for r in rows]
+        import config
+        ratio = (
+            config.DAILY_BAR_WICK_MAX_RATIO
+            if resolution == "1D" else config.BAR_WICK_MAX_RATIO
+        )
         changes = [
             (h, low, c, token_address, network_id, resolution, b["ts"])
-            for b, (h, low, c) in zip(series, bar_context_flags(series))
+            for b, (h, low, c) in zip(
+                series, bar_context_flags(series, max_ratio=ratio)
+            )
             if (h, low, c) != (b["h_suspect"], b["l_suspect"], b["c_suspect"])
         ]
         if changes:
@@ -1044,6 +1051,8 @@ _COLUMN_MIGRATIONS = (
     # الحيّ وحده)، لا تسريب حِقبة من نمط الغياب.
     ("training_rows", "is_live", "is_live INTEGER NOT NULL DEFAULT 0"),
     ("training_rows", "feature_version", "feature_version INTEGER NOT NULL DEFAULT 1"),
+    ("training_rows", "ath_history_complete", "ath_history_complete INTEGER"),
+    ("training_rows", "ath_history_days", "ath_history_days REAL"),
     ("watch_windows", "admission_price_usd", "admission_price_usd REAL"),
     ("watch_windows", "admission_source", "admission_source TEXT"),
     ("watch_windows", "design_version", "design_version INTEGER NOT NULL DEFAULT 1"),

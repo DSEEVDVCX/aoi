@@ -512,6 +512,44 @@ def test_bar_volume_surge_before_signal(db):
     assert 0.0 <= f["up_candle_ratio_24h"] <= 1.0
 
 
+def test_daily_ath_is_used_only_after_history_is_complete(db):
+    _bars(db, T0 - 3600, 12, c=1.5)
+    db.insert_bars([
+        {
+            "token_address": TOK, "network_id": NET, "resolution": "1D",
+            "ts": T0 - 3 * 86400, "o": 4.0, "h": 10.0, "l": 3.0,
+            "c": 5.0, "v": 1.0, "h_suspect": 0, "l_suspect": 0,
+            "c_suspect": 0, "fetched_at": "t",
+        },
+        {   # اليوم لم يغلق بعد t0؛ لا يجوز أن يتسرّب ATH منه
+            "token_address": TOK, "network_id": NET, "resolution": "1D",
+            "ts": T0 - 12 * 3600, "o": 5.0, "h": 99.0, "l": 4.0,
+            "c": 90.0, "v": 1.0, "h_suspect": 0, "l_suspect": 0,
+            "c_suspect": 0, "fetched_at": "t",
+        },
+    ])
+    db._conn.execute(
+        """INSERT INTO historical_bars_state(
+               token_address,network_id,resolution,cursor_to,oldest_ts,last_status,
+               candles,calls,attempts,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (TOK, NET, "1D", T0, T0 - 3 * 86400, "partial", 2, 1, 1, "t"),
+    )
+    partial = features.price_history_features(db, TOK, NET, T0)
+    assert partial["ath_history_complete"] == 0
+    assert partial["dist_from_ath"] > -0.5
+
+    db._conn.execute(
+        "UPDATE historical_bars_state SET last_status='ok' "
+        "WHERE token_address=? AND network_id=? AND resolution='1D'",
+        (TOK, NET),
+    )
+    complete = features.price_history_features(db, TOK, NET, T0)
+    assert complete["ath_history_complete"] == 1
+    assert complete["ath_history_days"] == pytest.approx(3.0)
+    assert complete["dist_from_ath"] == pytest.approx(1.5 / 10.0 - 1.0)
+
+
 def test_buyer_and_text_features(db):
     f = features.event_features({
         "signal_type": "large_buy", "price_usd": 0.002, "avg_cost": 0.001,

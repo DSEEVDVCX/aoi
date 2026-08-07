@@ -130,10 +130,38 @@ def main() -> None:
     rebuild = "--rebuild" in sys.argv
     model_candidates_only = "--model-candidates-only" in sys.argv
     limit = _arg_int("--limit", 10**9)
+    batch_size = max(1, _arg_int("--batch-size", 500))
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
-        stats = build(db, rebuild, limit, dry, model_candidates_only)
-        rows = stats.pop("rows")
+        if dry:
+            stats = build(db, rebuild, limit, True, model_candidates_only)
+            rows = stats.pop("rows")
+        else:
+            stats = {"built": 0, "skipped_no_event": 0}
+            rows: list[dict] = []
+            remaining = limit
+            first = True
+            while remaining > 0:
+                take = min(batch_size, remaining)
+                part = build(
+                    db, rebuild if first else False, take, False,
+                    model_candidates_only,
+                )
+                first = False
+                part_rows = part.pop("rows")
+                stats["built"] += part["built"]
+                stats["skipped_no_event"] += part["skipped_no_event"]
+                rows.extend(part_rows)
+                processed = part["built"] + part["skipped_no_event"]
+                if processed:
+                    print(
+                        f"progress built={stats['built']} "
+                        f"skipped={stats['skipped_no_event']}",
+                        flush=True,
+                    )
+                if processed < take or processed == 0:
+                    break
+                remaining -= processed
         print(f"صفوف مبنيّة: {stats['built']} · بلا حدث مصدر: {stats['skipped_no_event']}")
         if rows:
             classes: dict[str, int] = {}

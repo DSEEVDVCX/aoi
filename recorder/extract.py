@@ -301,14 +301,15 @@ def extract_token_static(
 # و from/to إلزاميان (بدونهما 400 "body.from - Required").
 # ---------------------------------------------------------------------------
 def bar_wick_flags(
-    o: float | None, h: float | None, low: float | None, c: float | None
+    o: float | None, h: float | None, low: float | None, c: float | None,
+    max_ratio: float | None = None,
 ) -> tuple[int, int]:
     """(h_suspect, l_suspect) لشمعة واحدة معزولة — ذيل يتجاوز جسمها بـ×K.
 
     فحص احتياطيّ فقط (شمعة بلا جيران). الفحص الأقوى هو `bar_context_flags`
     لأنّ التشوّه يصيب الإغلاق نفسه أحياناً فيتمدّد الجسم ويبدو الذيل معقولاً.
     """
-    ratio = config.BAR_WICK_MAX_RATIO
+    ratio = max_ratio or config.BAR_WICK_MAX_RATIO
     body_hi = max((v for v in (o, c) if v is not None and v > 0), default=None)
     body_lo = min((v for v in (o, c) if v is not None and v > 0), default=None)
     h_bad = 1 if (h is not None and body_hi is not None and h > ratio * body_hi) else 0
@@ -319,7 +320,7 @@ def bar_wick_flags(
 
 
 def bar_context_flags(
-    series: Sequence[Mapping[str, Any]],
+    series: Sequence[Mapping[str, Any]], max_ratio: float | None = None,
 ) -> list[tuple[int, int, int]]:
     """سلسلة شموع مرتّبة زمنياً → [(h_suspect, l_suspect, c_suspect)] لكلٍّ.
 
@@ -338,7 +339,7 @@ def bar_context_flags(
     الترتيب: نحكم على الإغلاقات أوّلاً، ثمّ نستعمل **الإغلاقات السليمة وحدها**
     مرجعاً للذيول — وإلّا حجب إغلاقٌ فاسد فساد ذيل شمعته.
     """
-    ratio = config.BAR_WICK_MAX_RATIO
+    ratio = max_ratio or config.BAR_WICK_MAX_RATIO
     n = len(series)
     closes = [
         (b.get("c") if isinstance(b.get("c"), (int, float)) and (b.get("c") or 0) > 0 else None)
@@ -370,7 +371,9 @@ def bar_context_flags(
             if 0 <= j < n and closes[j] is not None and not c_bad[j]
         ]
         if not refs:  # لا مرجع موثوق → الفحص المعزول احتياطاً
-            h_bad, l_bad = bar_wick_flags(b.get("o"), h, low, b.get("c"))
+            h_bad, l_bad = bar_wick_flags(
+                b.get("o"), h, low, b.get("c"), max_ratio=ratio
+            )
             out.append((h_bad, l_bad, c_bad[i]))
             continue
         hi, lo = max(refs), min(refs)
