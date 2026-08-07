@@ -164,11 +164,13 @@ RISK_PACING_SECONDS = 0.5
 # --- التحقق المباشر على السلسلة (Solana + EVM) ---
 # RPC الافتراضية العامة محدودة المعدّل؛ نفحص شريحة صغيرة بالتوازي ونجدّد كل ساعة.
 # كل endpoint قابل للتجاوز بمتغيرات AOI_SOLANA_RPC_URL / AOI_EVM_RPC_<networkId>.
+# AOI_HELIUS_KEYS_PATH اختياري: مخزن مفاتيح crib؛ يدور الفاحص عند 429 بلا طباعة سر.
 CHAIN_SECURITY_ENABLED = os.getenv("AOI_CHAIN_SECURITY_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
 CHAIN_SECURITY_PER_CYCLE = 6
-CHAIN_SECURITY_CONCURRENCY = 3
+# فحصا Solana متوازيان × نحو 4 RPC لكل عملة يبقيان الحمل دون 10 req/s للمفتاح.
+CHAIN_SECURITY_CONCURRENCY = 2
 CHAIN_SECURITY_REFRESH_SECONDS = 3600
 CHAIN_SECURITY_ERROR_RETRY_SECONDS = 300
 

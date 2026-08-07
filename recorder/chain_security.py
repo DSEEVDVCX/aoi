@@ -15,6 +15,7 @@ import os
 import re
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 ZERO_EVM_ADDRESS = "0x" + "0" * 40
 DEAD_EVM_ADDRESS = "0x" + "0" * 36 + "dead"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+HELIUS_HTTP_BASE = "https://mainnet.helius-rpc.com/?api-key="
 
 EIP1967_IMPLEMENTATION_SLOT = (
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
@@ -110,8 +112,12 @@ class RpcError(RuntimeError):
 
 
 class JsonRpc:
-    def __init__(self, url: str, client: httpx.AsyncClient) -> None:
-        self._url = url
+    def __init__(self, url: str | tuple[str, ...], client: httpx.AsyncClient) -> None:
+        urls = (url,) if isinstance(url, str) else url
+        self._urls = tuple(dict.fromkeys(item for item in urls if item))
+        if not self._urls:
+            raise ValueError("at least one RPC endpoint is required")
+        self._url_index = 0
         self._client = client
         self._next_id = 1
         self.trace: list[dict[str, Any]] = []
@@ -120,10 +126,11 @@ class JsonRpc:
         request_id = self._next_id
         self._next_id += 1
         body: Any = None
-        for attempt in range(2):
+        max_attempts = min(max(2, len(self._urls)), 8)
+        for attempt in range(max_attempts):
             try:
                 response = await self._client.post(
-                    self._url,
+                    self._urls[self._url_index],
                     json={
                         "jsonrpc": "2.0", "id": request_id,
                         "method": method, "params": params,
@@ -133,15 +140,27 @@ class JsonRpc:
                 body = response.json()
                 break
             except Exception as exc:  # noqa: BLE001 — لا نسرّب endpoint
+                status_code = (
+                    exc.response.status_code
+                    if isinstance(exc, httpx.HTTPStatusError) else None
+                )
                 retryable = (
                     isinstance(exc, httpx.TransportError)
                     or isinstance(exc, httpx.HTTPStatusError)
-                    and exc.response.status_code in {429, 500, 502, 503, 504}
+                    and status_code in {429, 500, 502, 503, 504}
                 )
-                if retryable and attempt == 0:
+                retrying = retryable and attempt + 1 < max_attempts
+                self.trace.append({
+                    "method": method,
+                    "transport_error": type(exc).__name__,
+                    "http_status": status_code,
+                    "retrying": retrying,
+                })
+                if retrying:
+                    if len(self._urls) > 1:
+                        self._url_index = (self._url_index + 1) % len(self._urls)
                     await asyncio.sleep(0.4)
                     continue
-                self.trace.append({"method": method, "transport_error": type(exc).__name__})
                 raise RpcError(f"{method}: transport failure") from None
         if not isinstance(body, dict):
             self.trace.append({"method": method, "protocol_error": "non_object"})
@@ -157,6 +176,40 @@ class JsonRpc:
         result = body.get("result")
         self.trace.append({"method": method, "result": result})
         return result
+
+
+def _solana_rpc_urls(fallback_url: str) -> tuple[str, ...]:
+    """يعيد RPC الأساسي ثم مفاتيح Helius المفعّلة من مخزن اختياري.
+
+    لا تُخزّن العناوين في النتائج أو السجل؛ `JsonRpc.trace` يحفظ method/status فقط.
+    المسار يضبط محلياً عبر AOI_HELIUS_KEYS_PATH ولا يُفترض داخل المستودع.
+    """
+    urls = [fallback_url]
+    store_path = os.getenv("AOI_HELIUS_KEYS_PATH", "").strip()
+    if not store_path:
+        return tuple(urls)
+    try:
+        payload = json.loads(Path(store_path).read_text(encoding="utf-8"))
+        keys = payload.get("keys") if isinstance(payload, dict) else None
+        if not isinstance(keys, list):
+            return tuple(urls)
+        store_urls: list[str] = []
+        for item in keys:
+            if not isinstance(item, dict) or item.get("disabled") or item.get("disabledAt"):
+                continue
+            api_key = str(item.get("apiKey") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9-]{16,}", api_key):
+                continue
+            store_urls.append(HELIUS_HTTP_BASE + api_key)
+        # إن كان fallback واحداً من المخزن، نكمل من المفتاح الذي يليه بدلاً من
+        # الرجوع إلى أول القائمة (قد يكون مستنفداً وقد اختير fallback بعد مسبار).
+        if fallback_url in store_urls:
+            index = store_urls.index(fallback_url)
+            store_urls = store_urls[index + 1:] + store_urls[:index]
+        urls.extend(store_urls)
+    except (OSError, ValueError, TypeError):
+        return tuple(urls)
+    return tuple(dict.fromkeys(urls))
 
 
 async def _optional(rpc: JsonRpc, method: str, params: list[Any]) -> Any | None:
@@ -220,7 +273,10 @@ async def scan_chain_token(
 
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0))
-    rpc = JsonRpc(spec.rpc_url, http)
+    rpc_urls = (
+        _solana_rpc_urls(spec.rpc_url) if spec.kind == "solana" else (spec.rpc_url,)
+    )
+    rpc = JsonRpc(rpc_urls, http)
     try:
         if spec.kind == "solana":
             out = await scan_solana(token_address, rpc)

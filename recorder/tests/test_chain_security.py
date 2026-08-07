@@ -1,5 +1,8 @@
 """اختبارات محلّل السلسلة بدوال RPC مزيّفة؛ لا شبكة ولا أسرار."""
+import json
 from typing import Any
+
+import httpx
 
 import chain_security as cs
 
@@ -66,6 +69,66 @@ async def test_solana_transfer_hook_or_authority_requires_review():
     assert result["gate_status"] == "review"
     assert "transfer_hook_configurable" in result["reason_codes"]
     assert result["dangerous_capabilities"] == ["transferHook"]
+
+
+def test_helius_store_adds_enabled_keys_without_leaking_path_defaults(
+    tmp_path, monkeypatch,
+):
+    store = tmp_path / "helius-keys.json"
+    store.write_text(json.dumps({"keys": [
+        {"apiKey": "enabled-key-123456789", "disabledAt": None},
+        {"apiKey": "disabled-key-12345678", "disabledAt": "2026-01-01"},
+        {"apiKey": "bad"},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("AOI_HELIUS_KEYS_PATH", str(store))
+
+    urls = cs._solana_rpc_urls("https://fallback.invalid")
+
+    assert urls == (
+        "https://fallback.invalid",
+        cs.HELIUS_HTTP_BASE + "enabled-key-123456789",
+    )
+
+
+def test_helius_rotation_continues_after_selected_fallback(tmp_path, monkeypatch):
+    keys = ["store-key-11111111", "store-key-22222222", "store-key-33333333"]
+    store = tmp_path / "helius-keys.json"
+    store.write_text(json.dumps({"keys": [
+        {"apiKey": key, "disabledAt": None} for key in keys
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("AOI_HELIUS_KEYS_PATH", str(store))
+    selected = cs.HELIUS_HTTP_BASE + keys[1]
+
+    assert cs._solana_rpc_urls(selected) == (
+        selected,
+        cs.HELIUS_HTTP_BASE + keys[2],
+        cs.HELIUS_HTTP_BASE + keys[0],
+    )
+
+
+async def test_json_rpc_rotates_endpoints_after_429_without_tracing_urls():
+    seen_hosts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        if request.url.host == "first.invalid":
+            return httpx.Response(429, json={"error": "limited"})
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": 1, "result": {"value": []},
+        })
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        rpc = cs.JsonRpc(
+            ("https://first.invalid", "https://second.invalid"), client
+        )
+        result = await rpc.call("getTokenLargestAccounts", ["mint"])
+
+    assert result == {"value": []}
+    assert seen_hosts == ["first.invalid", "second.invalid"]
+    assert rpc.trace[0]["http_status"] == 429
+    assert "first.invalid" not in json.dumps(rpc.trace)
+    assert "second.invalid" not in json.dumps(rpc.trace)
 
 
 def _evm_handler(
