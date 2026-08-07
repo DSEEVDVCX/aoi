@@ -11,6 +11,7 @@
 الاستعمال:
     py build_training_rows.py --dry-run          # تقرير: كم صفّاً وأيّ ميزات فارغة
     py build_training_rows.py                    # بناء تزايديّ
+    py build_training_rows.py --model-candidates-only  # الإشارات الحيّة المستقلّة فقط
     py build_training_rows.py --rebuild          # إعادة بناء الكل
     py build_training_rows.py --limit 200        # دفعة محدودة
 """
@@ -43,22 +44,46 @@ def _arg_int(name: str, default: int) -> int:
     return default
 
 
-def pending_outcomes(db: RecorderDB, rebuild: bool, limit: int) -> list[dict]:
+def pending_outcomes(
+    db: RecorderDB,
+    rebuild: bool,
+    limit: int,
+    model_candidates_only: bool = False,
+) -> list[dict]:
+    candidate_filter = ""
+    if model_candidates_only:
+        candidate_filter = """
+        AND o.kind = 'signal'
+        AND o.is_independent = 1
+        AND o.entry_ts >= ?"""
     where = """
         AND NOT EXISTS (SELECT 1 FROM training_rows r
                          WHERE r.kind = o.kind AND r.key = o.key
                            AND r.feature_version = ?)"""
-    params = (features.FEATURE_VERSION, limit)
+    params: tuple[int, ...]
+    if model_candidates_only:
+        params = (config.LIVE_START_TS, features.FEATURE_VERSION, limit)
+    else:
+        params = (features.FEATURE_VERSION, limit)
     rows = db._conn.execute(
         f"""SELECT o.* FROM outcomes o
-             WHERE o.status IN ('ok', 'no_bars') {where}
+             WHERE o.status IN ('ok', 'no_bars')
+             {candidate_filter} {where}
              ORDER BY o.entry_ts LIMIT ?""",
         params,
     ).fetchall()
     return [dict(r) for r in rows]
 
 
-def build(db: RecorderDB, rebuild: bool, limit: int, dry: bool) -> dict:
+def build(
+    db: RecorderDB,
+    rebuild: bool,
+    limit: int,
+    dry: bool,
+    model_candidates_only: bool = False,
+) -> dict:
+    if rebuild and model_candidates_only:
+        raise ValueError("--rebuild and --model-candidates-only cannot be combined")
     if rebuild:
         # Rebuild is a one-time reset. Subsequent invocations can resume by
         # selecting rows missing the current feature version.
@@ -66,7 +91,7 @@ def build(db: RecorderDB, rebuild: bool, limit: int, dry: bool) -> dict:
         db._conn.commit()
     stats = {"built": 0, "skipped_no_event": 0}
     rows: list[dict] = []
-    for out in pending_outcomes(db, rebuild, limit):
+    for out in pending_outcomes(db, rebuild, limit, model_candidates_only):
         row = features.build_training_row(db, out)
         if row is None:
             stats["skipped_no_event"] += 1
@@ -103,10 +128,11 @@ def coverage_report(rows: list[dict]) -> None:
 def main() -> None:
     dry = "--dry-run" in sys.argv
     rebuild = "--rebuild" in sys.argv
+    model_candidates_only = "--model-candidates-only" in sys.argv
     limit = _arg_int("--limit", 10**9)
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
-        stats = build(db, rebuild, limit, dry)
+        stats = build(db, rebuild, limit, dry, model_candidates_only)
         rows = stats.pop("rows")
         print(f"صفوف مبنيّة: {stats['built']} · بلا حدث مصدر: {stats['skipped_no_event']}")
         if rows:

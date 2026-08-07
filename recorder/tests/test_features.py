@@ -615,6 +615,26 @@ def test_incremental_builder_rebuild_does_not_repeat_current_version(db):
     assert pending_outcomes(db, rebuild=False, limit=10) == []
 
 
+def test_incremental_builder_can_limit_work_to_live_independent_signals(db):
+    from build_training_rows import pending_outcomes
+
+    cut = features.config.LIVE_START_TS
+    for key, ts in (("old", cut - 1), ("live", cut), ("duplicate", cut + 1)):
+        _signal(db, key, ts)
+        _outcome_at(db, key, ts)
+    db._conn.execute(
+        "UPDATE outcomes SET is_independent=0 WHERE kind='signal' AND key='duplicate'"
+    )
+    _outcome_at(db, "watch", cut + 2)
+    db._conn.execute("UPDATE outcomes SET kind='watch' WHERE key='watch'")
+    db._conn.commit()
+
+    rows = pending_outcomes(
+        db, rebuild=False, limit=10, model_candidates_only=True
+    )
+    assert [row["key"] for row in rows] == ["live"]
+
+
 # ---------------------------------------------------------------------------
 # اختلاف صيغ الأختمة من fomo — كشفه تقرير التغطية (token_age_h فارغاً 100%)
 # ---------------------------------------------------------------------------

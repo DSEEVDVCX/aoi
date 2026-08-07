@@ -205,6 +205,7 @@ py run_labeler.py 1                            # دورة يدوية واحدة
 py classify_tokens.py                   # حدِّث التصنيف أوّلاً (asset_class للصفّ)
 py build_training_rows.py --dry-run     # تقرير التغطية بلا كتابة
 py build_training_rows.py               # بناء تزايديّ
+py build_training_rows.py --model-candidates-only  # الحيّ المستقل فقط (تحليل سريع)
 py build_training_rows.py --rebuild     # إلزاميّ قبل التدريب (~6 دقائق لـ5.4k صفّ)
 ```
 
@@ -221,6 +222,21 @@ py build_training_rows.py --rebuild     # إلزاميّ قبل التدريب (
 
 و`mintable`/`freezable`/`top10_holders_pct` فراغ منبع حقيقيّ لا عطب. وعمر سالب
 مستحيل (ختم إدراج لا إنشاء) يُترك None لا رقماً سالباً يتعلّمه النموذج.
+
+## تحليل أنماط الصعود والضوضاء (`pattern_analysis.py`)
+
+يستخرج قواعد قابلة للتفسير من `train` فقط، ثم يقيسها على `val` و`test` وعلى
+الأيام منفصلة، ويحسب فواصل الثقة بإعادة أخذ العينات على مستوى **العملة**. يفصل
+بين لمس +20% خلال 24 ساعة، والإغلاق النهائي بعد 48 ساعة، ومحاكاة خروج تمشي على
+الشموع بترتيبها (هدف +20%، وقف −30%، خروج 24 ساعة، تكلفة دورة 2%).
+
+```powershell
+py pattern_analysis.py
+# الناتج: docs/pattern-analysis-YYYY-MM-DD.md
+```
+
+بعد قراءة تقرير الاختبار تصبح عيّنة `test` الحالية مستهلكة؛ لا تُعدّل القواعد
+ثم تعاود تسميتها اختباراً مستقلاً. ثبّت القواعد وانتظر بيانات زمنية جديدة.
 
 ## تصنيف الأصول (`classify_tokens.py`)
 
@@ -515,6 +531,7 @@ Start-ScheduledTask -TaskName FomoRecorder
 | `labeler.py` / `run_labeler.py` | حساب النتائج (منطق خالص) + خدمة التوسيم كل 15 دقيقة |
 | **`features.py`** | **مستخرج الميزات: 104 ميزة مقيَّدة بـt=0 — قطعة واحدة للتدريب والحيّ** |
 | `build_training_rows.py` | بناء `training_rows` من النتائج الموسومة + تقرير التغطية |
+| `pattern_analysis.py` | قواعد صعود/ضوضاء مفسّرة + تحقق بالعملة واليوم + محاكاة خروج |
 | `classify_tokens.py` | تصنيف الأصول → `token_class` (ميم/كبير/مسعَّر/مستقرّة) |
 | `backfill_bar_flags.py` | إعادة حساب أعلام تشوّه الشموع من الخام |
 | `relabel_suspect.py` | حذف نتائج نافذتها مشوّهة ليعيد الموسِّم حسابها (بنسخة احتياطية) |

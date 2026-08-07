@@ -5,3 +5,4 @@
 # Research/phase-1 analysis dependencies used outside api/.
 numpy>=1.26,<3
 scipy>=1.13,<2
+pandas>=2.2,<4
