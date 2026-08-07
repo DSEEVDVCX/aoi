@@ -1,5 +1,6 @@
 """اختبارات محلّل السلسلة بدوال RPC مزيّفة؛ لا شبكة ولا أسرار."""
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -131,6 +132,57 @@ def test_all_disabled_helius_keys_return_no_rpc(tmp_path, monkeypatch):
     assert cs._solana_rpc_urls(cs.HELIUS_HTTP_BASE + key) == ()
 
 
+def test_solana_pool_rotates_start_between_scans(tmp_path, monkeypatch):
+    keys = ["round-key-111111111", "round-key-222222222", "round-key-333333333"]
+    store = tmp_path / "helius-keys.json"
+    store.write_text(json.dumps({"keys": [
+        {"apiKey": key, "disabledAt": None} for key in keys
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("AOI_HELIUS_KEYS_PATH", str(store))
+    monkeypatch.setattr(cs, "_SOLANA_POOL_CURSOR", 0)
+    fallback = cs.HELIUS_HTTP_BASE + keys[0]
+
+    first = cs._solana_rpc_urls(fallback, rotate_start=True)
+    second = cs._solana_rpc_urls(fallback, rotate_start=True)
+
+    assert first[0] == cs.HELIUS_HTTP_BASE + keys[0]
+    assert second[0] == cs.HELIUS_HTTP_BASE + keys[1]
+
+
+def test_repeated_429_disables_key_for_session_only(monkeypatch):
+    url = cs.HELIUS_HTTP_BASE + "rate-limit-key-111111"
+    monkeypatch.setattr(cs, "_RPC_RATE_LIMIT_STRIKES", {})
+    monkeypatch.setattr(cs, "_RPC_SESSION_DEAD", set())
+
+    for _ in range(cs._RATE_LIMIT_STRIKES_TO_DISABLE):
+        cs._note_endpoint_failure(url, "rate_limited")
+
+    assert cs._endpoint_available(url) is False
+    assert url in cs._RPC_SESSION_DEAD
+
+
+def test_non_helius_429_never_kills_only_evm_endpoint(monkeypatch):
+    url = "https://public-evm-rpc.invalid"
+    monkeypatch.setattr(cs, "_RPC_RATE_LIMIT_STRIKES", {})
+    monkeypatch.setattr(cs, "_RPC_SESSION_DEAD", set())
+
+    for _ in range(cs._RATE_LIMIT_STRIKES_TO_DISABLE + 2):
+        cs._note_endpoint_failure(url, "rate_limited")
+
+    assert cs._endpoint_available(url) is True
+    assert url not in cs._RPC_SESSION_DEAD
+
+
+def test_helius_deprioritized_response_is_retryable():
+    assert cs._rpc_failure_kind(
+        code=-32600,
+        message=(
+            "Request deprioritized due to number of accounts requested. "
+            "Slow down requests or add filters to narrow down results"
+        ),
+    ) == "transient"
+
+
 async def test_json_rpc_rotates_endpoints_after_429_without_tracing_urls():
     seen_hosts = []
 
@@ -154,6 +206,88 @@ async def test_json_rpc_rotates_endpoints_after_429_without_tracing_urls():
     assert rpc.trace[0]["http_status"] == 429
     assert "first.invalid" not in json.dumps(rpc.trace)
     assert "second.invalid" not in json.dumps(rpc.trace)
+
+
+async def test_json_rpc_rotates_on_helius_overload_beyond_old_eight_key_cap():
+    seen_hosts = []
+    urls = tuple(f"https://key-{index}.invalid" for index in range(10))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        if request.url.host != "key-9.invalid":
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": 1,
+                "error": {
+                    "code": -32603,
+                    "message": "account index service overloaded, please try again.",
+                },
+            })
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": 1, "result": {"value": []},
+        })
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        rpc = cs.JsonRpc(urls, client)
+        result = await rpc.call("getTokenLargestAccounts", ["mint"])
+
+    assert result == {"value": []}
+    assert len(seen_hosts) == 10
+    assert rpc.trace[0]["failure_kind"] == "transient"
+
+
+async def test_explicit_credit_exhaustion_disables_key_and_uses_next(
+    tmp_path, monkeypatch,
+):
+    exhausted = "credit-key-aaaaaaaaaaaa"
+    working = "credit-key-bbbbbbbbbbbb"
+    store = tmp_path / "helius-keys.json"
+    store.write_text(json.dumps({"keys": [
+        {"apiKey": exhausted, "disabledAt": None},
+        {"apiKey": working, "disabledAt": None},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("AOI_HELIUS_KEYS_PATH", str(store))
+    urls = (
+        cs.HELIUS_HTTP_BASE + exhausted,
+        cs.HELIUS_HTTP_BASE + working,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if exhausted in str(request.url):
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": 1,
+                "error": {"code": -32000, "message": "out of credits for this month"},
+            })
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": 1, "result": 123,
+        })
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        rpc = cs.JsonRpc(urls, client)
+        assert await rpc.call("getSlot", []) == 123
+
+    saved = json.loads(store.read_text(encoding="utf-8"))
+    assert saved["keys"][0]["disabledAt"]
+    assert saved["keys"][0]["disabledReason"] == "نفدت الحصّة تلقائياً"
+    assert saved["keys"][1]["disabledAt"] is None
+    assert Path(str(store) + ".bak").exists()
+    assert exhausted not in json.dumps(rpc.trace)
+
+
+async def test_solana_rpc_failure_is_unknown_not_review():
+    def handler(method, _params):
+        if method == "getAccountInfo":
+            return _sol_account()
+        if method == "getTokenLargestAccounts":
+            return cs.RpcError("all endpoints failed")
+        raise AssertionError(method)
+
+    result = await cs.scan_solana("mint", FakeRpc(handler))
+
+    assert result["gate_status"] == "unknown"
+    assert result["reason_codes"] == ["holder_transfer_check_unavailable"]
+    assert result["transfer_simulation_status"] == "unavailable"
 
 
 def _evm_handler(

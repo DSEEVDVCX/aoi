@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import base64
-import asyncio
 import json
 import os
 import re
+import shutil
 import struct
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,27 @@ ZERO_EVM_ADDRESS = "0x" + "0" * 40
 DEAD_EVM_ADDRESS = "0x" + "0" * 36 + "dead"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 HELIUS_HTTP_BASE = "https://mainnet.helius-rpc.com/?api-key="
+
+# حالة مجمّع Helius داخل جلسة المسجّل. لا تُكتب العناوين أو المفاتيح في السجلّ؛
+# المفتاح هنا عنوان داخلي في الذاكرة فقط. مثل crib، 429 المتكرر ثلاث مرات يستبعد
+# المفتاح للجلسة فقط، أمّا نفاد credits الصريح فيُحفظ في المخزن المشترك أيضاً.
+_SOLANA_POOL_CURSOR = 0
+_RPC_RATE_LIMIT_STRIKES: dict[str, int] = {}
+_RPC_SESSION_DEAD: set[str] = set()
+_RATE_LIMIT_STRIKES_TO_DISABLE = 3
+
+_CREDIT_EXHAUSTED_MARKERS = (
+    "out of credits", "credits exhausted", "credit limit",
+    "insufficient credit", "no credits", "monthly credit",
+    "monthly usage limit", "monthly limit", "payment required",
+    "plan limit",
+)
+_RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "rate-limit")
+_TRANSIENT_RPC_MARKERS = (
+    "overloaded", "please try again", "temporarily unavailable",
+    "service unavailable", "timeout", "timed out", "deprioritized",
+    "slow down requests",
+)
 
 EIP1967_IMPLEMENTATION_SLOT = (
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
@@ -111,6 +134,161 @@ class RpcError(RuntimeError):
     """خطأ RPC منزوع عنوان endpoint كي لا يتسرّب مفتاح ضمن URL."""
 
 
+def _rpc_failure_kind(
+    *, http_status: int | None = None, code: Any = None, message: Any = None,
+) -> str:
+    """يصنّف فشل المزوّد بلا الاحتفاظ بعنوانه أو مفتاحه.
+
+    Helius قد يعيد نفاد الرصيد أو overload داخل JSON-RPC مع HTTP 200، لذلك لا
+    يكفي فحص status. الأخطاء الدلالية مثل invalid params تبقى غير قابلة للتدوير.
+    """
+    text = str(message or "").lower()
+    if any(marker in text for marker in _CREDIT_EXHAUSTED_MARKERS):
+        return "credits_exhausted"
+    if http_status in {401, 403} or any(
+        marker in text for marker in ("invalid api key", "unauthorized", "forbidden")
+    ):
+        return "unauthorized"
+    if http_status == 429 or code == 429 or any(
+        marker in text for marker in _RATE_LIMIT_MARKERS
+    ):
+        return "rate_limited"
+    if http_status in {500, 502, 503, 504} or any(
+        marker in text for marker in _TRANSIENT_RPC_MARKERS
+    ):
+        return "transient"
+    return "fatal"
+
+
+def _safe_rpc_message(value: Any) -> str:
+    text = str(value or "")[:240]
+    text = re.sub(r"(?i)(api-key=)[^&\s]+", r"\1•••", text)
+    return re.sub(
+        r"(?i)\b[0-9a-f]{8}-[0-9a-f-]{27,36}\b", "<uuid>", text
+    )
+
+
+def _endpoint_available(url: str) -> bool:
+    return url not in _RPC_SESSION_DEAD
+
+
+def _note_endpoint_success(url: str) -> None:
+    _RPC_RATE_LIMIT_STRIKES.pop(url, None)
+
+
+def _note_endpoint_failure(url: str, kind: str) -> None:
+    # الاستبعاد/الضربات سياسة مجمّع مفاتيح Helius فقط. endpoint عام وحيد لشبكة
+    # EVM لا بديل له؛ قتله للجلسة بعد 429 يجعل كل الفحوص اللاحقة تفشل بلا محاولة.
+    if _extract_helius_key(url) is None:
+        return
+    if kind in {"credits_exhausted", "unauthorized"}:
+        _RPC_SESSION_DEAD.add(url)
+        _RPC_RATE_LIMIT_STRIKES.pop(url, None)
+        return
+    if kind != "rate_limited":
+        return
+    strikes = _RPC_RATE_LIMIT_STRIKES.get(url, 0) + 1
+    if strikes < _RATE_LIMIT_STRIKES_TO_DISABLE:
+        _RPC_RATE_LIMIT_STRIKES[url] = strikes
+        return
+    _RPC_RATE_LIMIT_STRIKES.pop(url, None)
+    _RPC_SESSION_DEAD.add(url)
+
+
+def _extract_helius_key(url: str) -> str | None:
+    match = re.search(r"[?&]api-key=([^&\s]+)", url, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _persist_credit_exhausted(url: str) -> bool:
+    """يعطّل مفتاح credits المنتهي في مخزن crib تحت قفله المتوافق.
+
+    لا نعطّل 429 فارغاً/عابراً في القرص؛ وحده نص نفاد الرصيد الصريح يصل هنا.
+    """
+    api_key = _extract_helius_key(url)
+    store_value = os.getenv("AOI_HELIUS_KEYS_PATH", "").strip()
+    if not api_key or not store_value:
+        return False
+    target = Path(store_value)
+    lock_path = Path(str(target) + ".lock")
+    token = f"{os.getpid()}:{uuid.uuid4().hex}"
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            descriptor = os.open(
+                lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+                handle.flush()
+                os.fsync(handle.fileno())
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 10.0:
+                    lock_path.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        except OSError:
+            return False
+
+    try:
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+        keys = payload.get("keys") if isinstance(payload, dict) else None
+        if not isinstance(keys, list):
+            return False
+        item = next(
+            (
+                entry for entry in keys
+                if isinstance(entry, dict) and entry.get("apiKey") == api_key
+            ),
+            None,
+        )
+        if item is None:
+            return False
+        if item.get("disabledAt"):
+            return True
+        item["disabledAt"] = int(time.time() * 1000)
+        item["disabledReason"] = "نفدت الحصّة تلقائياً"
+
+        backup = Path(str(target) + ".bak")
+        shutil.copy2(target, backup)
+        temp = target.with_name(
+            f"{target.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+        )
+        try:
+            descriptor = os.open(
+                temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, target)
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            if lock_path.read_text(encoding="utf-8") == token:
+                lock_path.unlink()
+        except OSError:
+            pass
+
+
 class JsonRpc:
     def __init__(self, url: str | tuple[str, ...], client: httpx.AsyncClient) -> None:
         urls = (url,) if isinstance(url, str) else url
@@ -125,61 +303,117 @@ class JsonRpc:
     async def call(self, method: str, params: list[Any]) -> Any:
         request_id = self._next_id
         self._next_id += 1
-        body: Any = None
-        max_attempts = min(max(2, len(self._urls)), 8)
-        for attempt in range(max_attempts):
+        tried: set[int] = set()
+        last_failure = "no_available_endpoint"
+        for _attempt in range(len(self._urls)):
+            index = self._next_available_index(tried)
+            if index is None:
+                break
+            tried.add(index)
+            url = self._urls[index]
             try:
                 response = await self._client.post(
-                    self._urls[self._url_index],
+                    url,
                     json={
                         "jsonrpc": "2.0", "id": request_id,
                         "method": method, "params": params,
                     },
                 )
-                response.raise_for_status()
-                body = response.json()
-                break
-            except Exception as exc:  # noqa: BLE001 — لا نسرّب endpoint
-                status_code = (
-                    exc.response.status_code
-                    if isinstance(exc, httpx.HTTPStatusError) else None
-                )
-                retryable = (
-                    isinstance(exc, httpx.TransportError)
-                    or isinstance(exc, httpx.HTTPStatusError)
-                    and status_code in {429, 500, 502, 503, 504}
-                )
-                retrying = retryable and attempt + 1 < max_attempts
+            except httpx.TransportError as exc:
+                last_failure = "transport"
                 self.trace.append({
                     "method": method,
                     "transport_error": type(exc).__name__,
-                    "http_status": status_code,
-                    "retrying": retrying,
+                    "http_status": None,
+                    "failure_kind": "transient",
+                    "retrying": len(tried) < len(self._urls),
                 })
-                if retrying:
-                    if len(self._urls) > 1:
-                        self._url_index = (self._url_index + 1) % len(self._urls)
-                    await asyncio.sleep(0.4)
+                self._url_index = (index + 1) % len(self._urls)
+                continue
+
+            try:
+                body: Any = response.json()
+            except ValueError:
+                body = None
+
+            if response.status_code >= 400:
+                error = body.get("error") if isinstance(body, dict) else None
+                message = (
+                    error.get("message") if isinstance(error, dict)
+                    else response.text
+                )
+                kind = _rpc_failure_kind(
+                    http_status=response.status_code, message=message
+                )
+                retryable = kind != "fatal"
+                last_failure = kind
+                self.trace.append({
+                    "method": method,
+                    "transport_error": "HTTPStatusError",
+                    "http_status": response.status_code,
+                    "failure_kind": kind,
+                    "retrying": retryable and len(tried) < len(self._urls),
+                })
+                _note_endpoint_failure(url, kind)
+                if kind == "credits_exhausted":
+                    _persist_credit_exhausted(url)
+                if retryable:
+                    self._url_index = (index + 1) % len(self._urls)
                     continue
-                raise RpcError(f"{method}: transport failure") from None
-        if not isinstance(body, dict):
-            self.trace.append({"method": method, "protocol_error": "non_object"})
-            raise RpcError(f"{method}: invalid JSON-RPC envelope")
-        if body.get("error") is not None:
-            error = body["error"]
-            safe_error = {
-                "code": error.get("code") if isinstance(error, dict) else None,
-                "message": error.get("message") if isinstance(error, dict) else str(error),
-            }
-            self.trace.append({"method": method, "error": safe_error})
-            raise RpcError(f"{method}: RPC error")
-        result = body.get("result")
-        self.trace.append({"method": method, "result": result})
-        return result
+                raise RpcError(f"{method}: HTTP failure") from None
+
+            if not isinstance(body, dict):
+                last_failure = "invalid_protocol"
+                self.trace.append({
+                    "method": method,
+                    "protocol_error": "non_object",
+                    "failure_kind": "transient",
+                    "retrying": len(tried) < len(self._urls),
+                })
+                self._url_index = (index + 1) % len(self._urls)
+                continue
+
+            if body.get("error") is not None:
+                error = body["error"]
+                code = error.get("code") if isinstance(error, dict) else None
+                message = error.get("message") if isinstance(error, dict) else str(error)
+                safe_error = {"code": code, "message": _safe_rpc_message(message)}
+                kind = _rpc_failure_kind(code=code, message=message)
+                retryable = kind != "fatal"
+                last_failure = kind
+                self.trace.append({
+                    "method": method,
+                    "error": safe_error,
+                    "failure_kind": kind,
+                    "retrying": retryable and len(tried) < len(self._urls),
+                })
+                _note_endpoint_failure(url, kind)
+                if kind == "credits_exhausted":
+                    _persist_credit_exhausted(url)
+                if retryable:
+                    self._url_index = (index + 1) % len(self._urls)
+                    continue
+                raise RpcError(f"{method}: RPC error") from None
+
+            result = body.get("result")
+            self._url_index = index
+            _note_endpoint_success(url)
+            self.trace.append({"method": method, "result": result})
+            return result
+        raise RpcError(f"{method}: all RPC endpoints failed ({last_failure})")
+
+    def _next_available_index(self, tried: set[int]) -> int | None:
+        for step in range(len(self._urls)):
+            index = (self._url_index + step) % len(self._urls)
+            if index not in tried and _endpoint_available(self._urls[index]):
+                return index
+        return None
 
 
-def _solana_rpc_urls(fallback_url: str) -> tuple[str, ...]:
-    """يعيد RPC الأساسي ثم مفاتيح Helius المفعّلة من مخزن اختياري.
+def _solana_rpc_urls(
+    fallback_url: str, *, rotate_start: bool = False
+) -> tuple[str, ...]:
+    """يعيد مفاتيح Helius المفعّلة، مع بداية دائرية اختيارية لكل فحص.
 
     لا تُخزّن العناوين في النتائج أو السجل؛ `JsonRpc.trace` يحفظ method/status فقط.
     المسار يضبط محلياً عبر AOI_HELIUS_KEYS_PATH ولا يُفترض داخل المستودع.
@@ -209,6 +443,11 @@ def _solana_rpc_urls(fallback_url: str) -> tuple[str, ...]:
         if fallback_url in store_urls:
             index = store_urls.index(fallback_url)
             store_urls = store_urls[index:] + store_urls[:index]
+        if rotate_start and len(store_urls) > 1:
+            global _SOLANA_POOL_CURSOR
+            start = _SOLANA_POOL_CURSOR % len(store_urls)
+            _SOLANA_POOL_CURSOR = (_SOLANA_POOL_CURSOR + 1) % len(store_urls)
+            store_urls = store_urls[start:] + store_urls[:start]
     except (OSError, ValueError, TypeError):
         return (fallback_url,)
     return tuple(dict.fromkeys(store_urls))
@@ -274,7 +513,8 @@ async def scan_chain_token(
         return out
 
     rpc_urls = (
-        _solana_rpc_urls(spec.rpc_url) if spec.kind == "solana" else (spec.rpc_url,)
+        _solana_rpc_urls(spec.rpc_url, rotate_start=True)
+        if spec.kind == "solana" else (spec.rpc_url,)
     )
     if not rpc_urls:
         out = _result_base(spec.kind, str(spec.rpc_chain_id) if spec.rpc_chain_id else None)
@@ -411,9 +651,14 @@ async def scan_solana(mint: str, rpc: JsonRpc) -> dict[str, Any]:
         unknown.append("invalid_supply")
 
     largest_values: list[dict[str, Any]] = []
-    largest = await _optional(
-        rpc, "getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]
-    )
+    largest_rpc_failed = False
+    try:
+        largest = await rpc.call(
+            "getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]
+        )
+    except RpcError:
+        largest = None
+        largest_rpc_failed = True
     if isinstance(largest, dict) and isinstance(largest.get("value"), list):
         largest_values = [v for v in largest["value"] if isinstance(v, dict)]
         amounts = []
@@ -426,12 +671,23 @@ async def scan_solana(mint: str, rpc: JsonRpc) -> dict[str, Any]:
             out["top1_account_pct"] = amounts[0] / supply * 100
             out["top10_accounts_pct"] = sum(amounts[:10]) / supply * 100
 
-    simulation = await _simulate_solana_transfer(
-        rpc, mint, program_id, int(info.get("decimals") or 0), largest_values
+    simulation = (
+        {"status": "unavailable", "reason": "largest_accounts_rpc_failed"}
+        if largest_rpc_failed
+        else await _simulate_solana_transfer(
+            rpc, mint, program_id, int(info.get("decimals") or 0), largest_values
+        )
     )
     out["transfer_simulation_status"] = simulation["status"]
     if simulation["status"] != "success":
-        review.append("holder_transfer_not_proven")
+        if simulation.get("reason") in {
+            "largest_accounts_rpc_failed",
+            "token_accounts_unreadable",
+            "simulation_rpc_failed",
+        }:
+            unknown.append("holder_transfer_check_unavailable")
+        else:
+            review.append("holder_transfer_not_proven")
 
     out["details"] = {
         "extensions": extension_details,
