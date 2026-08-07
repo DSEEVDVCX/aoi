@@ -161,6 +161,17 @@ RISK_REFRESH_SECONDS = 900          # تغيّر الصلاحيات/التحذي
 RISK_ERROR_RETRY_SECONDS = 300      # الفشل = مجهول؛ أعد المحاولة أسرع من التحديث
 RISK_PACING_SECONDS = 0.5
 
+# --- التحقق المباشر على السلسلة (Solana + EVM) ---
+# RPC الافتراضية العامة محدودة المعدّل؛ نفحص شريحة صغيرة بالتوازي ونجدّد كل ساعة.
+# كل endpoint قابل للتجاوز بمتغيرات AOI_SOLANA_RPC_URL / AOI_EVM_RPC_<networkId>.
+CHAIN_SECURITY_ENABLED = os.getenv("AOI_CHAIN_SECURITY_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+CHAIN_SECURITY_PER_CYCLE = 6
+CHAIN_SECURITY_CONCURRENCY = 3
+CHAIN_SECURITY_REFRESH_SECONDS = 3600
+CHAIN_SECURITY_ERROR_RETRY_SECONDS = 300
+
 # --- المجموعة الضابطة (الصنف السالب) ---
 # عملات تدخل المراقبة **بالاختيار العشوائي لا بإشارة**، وتُسجَّل بنفس الطريقة.
 # بلا هذا الصنف يستطيع النموذج تعلّم "أي عملة مُشار إليها ترتفع أكثر"، لكنّه لا

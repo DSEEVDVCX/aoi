@@ -50,6 +50,7 @@ def test_schema_creates_all_tables(db):
     names = {r["name"] for r in rows}
     for t in ("watchlist", "signal_events", "market_ticks", "token_static",
               "snapshots", "token_risk_assessments", "risk_fetch_state",
+              "token_chain_assessments", "chain_fetch_state",
               "outcomes", "meta"):
         assert t in names
 

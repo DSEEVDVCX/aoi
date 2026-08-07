@@ -73,6 +73,7 @@ fomo.family تعرض حالة السوق **الآن** ولا تحفظ التار
    GET  /proxy/verifiedTokens  ┘ → snapshots + market_ticks + token_static
 2.25) اختيار عملات ضابطة عشوائية      (حتى بلوغ 40)
 2.4)  POST /proxy/tokenWarnings → بوابة مخاطر الشراء/البيع (12 عملة/دورة)
+2.45) Solana/EVM JSON-RPC       → صلاحيات العقد + Token-2022 + محاكاة نقل (6/دورة)
 2.5)  POST /proxy/getBarsNew   → token_bars     (9 عملات/دورة، تناوب)
 2.75) GET /feed/token/thesis   → token_social   (4 عملات/دورة، تناوب)
 2.9)  POST /proxy/getBarsNew   → شموع SOL/WETH/WBTC الساعية (كل ساعة)
@@ -96,12 +97,14 @@ fomo.family تعرض حالة السوق **الآن** ولا تحفظ التار
 | `token_social` | سلسلة زمنية للزخم الاجتماعي | `thesis_total` لا `thesis_count` |
 | `token_thesis` | صفّ لكل أطروحة بختم كتابتها | يتيح العدّ **التاريخي** |
 | `token_risk_assessments` | سلسلة زمنية لبوابات الشراء/البيع والتحذيرات | `pass` غربلة مزوّد فقط، **لا يثبت إمكان البيع** |
+| `token_chain_assessments` | فحص مباشر لسولانا/EVM وصلاحيات قابلة للتغيير ومحاكاة نقل | تحويل الحائز **ليس** بيع DEX؛ المجهول لا يمرّ |
+| `latest_token_safety` | أحدث حكم مركّب من المزوّد والسلسلة | `blocked` يتغلّب؛ `pass` تحتاج نجاح المصدرين |
 | `snapshots` | أرشيف خام كامل لكل مصدر/دورة | يشمل **الصدارة الخام كل ساعة** (منذ 2026-07-28) |
 | `outcomes` | **النتائج (labels)** | يملؤها الموسِّم حصراً |
 | `phase1_watch_outcomes` | نتائج المقارنة المؤهلة فقط | View آمنة لا تعرض إلا بيانات المقارنة الجديدة `v3` |
 | `token_class` | تصنيف الأصل (ميم/كبير/مسعَّر/مستقرّة) | مشتقّ — `classify_tokens.py` |
 | `training_rows` | **جدول التدريب**: 104 ميزة عند t=0 + الليبل | مشتقّ — `build_training_rows.py`؛ **`--rebuild` إلزاميّ قبل أيّ تدريب** |
-| `bars_fetch_state` / `social_fetch_state` / `risk_fetch_state` | حالة التناوب | تقود الجدولة الدوّارة |
+| `bars_fetch_state` / `social_fetch_state` / `risk_fetch_state` / `chain_fetch_state` | حالة التناوب | تقود الجدولة الدوّارة |
 | `meta` | عدّادات وحالة تشغيل | `last_error_*`, `last_feed_event_at` |
 
 **لقطة الحالة** (2026-08-07): 41,474 إشارة · **750 عملة مصنَّفة** (716 ميم) ·
@@ -551,6 +554,11 @@ cd recorder; py run_exit_sim.py --source activity --cost 0.02   # على الر�
 - **المنافذ محلّية فقط**: 8080 و8090 على `127.0.0.1`.
 - **اللوحة تفتح القاعدة `mode=ro`** — لا كتابة إطلاقاً، لا تعطّل المسجّل.
 - **قراءة فقط تجاه fomo**: لا نداء يكتب حالة حساب أو تداول.
+- **فاحص السلسلة للقراءة والمحاكاة فقط**: لا مفاتيح خاصة، لا توقيع، ولا بثّ
+  معاملة. RPC البديل يُضبط عبر `AOI_SOLANA_RPC_URL` أو
+  `AOI_EVM_RPC_<networkId>`؛ لا تُنسخ أسرار `crib`.
+- **لا مساواة بين النقل والبيع**: نجاح `transfer` لا يثبت سيولة DEX أو مسار
+  swap أو ضريبة البيع، ولذلك لا يفعّل التنفيذ الآلي.
 - **Redis غائب** — النظام يعمل على `FakeRedis` في الذاكرة. كافٍ محلياً؛ الجلسات
   تُمسح عند إعادة التشغيل ويعيد الإقلاع توليدها.
 
@@ -561,7 +569,7 @@ cd recorder; py run_exit_sim.py --source activity --cost 0.02   # على الر�
 | الوثيقة | المحتوى |
 |---|---|
 | [`docs/PLAN.md`](docs/PLAN.md) | **ماذا نفعل بعد جمع البيانات — بالتفصيل** |
-| [`docs/TOKEN_RISK_GATE.md`](docs/TOKEN_RISK_GATE.md) | بوابة مخاطر البيع وخطة الاستفادة من مشروع `crib` |
+| [`docs/TOKEN_RISK_GATE.md`](docs/TOKEN_RISK_GATE.md) | بوابة المخاطر المنفّذة على Fomo وSolana وEVM وحدود إثبات البيع |
 | [`recorder/README.md`](recorder/README.md) | المسجّل والموسِّم: الشموع، الاجتماعي، الضابطة، الضغط |
 | [`api/README.md`](api/README.md) | الخادم: المصادقة، التنبيهات، السجلّات |
 | [`dashboard/README.md`](dashboard/README.md) | اللوحة: المقاييس، قرارات التصميم |

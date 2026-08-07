@@ -640,6 +640,55 @@ class RecorderDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # --- token_chain_assessments ---
+    def insert_chain_assessment(self, row: Mapping[str, Any]) -> bool:
+        cols = _CHAIN_ASSESSMENT_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO token_chain_assessments({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        self._commit()
+        return cur.rowcount > 0
+
+    def set_chain_state(
+        self, token_address: str, network_id: str, status: str, now_iso: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO chain_fetch_state(
+                   token_address, network_id, last_fetch_at, last_status, attempts)
+               VALUES(?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_fetch_at=excluded.last_fetch_at,
+                   last_status=excluded.last_status,
+                   attempts=chain_fetch_state.attempts + 1""",
+            (token_address, network_id, now_iso, status),
+        )
+        self._commit()
+
+    def chain_fetch_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+    ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT w.token_address, w.network_id, w.first_seen_at,
+                      w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
+                 FROM watchlist w
+                 LEFT JOIN chain_fetch_state s
+                   ON s.token_address=w.token_address AND s.network_id=w.network_id
+                WHERE w.active=1
+                  AND (s.last_fetch_at IS NULL
+                       OR (s.last_status='error' AND s.last_fetch_at < ?)
+                       OR (COALESCE(s.last_status, '') <> 'error'
+                           AND s.last_fetch_at < ?))
+                ORDER BY s.last_fetch_at IS NOT NULL,
+                         w.is_control,
+                         s.last_fetch_at,
+                         w.first_seen_at DESC
+                LIMIT ?""",
+            (error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- watchlist ---
     def upsert_watch(
         self,
@@ -1054,6 +1103,16 @@ _RISK_COLUMNS = (
     "entry_signal_id", "is_control", "disable_buying", "disable_selling",
     "warning_count", "severe_count", "high_count", "gate_status",
     "warning_types_json", "warnings_json", "raw_json",
+)
+
+_CHAIN_ASSESSMENT_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control", "chain_kind", "rpc_chain_id", "gate_status",
+    "reason_codes_json", "contract_exists", "token_standard",
+    "program_or_implementation", "owner_authority", "owner_renounced",
+    "mint_authority", "freeze_authority", "paused", "upgradeable",
+    "dangerous_capabilities_json", "transfer_simulation_status",
+    "top1_account_pct", "top10_accounts_pct", "details_json", "raw_json",
 )
 
 _STATIC_COLUMNS = (

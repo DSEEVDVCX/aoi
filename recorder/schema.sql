@@ -398,6 +398,90 @@ CREATE TABLE IF NOT EXISTS risk_fetch_state (
     PRIMARY KEY (token_address, network_id)
 );
 
+-- فحص مباشر على السلسلة، منفصل عن تحذيرات مزوّد Fomo. يشمل صلاحيات SPL/
+-- Token-2022، كود ERC-20/proxy/owner، ومحاكاة نقل حائز حين تتاح. لا نسمّيها
+-- sell simulation: نقل التوكن لا يثبت مسار بيع DEX ورسومه وسيولته.
+CREATE TABLE IF NOT EXISTS token_chain_assessments (
+    token_address              TEXT NOT NULL,
+    network_id                 TEXT NOT NULL,
+    recorded_at                TEXT NOT NULL,
+    watch_first_seen_at        TEXT NOT NULL,
+    entry_signal_id            TEXT,
+    is_control                 INTEGER NOT NULL DEFAULT 0,
+    chain_kind                 TEXT NOT NULL,       -- solana / evm / unsupported
+    rpc_chain_id               TEXT,                -- قد يختلف عن networkId (1337→999)
+    gate_status                TEXT NOT NULL,       -- pass/review/blocked/unknown/unsupported
+    reason_codes_json          TEXT NOT NULL,
+    contract_exists            INTEGER,
+    token_standard             TEXT,
+    program_or_implementation  TEXT,
+    owner_authority            TEXT,
+    owner_renounced            INTEGER,
+    mint_authority             TEXT,
+    freeze_authority           TEXT,
+    paused                     INTEGER,
+    upgradeable                INTEGER,
+    dangerous_capabilities_json TEXT NOT NULL,
+    transfer_simulation_status TEXT NOT NULL,
+    top1_account_pct           REAL,
+    top10_accounts_pct         REAL,
+    details_json               TEXT NOT NULL,
+    raw_json                   BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_chain_assessment_token_ts
+    ON token_chain_assessments (token_address, network_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_chain_assessment_gate_ts
+    ON token_chain_assessments (gate_status, recorded_at);
+
+CREATE TABLE IF NOT EXISTS chain_fetch_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                            -- ok/review/blocked/unknown/error/unsupported
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+
+-- أحدث حكم مركّب صالح للعرض/بوابة التنفيذ. النجاح يحتاج نجاح المصدرين؛ غياب
+-- أحدهما أو unsupported يبقى unknown (fail-closed).
+CREATE VIEW IF NOT EXISTS latest_token_safety AS
+WITH provider_latest AS (
+    SELECT token_address, network_id, MAX(recorded_at) AS recorded_at
+      FROM token_risk_assessments GROUP BY token_address, network_id
+), provider AS (
+    SELECT a.token_address, a.network_id, a.recorded_at, a.gate_status
+      FROM token_risk_assessments a JOIN provider_latest l
+        ON l.token_address=a.token_address AND l.network_id=a.network_id
+       AND l.recorded_at=a.recorded_at
+), chain_latest AS (
+    SELECT token_address, network_id, MAX(recorded_at) AS recorded_at
+      FROM token_chain_assessments GROUP BY token_address, network_id
+), chain_scan AS (
+    SELECT a.token_address, a.network_id, a.recorded_at, a.gate_status
+      FROM token_chain_assessments a JOIN chain_latest l
+        ON l.token_address=a.token_address AND l.network_id=a.network_id
+       AND l.recorded_at=a.recorded_at
+)
+SELECT w.token_address, w.network_id, w.first_seen_at, w.entry_signal_id,
+       w.is_control, p.recorded_at AS provider_recorded_at,
+       p.gate_status AS provider_status, c.recorded_at AS chain_recorded_at,
+       c.gate_status AS chain_status,
+       CASE
+         WHEN p.gate_status='blocked' OR c.gate_status='blocked' THEN 'blocked'
+         WHEN p.gate_status IS NULL OR c.gate_status IS NULL THEN 'unknown'
+         WHEN p.gate_status='unknown'
+           OR c.gate_status IN ('unknown','unsupported') THEN 'unknown'
+         WHEN p.gate_status='review' OR c.gate_status='review' THEN 'review'
+         WHEN p.gate_status='pass' AND c.gate_status='pass' THEN 'pass'
+         ELSE 'unknown'
+       END AS combined_status
+  FROM watchlist w
+  LEFT JOIN provider p
+    ON p.token_address=w.token_address AND p.network_id=w.network_id
+  LEFT JOIN chain_scan c
+    ON c.token_address=w.token_address AND c.network_id=w.network_id;
+
 -- النتائج (labels): يملؤها الـ labeler (عملية FomoLabeler المنفصلة)، لا المسجّل
 -- — المسجّل يسجّل خاماً فقط (منع تسرّب المستقبل)، والتوسيم لا يجري إلّا بعد
 -- اكتمال نافذة الـ48 ساعة.

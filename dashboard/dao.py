@@ -42,6 +42,13 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _view_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='view' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
 def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """اللوحة تقرأ قاعدة يكتبها المسجّل؛ قد تسبق نسخةُ اللوحة ترحيلَ المسجّل
     (أو العكس). الفحص يجعل العمود الجديد اختيارياً بدل أن يُسقط اللوحة."""
@@ -228,15 +235,51 @@ def recent_signals(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, 
 def active_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     if not _table_exists(conn, "watchlist"):
         return []
+    if _view_exists(conn, "latest_token_safety"):
+        safety_columns = (
+            "s.provider_status, s.chain_status, s.combined_status, "
+            "s.provider_recorded_at, s.chain_recorded_at"
+        )
+        safety_join = (
+            "LEFT JOIN latest_token_safety s ON s.token_address=w.token_address "
+            "AND s.network_id=w.network_id"
+        )
+    else:
+        safety_columns = (
+            "NULL AS provider_status, NULL AS chain_status, NULL AS combined_status, "
+            "NULL AS provider_recorded_at, NULL AS chain_recorded_at"
+        )
+        safety_join = ""
     rows = conn.execute(
-        """SELECT w.token_address, w.network_id, w.source, w.first_seen_at, w.watch_until,
-                  (SELECT COUNT(*) FROM market_ticks m
-                     WHERE m.token_address = w.token_address) AS tick_count
-           FROM watchlist w
-           WHERE w.active = 1
-           ORDER BY w.first_seen_at DESC""",
+        f"""SELECT w.token_address, w.network_id, w.source, w.first_seen_at, w.watch_until,
+                   (SELECT COUNT(*) FROM market_ticks m
+                      WHERE m.token_address = w.token_address) AS tick_count,
+                   {safety_columns}
+              FROM watchlist w {safety_join}
+             WHERE w.active = 1
+             ORDER BY w.first_seen_at DESC""",
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def safety_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """حكم الأمان المركّب للعملات النشطة؛ غياب أي طبقة يبقى unknown."""
+    active = active_watch_count(conn)
+    counts = {"pass": 0, "review": 0, "blocked": 0, "unknown": active}
+    if not _view_exists(conn, "latest_token_safety"):
+        return {"active": active, "counts": counts, "assessed": 0}
+    rows = conn.execute(
+        """SELECT s.combined_status, COUNT(*) AS n
+             FROM latest_token_safety s JOIN watchlist w
+               ON w.token_address=s.token_address AND w.network_id=s.network_id
+            WHERE w.active=1 GROUP BY s.combined_status"""
+    ).fetchall()
+    counts = {"pass": 0, "review": 0, "blocked": 0, "unknown": 0}
+    for row in rows:
+        status = row["combined_status"]
+        counts[status if status in counts else "unknown"] += int(row["n"])
+    assessed = counts["pass"] + counts["review"] + counts["blocked"]
+    return {"active": active, "counts": counts, "assessed": assessed}
 
 
 # --- OHLCV bars ---

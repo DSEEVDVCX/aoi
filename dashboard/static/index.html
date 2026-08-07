@@ -292,6 +292,14 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 
   <div class="card">
     <header>
+      <h2>بوابة أمان العملات</h2>
+      <span class="note">تحذيرات المزوّد + تحقق مباشر من السلسلة؛ unknown لا يمرّ</span>
+    </header>
+    <div class="body" id="safety" aria-live="polite"></div>
+  </div>
+
+  <div class="card">
+    <header>
       <h2>قائمة المراقبة</h2>
       <span class="note">نافذة 48 ساعة لكل عملة</span>
     </header>
@@ -955,13 +963,14 @@ function renderWatchlist(rows) {
   const host = document.getElementById("watchlist");
   if (!rows.length) { host.innerHTML = `<div class="empty">لا عملات مراقَبة نشطة.</div>`; return; }
   host.innerHTML = `<table><thead><tr>
-      <th>العنوان</th><th>المصدر</th><th>أوّل ظهور</th><th style="width:22%">المتبقّي من 48 ساعة</th><th>لقطات</th>
+      <th>العنوان</th><th>الأمان</th><th>المصدر</th><th>أوّل ظهور</th><th style="width:22%">المتبقّي من 48 ساعة</th><th>لقطات</th>
     </tr></thead><tbody>${rows.map(w => {
       const r = remaining(w.watch_until);
       const low = r.frac < 0.15;
       return `<tr>
         <td class="mono">${extLink(fomoTokenUrl(w.token_address, w.network_id),
               esc(shortAddr(w.token_address)))}</td>
+        <td>${safetyBadge(w.combined_status)}</td>
         <td><span class="badge"><i class="key" style="background:${typeColor(w.source)}"></i>${esc(typeLabel(w.source))}</span></td>
         <td>${ago(w.first_seen_at)}</td>
         <td><div style="display:flex;align-items:center;gap:9px">
@@ -970,6 +979,28 @@ function renderWatchlist(rows) {
         </div></td>
         <td class="num">${num(w.tick_count)}</td></tr>`;
     }).join("")}</tbody></table>`;
+}
+
+function safetyBadge(status) {
+  if (status === "pass") return `<span class="badge good">✓ اجتازت</span>`;
+  if (status === "blocked") return `<span class="badge bad">✕ محظورة</span>`;
+  if (status === "review") return `<span class="badge warn">! مراجعة</span>`;
+  return `<span class="badge">؟ مجهولة</span>`;
+}
+
+function renderSafety(data) {
+  const c = data.counts || {};
+  const cells = [
+    ["اجتازت الطبقتين", c.pass || 0, "var(--good)"],
+    ["تحتاج مراجعة", c.review || 0, "var(--warn)"],
+    ["محظورة", c.blocked || 0, "var(--crit)"],
+    ["مجهولة/غير مكتملة", c.unknown || 0, "var(--muted)"],
+  ];
+  document.getElementById("safety").innerHTML = `
+    <div class="summary">${cells.map(x => `<div class="cell">
+      <div class="l">${x[0]}</div><div class="v" style="color:${x[2]}">${num(x[1])}</div>
+    </div>`).join("")}</div>
+    <p class="note" style="margin:12px 0 0">الاجتياز ليس ضمان ربح ولا إثبات بيع DEX؛ هو غياب مانع معروف في الفحصين لحظة القياس.</p>`;
 }
 
 function renderSignals(rows) {
@@ -1035,7 +1066,7 @@ async function tick() {
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
   try {
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress] = await Promise.all([
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, safety] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -1047,6 +1078,7 @@ async function tick() {
       getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
       getJSON("/api/signal-timeline?hours=24"),
       getJSON("/api/control-progress"),
+      getJSON("/api/safety"),
     ]);
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
@@ -1060,6 +1092,7 @@ async function tick() {
     paint("control-progress", () => renderControlProgress(controlProgress));
     paint("timeline",     () => renderTimeline(tl));
     paint("health",    () => renderHealth(bars, storage, st));
+    paint("safety",    () => renderSafety(safety));
     paint("watchlist", () => renderWatchlist(wl.watchlist || []));
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));

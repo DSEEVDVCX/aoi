@@ -94,6 +94,11 @@ def api_watchlist() -> dict[str, Any]:
     return {"watchlist": rows}
 
 
+@app.get("/api/safety")
+def api_safety() -> dict[str, Any]:
+    return _with_conn(dao.safety_summary)
+
+
 @app.get("/api/ticks-summary")
 def api_ticks_summary() -> dict[str, Any]:
     return _with_conn(dao.ticks_summary)

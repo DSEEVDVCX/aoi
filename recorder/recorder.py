@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import config
+import chain_security
 import extract
 from db import RecorderDB, utcnow_iso
 from leaderboard_cache import LeaderboardCache
@@ -525,6 +526,95 @@ async def run_risk_cycle(
     return stats
 
 
+async def run_chain_security_cycle(
+    db: RecorderDB, recorded_at: str
+) -> dict[str, int]:
+    """يشغّل فحص السلسلة بالتوازي المحدود ثم يحفظ النتائج تسلسلياً في SQLite."""
+    stats = {
+        "chain_tokens": 0, "chain_pass": 0, "chain_review": 0,
+        "chain_blocked": 0, "chain_unknown": 0, "chain_errors": 0,
+    }
+    if not config.CHAIN_SECURITY_ENABLED:
+        return stats
+    now_dt = datetime.fromisoformat(recorded_at)
+    stale_before = (
+        now_dt - timedelta(seconds=config.CHAIN_SECURITY_REFRESH_SECONDS)
+    ).isoformat()
+    error_stale_before = (
+        now_dt - timedelta(seconds=config.CHAIN_SECURITY_ERROR_RETRY_SECONDS)
+    ).isoformat()
+    due = db.chain_fetch_due(
+        config.CHAIN_SECURITY_PER_CYCLE, stale_before, error_stale_before
+    )
+    if not due:
+        return stats
+
+    import httpx
+
+    semaphore = asyncio.Semaphore(config.CHAIN_SECURITY_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0)) as http:
+        async def scan(watch: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            async with semaphore:
+                result = await chain_security.scan_chain_token(
+                    watch["token_address"], str(watch["network_id"] or ""), client=http
+                )
+                return watch, result
+
+        scans = await asyncio.gather(*(scan(w) for w in due))
+
+    for watch, result in scans:
+        addr = watch["token_address"]
+        net = str(watch["network_id"] or "")
+        gate = str(result.get("gate_status") or "unknown")
+        reason_codes = result.get("reason_codes") or []
+        row = {
+            "token_address": addr,
+            "network_id": net,
+            "recorded_at": recorded_at,
+            "watch_first_seen_at": watch["first_seen_at"],
+            "entry_signal_id": watch.get("entry_signal_id"),
+            "is_control": int(watch.get("is_control") or 0),
+            "chain_kind": result.get("chain_kind") or "unsupported",
+            "rpc_chain_id": result.get("rpc_chain_id"),
+            "gate_status": gate,
+            "reason_codes_json": chain_security.dumps_compact(reason_codes),
+            "contract_exists": result.get("contract_exists"),
+            "token_standard": result.get("token_standard"),
+            "program_or_implementation": result.get("program_or_implementation"),
+            "owner_authority": result.get("owner_authority"),
+            "owner_renounced": result.get("owner_renounced"),
+            "mint_authority": result.get("mint_authority"),
+            "freeze_authority": result.get("freeze_authority"),
+            "paused": result.get("paused"),
+            "upgradeable": result.get("upgradeable"),
+            "dangerous_capabilities_json": chain_security.dumps_compact(
+                result.get("dangerous_capabilities") or []
+            ),
+            "transfer_simulation_status": result.get("transfer_simulation_status")
+            or "not_attempted",
+            "top1_account_pct": result.get("top1_account_pct"),
+            "top10_accounts_pct": result.get("top10_accounts_pct"),
+            "details_json": chain_security.dumps_compact(result.get("details") or {}),
+            "raw_json": chain_security.dumps_compact(result.get("raw") or {}),
+        }
+        db.insert_chain_assessment(row)
+        error = "scanner_error" in reason_codes
+        db.set_chain_state(addr, net, "error" if error else ("ok" if gate == "pass" else gate),
+                           recorded_at)
+        stats["chain_tokens"] += 1
+        if gate == "pass":
+            stats["chain_pass"] += 1
+        elif gate == "review":
+            stats["chain_review"] += 1
+        elif gate == "blocked":
+            stats["chain_blocked"] += 1
+        else:
+            stats["chain_unknown"] += 1
+        if error:
+            stats["chain_errors"] += 1
+    return stats
+
+
 async def run_cycle(
     client: Any,
     db: RecorderDB,
@@ -540,6 +630,8 @@ async def run_cycle(
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
         "risk_tokens": 0, "risk_blocked": 0, "risk_review": 0,
         "risk_unknown": 0, "risk_warnings": 0,
+        "chain_tokens": 0, "chain_pass": 0, "chain_review": 0,
+        "chain_blocked": 0, "chain_unknown": 0,
         "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
 
@@ -661,6 +753,17 @@ async def run_cycle(
             stats["errors"] += risk["risk_errors"]
     except Exception as exc:  # noqa: BLE001
         _fail("risk", exc)
+
+    # 2.45) تحقق مستقلّ من السلسلة: صلاحيات Token-2022/عقد EVM ومحاكاة نقل.
+    try:
+        chain = await run_chain_security_cycle(db, recorded_at)
+        for key in ("chain_tokens", "chain_pass", "chain_review",
+                    "chain_blocked", "chain_unknown"):
+            stats[key] = chain[key]
+        if chain["chain_errors"]:
+            stats["errors"] += chain["chain_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("chain_security", exc)
 
     # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
     try:
