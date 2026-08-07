@@ -623,6 +623,81 @@ def extract_social(
 
 
 # ---------------------------------------------------------------------------
+# بوابة مخاطر التداول: responseObject{disableBuying, disableSelling, warnings[]}
+# ---------------------------------------------------------------------------
+def extract_risk_assessment(
+    raw_envelope: Any,
+    token_address: str,
+    network_id: str,
+    recorded_at: str,
+    watch_first_seen_at: str,
+    entry_signal_id: str | None,
+    is_control: int = 0,
+) -> dict[str, Any] | None:
+    """مغلّف tokenWarnings → لقطة قابلة للتدقيق، من دون افتراض أن الغائب آمن.
+
+    `pass` هنا نتيجة غربلة المزود فقط. لا نسمّيها sellable لأن إثبات البيع
+    يحتاج محاكاة معاملة وفحص صلاحيات العقد/Token-2022 بصورة مستقلة.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, Mapping):
+        return None
+
+    disable_buying = _bool_to_int(ro.get("disableBuying"))
+    disable_selling = _bool_to_int(ro.get("disableSelling"))
+    warnings_raw = ro.get("warnings")
+    warnings_known = isinstance(warnings_raw, list)
+    warnings = warnings_raw if warnings_known else []
+
+    types: set[str] = set()
+    severe_count = 0
+    high_count = 0
+    for warning in warnings:
+        if not isinstance(warning, Mapping):
+            continue
+        warning_type = _str(warning.get("type"))
+        if warning_type:
+            types.add(warning_type)
+        severity = (_str(warning.get("severity")) or "").strip().upper()
+        if severity in {"SEVERE", "CRITICAL"}:
+            severe_count += 1
+        elif severity == "HIGH":
+            high_count += 1
+
+    if disable_buying == 1 or disable_selling == 1:
+        gate_status = "blocked"
+    elif disable_buying is None or disable_selling is None or not warnings_known:
+        gate_status = "unknown"
+    # بوابة تنفيذ محافظة: وجود تحذير من المزوّد يكفي لإيقاف القبول الآلي، حتى
+    # لو صُنّف MODERATE (مثال حيّ: TOKEN_MINTABLE يسمح بتخفيف الحيازة،
+    # وTOKEN_FREEZABLE يسمح بمنع البيع). الشدة تبقى محفوظة للتحليل اللاحق.
+    elif warnings:
+        gate_status = "review"
+    else:
+        gate_status = "pass"
+
+    return {
+        "token_address": token_address,
+        "network_id": network_id,
+        "recorded_at": recorded_at,
+        "watch_first_seen_at": watch_first_seen_at,
+        "entry_signal_id": entry_signal_id,
+        "is_control": 1 if is_control else 0,
+        "disable_buying": disable_buying,
+        "disable_selling": disable_selling,
+        "warning_count": len(warnings),
+        "severe_count": severe_count,
+        "high_count": high_count,
+        "gate_status": gate_status,
+        "warning_types_json": _dumps(sorted(types)),
+        "warnings_json": _dumps(warnings),
+        "raw_json": _dumps(raw_envelope),
+    }
+
+
+# ---------------------------------------------------------------------------
 # leaderboard: صفّ trader مُعيَّن (id, rank) → خريطة id→rank
 # get_leaderboard تعيد {"traders": [{id, rank, ...}], "total_items": N}
 # ---------------------------------------------------------------------------

@@ -354,6 +354,50 @@ CREATE TABLE IF NOT EXISTS social_fetch_state (
     PRIMARY KEY (token_address, network_id)
 );
 
+-- لقطات بوابة مخاطر التداول من POST /proxy/tokenWarnings.
+--
+-- هذه **مشاهدة زمنية بعد القبول** وليست ميزة معروفة بأثر رجعي عند t0. لذلك
+-- نحفظ first_seen_at/entry_signal_id كي يستطيع التحليل اللاحق ضبط زمن الدخول
+-- على recorded_at (اكتمال الفحص)، ولا يلصق التحذير لاحقاً بصفّ الإشارة القديم
+-- فينشأ تسرّب للمستقبل.
+--
+-- `gate_status='pass'` يعني أن مزوّد التحذيرات لم يمنع الشراء/البيع ولم يرجع
+-- تحذيراً عالي الخطورة في تلك اللحظة؛ لا يعني أن البيع مثبت بمحاكاة معاملة.
+CREATE TABLE IF NOT EXISTS token_risk_assessments (
+    token_address       TEXT NOT NULL,
+    network_id          TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    watch_first_seen_at TEXT NOT NULL,
+    entry_signal_id     TEXT,
+    is_control          INTEGER NOT NULL DEFAULT 0,
+    disable_buying      INTEGER,                 -- NULL = لم يصرّح المزود
+    disable_selling     INTEGER,                 -- NULL = مجهول، لا نفترض False
+    warning_count       INTEGER NOT NULL,
+    severe_count        INTEGER NOT NULL,
+    high_count          INTEGER NOT NULL,
+    gate_status         TEXT NOT NULL,           -- pass / blocked / review / unknown
+    warning_types_json  TEXT NOT NULL,
+    warnings_json       TEXT NOT NULL,
+    raw_json            BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_risk_token_ts
+    ON token_risk_assessments (token_address, network_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_risk_gate_ts
+    ON token_risk_assessments (gate_status, recorded_at);
+
+-- حالة الجدولة الدوّارة لبوابة المخاطر. الخطأ يُعاد سريعاً، لأن غياب نتيجة
+-- الفحص يجب أن يبقى `unknown` ولا يجوز أن يمرّ كعملة آمنة.
+CREATE TABLE IF NOT EXISTS risk_fetch_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                          -- ok / blocked / review / unknown / error
+    warnings      INTEGER,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+
 -- النتائج (labels): يملؤها الـ labeler (عملية FomoLabeler المنفصلة)، لا المسجّل
 -- — المسجّل يسجّل خاماً فقط (منع تسرّب المستقبل)، والتوسيم لا يجري إلّا بعد
 -- اكتمال نافذة الـ48 ساعة.

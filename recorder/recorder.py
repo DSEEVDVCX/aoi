@@ -352,6 +352,17 @@ async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) ->
     return await client._get(settings.upstream_feed_token_thesis_path, params)
 
 
+async def _fetch_risk_raw(client: Any, token_address: str, network_id: str) -> Any:
+    """خام POST /proxy/tokenWarnings — بوابات الشراء/البيع والتحذيرات."""
+    from fomo_api.config import settings
+
+    body = {
+        "address": token_address,
+        "networkId": int(network_id) if str(network_id).isdigit() else network_id,
+    }
+    return await client._post(settings.upstream_token_warnings_path, body)
+
+
 async def refresh_leaderboard(
     lb: LeaderboardCache, db: RecorderDB, now_mono: float, recorded_at: str
 ) -> None:
@@ -463,6 +474,57 @@ async def run_social_cycle(
     return stats
 
 
+async def run_risk_cycle(
+    client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
+) -> dict[str, int]:
+    """يفحص مخاطر التداول زمنياً؛ الخطأ أو الحقول الناقصة لا تتحول إلى أمان."""
+    stats = {
+        "risk_tokens": 0, "risk_blocked": 0, "risk_review": 0,
+        "risk_unknown": 0, "risk_warnings": 0, "risk_errors": 0,
+    }
+    now_dt = datetime.fromisoformat(recorded_at)
+    stale_before = (now_dt - timedelta(seconds=config.RISK_REFRESH_SECONDS)).isoformat()
+    error_stale_before = (
+        now_dt - timedelta(seconds=config.RISK_ERROR_RETRY_SECONDS)
+    ).isoformat()
+    due = db.risk_fetch_due(
+        limit=config.RISK_PER_CYCLE,
+        stale_before_iso=stale_before,
+        error_stale_before_iso=error_stale_before,
+    )
+
+    for i, w in enumerate(due):
+        addr = w["token_address"]
+        net = str(w["network_id"] or "")
+        try:
+            raw = await _fetch_risk_raw(client, addr, net)
+            row = extract.extract_risk_assessment(
+                raw, addr, net, recorded_at, w["first_seen_at"],
+                w.get("entry_signal_id"), int(w.get("is_control") or 0),
+            )
+            if row is None:
+                raise ValueError("tokenWarnings responseObject is missing")
+            db.insert_risk_assessment(row)
+            gate = row["gate_status"]
+            db.set_risk_state(addr, net, gate if gate != "pass" else "ok",
+                              row["warning_count"], recorded_at)
+            stats["risk_tokens"] += 1
+            stats["risk_warnings"] += row["warning_count"]
+            if gate == "blocked":
+                stats["risk_blocked"] += 1
+            elif gate == "review":
+                stats["risk_review"] += 1
+            elif gate == "unknown":
+                stats["risk_unknown"] += 1
+        except Exception as exc:  # noqa: BLE001 — فشل عملة لا يمنع الباقي
+            stats["risk_errors"] += 1
+            db.set_risk_state(addr, net, "error", 0, recorded_at)
+            db.set_meta("last_error_risk", f"{recorded_at}: {type(exc).__name__}: {exc}")
+        if i + 1 < len(due):
+            await sleep(config.RISK_PACING_SECONDS)
+    return stats
+
+
 async def run_cycle(
     client: Any,
     db: RecorderDB,
@@ -476,6 +538,8 @@ async def run_cycle(
         "signals": 0, "watch_added": 0, "comparison_signal_added": 0,
         "control_added": 0, "ticks": 0, "static": 0,
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
+        "risk_tokens": 0, "risk_blocked": 0, "risk_review": 0,
+        "risk_unknown": 0, "risk_warnings": 0,
         "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
 
@@ -585,6 +649,18 @@ async def run_cycle(
             )
         except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
             _fail("control", exc)
+
+    # 2.4) بوابة مخاطر التداول. توضع بعد قبول الإشارة مباشرة وقبل بقية الطبقات
+    # حتى يكون recorded_at أقرب ما يمكن إلى قرار الدخول، مع بقائها مشاهدة لاحقة.
+    try:
+        risk = await run_risk_cycle(client, db, recorded_at)
+        for key in ("risk_tokens", "risk_blocked", "risk_review",
+                    "risk_unknown", "risk_warnings"):
+            stats[key] = risk[key]
+        if risk["risk_errors"]:
+            stats["errors"] += risk["risk_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("risk", exc)
 
     # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
     try:

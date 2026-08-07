@@ -72,6 +72,7 @@ fomo.family تعرض حالة السوق **الآن** ولا تحفظ التار
 2) POST /proxy/trendingTokens  ┐
    GET  /proxy/verifiedTokens  ┘ → snapshots + market_ticks + token_static
 2.25) اختيار عملات ضابطة عشوائية      (حتى بلوغ 40)
+2.4)  POST /proxy/tokenWarnings → بوابة مخاطر الشراء/البيع (12 عملة/دورة)
 2.5)  POST /proxy/getBarsNew   → token_bars     (9 عملات/دورة، تناوب)
 2.75) GET /feed/token/thesis   → token_social   (4 عملات/دورة، تناوب)
 2.9)  POST /proxy/getBarsNew   → شموع SOL/WETH/WBTC الساعية (كل ساعة)
@@ -94,12 +95,13 @@ fomo.family تعرض حالة السوق **الآن** ولا تحفظ التار
 | `token_static` | ثوابت العملة (mint/freeze/socials) | مرّة واحدة عند الدخول |
 | `token_social` | سلسلة زمنية للزخم الاجتماعي | `thesis_total` لا `thesis_count` |
 | `token_thesis` | صفّ لكل أطروحة بختم كتابتها | يتيح العدّ **التاريخي** |
+| `token_risk_assessments` | سلسلة زمنية لبوابات الشراء/البيع والتحذيرات | `pass` غربلة مزوّد فقط، **لا يثبت إمكان البيع** |
 | `snapshots` | أرشيف خام كامل لكل مصدر/دورة | يشمل **الصدارة الخام كل ساعة** (منذ 2026-07-28) |
 | `outcomes` | **النتائج (labels)** | يملؤها الموسِّم حصراً |
 | `phase1_watch_outcomes` | نتائج المقارنة المؤهلة فقط | View آمنة لا تعرض إلا بيانات المقارنة الجديدة `v3` |
 | `token_class` | تصنيف الأصل (ميم/كبير/مسعَّر/مستقرّة) | مشتقّ — `classify_tokens.py` |
 | `training_rows` | **جدول التدريب**: 104 ميزة عند t=0 + الليبل | مشتقّ — `build_training_rows.py`؛ **`--rebuild` إلزاميّ قبل أيّ تدريب** |
-| `bars_fetch_state` / `social_fetch_state` | حالة التناوب | تقود الجدولة الدوّارة |
+| `bars_fetch_state` / `social_fetch_state` / `risk_fetch_state` | حالة التناوب | تقود الجدولة الدوّارة |
 | `meta` | عدّادات وحالة تشغيل | `last_error_*`, `last_feed_event_at` |
 
 **لقطة الحالة** (2026-08-07): 41,474 إشارة · **750 عملة مصنَّفة** (716 ميم) ·
@@ -117,6 +119,8 @@ fomo.family تعرض حالة السوق **الآن** ولا تحفظ التار
 4. **مقاومة انحياز البقاء** — العملة الخاسرة والميّتة تُسجَّل كالرابحة تماماً.
 5. **قراءة فقط (FR-012)** — لا نداء يكتب حالة حساب أو تداول.
 6. **لا تصفية عند الجمع** — سجّل كل شيء، صفِّ عند النمذجة (§7).
+7. **الأمان المجهول لا يساوي آمناً** — فشل الفحص أو غياب حقل البيع يبقى
+   `unknown`. وتوقيت الفحص محفوظ؛ لا يُلصق بإشارة t=0 بأثر رجعي.
 
 ---
 
@@ -557,6 +561,7 @@ cd recorder; py run_exit_sim.py --source activity --cost 0.02   # على الر�
 | الوثيقة | المحتوى |
 |---|---|
 | [`docs/PLAN.md`](docs/PLAN.md) | **ماذا نفعل بعد جمع البيانات — بالتفصيل** |
+| [`docs/TOKEN_RISK_GATE.md`](docs/TOKEN_RISK_GATE.md) | بوابة مخاطر البيع وخطة الاستفادة من مشروع `crib` |
 | [`recorder/README.md`](recorder/README.md) | المسجّل والموسِّم: الشموع، الاجتماعي، الضابطة، الضغط |
 | [`api/README.md`](api/README.md) | الخادم: المصادقة، التنبيهات، السجلّات |
 | [`dashboard/README.md`](dashboard/README.md) | اللوحة: المقاييس، قرارات التصميم |

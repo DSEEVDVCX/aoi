@@ -79,9 +79,40 @@ class RecorderDB:
             raise
         with open(schema_path, "r", encoding="utf-8") as fh:
             self._conn.executescript(fh.read())
+        self._normalize_risk_assessments()
         self._backfill_watch_windows()
         self._quarantine_legacy_outcomes()
         self._conn.commit()
+
+    def _normalize_risk_assessments(self) -> None:
+        """يعيد اشتقاق القرار المحافظ للصفوف السابقة بعد تشديد البوابة.
+
+        `gate_status` مشتقّ لا خام؛ الخام والتحذيرات لا يتغيّران. سبق أن مرّ
+        تحذير MODERATE مثل TOKEN_MINTABLE كـpass، وهذا غير صالح للتنفيذ الآلي.
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("token_risk_assessments",),
+        ).fetchone()
+        if not exists:
+            return
+        self._conn.execute(
+            """UPDATE token_risk_assessments
+                  SET gate_status='review'
+                WHERE gate_status='pass' AND warning_count > 0"""
+        )
+        self._conn.execute(
+            """UPDATE risk_fetch_state AS s
+                  SET last_status='review'
+                WHERE last_status='ok'
+                  AND EXISTS (
+                      SELECT 1 FROM token_risk_assessments a
+                       WHERE a.token_address=s.token_address
+                         AND a.network_id=s.network_id
+                         AND a.recorded_at=s.last_fetch_at
+                         AND a.gate_status='review'
+                  )"""
+        )
 
     def _quarantine_legacy_outcomes(self) -> None:
         """يعزل كل نتيجة watch أقدم من تصميم المقارنة الحالي."""
@@ -556,6 +587,59 @@ class RecorderDB:
         ).fetchone()
         return int(row["n"])
 
+    # --- token_risk_assessments ---
+    def insert_risk_assessment(self, row: Mapping[str, Any]) -> bool:
+        """لقطة بوابة مخاطر؛ الخام مضغوط والمفتاح يمنع تكرار الدورة نفسها."""
+        cols = _RISK_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO token_risk_assessments({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        self._commit()
+        return cur.rowcount > 0
+
+    def set_risk_state(
+        self, token_address: str, network_id: str, status: str,
+        warnings: int, now_iso: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO risk_fetch_state(
+                   token_address, network_id, last_fetch_at, last_status, warnings, attempts)
+               VALUES(?, ?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_fetch_at = excluded.last_fetch_at,
+                   last_status   = excluded.last_status,
+                   warnings      = excluded.warnings,
+                   attempts      = risk_fetch_state.attempts + 1""",
+            (token_address, network_id, now_iso, status, warnings),
+        )
+        self._commit()
+
+    def risk_fetch_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+    ) -> list[dict[str, Any]]:
+        """المراقَبات المستحقّة لفحص الخطر؛ الجديدة أولاً والإشارات قبل الضابطة."""
+        rows = self._conn.execute(
+            """SELECT w.token_address, w.network_id, w.first_seen_at,
+                      w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
+                 FROM watchlist w
+                 LEFT JOIN risk_fetch_state s
+                   ON s.token_address=w.token_address AND s.network_id=w.network_id
+                WHERE w.active=1
+                  AND (s.last_fetch_at IS NULL
+                       OR (s.last_status='error' AND s.last_fetch_at < ?)
+                       OR (COALESCE(s.last_status, '') <> 'error'
+                           AND s.last_fetch_at < ?))
+                ORDER BY s.last_fetch_at IS NOT NULL,
+                         w.is_control,
+                         s.last_fetch_at,
+                         w.first_seen_at DESC
+                LIMIT ?""",
+            (error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- watchlist ---
     def upsert_watch(
         self,
@@ -963,6 +1047,13 @@ _SOCIAL_COLUMNS = (
     "thesis_total", "thesis_sampled", "has_next_page", "thesis_count",
     "thesis_likes", "thesis_replies", "thesis_authors", "holder_authors",
     "newest_thesis_at", "raw_json",
+)
+
+_RISK_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control", "disable_buying", "disable_selling",
+    "warning_count", "severe_count", "high_count", "gate_status",
+    "warning_types_json", "warnings_json", "raw_json",
 )
 
 _STATIC_COLUMNS = (
