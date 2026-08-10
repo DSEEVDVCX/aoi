@@ -1110,9 +1110,7 @@ _COLUMN_MIGRATIONS = (
     # صدارات المدد (v7): سقف المصدر 50 في الصدارة الأساسيّة وكل صيغ الترقيم
     # مُهمَلة بصمت، لكنّ /24h و/7d و/30d تعيد كلٌّ 100 فاتّحاد الأربع 214 متداولاً
     # (المطابقة 3.68% ← 15.26% على 7,200 حدثاً). لا سبيل لتعبئة الماضي: الأرشيف
-    # حفظ totalPnL وحدها فلا تاريخ لرتب المدد — الصفوف القديمة تبقى NULL بحقّ،
-    # وprune_dead_features يُسقط العائلة حتى تُقاس في نصفَي المجموعة (نمط حِقبة،
-    # لا ميزة).
+    # حفظ totalPnL وحدها فلا تاريخ لرتب المدد — الصفوف القديمة تبقى NULL بحقّ.
     ("signal_events", "top_trader_match_count_24h", "top_trader_match_count_24h INTEGER"),
     ("signal_events", "buyers_best_rank_24h", "buyers_best_rank_24h INTEGER"),
     ("signal_events", "top_trader_match_count_7d", "top_trader_match_count_7d INTEGER"),
@@ -1137,8 +1135,7 @@ _COLUMN_MIGRATIONS = (
     #    الوجود هو المعلومة. الصفوف القديمة تبقى NULL (الخام يحفظها لو أُريد ملؤها).
     ("signal_events", "is_top_trader_tagged", "is_top_trader_tagged INTEGER"),
     # 3) ميزات التدفّق والدمج على صفوف التدريب — من tokenDetails المجلوب أصلاً.
-    #    كلّها NULL قبل بدء الجمع، وprune_dead_features يُسقطها حتى تُقاس في
-    #    نصفَي المجموعة (نمط حِقبة لا ميزة) — كما حدث لعائلة الحيازة.
+    #    كلّها NULL قبل بدء الجمع (FR-007: «لم نقس» لا «صفر»).
     ("training_rows", "tick_rich_age_min", "tick_rich_age_min REAL"),
     ("training_rows", "flow_age_min", "flow_age_min REAL"),
     ("training_rows", "flow_buy_volume_5m", "flow_buy_volume_5m REAL"),

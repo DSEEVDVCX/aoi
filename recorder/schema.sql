@@ -534,8 +534,7 @@ CREATE TABLE IF NOT EXISTS training_rows (
     rank_le_50       INTEGER,
     -- عائلة صدارات المدد (v7): رتبة كل مدّة قياس مستقلّ، وعرض الحضور
     -- (periods_matched) يميّز متصدّر الأربع كلّها من متصدّر 24h وحدها.
-    -- كلّها NULL في الصفوف المبنيّة قبل تشغيل الجمع — نمط حِقبة يكشفه
-    -- prune_dead_features ويُسقط العائلة تلقائياً حتى تُقاس في نصفَي المجموعة.
+    -- كلّها NULL في الصفوف المبنيّة قبل تشغيل الجمع (FR-007: «لم نقس» لا «صفر»).
     top_trader_match_count_24h INTEGER,
     buyers_best_rank_24h INTEGER,
     top_trader_match_count_7d INTEGER,

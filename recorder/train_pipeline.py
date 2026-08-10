@@ -28,66 +28,6 @@ FORBIDDEN = {
     "win_trade", "up20_48h", "up100", "up200", "up300", "up500", "up1000", "up2000",
 }
 
-# دون هذا الحدّ يصير نصف الإطار أصغر من أن يميّز «ثابت بحكم الحِقبة» عن «ثابت
-# بالصدفة»، فنكتفي بفلتر التباين وحده.
-MIN_HALF_FOR_EPOCH = 200
-
-
-def prune_dead_features(frame: pd.DataFrame, feat_cols: list[str]) -> list[str]:
-    """يُسقط الأعمدة التي لا تحمل معلومة، ويكشف علامات الحِقبة.
-
-    `FORBIDDEN` قائمةُ **منعٍ** يدوية: كل عمود لا يُذكر فيها صراحةً يصير ميزةً.
-    فالحقول التي ترسلها fomo بقيمة ميتة — `social_replies` و`are_top_traders`
-    و`is_scam` و`platform_dev_holding` — تدخل النموذج اليوم بلا أن يقصدها أحد.
-    وحذفُها بيدٍ من القائمة يحلّ اليوم ويصنع مشكلة الغد: إن بدأت المنصّة تملأ
-    أحدها فلن ينتبه أحد لإعادته. القرار هنا بالتباين المقيس لا بالاسم، فيسقط
-    الميت الآن ويُقبل تلقائياً يوم يحمل قيماً — والسطر المطبوع هو الإشعار.
-
-    وفي «يوم يحمل قيماً» فخّ: عمود ثابت في كل الصفوف القديمة ومتغيّر في الجديدة
-    ليس ميزة بل **ساعة** — يقرأ منه النموذج حِقبة الصفّ فيتنبّأ بمعدّل الأساس لا
-    بالعملة، وAUC يرتفع بلا أفضلية حقيقية. هذا بعينه ما رُفض سابقاً في
-    `config.py:43` (تسريب حِقبة)، فنكشفه هنا بدل أن ينزلق مع أول تصحيح للمنصّة
-    أو مع أول مصدر جديد لم ينضج بعدُ عبر نافذة الـ48 ساعة.
-
-    يُنادى **بعد** ترقيم الأعمدة النصّية: `factorize` يعطي NaN القيمة −1، فيبقى
-    تمييز «غائب/حاضر» قائماً وهو جوهر كشف الحِقبة.
-    """
-    kept: list[str] = []
-    dead: list[str] = []
-    epoch: list[str] = []
-    mid = len(frame) // 2
-    for c in feat_cols:
-        col = frame[c]
-        if col.nunique(dropna=False) <= 1:
-            dead.append(c)  # ثابت أو NULL بالكامل — لا معلومة أصلاً
-            continue
-        # الإطار مرتَّب زمنياً في `load_frame`، فالنصف الأول هو الماضي.
-        if mid >= MIN_HALF_FOR_EPOCH:
-            early, late = col.iloc[:mid], col.iloc[mid:]
-            const_half = None
-            if early.nunique(dropna=False) <= 1:
-                const_half, other = early, late
-            elif late.nunique(dropna=False) <= 1:
-                const_half, other = late, early
-            if const_half is not None:
-                v = const_half.iloc[0]
-                shared = other.isna() if pd.isna(v) else (other == v)
-                # قيمة النصف الثابت لا تظهر في النصف الآخر ولو مرّة ⇒ العمود
-                # يحدّد الحِقبة يقيناً لنصف الصفوف. ذلك تأريخ لا قياس.
-                if not shared.any():
-                    epoch.append(c)
-                    continue
-        kept.append(c)
-
-    if dead:
-        print(f"أُسقط {len(dead)} عموداً بلا تباين: {', '.join(sorted(dead))}")
-    if epoch:
-        print(f"أُسقط {len(epoch)} عموداً كعلامة حِقبة: {', '.join(sorted(epoch))}")
-        print("  (قيمة نصفه الثابت غائبة تماماً عن النصف الآخر — النموذج يقرأ "
-              "منه التاريخ. إن كان إشارة جديدة صحيحة فانتظر تغطيتها النصف "
-              "المبكّر قبل إدخالها.)")
-    return kept
-
 
 DEFAULT_PARAMS = {"lr": 0.05, "depth": 3, "leaf": 40, "l2": 1.0, "iters": 300}
 PARAM_GRID = [
@@ -145,9 +85,7 @@ def main() -> None:
     for c in feat_cols:
         if isinstance(frame[c].dtype, pd.StringDtype) or frame[c].dtype == object:
             frame[c] = pd.factorize(frame[c], use_na_sentinel=True)[0].astype(float)
-    raw_n = len(feat_cols)
-    feat_cols = prune_dead_features(frame, feat_cols)
-    print(f"إجمالي: {len(frame)} · ميزات: {len(feat_cols)}/{raw_n} · هدف: {target}")
+    print(f"إجمالي: {len(frame)} · ميزات: {len(feat_cols)} · هدف: {target}")
 
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import roc_auc_score
