@@ -77,6 +77,41 @@ async def _fetch_verified_raw(client: Any) -> Any:
     return await client._get(settings.upstream_verified_tokens_path)
 
 
+async def _fetch_most_held_raw(client: Any) -> Any:
+    """خام POST /proxy/mostHeld — قائمة اكتشاف ثالثة.
+
+    مقيس حيّاً: `[200]`، 25 عنصراً، يتقاطع مع مستخرِج trending في 18 مفتاحاً
+    ⇒ `extract_market_tick` يكفي بلا تعديل. 19 من 25 كانت مراقَبة عندنا و**6
+    جديدة تماماً** — أي أنّه يرى عملات لا تراها القائمتان الأخريان.
+    """
+    from fomo_api.config import settings
+
+    return await client._post(settings.upstream_most_held_path, {})
+
+
+async def _fetch_filter_tokens_raw(client: Any, symbols: list[str]) -> Any:
+    """خام POST /proxy/filterTokens — الجسم **مصفوفة** `"address:networkId"`.
+
+    مقيس حيّاً: 150 عنواناً في نداء واحد ترجع 150/150 (326 KB)، والعنوان
+    الميّت **يُحذف بصمت والدفعة تنجو** (5 من 6 رجعت، `[200]`) — فعملة تُشطب
+    أثناء النافذة لا تُعمي بقيّة الدفعة.
+    """
+    from fomo_api.config import settings
+
+    return await client._post(settings.upstream_filter_tokens_path, symbols)
+
+
+async def _fetch_trader_raw(client: Any, trader_id: str) -> Any:
+    """خام GET /v2/users/{id} — ملفّ المتداول.
+
+    نتجاوز `get_trader` لأنّها تُعيّن وتُسقط حقولاً؛ نريد المغلّف كاملاً
+    للأرشيف. مقيس حيّاً: 26 مفتاحاً في `responseObject`.
+    """
+    from fomo_api.config import settings
+
+    return await client._get(settings.upstream_trader_path.format(trader_id=trader_id))
+
+
 async def _fetch_bars_raw(
     client: Any, token_address: str, network_id: str, from_ts: int, to_ts: int,
     resolution: str | None = None,
@@ -526,10 +561,16 @@ async def run_holders_cycle(
 
     كلٌّ يُخزَّن بصفّه (`source` داخل المفتاح الأساسي) فلا يطمس أحدهما قياس
     الآخر، ولا نفبرك قيمة غائبة (FR-007). فشل مصدر لا يُسقط الثاني.
+
+    وردّ `tokenDetails` يُستخرَج **مرّتين**: تركّز الملكية إلى `token_holders`،
+    وتدفّق الشراء/البيع إلى `token_flow` — **جلب واحد، مستخرِجان، جدولان**.
+    الردّ يحمل (100% في 300 ردّ مؤرشف) انقسام الشراء/البيع وطبقة 5 دقائق
+    كاملة، وكنّا نرميها كلّها. صفر نداء إضافي. فشل أحد المستخرِجَين لا يُسقط
+    الآخر: التدفّق في `try` خاصّ به.
     """
     stats = {
         "holders_tokens": 0, "holders_details": 0,
-        "holders_top": 0, "holders_errors": 0,
+        "holders_top": 0, "holders_errors": 0, "flow_rows": 0,
     }
     now_dt = datetime.fromisoformat(recorded_at)
     stale_before = (now_dt - timedelta(seconds=config.HOLDERS_REFRESH_SECONDS)).isoformat()
@@ -555,30 +596,173 @@ async def run_holders_cycle(
             ("token_details", _fetch_token_details_raw, extract.extract_token_details_holders),
             ("hodlers_top", _fetch_hodlers_raw, extract.extract_platform_holders),
         ):
+            raw: Any = None  # يبقى None لو رمى الجلب — يُقرأ في فرع التدفّق أدناه
             try:
                 raw = await fetch_fn(client, addr, net)
                 row = extract_fn(raw, addr, net, recorded_at, first_seen, sig, is_control)
-                if row is None:
-                    continue
-                db.insert_holders(row)
-                got += 1
-                if source == "token_details":
-                    stats["holders_details"] += 1
-                else:
-                    stats["holders_top"] += 1
-                if top10 is None:
-                    top10 = row["top10_pct"]
+                if row is not None:
+                    db.insert_holders(row)
+                    got += 1
+                    if source == "token_details":
+                        stats["holders_details"] += 1
+                    else:
+                        stats["holders_top"] += 1
+                    if top10 is None:
+                        top10 = row["top10_pct"]
             except Exception as exc:  # noqa: BLE001 — مصدر واحد لا يُسقط الباقي
                 stats["holders_errors"] += 1
                 db.set_meta(
                     "last_error_holders",
                     f"{recorded_at}: {source}: {type(exc).__name__}: {exc}",
                 )
+            # التدفّق من **نفس** الردّ: مستخرِج ثانٍ على مغلّف بين أيدينا، بلا
+            # نداء إضافي. `try` مستقلّ حتى لا يُسقط أحد الجدولين الآخر، و**خارج**
+            # فرع الحيازة عمداً: مستخرِج الحيازة يعيد None حين تغيب نسب الملكية،
+            # فلو عُلِّق التدفّق عليه لابتُلع معها — وهو حاضر 100% بينما هي لا.
+            if source == "token_details" and raw is not None:
+                try:
+                    frow = extract.extract_token_flow(
+                        raw, addr, net, recorded_at, first_seen, sig, is_control
+                    )
+                    if frow is not None:
+                        db.insert_flow(frow)
+                        stats["flow_rows"] += 1
+                except Exception as exc:  # noqa: BLE001
+                    stats["holders_errors"] += 1
+                    db.set_meta(
+                        "last_error_holders",
+                        f"{recorded_at}: flow: {type(exc).__name__}: {exc}",
+                    )
             await sleep(config.HOLDERS_PACING_SECONDS)
 
         if got:
             stats["holders_tokens"] += 1
         db.set_holders_state(addr, net, "ok" if got else "error", top10, recorded_at)
+    return stats
+
+
+async def run_filter_tokens_cycle(
+    client: Any,
+    db: RecorderDB,
+    recorded_at: str,
+    watched: set[tuple[str, str]],
+    captured: set[tuple[str, str]],
+    sleep=asyncio.sleep,
+) -> dict[str, int]:
+    """يقيس المراقَبات التي **لم تلتقطها** trending/verified في هذه الدورة.
+
+    القائمتان العامّتان تقيسان ما هو رائج، ونحن نراقب ما أشارت إليه الإشارة —
+    والمجموعتان تفترقان بسرعة. مقيس على القاعدة الحيّة: 53 من 189 مراقَبة نشطة
+    بلا لقطة منذ ساعتين، و35 لم تُقَس ولا مرّة. `filterTokens` يطلب عناويننا
+    بالاسم فيرجعها بلا اعتماد على شعبيّتها.
+
+    قيود مقيسة حيّاً لا مفترضة:
+    - الربط **بالعنوان لا بالترتيب**: كل عنصر يحمل `token.address`، والمصدر
+      **يحذف الميّت بصمت** (5 من 6 رجعت) — فالفهرس ينزلق والترتيب يكذب.
+    - **بلا `insert_snapshot`**: طلبنا مراقَباتنا بالذات فكل عنصر يصير صفّاً
+      يحمل `raw_json` الخاص به؛ اللقطة تكرار محض (~94 MB/يوم بلا فائدة).
+      بخلاف trending/verified حيث اللقطة تحفظ غير المراقَب أيضاً.
+    - أعمدة العدّ/الفريد الـ18 تبقى `NULL` من هذا المصدر — هذا هو الصواب
+      (FR-007)، ودمج المصادر في `features.market_features` هو ما يمنع هذا
+      النقص من طمس قياس أغنى جاء من trending.
+    """
+    stats = {"filter_requested": 0, "filter_ticks": 0, "filter_errors": 0}
+    missing = sorted(watched - captured)
+    if not missing:
+        return stats
+
+    for start in range(0, len(missing), config.FILTER_TOKENS_BATCH):
+        batch = missing[start : start + config.FILTER_TOKENS_BATCH]
+        symbols = [f"{addr}:{net}" for addr, net in batch]
+        stats["filter_requested"] += len(symbols)
+        try:
+            raw = await _fetch_filter_tokens_raw(client, symbols)
+            items = extract.unwrap_token_list(raw)
+            # خريطة العنوان → عنصر. العنوان يعود بحالة أحرف قد تخالف المخزَّنة
+            # (EVM checksummed)، فالمفتاح صغيرٌ كلّه على الطرفين.
+            by_addr: dict[str, Any] = {}
+            for item in items:
+                a = extract.token_list_address(item)
+                if a:
+                    by_addr[a.lower()] = item
+            with db.batch():
+                for addr, net in batch:
+                    item = by_addr.get(addr.lower())
+                    if item is None:
+                        continue  # حُذف بصمت (عملة مشطوبة) — لا يكسر الدفعة
+                    tick = extract.extract_market_tick(item, recorded_at, "filter")
+                    if tick is None:
+                        continue
+                    if db.insert_tick(tick):
+                        stats["filter_ticks"] += 1
+                    # `dex_protocol` غائب تماماً من خام trending (0 من 3,000)
+                    # وهذا مصدره الوحيد — نملأه حين يكون العمود فارغاً فقط.
+                    proto = extract.filter_item_protocol(item)
+                    if proto:
+                        db.set_static_protocol(tick["token_address"],
+                                               str(tick["network_id"] or ""), proto)
+        except Exception as exc:  # noqa: BLE001 — دفعة واحدة لا تُسقط الباقي
+            stats["filter_errors"] += 1
+            db.set_meta(
+                "last_error_filter",
+                f"{recorded_at}: {type(exc).__name__}: {exc}",
+            )
+        await sleep(config.FILTER_TOKENS_PACING_SECONDS)
+    return stats
+
+
+async def run_traders_cycle(
+    client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
+) -> dict[str, int]:
+    """يبني ملفّات المشترين الذين تتكرّر أسماؤهم في إشاراتنا.
+
+    `signal_events.buyer_id` مخزَّن منذ اليوم الأوّل ولا جدول تجّار في القاعدة:
+    5,572 معرّفاً مميّزاً، **3,202 منهم بـ≥3 أحداث**. فالسؤال «هل هذا المشتري
+    ماهر أم يشتري كل شيء؟» بقي بلا جواب رغم أنّ الجواب على بُعد نداء واحد.
+
+    الجدولة دوّارة كدورة الحائزين: غير المجلوب قطّ أوّلاً، ثم الأقدم جلباً،
+    ثم الأكثر أحداثاً. `INSERT OR REPLACE` عمداً (بخلاف كل الجداول الأخرى):
+    الملفّ **يتغيّر** — المتابعون ومدّة الحمل ليست ثوابت.
+    """
+    stats = {"traders_fetched": 0, "traders_rows": 0, "traders_errors": 0}
+    now_dt = datetime.fromisoformat(recorded_at)
+    stale_before = (
+        now_dt - timedelta(seconds=config.TRADERS_REFRESH_SECONDS)
+    ).isoformat()
+    error_stale_before = (
+        now_dt - timedelta(seconds=config.TRADERS_ERROR_RETRY_SECONDS)
+    ).isoformat()
+    due = db.traders_fetch_due(
+        limit=config.TRADERS_PER_CYCLE,
+        stale_before_iso=stale_before,
+        error_stale_before_iso=error_stale_before,
+        min_events=config.TRADERS_MIN_EVENTS,
+    )
+
+    for w in due:
+        tid = w["trader_id"]
+        status = "error"
+        try:
+            raw = await _fetch_trader_raw(client, tid)
+            stats["traders_fetched"] += 1
+            if raw is None:
+                status = "empty"  # 404: حساب محذوف — لا نعيد المحاولة سريعاً
+            else:
+                row = extract.extract_trader(raw, tid, recorded_at)
+                if row is None:
+                    status = "empty"
+                else:
+                    db.upsert_trader(row)
+                    stats["traders_rows"] += 1
+                    status = "ok"
+        except Exception as exc:  # noqa: BLE001 — متداول واحد لا يُسقط الباقي
+            stats["traders_errors"] += 1
+            db.set_meta(
+                "last_error_traders",
+                f"{recorded_at}: {type(exc).__name__}: {exc}",
+            )
+        db.set_trader_state(tid, status, recorded_at)
+        await sleep(config.TRADERS_PACING_SECONDS)
     return stats
 
 
@@ -596,6 +780,8 @@ async def run_cycle(
         "control_added": 0, "ticks": 0, "static": 0,
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
         "holders_tokens": 0, "holders_details": 0, "holders_top": 0,
+        "flow_rows": 0, "filter_requested": 0, "filter_ticks": 0,
+        "traders_rows": 0,
         "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
 
@@ -654,12 +840,21 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("feed", exc)
 
-    # 2) trending + verified الخام → snapshots + market_ticks + token_static.
+    # 2) trending + verified + mostHeld الخام → snapshots + market_ticks + token_static.
+    # `mostHeld` قائمة اكتشاف ثالثة: مقيس أنّها تعطي 25 عنصراً منها **6 لم نكن
+    # نراها** في القائمتين الأخريين، وتتقاطع معهما في 18 مفتاحاً ⇒ نفس المستخرِج
+    # يكفي، وتدخل تلقائياً في المرشّحين والضابطة وthe token_static بلا كود جديد.
     watched = {(w["token_address"], str(w["network_id"] or "")) for w in db.active_watches()}
+    # المفاتيح الملقوطة في هذه الدورة — ما يتبقّى منها تسدّه دورة filterTokens.
+    captured: set[tuple[str, str]] = set()
     # مرشّحو المجموعة الضابطة: كل عملة نراها في هذه الدورة ولم تدخل من قبل.
     # نجمعها هنا مجّاناً — البيانات في اليد أصلاً، فلا نداء شبكة إضافيّ.
     control_candidates: list[tuple[str, str, float | None, str]] = []
-    for source, fetch in (("trending", _fetch_trending_raw), ("verified", _fetch_verified_raw)):
+    for source, fetch in (
+        ("trending", _fetch_trending_raw),
+        ("verified", _fetch_verified_raw),
+        ("most_held", _fetch_most_held_raw),
+    ):
         try:
             raw = await fetch(client)
             if raw is None:
@@ -678,6 +873,7 @@ async def run_cycle(
                     # نسجّل tick لكل عملة مراقَبة (المصدر الأساسي للسلسلة الزمنية).
                     # نسجّل أيضاً الثوابت لكل عملة نراها لأول مرّة إن كانت مراقَبة.
                     if key in watched:
+                        captured.add(key)
                         if db.insert_tick(tick):
                             stats["ticks"] += 1
                         if not db.static_exists(
@@ -689,6 +885,18 @@ async def run_cycle(
                                 stats["static"] += 1
         except Exception as exc:  # noqa: BLE001
             _fail(source, exc)
+
+    # 2.3) سدّ فجوة القياس: المراقَبات التي لم تلتقطها أي قائمة في هذه الدورة.
+    # بلا هذه الخطوة تتوقّف العملة عن القياس لحظة سقوطها من القوائم العامّة —
+    # وهي لا تزال داخل نافذة الـ48 ساعة التي نزعم أنّنا نقيسها (53 من 189).
+    try:
+        filt = await run_filter_tokens_cycle(client, db, recorded_at, watched, captured)
+        stats["filter_requested"] = filt["filter_requested"]
+        stats["filter_ticks"] = filt["filter_ticks"]
+        if filt["filter_errors"]:
+            stats["errors"] += filt["filter_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("filter", exc)
 
     # 2.2) نوافذ إشارة من الكون نفسه وسعر السوق نفسه المستخدم للضابطة.
     try:
@@ -712,12 +920,22 @@ async def run_cycle(
     # لكل عملة EVM عندنا.
     try:
         hold = await run_holders_cycle(client, db, recorded_at)
-        for key in ("holders_tokens", "holders_details", "holders_top"):
+        for key in ("holders_tokens", "holders_details", "holders_top", "flow_rows"):
             stats[key] = hold[key]
         if hold["holders_errors"]:
             stats["errors"] += hold["holders_errors"]
     except Exception as exc:  # noqa: BLE001
         _fail("holders", exc)
+
+    # 2.45) ملفّات المشترين المتكرّرين — «من اشترى؟» كان سؤالاً بلا جواب رغم أنّ
+    # buyer_id مخزَّن في كل حدث منذ اليوم الأوّل.
+    try:
+        trd = await run_traders_cycle(client, db, recorded_at)
+        stats["traders_rows"] = trd["traders_rows"]
+        if trd["traders_errors"]:
+            stats["errors"] += trd["traders_errors"]
+    except Exception as exc:  # noqa: BLE001
+        _fail("traders", exc)
 
     # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
     try:

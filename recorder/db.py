@@ -593,6 +593,92 @@ class RecorderDB:
         )
         self._commit()
 
+    # --- token_flow ---
+    def insert_flow(self, row: Mapping[str, Any]) -> bool:
+        """صفّ تدفّق تداول (شراء/بيع). نفس ردّ tokenDetails الذي يغذّي الحيازة."""
+        cols = _FLOW_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO token_flow({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        self._commit()
+        return cur.rowcount > 0
+
+    # --- traders ---
+    def upsert_trader(self, row: Mapping[str, Any]) -> None:
+        """ملفّ متداول. الملفّ **يتغيّر** (متابعون، عدد صفقات) فنكتب فوقه —
+        بخلاف token_static الثابت بطبعه."""
+        cols = _TRADER_COLUMNS
+        sql = (
+            f"INSERT OR REPLACE INTO traders({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        self._commit()
+
+    def set_trader_state(self, trader_id: str, status: str, now_iso: str) -> None:
+        self._conn.execute(
+            """INSERT INTO traders_fetch_state(
+                   trader_id, last_fetch_at, last_status, attempts)
+               VALUES(?, ?, ?, 1)
+               ON CONFLICT(trader_id) DO UPDATE SET
+                   last_fetch_at = excluded.last_fetch_at,
+                   last_status   = excluded.last_status,
+                   attempts      = traders_fetch_state.attempts + 1""",
+            (trader_id, now_iso, status),
+        )
+        self._commit()
+
+    def traders_fetch_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+        min_events: int = 3,
+    ) -> list[dict[str, Any]]:
+        """المتداولون المستحقّون للجلب: **المتكرّرون وحدهم** (≥`min_events` حدثاً).
+
+        مقيس: 5,572 مشترياً مميّزاً لكنّ 3,202 فقط بـ≥3 أحداث — ومن ظهر مرّة
+        واحدة لا سلوك له نتعلّمه، فجلبه يستهلك ميزانية الدورة بلا مقابل.
+        الترتيب: من لم يُجلَب قطّ أولاً، ثم الأكثر نشاطاً (أحداثه أكثر معلومة).
+
+        `COALESCE(s.last_status,'') <> 'error'` إلزاميّ: بدونه يصير الشرط NULL
+        لمن لا صفّ حالة له فيُستبعد إلى الأبد.
+        """
+        rows = self._conn.execute(
+            """SELECT e.buyer_id AS trader_id, e.n AS event_count,
+                      s.last_fetch_at, s.last_status
+                 FROM (SELECT buyer_id, COUNT(*) n FROM signal_events
+                        WHERE buyer_id IS NOT NULL AND buyer_id <> ''
+                        GROUP BY buyer_id HAVING COUNT(*) >= ?) e
+                 LEFT JOIN traders_fetch_state s ON s.trader_id = e.buyer_id
+                WHERE (s.last_fetch_at IS NULL
+                       OR (s.last_status='error' AND s.last_fetch_at < ?)
+                       OR (COALESCE(s.last_status, '') <> 'error'
+                           AND s.last_fetch_at < ?))
+                ORDER BY s.last_fetch_at IS NOT NULL,
+                         s.last_fetch_at,
+                         e.n DESC
+                LIMIT ?""",
+            (min_events, error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_static_protocol(
+        self, token_address: str, network_id: str, protocol: str
+    ) -> bool:
+        """يملأ `dex_protocol` **حين يكون فارغاً فقط**.
+
+        `upsert_static` هو INSERT OR IGNORE فلا يحدّث صفّاً قائماً، والبروتوكول
+        لا يأتي إلّا من filterTokens (غائب من خام trending: صفر من 3,000) —
+        فيلزم مسار تحديث ضيّق. شرط `IS NULL` يمنع الكتابة فوق قياس قائم.
+        """
+        cur = self._conn.execute(
+            """UPDATE token_static SET dex_protocol=?
+                WHERE token_address=? AND network_id=? AND dex_protocol IS NULL""",
+            (protocol, token_address, network_id),
+        )
+        self._commit()
+        return cur.rowcount > 0
+
     def holders_fetch_due(
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
     ) -> list[dict[str, Any]]:
@@ -1043,6 +1129,43 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "top_trader_periods_matched", "top_trader_periods_matched INTEGER"),
     ("training_rows", "top_trader_any_period", "top_trader_any_period INTEGER"),
     ("training_rows", "best_rank_any_period", "best_rank_any_period INTEGER"),
+    # v8 — سدّ فجوة الجمع. ثلاثة أشياء كانت متاحة ولا تُجمع:
+    # 1) بروتوكول الحوض: غائب من خام trending (صفر من 3,000) ويأتي من
+    #    filterTokens وحده. الصفوف القائمة تُملأ حين نراها لاحقاً (set_static_protocol).
+    ("token_static", "dex_protocol", "dex_protocol TEXT"),
+    # 2) وسم الحدث: body.tag بقيمة وحيدة 'Top Trader' في 3.4% من 4,000 حدث ⇒
+    #    الوجود هو المعلومة. الصفوف القديمة تبقى NULL (الخام يحفظها لو أُريد ملؤها).
+    ("signal_events", "is_top_trader_tagged", "is_top_trader_tagged INTEGER"),
+    # 3) ميزات التدفّق والدمج على صفوف التدريب — من tokenDetails المجلوب أصلاً.
+    #    كلّها NULL قبل بدء الجمع، وprune_dead_features يُسقطها حتى تُقاس في
+    #    نصفَي المجموعة (نمط حِقبة لا ميزة) — كما حدث لعائلة الحيازة.
+    ("training_rows", "tick_rich_age_min", "tick_rich_age_min REAL"),
+    ("training_rows", "flow_age_min", "flow_age_min REAL"),
+    ("training_rows", "flow_buy_volume_5m", "flow_buy_volume_5m REAL"),
+    ("training_rows", "flow_sell_volume_5m", "flow_sell_volume_5m REAL"),
+    ("training_rows", "flow_net_volume_5m", "flow_net_volume_5m REAL"),
+    ("training_rows", "flow_net_volume_1h", "flow_net_volume_1h REAL"),
+    ("training_rows", "flow_net_volume_24h", "flow_net_volume_24h REAL"),
+    ("training_rows", "flow_buy_sell_volume_ratio_5m",
+     "flow_buy_sell_volume_ratio_5m REAL"),
+    ("training_rows", "flow_buy_sell_volume_ratio_1h",
+     "flow_buy_sell_volume_ratio_1h REAL"),
+    ("training_rows", "flow_buy_sell_volume_ratio_24h",
+     "flow_buy_sell_volume_ratio_24h REAL"),
+    ("training_rows", "flow_buy_count_5m", "flow_buy_count_5m INTEGER"),
+    ("training_rows", "flow_sell_count_5m", "flow_sell_count_5m INTEGER"),
+    ("training_rows", "flow_unique_buys_5m", "flow_unique_buys_5m INTEGER"),
+    ("training_rows", "flow_unique_sells_5m", "flow_unique_sells_5m INTEGER"),
+    ("training_rows", "flow_buy_sell_count_ratio_5m",
+     "flow_buy_sell_count_ratio_5m REAL"),
+    ("training_rows", "flow_unique_ratio_5m", "flow_unique_ratio_5m REAL"),
+    ("training_rows", "flow_trade_size_5m", "flow_trade_size_5m REAL"),
+    ("training_rows", "flow_is_low_fees", "flow_is_low_fees INTEGER"),
+    # ملحوظة: `dex_protocol` و`is_top_trader_tagged` **ليسا** هنا. هما عمودا
+    # جمعٍ على token_static وsignal_events (وهناك مكانهما في الهجرة أعلاه)، ولا
+    # يُنتجهما `build_features`؛ فعمودٌ لهما في training_rows يبقى NULL أبداً —
+    # وهو بالضبط عطب top10_holders_pct (1.43 مليون صفّ فارغ). عمودُ صفوف تدريب
+    # لا يُضاف إلّا ومعه مفتاحٌ في ROW_COLUMNS يكتبه.
 )
 
 _BAR_COLUMNS = (
@@ -1062,7 +1185,29 @@ _SIGNAL_COLUMNS = (
     "buyer_id", "buyer_handle", "num_swaps", "is_first_buy", "buyer_pnl_pct",
     "avg_cost", "size_usd", "in_amount", "in_token_address", "out_amount",
     "out_token_address", "token_amount", "realized_pnl_usd", "likes", "views",
-    "num_replies", "pinned", "raw_json",
+    "num_replies", "pinned", "is_top_trader_tagged", "raw_json",
+)
+
+# ترتيب أعمدة token_flow — يطابق schema.sql (بلا طبقة 12h: المصدر لا يعطيها).
+_FLOW_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control",
+    "buy_count_5m", "buy_count_1h", "buy_count_4h", "buy_count_24h",
+    "sell_count_5m", "sell_count_1h", "sell_count_4h", "sell_count_24h",
+    "buy_volume_5m", "buy_volume_1h", "buy_volume_4h", "buy_volume_24h",
+    "sell_volume_5m", "sell_volume_1h", "sell_volume_4h", "sell_volume_24h",
+    "unique_buys_5m", "unique_buys_1h", "unique_buys_4h", "unique_buys_24h",
+    "unique_sells_5m", "unique_sells_1h", "unique_sells_4h", "unique_sells_24h",
+    "is_low_fees", "raw_json",
+)
+
+# ترتيب أعمدة traders — يطابق schema.sql، ويطابق ما يعطيه /v2/users/{id}
+# **مقيساً حيّاً** (26 مفتاحاً): لا ربح ولا نسبة نجاح في هذا الردّ إطلاقاً.
+_TRADER_COLUMNS = (
+    "trader_id", "recorded_at", "handle", "display_name", "followers_count",
+    "following_count", "swap_count", "num_trades", "total_volume_usd",
+    "avg_hold_seconds", "is_restricted", "is_private", "wallet_address",
+    "evm_address", "twitter_url", "created_at", "raw_json",
 )
 
 _OUTCOME_COLUMNS = (
@@ -1101,7 +1246,8 @@ _STATIC_COLUMNS = (
     "mintable", "freezable", "is_scam", "creator_address", "launchpad_name",
     "migrated", "graduation_percent", "twitter", "telegram", "website", "discord",
     "token_created_at", "exchanges_count", "exchanges_json", "cmc_id",
-    "description", "description_len", "has_banner", "has_image", "raw_json",
+    "description", "description_len", "has_banner", "has_image",
+    "dex_protocol", "raw_json",
 )
 
 _HOLDERS_COLUMNS = (

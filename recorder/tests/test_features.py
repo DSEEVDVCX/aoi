@@ -545,6 +545,130 @@ def test_market_dense_windows_and_ratios(db):
     assert f["float_ratio"] == pytest.approx(0.6)
 
 
+# --- دمج لقطات السوق عبر المصادر (v8) ---------------------------------------
+# المصدران غير متكافئين، مقيس على 200 ألف صفّ: `verified` يحمل السعر والسيولة
+# بـ100% و**صفر%** من العدّادات، و`trending` يحملها كلّها. «أحدث صفّ» وحده كان
+# يرث فقر من صادف أن كتب أخيراً — 50% من العملات. هذه الاختبارات تحرس الإصلاح.
+def _tick(db, epoch, source, **cols):
+    db.insert_tick({
+        "token_address": TOK, "network_id": NET, "recorded_at": _iso(epoch),
+        "source": source, "raw_json": "{}", **cols,
+    })
+
+
+_RICH = {"buy_count_24h": 400, "sell_count_24h": 100, "unique_buys_24h": 250,
+         "unique_sells_24h": 80, "holders": 900, "top10_holders_pct": 42.0}
+
+
+def test_market_merge_recovers_counters_from_older_rich_row(db):
+    """صفّ `verified` أحدث وفقير فوق صفّ `trending` أقدم وغنيّ.
+
+    قبل الإصلاح كانت العدّادات كلّها None لأنّ الأحدث لا يحملها — وهي في الجدول.
+    """
+    _tick(db, T0 - 3600, "trending", liquidity=10_000.0, volume_24h=1_000.0, **_RICH)
+    _tick(db, T0 - 60, "verified", liquidity=50_000.0, volume_24h=150_000.0)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["buy_count_24h"] == 400            # من الصفّ الأقدم
+    assert f["unique_buys_24h"] == 250
+    assert f["holders"] == 900
+    assert f["top10_holders_pct"] == 42.0
+    assert f["buy_sell_ratio_24h"] == pytest.approx(4.0)   # مشتقّ **بعد** الدمج
+    # السعر والسيولة من الأحدث لا من الأقدم:
+    assert f["liquidity"] == 50_000.0
+    assert f["volume_to_liquidity"] == pytest.approx(3.0)
+
+
+def test_market_merge_stamps_two_ages_not_one(db):
+    """طزاجة صادقة: عدّاد عمره ساعة لا يُقرأ كأنّه ابن دقيقة."""
+    _tick(db, T0 - 3600, "trending", liquidity=10_000.0, **_RICH)
+    _tick(db, T0 - 60, "verified", liquidity=50_000.0)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["tick_age_min"] == pytest.approx(1.0)        # أحدث صفّ
+    assert f["tick_rich_age_min"] == pytest.approx(60.0)  # مصدر العدّادات
+
+
+def test_market_merge_rich_age_follows_newest_rich_row(db):
+    """حين يكون الأحدث غنيّاً بنفسه فالختمان يتطابقان — لا تقادُم وهميّ."""
+    _tick(db, T0 - 3600, "trending", liquidity=10_000.0, **_RICH)
+    _tick(db, T0 - 120, "trending", liquidity=50_000.0, **_RICH)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["tick_age_min"] == pytest.approx(2.0)
+    assert f["tick_rich_age_min"] == pytest.approx(2.0)
+
+
+def test_market_merge_without_any_rich_row_leaves_age_null(db):
+    """لا عدّاد في المدى ⇒ `tick_rich_age_min` = None لا صفر (FR-007)."""
+    _tick(db, T0 - 60, "verified", liquidity=50_000.0, volume_24h=150_000.0)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["tick_age_min"] == pytest.approx(1.0)
+    assert f["tick_rich_age_min"] is None
+    assert f["buy_count_24h"] is None
+    assert f["buy_sell_ratio_24h"] is None      # لا يُشتقّ من غياب
+
+
+def test_market_merge_keeps_measured_zero(db):
+    """صفر مقيس ≠ غائب: `x is None` لا `x or y` — وإلّا ابتلع الأقدمُ الصفرَ."""
+    _tick(db, T0 - 3600, "trending", liquidity=10_000.0,
+          buy_count_24h=400, sell_count_24h=100, volume_24h=9_999.0)
+    _tick(db, T0 - 60, "trending", liquidity=50_000.0,
+          buy_count_24h=0, sell_count_24h=0, volume_24h=0.0)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["buy_count_24h"] == 0              # لا 400
+    assert f["volume_24h"] == 0.0
+    assert f["buy_sell_ratio_24h"] is None      # قسمة على صفر ⇒ None لا inf
+    assert f["tick_rich_age_min"] == pytest.approx(1.0)
+
+
+def test_market_merge_fills_each_column_from_its_own_newest_row(db):
+    """الدمج عمودٌ بعمود لا صفٌّ كامل: كل عمود من أحدث صفّ يحمله هو."""
+    _tick(db, T0 - 1800, "trending", holders=700, total_supply=1_000.0)
+    _tick(db, T0 - 600, "verified", market_cap=500_000.0)
+    _tick(db, T0 - 60, "filter", liquidity=50_000.0)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["liquidity"] == 50_000.0
+    assert f["holders"] == 700
+    assert f["liquidity_to_mcap"] == pytest.approx(0.1)   # من صفّين مختلفين
+
+
+def test_market_merge_ignores_rows_after_t0(db):
+    """قانون النقطة الزمنية يسبق الدمج: صفّ غنيّ بعد t0 لا يُستدعى لسدّ فقر."""
+    _tick(db, T0 - 60, "verified", liquidity=50_000.0)
+    before = features.market_features(db, TOK, NET, T0)
+    _tick(db, T0 + 30, "trending", liquidity=99.0, **_RICH)
+
+    assert features.market_features(db, TOK, NET, T0) == before
+    assert before["buy_count_24h"] is None
+    assert before["tick_rich_age_min"] is None
+
+
+def test_market_merge_lookback_is_bounded(db):
+    """المدى محدود عمداً: عدّاد أقدم من نافذة البحث لا يُبعث حيّاً.
+
+    12 صفّاً ≈ ثلاث دورات بمصادرها الأربعة. ما وراءها قديم بما يكفي ليكذب.
+    """
+    _tick(db, T0 - 7200, "trending", **_RICH)
+    for i in range(features._TICK_MERGE_LOOKBACK):
+        _tick(db, T0 - 60 * (i + 1), "verified", liquidity=50_000.0)
+
+    f = features.market_features(db, TOK, NET, T0)
+
+    assert f["liquidity"] == 50_000.0
+    assert f["buy_count_24h"] is None
+    assert f["tick_rich_age_min"] is None
+
+
 def test_bar_volume_surge_before_signal(db):
     _bars(db, T0 - 86400, 288, c=1.0)                 # حجم 10 لكل شمعة
     db.insert_bars([{

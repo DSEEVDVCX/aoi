@@ -52,7 +52,21 @@ _THESIS_PAGE_CAP = 380
 #    totalPnL وحدها فلا تاريخ لرتب المدد، والصفوف القديمة تبقى NULL بحقّ —
 #    وهذا بالضبط نمط الحِقبة الذي يكشفه prune_dead_features، فالعائلة تُسقَط
 #    تلقائياً من التدريب حتى تُقاس في نصفَي المجموعة (أسابيع).
-FEATURE_VERSION = 7
+# 8: دمج مصادر اللقطة + عائلة التدفّق. البند الأوّل **إصلاح خلل قائم** لا
+#    إضافة: market_features كان يقرأ أحدث صفّ في market_ticks بلا تمييز مصدر،
+#    والمصدران غير متكافئين — مقيس على 200 ألف صفّ أنّ `verified` يحمل السعر
+#    والسيولة 100% و**صفر%** من عدّادات الشراء/البيع والفريدين والحائزين، بينما
+#    `trending` يحملها كلّها. النتيجة: **50% من العملات أحدث صفّ لها فقير**، و14
+#    عملة في يوم واحد كان لها قياس غنيّ أقدم بـ105 دقائق وسطياً يُهمَل تماماً.
+#    الآن ندمج عمود‑بعمود عبر آخر 12 صفّاً (الأحدث غير الفارغ يفوز)،
+#    و`tick_rich_age_min` يقيس طزاجة العدّادات وحدها كي لا يُحسب قياسٌ عمره
+#    ساعتان طازجاً. البند الثاني عائلة `flow_*` من `token_flow`: انقسام
+#    الشراء/البيع (كل حجم آخر عندنا مجموع، فاتّجاه التدفّق كان مجهولاً) وطبقة
+#    **5 دقائق** لم نملك مثلها قطّ — أقصر ما عندنا ساعة. المصدر هو نفس ردّ
+#    tokenDetails المجلوب لدورة الحائزين: صفر نداء إضافيّ، حضور 100% في 300
+#    ردّ مؤرشف. العائلة الجديدة ستُسقَط من التدريب كعلامة حقبة حتى تمتدّ
+#    تغطيتها إلى نصفَي الإطار — كما حدث لعائلة الحائزين، وهو سلوك صحيح.
+FEATURE_VERSION = 8
 
 
 # ---------------------------------------------------------------------------
@@ -508,59 +522,105 @@ def price_history_features(
 # ---------------------------------------------------------------------------
 # عائلة هـ — لقطة السوق الأخيرة قبل t0 (تغطية جزئية ⇒ NULLs مقصودة)
 # ---------------------------------------------------------------------------
+# الأعمدة التي نقرأها من market_ticks، مدموجةً عبر المصادر. الترتيب لا يهمّ.
+_TICK_MERGE_COLUMNS: tuple[str, ...] = (
+    "liquidity", "market_cap", "holders", "top10_holders_pct",
+    "change_1h", "change_4h", "change_24h",
+    "volume_1h", "volume_4h", "volume_24h",
+    "txn_count_1h", "txn_count_24h",
+    "buy_count_24h", "sell_count_24h", "unique_buys_24h", "unique_sells_24h",
+    "circulating_supply", "total_supply",
+)
+# الأعمدة التي يحملها المصدر الغنيّ وحده — طزاجتها تُقاس على حدة لأنّها قد تأتي
+# من صفّ أقدم من الأحدث. (مقيس: verified صفر% منها، trending 100%.)
+_TICK_RICH_COLUMNS: frozenset[str] = frozenset(
+    {"buy_count_24h", "sell_count_24h", "unique_buys_24h", "unique_sells_24h",
+     "holders", "top10_holders_pct"}
+)
+# كم صفّاً نقرأ للبحث عن قيمة غير فارغة. المصادر ثلاثة (trending/verified/filter)
+# وكلٌّ قد يكتب صفّاً في الدقيقة الواحدة، فـ12 يغطّي عدّة دورات بلا مسح الجدول.
+_TICK_MERGE_LOOKBACK = 12
+
+
 def market_features(
     db: RecorderDB, token: str, network: str, t0: int
 ) -> dict[str, Any]:
-    """أحدث لقطة سوق **عند/قبل t0**. `tick_age_min` يُعلم النموذج بطزاجتها.
+    """أحدث لقطة سوق **عند/قبل t0**، مدموجةً عبر المصادر عموداً بعمود.
 
-    نستعمل النوافذ **الكثيفة** (change/volume/txn بتغطية 100% على 588 ألف لقطة)
-    لا الأعمدة النادرة وحدها: عدّادات الشراء/البيع مغطّاة 24% فقط، فالاعتماد
-    عليها كان يهدر أغنى ما في الجدول.
+    المصادر **غير متكافئة الحقول**، مقيس على 200 ألف صفّ: `verified` يحمل
+    السعر والسيولة والحجم بـ100% لكنّه يحمل **صفر%** من عدّادات الشراء/البيع
+    والفريدين والحائزين، بينما `trending` يحملها كلّها بـ100%. وقراءة «أحدث صفّ»
+    وحده كانت ترث فقر المصدر الذي صادف أن كتب أخيراً: **50% من العملات كان أحدث
+    صفّ لها فقيراً**، و14 عملة في يوم واحد أُهمل لها قياس غنيّ أقدم بـ105 دقائق
+    وسطياً كان موجوداً في الجدول.
+
+    فالدمج هنا: نمرّ على الصفوف من الأحدث للأقدم ونملأ كل عمود بأوّل قيمة غير
+    فارغة نجدها. ليس تخفيفاً لنقص مصدر جديد بل **إصلاح لخسارة قائمة اليوم**.
+
+    الطزاجة تبقى صادقة بختمين لا ختم واحد: `tick_age_min` عمر أحدث صفّ (السعر
+    والسيولة)، و`tick_rich_age_min` عمر الصفّ الذي جاءت منه العدّادات — بلا
+    الثاني يقرأ النموذج عدّاداً عمره ساعتان كأنّه طازج.
+
+    القيمة صفر **قياس** لا غياب: الفحص `is None` صراحةً لا `or` (FR-007).
     """
     empty = {
         "liquidity": None, "holders": None, "top10_holders_pct": None,
         "volume_24h": None, "buy_count_24h": None, "sell_count_24h": None,
         "buy_sell_ratio_24h": None, "unique_buys_24h": None,
-        "unique_sells_24h": None, "tick_age_min": None,
+        "unique_sells_24h": None, "tick_age_min": None, "tick_rich_age_min": None,
         "tick_change_1h": None, "tick_change_4h": None, "tick_change_24h": None,
         "tick_volume_1h": None, "tick_volume_4h": None,
         "tick_txn_1h": None, "tick_txn_24h": None,
         "volume_to_liquidity": None, "liquidity_to_mcap": None,
         "float_ratio": None,
     }
-    r = db._conn.execute(
+    rows = db._conn.execute(
         """SELECT *, CAST(strftime('%s', recorded_at) AS INTEGER) e FROM market_ticks
             WHERE token_address=? AND network_id=?
               AND CAST(strftime('%s', recorded_at) AS INTEGER) <= ?
-            ORDER BY e DESC LIMIT 1""",
-        (token, network, t0),
-    ).fetchone()
-    if r is None:
+            ORDER BY e DESC LIMIT ?""",
+        (token, network, t0, _TICK_MERGE_LOOKBACK),
+    ).fetchall()
+    if not rows:
         return empty
+
+    m: dict[str, Any] = dict.fromkeys(_TICK_MERGE_COLUMNS)
+    rich_e: int | None = None
+    for r in rows:  # من الأحدث للأقدم: أوّل قيمة غير فارغة تفوز
+        for col in _TICK_MERGE_COLUMNS:
+            if m[col] is None:
+                v = r[col]
+                if v is not None:
+                    m[col] = v
+                    if rich_e is None and col in _TICK_RICH_COLUMNS:
+                        rich_e = r["e"]
+
     return {
-        "liquidity": r["liquidity"],
-        "holders": r["holders"],
-        "top10_holders_pct": r["top10_holders_pct"],
-        "volume_24h": r["volume_24h"],
-        "buy_count_24h": r["buy_count_24h"],
-        "sell_count_24h": r["sell_count_24h"],
-        "buy_sell_ratio_24h": _div(r["buy_count_24h"], r["sell_count_24h"]),
-        "unique_buys_24h": r["unique_buys_24h"],
-        "unique_sells_24h": r["unique_sells_24h"],
-        "tick_age_min": (t0 - r["e"]) / 60,
+        "liquidity": m["liquidity"],
+        "holders": m["holders"],
+        "top10_holders_pct": m["top10_holders_pct"],
+        "volume_24h": m["volume_24h"],
+        "buy_count_24h": m["buy_count_24h"],
+        "sell_count_24h": m["sell_count_24h"],
+        "buy_sell_ratio_24h": _div(m["buy_count_24h"], m["sell_count_24h"]),
+        "unique_buys_24h": m["unique_buys_24h"],
+        "unique_sells_24h": m["unique_sells_24h"],
+        # ختمان: الأوّل للسعر/السيولة (أحدث صفّ)، والثاني للعدّادات المدموجة.
+        "tick_age_min": (t0 - rows[0]["e"]) / 60,
+        "tick_rich_age_min": (t0 - rich_e) / 60 if rich_e is not None else None,
         # النوافذ القصيرة: زخم أقرب إلى لحظة القرار من نافذة 24 ساعة
-        "tick_change_1h": r["change_1h"],
-        "tick_change_4h": r["change_4h"],
-        "tick_change_24h": r["change_24h"],
-        "tick_volume_1h": r["volume_1h"],
-        "tick_volume_4h": r["volume_4h"],
-        "tick_txn_1h": r["txn_count_1h"],
-        "tick_txn_24h": r["txn_count_24h"],
+        "tick_change_1h": m["change_1h"],
+        "tick_change_4h": m["change_4h"],
+        "tick_change_24h": m["change_24h"],
+        "tick_volume_1h": m["volume_1h"],
+        "tick_volume_4h": m["volume_4h"],
+        "tick_txn_1h": m["txn_count_1h"],
+        "tick_txn_24h": m["txn_count_24h"],
         # دوران الحوض: حجم كبير على سيولة ضحلة = ضخّ سريع وانزلاق قاتل
-        "volume_to_liquidity": _div(r["volume_24h"], r["liquidity"]),
-        "liquidity_to_mcap": _div(r["liquidity"], r["market_cap"]),
+        "volume_to_liquidity": _div(m["volume_24h"], m["liquidity"]),
+        "liquidity_to_mcap": _div(m["liquidity"], m["market_cap"]),
         # نسبة التعويم: معروض متداول ÷ الكلّي — تعويم ضئيل = خطر تصريف
-        "float_ratio": _div(r["circulating_supply"], r["total_supply"]),
+        "float_ratio": _div(m["circulating_supply"], m["total_supply"]),
     }
 
 
@@ -629,6 +689,80 @@ def holders_features(
     # طزاجة القياس: أحدث ختم من المصدرين (كلٌّ يُجدَّد بدورته)
     stamps = [r["e"] for r in (det, plat) if r is not None]
     out["holders_age_min"] = (t0 - max(stamps)) / 60 if stamps else None
+    return out
+
+
+def flow_features(
+    db: RecorderDB, token: str, network: str, t0: int
+) -> dict[str, Any]:
+    """أحدث تدفّق شراء/بيع **عند/قبل t0** من `token_flow`.
+
+    كل ما نعرفه عن الحجم اليوم مجموع: `volume_24h` لا يقول من كان يشتري ومن
+    كان يبيع. هذا المصدر (نفس ردّ `tokenDetails` المجلوب لدورة الحائزين، بلا
+    نداء إضافيّ) يعطي الانقسام، ويعطي **طبقة 5 دقائق** لم نملك مثلها إطلاقاً:
+    أقصر ما عندنا ساعة، وهي عمياء عن الانعطاف داخل نافذة الـ48 ساعة.
+
+    النِّسب هي المعلومة لا القيم المطلقة: عملة بحجم شراء 90k$ ليست بالضرورة
+    أقوى من أخرى بـ9k$ — المهمّ كم قابلها من بيع. لذلك `_div` على كل زوج.
+    ونحتفظ بالقيم المطلقة للطبقة 5m وحدها: الطبقات الأطول موجودة أصلاً في
+    `market_ticks` مجموعةً، فتكرارها المطلق لا يضيف.
+
+    كل الصفوف قبل بدء الجمع ستكون None هنا — مقصود: NULL «لم نقس» لا «صفر»
+    (FR-007). و`prune_dead_features` سيُسقطها من التدريب حتى تمتدّ تغطيتها
+    إلى نصفَي الإطار الزمنيّ، كما حدث لعائلة الحائزين.
+    """
+    out: dict[str, Any] = {
+        "flow_age_min": None,
+        "flow_buy_volume_5m": None, "flow_sell_volume_5m": None,
+        "flow_net_volume_5m": None, "flow_net_volume_1h": None,
+        "flow_net_volume_24h": None,
+        "flow_buy_sell_volume_ratio_5m": None,
+        "flow_buy_sell_volume_ratio_1h": None,
+        "flow_buy_sell_volume_ratio_24h": None,
+        "flow_buy_count_5m": None, "flow_sell_count_5m": None,
+        "flow_unique_buys_5m": None, "flow_unique_sells_5m": None,
+        "flow_buy_sell_count_ratio_5m": None,
+        "flow_unique_ratio_5m": None,
+        "flow_trade_size_5m": None,
+        "flow_is_low_fees": None,
+    }
+    row = db._conn.execute(
+        """SELECT *, CAST(strftime('%s', recorded_at) AS INTEGER) e
+             FROM token_flow
+            WHERE token_address=? AND network_id=?
+              AND CAST(strftime('%s', recorded_at) AS INTEGER) <= ?
+            ORDER BY e DESC LIMIT 1""",
+        (token, network, t0),
+    ).fetchone()
+    if row is None:
+        return out
+
+    out["flow_age_min"] = (t0 - row["e"]) / 60
+    out["flow_buy_volume_5m"] = row["buy_volume_5m"]
+    out["flow_sell_volume_5m"] = row["sell_volume_5m"]
+    out["flow_buy_count_5m"] = row["buy_count_5m"]
+    out["flow_sell_count_5m"] = row["sell_count_5m"]
+    out["flow_unique_buys_5m"] = row["unique_buys_5m"]
+    out["flow_unique_sells_5m"] = row["unique_sells_5m"]
+    out["flow_is_low_fees"] = row["is_low_fees"]
+
+    # صافي التدفّق: الطرف الغائب لا يُعامَل صفراً — بيع مجهول ليس بيعاً معدوماً.
+    for period in ("5m", "1h", "24h"):
+        b = row[f"buy_volume_{period}"]
+        s = row[f"sell_volume_{period}"]
+        if b is not None and s is not None:
+            out[f"flow_net_volume_{period}"] = b - s
+        out[f"flow_buy_sell_volume_ratio_{period}"] = _div(b, s)
+
+    out["flow_buy_sell_count_ratio_5m"] = _div(
+        row["buy_count_5m"], row["sell_count_5m"]
+    )
+    # متداولون فريدون قليلون بصفقات كثيرة = غسل أو بوت؛ العكس طلب عريض.
+    out["flow_unique_ratio_5m"] = _div(
+        row["unique_buys_5m"], row["buy_count_5m"]
+    )
+    # متوسّط حجم صفقة الشراء: حيتان قليلة أم حشد صغير؟
+    out["flow_trade_size_5m"] = _div(row["buy_volume_5m"], row["buy_count_5m"])
     return out
 
 
@@ -750,10 +884,23 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "tick_age_min", "tick_change_1h", "tick_change_4h", "tick_change_24h",
     "tick_volume_1h", "tick_volume_4h", "tick_txn_1h", "tick_txn_24h",
     "volume_to_liquidity", "liquidity_to_mcap", "float_ratio",
+    # طزاجة العدّادات وحدها: قد تأتي من صفّ أقدم من الأحدث بعد دمج المصادر،
+    # وبلا هذا يظنّ النموذج أنّ عدّاداً عمره ساعتان طازج كسعرٍ عمره دقيقة.
+    "tick_rich_age_min",
     # هـ٢ — الملكية: تركيز السلسلة (يُصلح top10_holders_pct الميّت) وتموضع الحشد
     "chain_top10_pct", "chain_holder_count", "holders_age_min",
     "platform_holders", "platform_penetration", "platform_underwater_ratio",
     "platform_value_usd", "platform_median_hold_h", "platform_dev_holding",
+    # هـ٣ — التدفّق: من يشتري ومن يبيع (كل حجم آخر عندنا مجموع)، وطبقة 5 دقائق
+    # لم نملك مثلها قطّ — أقصر ما عندنا ساعة، وهي عمياء عن الانعطاف السريع.
+    "flow_age_min", "flow_buy_volume_5m", "flow_sell_volume_5m",
+    "flow_net_volume_5m", "flow_net_volume_1h", "flow_net_volume_24h",
+    "flow_buy_sell_volume_ratio_5m", "flow_buy_sell_volume_ratio_1h",
+    "flow_buy_sell_volume_ratio_24h",
+    "flow_buy_count_5m", "flow_sell_count_5m",
+    "flow_unique_buys_5m", "flow_unique_sells_5m",
+    "flow_buy_sell_count_ratio_5m", "flow_unique_ratio_5m",
+    "flow_trade_size_5m", "flow_is_low_fees",
     # و — الماكرو
     "sol_ret_4h", "sol_ret_24h", "eth_ret_24h",
     # ز — الكثافة
@@ -786,6 +933,7 @@ def build_features(
     out.update(price_history_features(db, token, network, t0))
     out.update(market_features(db, token, network, t0))
     out.update(holders_features(db, token, network, t0))
+    out.update(flow_features(db, token, network, t0))
     out.update(macro_features(db, t0))
     out.update(density_features(db, token, network, t0, exclude_key))
     return {k: out.get(k) for k in FEATURE_COLUMNS}

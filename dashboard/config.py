@@ -62,6 +62,6 @@ DISK_FREE_WARN_GB = 25.0
 # مصادر المسجّل التي نعرض آخر خطأ لكلٍّ منها (تطابق مفاتيح meta: last_error_<src>).
 # القائمة تغطّي كل ما يكتبه المسجّل فعلاً؛ bars/social كانا يُسجَّلان بلا عرض.
 RECORDER_SOURCES = (
-    "feed", "trending", "verified", "leaderboard", "control",
-    "bars", "social", "macro", "cleanup",
+    "feed", "trending", "verified", "most_held", "leaderboard", "control",
+    "bars", "social", "holders", "filter", "traders", "macro", "cleanup",
 )

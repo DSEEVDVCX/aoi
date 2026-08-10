@@ -211,6 +211,9 @@ async def test_holders_cycle_writes_two_rows_per_token(db):
     assert stats == {
         "holders_tokens": 2, "holders_details": 2,
         "holders_top": 2, "holders_errors": 0,
+        # الردّ المزيّف هنا بلا مفاتيح تدفّق ⇒ لا صفّ تدفّق. غياب التدفّق لا
+        # يمنع صفّ الحيازة، وهذا هو المقصود: مستخرِجان مستقلّان على ردّ واحد.
+        "flow_rows": 0,
     }
     rows = db._conn.execute(
         "SELECT token_address, source, top10_pct, platform_holders "

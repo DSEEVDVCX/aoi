@@ -260,6 +260,10 @@ def extract_signal_event(
         "views": _int(event.get("views")),
         "num_replies": _int(event.get("numReplies")),
         "pinned": _bool_to_int(event.get("pinned")),
+        # وسم fomo للحدث. مقيس على 4,000 حدث: قيمة **وحيدة** 'Top Trader' في
+        # 3.4% ⇒ نخزّن الوجود لا النصّ. الغياب هنا صفر لا None: الوسم حاضر في
+        # كل ردّ (حقل من الهيكل)، وغيابه قرار من المصدر لا قياس مفقود.
+        "is_top_trader_tagged": 1 if _str(body.get("tag")) else 0,
         "raw_json": _dumps(event),
     }
 
@@ -295,6 +299,33 @@ def _token_obj(item: Mapping[str, Any]) -> Mapping[str, Any]:
 def _token_address(item: Mapping[str, Any]) -> str | None:
     tok = _token_obj(item)
     return _str(tok.get("address")) or _str(item.get("address"))
+
+
+def token_list_address(item: Mapping[str, Any]) -> str | None:
+    """عنوان عنصر من قائمة عملات — للربط بالعنوان لا بالترتيب.
+
+    `filterTokens` **يحذف العنوان الميّت بصمت** (مقيس: 5 من 6 رجعت بـ`[200]`)،
+    فالفهرس ينزلق والترتيب يكذب. هذه الواجهة العامّة لما يفعله المستخرِج داخلياً.
+    """
+    return _token_address(item)
+
+
+def filter_item_protocol(item: Mapping[str, Any]) -> str | None:
+    """بروتوكول الـDEX من عنصر `filterTokens` (مثل `PumpAmm`).
+
+    مقيس: **غائب تماماً من خام trending (0 من 3,000)** فهذا مصدره الوحيد؛
+    ويسكن **المستوى الأعلى للعنصر لا تحت `token`** — الاحتياط أدناه للشكلين.
+    """
+    pair = item.get("pair")
+    if isinstance(pair, Mapping):
+        proto = _str(pair.get("protocol"))
+        if proto:
+            return proto
+    tok = _token_obj(item)
+    tok_pair = tok.get("pair")
+    if isinstance(tok_pair, Mapping):
+        return _str(tok_pair.get("protocol"))
+    return None
 
 
 def extract_market_tick(
@@ -1028,6 +1059,134 @@ def extract_platform_holders(
             }
             for h in holders[:50]
         ]),
+        "raw_json": _dumps(raw_envelope),
+    }
+
+
+# ---------------------------------------------------------------------------
+# تدفّق الشراء والبيع — من نفس ردّ `tokenDetails` المجلوب لدورة الحائزين
+#
+# **صفر نداء إضافي**: `run_holders_cycle` يستدعي `tokenDetails` ستّ مرّات في
+# الدورة ثمّ يرمي كل الردّ إلا حقلين (`top10HoldersPercent`, `holders`). الردّ
+# يحمل — بحضور **100%** في 300 ردّ مؤرشف — ما لا يعطيه أي مصدر آخر عندنا:
+#
+# - **انقسام الشراء/البيع**: `buyVolume*` و`sellVolume*`. قوائم trending
+#   وverified تعطي `volume_24h` مجموعاً فقط، فاتّجاه التدفّق مجهول اليوم.
+# - **طبقة 5 دقائق كاملة**: `buyCount5m`, `sellCount5m`, `uniqueBuys5m`,
+#   `uniqueSells5m`. أقصر طبقة نملكها اليوم ساعة — وهي عمياء عن الانعطاف
+#   داخل نافذة الـ48 ساعة التي نقيسها.
+#
+# **لا طبقة 12h في هذا المصدر** ⇒ لا عمود `*_12h` (سيبقى NULL أبداً).
+# القيم تصل **نصوصاً** (`'90135'`) — `_num`/`_int` يتكفّلان بالتحويل.
+#
+# **لماذا جدول مستقلّ** لا أعمدة على `token_holders`: ذاك موصوف بأنّه تركّز
+# الملكية، ومستخرِجه يعيد `None` حين تغيب بيانات الحيازة — فيبتلع التدفّق
+# معها. ولا صفوف على `market_ticks`: لا سعر هنا، فيصير الصفّ فقيراً ويُفاقم
+# مشكلة «أحدث صفّ يفوز» التي أصلحناها في features.market_features.
+# ---------------------------------------------------------------------------
+# طبقات التدفّق ولاحقة كل طبقة في مفاتيح المصدر. الترتيب يطابق أعمدة الجدول.
+_FLOW_PERIODS: tuple[tuple[str, str], ...] = (
+    ("5m", "5m"), ("1h", "1"), ("4h", "4"), ("24h", "24"),
+)
+
+
+def extract_token_flow(
+    raw_envelope: Any,
+    token_address: str,
+    network_id: str,
+    recorded_at: str,
+    watch_first_seen_at: str,
+    entry_signal_id: str | None,
+    is_control: int = 0,
+) -> dict[str, Any] | None:
+    """`tokenDetails` خام → صفّ تدفّق شراء/بيع. بلا مغلّف صالح → None.
+
+    نفس توقيع `extract_token_details_holders` بالضبط: **جلب واحد، مستخرِجان،
+    جدولان**. الحقل الغائب يبقى `None` ولا يصير صفراً (FR-007) — فرق «لم
+    يُقَس» عن «قيس فكان صفراً» هو نفسه معلومةٌ للنموذج.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, Mapping):
+        return None
+
+    row: dict[str, Any] = {
+        "token_address": token_address,
+        "network_id": network_id,
+        "recorded_at": recorded_at,
+        "watch_first_seen_at": watch_first_seen_at,
+        "entry_signal_id": entry_signal_id,
+        "is_control": 1 if is_control else 0,
+    }
+    # المفاتيح: buyCount5m/buyCount1/buyCount4/buyCount24 — اللاحقة تختلف عن
+    # اسم الطبقة في كل ما عدا 5m، فالخريطة أعلاه لا تُختصر إلى صيغة واحدة.
+    measured = 0
+    for col_pfx, src_pfx, cast in (
+        ("buy_count", "buyCount", _int), ("sell_count", "sellCount", _int),
+        ("buy_volume", "buyVolume", _num), ("sell_volume", "sellVolume", _num),
+        ("unique_buys", "uniqueBuys", _int), ("unique_sells", "uniqueSells", _int),
+    ):
+        for period, suffix in _FLOW_PERIODS:
+            val = cast(ro.get(f"{src_pfx}{suffix}"))
+            row[f"{col_pfx}_{period}"] = val
+            if val is not None:
+                measured += 1
+
+    # لا قيمة واحدة وصلت ⇒ الردّ لا يحمل تدفّقاً: لا نكتب صفّاً فارغاً (FR-007).
+    if not measured:
+        return None
+
+    # `isLowFees` ليس ميتاً: 11 True من 800 ردّ مؤرشف (1.4%). `_bool_to_int`
+    # يحفظ False صفراً ويحفظ الغياب None — والفرق بينهما مقصود.
+    row["is_low_fees"] = _bool_to_int(ro.get("isLowFees"))
+    row["raw_json"] = _dumps(raw_envelope)
+    return row
+
+
+# ---------------------------------------------------------------------------
+# ملفّ المتداول — GET /v2/users/{trader_id}
+#
+# `signal_events.buyer_id` مخزَّن منذ البداية ولا جدول تجّار في القاعدة: 5,572
+# معرّفاً مميّزاً، **3,202 منهم بـ≥3 أحداث**. فسؤال «من اشترى؟» كان بلا جواب
+# رغم أنّ الجواب في أيدينا. من يظهر مرّة واحدة لا سلوك له نتعلّمه، فالمتكرّرون
+# وحدهم يُجلبون.
+#
+# الحقول مقيسة حيّاً 2026-08-10 على متداولَين (26 مفتاحاً في `responseObject`):
+# `followers` 2,143 و214,422 · `swapCount` 5,450 و3,319 · `numTrades` 518 و587
+# · `averageHoldTimeSeconds` 38,304 و169,883 · `totalVolume` 12.99M و5.45M.
+# **لا ربح ولا نسبة نجاح في هذا الردّ** — الملفّ لا يحملهما (لهما endpoint
+# منفصل)، فلا عمود لهما: العمود الميّت يكلّف ولا يُفيد.
+# ---------------------------------------------------------------------------
+def extract_trader(
+    raw_envelope: Any, trader_id: str, recorded_at: str
+) -> dict[str, Any] | None:
+    """`/v2/users/{id}` خام → صفّ `traders`. بلا مغلّف صالح → None."""
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, Mapping):
+        return None
+
+    # المعرّف من الردّ أوثق من المطلوب، لكنّ غيابه لا يُسقط الصفّ: المفتاح
+    # الأساسي هو ما طلبناه به، وهو ما يربط بـ signal_events.buyer_id.
+    return {
+        "trader_id": _str(ro.get("id")) or trader_id,
+        "recorded_at": recorded_at,
+        "handle": _str(ro.get("userHandle")),
+        "display_name": _str(ro.get("displayName")),
+        "followers_count": _int(ro.get("followers")),
+        "following_count": _int(ro.get("following")),
+        "swap_count": _int(ro.get("swapCount")),
+        "num_trades": _int(ro.get("numTrades")),
+        "total_volume_usd": _num(ro.get("totalVolume")),
+        "avg_hold_seconds": _num(ro.get("averageHoldTimeSeconds")),
+        "is_restricted": _bool_to_int(ro.get("isRestricted")),
+        "is_private": _bool_to_int(ro.get("private")),
+        "wallet_address": _str(ro.get("address")),
+        "evm_address": _str(ro.get("evmAddress")),
+        "twitter_url": _str(ro.get("twitter")),
+        "created_at": _str(ro.get("createdAt")),
         "raw_json": _dumps(raw_envelope),
     }
 

@@ -111,6 +111,10 @@ CREATE TABLE IF NOT EXISTS signal_events (
     views                  INTEGER,              -- views (المستوى الأعلى للحدث)
     num_replies            INTEGER,              -- numReplies إن وُجد
     pinned                 INTEGER,              -- مثبَّت من fomo (bool)
+    -- وسم fomo للحدث (body.tag). مقيس على 4,000 حدث: قيمة **وحيدة** هي
+    -- 'Top Trader' في 3.4% منها — فالمعلومة وجود الوسم لا نصّه، ونخزّنه علماً
+    -- منطقياً لا نصّاً. (لو ظهرت قيم أخرى لاحقاً فالخام يحفظها.)
+    is_top_trader_tagged   INTEGER,
     raw_json               TEXT NOT NULL         -- الحدث الخام كاملاً
 );
 CREATE INDEX IF NOT EXISTS idx_signal_token ON signal_events (token_address, network_id);
@@ -197,6 +201,10 @@ CREATE TABLE IF NOT EXISTS token_static (
     description_len    INTEGER,                  -- طول الوصف (0 = لا وصف)
     has_banner         INTEGER,                  -- imageBannerUrl موجود (bool)
     has_image          INTEGER,                  -- أي صورة للعملة موجودة (bool)
+    -- بروتوكول الحوض (PumpAmm/Uniswap…). مقيس أنّه **غائب تماماً من خام
+    -- trending** (صفر من 3,000 عنصر) ويأتي من filterTokens وحده — وفي المستوى
+    -- الأعلى للعنصر لا تحت token. حوض المُطلِق ليس حوضاً مهاجَراً.
+    dex_protocol       TEXT,
     raw_json           TEXT NOT NULL,
     PRIMARY KEY (token_address, network_id)
 );
@@ -618,6 +626,9 @@ CREATE TABLE IF NOT EXISTS training_rows (
     volume_to_liquidity REAL,
     liquidity_to_mcap REAL,
     float_ratio      REAL,
+    -- طزاجة العدّادات وحدها: بعد دمج المصادر قد تأتي من صفّ أقدم من الأحدث،
+    -- وبلا هذا يظنّ النموذج أنّ عدّاداً عمره ساعتان طازج كسعرٍ عمره دقيقة.
+    tick_rich_age_min REAL,
     -- هـ٢) الملكية: تركيز السلسلة (يُصلح top10_holders_pct الميّت) وتموضع الحشد
     chain_top10_pct  REAL,                 -- أكبر 10 % من المعروض (token_details)
     chain_holder_count INTEGER,            -- حائزو السلسلة الكلّي
@@ -628,6 +639,25 @@ CREATE TABLE IF NOT EXISTS training_rows (
     platform_value_usd REAL,               -- مجموع قيمة مراكز المنصّة
     platform_median_hold_h REAL,           -- وسيط مدّة الحمل (ساعات)
     platform_dev_holding INTEGER,          -- 1 = المطوّر بين الحائزين
+    -- هـ٣) التدفّق (token_flow): من يشتري ومن يبيع — كل حجم آخر عندنا **مجموع**،
+    -- وطبقة 5 دقائق لم نملك مثلها قطّ (أقصر ما عندنا ساعة، عمياء عن الانعطاف).
+    flow_age_min     REAL,
+    flow_buy_volume_5m  REAL,
+    flow_sell_volume_5m REAL,
+    flow_net_volume_5m  REAL,              -- شراء − بيع (الغائب لا يصير صفراً)
+    flow_net_volume_1h  REAL,
+    flow_net_volume_24h REAL,
+    flow_buy_sell_volume_ratio_5m  REAL,   -- النسبة هي المعلومة لا القيمة المطلقة
+    flow_buy_sell_volume_ratio_1h  REAL,
+    flow_buy_sell_volume_ratio_24h REAL,
+    flow_buy_count_5m   INTEGER,
+    flow_sell_count_5m  INTEGER,
+    flow_unique_buys_5m  INTEGER,
+    flow_unique_sells_5m INTEGER,
+    flow_buy_sell_count_ratio_5m REAL,
+    flow_unique_ratio_5m REAL,             -- فريدون ÷ صفقات: منخفض = غسل/بوت
+    flow_trade_size_5m   REAL,             -- حيتان قليلة أم حشد صغير؟
+    flow_is_low_fees     INTEGER,
     -- و) النظام السوقيّ
     sol_ret_4h       REAL,
     sol_ret_24h      REAL,
@@ -729,6 +759,95 @@ CREATE TABLE IF NOT EXISTS holders_fetch_state (
     top10_pct     REAL,
     attempts      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (token_address, network_id)
+);
+
+-- تدفّق التداول: انقسام الشراء/البيع من ردّ tokenDetails **نفسه** الذي تجلبه
+-- دورة الحيازة — صفر نداء إضافي. كان الردّ يُستخرج منه حقلان (top10/holders)
+-- ويُرمى الباقي، ومقيس على 300 ردّ مؤرشف أنّه يحمل بحضور 100%:
+--   * انقسام الحجم شراءً وبيعاً (المصادر الأخرى تعطي الحجم الكلّي وحده — فحجم
+--     مليون دولار بيعاً كان يبدو كمليون شراءً أمام النموذج)، و
+--   * **طبقة 5 دقائق كاملة** لا يعطيها أيّ مصدر آخر (أقرب نافذة إلى لحظة القرار).
+-- جدول مستقلّ لا أعمدة على token_holders: ذاك يقيس تركّز الملكية ومستخرِجه يعيد
+-- None حين تغيب بيانات الحيازة، فكان سيبتلع التدفّق معها. ولا صفوف على
+-- market_ticks: لا سعر هنا فتُفاقم صفوفاً فقيرة.
+-- لا طبقة 12h في هذا المصدر إطلاقاً ⇒ لا عمود لها (غياب دائم ≠ قياس).
+CREATE TABLE IF NOT EXISTS token_flow (
+    token_address       TEXT NOT NULL,
+    network_id          TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    watch_first_seen_at TEXT NOT NULL,
+    entry_signal_id     TEXT,
+    is_control          INTEGER NOT NULL DEFAULT 0,
+    buy_count_5m        INTEGER,
+    buy_count_1h        INTEGER,
+    buy_count_4h        INTEGER,
+    buy_count_24h       INTEGER,
+    sell_count_5m       INTEGER,
+    sell_count_1h       INTEGER,
+    sell_count_4h       INTEGER,
+    sell_count_24h      INTEGER,
+    -- تصل **نصوصاً** من المصدر ('90135') — يحوّلها _num
+    buy_volume_5m       REAL,
+    buy_volume_1h       REAL,
+    buy_volume_4h       REAL,
+    buy_volume_24h      REAL,
+    sell_volume_5m      REAL,
+    sell_volume_1h      REAL,
+    sell_volume_4h      REAL,
+    sell_volume_24h     REAL,
+    unique_buys_5m      INTEGER,
+    unique_buys_1h      INTEGER,
+    unique_buys_4h      INTEGER,
+    unique_buys_24h     INTEGER,
+    unique_sells_5m     INTEGER,
+    unique_sells_1h     INTEGER,
+    unique_sells_4h     INTEGER,
+    unique_sells_24h    INTEGER,
+    -- يتباين فعلاً: 11 True من 800 ردّ — رسوم منخفضة تعني حوضاً مختلفاً
+    is_low_fees         INTEGER,
+    raw_json            BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_flow_token_ts
+    ON token_flow (token_address, network_id, recorded_at);
+
+-- ملفّ المتداول. مقيس: 5,572 معرّف مشترٍ مميّز في signal_events و**3,202 منهم
+-- متكرّرون (≥3 أحداث)** — ولا جدول تجّار في القاعدة إطلاقاً، فكان «من اشترى؟»
+-- سؤالاً بلا جواب رغم أنّ المعرّف مخزَّن في كل حدث. المتكرّرون وحدهم يُجلبون:
+-- من يظهر مرّة واحدة لا سلوك له نتعلّمه.
+--
+-- الأعمدة تطابق ردّ /v2/users/{id} **المقيس حيّاً 2026-08-10 على متداولَين**
+-- (26 مفتاحاً). ما ليس في الردّ فلا عمود له: **لا win_rate ولا realized_pnl**
+-- — الملفّ لا يحمل ربحاً إطلاقاً (لذلك يوجد endpoint منفصل
+-- aggregatedSnapshot). وضعُ عمودٍ لحقل غير موجود يصنع عموداً ميتاً كـ
+-- top10_holders_pct الذي كلّفنا 1.43 مليون صفّ فارغ.
+CREATE TABLE IF NOT EXISTS traders (
+    trader_id        TEXT PRIMARY KEY,
+    recorded_at      TEXT NOT NULL,             -- وقت آخر تحديث للملفّ
+    handle           TEXT,                      -- userHandle
+    display_name     TEXT,
+    followers_count  INTEGER,                   -- followers: 2,143 و214,422 مقيسان
+    following_count  INTEGER,                   -- following
+    swap_count       INTEGER,                   -- swapCount: كل مبادلاته
+    num_trades       INTEGER,                   -- numTrades: أقلّ من swapCount دائماً
+    total_volume_usd REAL,                      -- totalVolume: 12.99M و5.45M مقيسان
+    avg_hold_seconds REAL,                      -- averageHoldTimeSeconds: 38k و170k
+    is_restricted    INTEGER,                   -- isRestricted (bool)
+    is_private       INTEGER,                   -- private (bool)
+    wallet_address   TEXT,                      -- address (Solana)
+    evm_address      TEXT,                      -- evmAddress
+    twitter_url      TEXT,                      -- حضوره من عدمه إشارة سمعة
+    created_at       TEXT,                      -- عمر الحساب
+    raw_json         BLOB NOT NULL
+);
+
+-- حالة الجدولة الدوّارة للتجّار. **مفتاحها معرّف المتداول وحده** لا
+-- (عملة، شبكة) كبقيّة جداول الحالة — التاجر عابر للعملات.
+CREATE TABLE IF NOT EXISTS traders_fetch_state (
+    trader_id     TEXT PRIMARY KEY,
+    last_fetch_at TEXT,
+    last_status   TEXT,                         -- ok / empty / error
+    attempts      INTEGER NOT NULL DEFAULT 0
 );
 
 -- حالة التشغيل: آخر تشغيل، عدّادات، حالة getBars، إصدار المخطّط.
