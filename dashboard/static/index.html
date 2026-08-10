@@ -212,18 +212,6 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .errline:last-child { border-bottom: none; }
 .errline.resolved { opacity: .5; }
 .banner { padding: 10px 14px; border-radius: 9px; background: color-mix(in srgb, var(--crit) 14%, transparent); border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent); color: var(--ink); font-size: 12.5px; margin-bottom: 18px; }
-.key-form { display: grid; grid-template-columns: minmax(220px,2fr) minmax(160px,1fr) auto; gap: 10px; align-items: end; }
-.key-field { display: grid; gap: 5px; color: var(--muted); font-size: 11.5px; }
-.key-field input { width: 100%; min-width: 0; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: inherit; }
-.key-field input:focus { outline: 2px solid color-mix(in srgb, var(--s1) 55%, transparent); border-color: var(--s1); }
-.key-summary { display: flex; gap: 9px; flex-wrap: wrap; margin-bottom: 12px; }
-.key-message { min-height: 22px; margin-top: 9px; color: var(--muted); font-size: 12px; }
-.key-message.good { color: var(--good); } .key-message.bad { color: var(--crit); }
-.key-actions { display: flex; gap: 6px; }
-.key-actions .btn { padding: 3px 8px; }
-.key-actions .danger { color: var(--crit); }
-.key-disabled { opacity: .58; }
-@media (max-width: 760px) { .key-form { grid-template-columns: 1fr; } }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
 </head>
@@ -300,41 +288,6 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     </header>
     <div class="body" id="control-progress" aria-live="polite"></div>
     <div class="body flush" id="comparison"></div>
-  </div>
-
-  <div class="card">
-    <header>
-      <h2>بوابة أمان العملات</h2>
-      <span class="note">تحذيرات المزوّد + تحقق مباشر من السلسلة؛ unknown لا يمرّ</span>
-    </header>
-    <div class="body" id="safety" aria-live="polite"></div>
-  </div>
-
-  <div class="card" id="helius-card">
-    <header>
-      <h2>مفاتيح Helius</h2>
-      <span class="note">مقنّعة دائماً · الإضافة والتعطيل يسريان في دورة الفحص التالية</span>
-    </header>
-    <div class="body">
-      <div id="helius-summary" class="key-summary" aria-live="polite"></div>
-      <div class="key-form">
-        <label class="key-field">مفتاح Helius أو عنوان RPC
-          <input id="helius-api-key" type="password" autocomplete="off" spellcheck="false"
-                 placeholder="UUID أو https://…?api-key=…" />
-        </label>
-        <label class="key-field">اسم مميّز (اختياري)
-          <input id="helius-username" maxlength="60" autocomplete="off" placeholder="مثلاً: الحساب الثاني" />
-        </label>
-        <button class="btn" id="helius-add" type="button">إضافة المفتاح</button>
-      </div>
-      <div id="helius-message" class="key-message" role="status" aria-live="polite"></div>
-    </div>
-    <div class="body flush tablewrap">
-      <table>
-        <thead><tr><th>#</th><th>الاسم</th><th>المفتاح</th><th>الحالة</th><th>الفحص</th><th>أُضيف</th><th>إجراءات</th></tr></thead>
-        <tbody id="helius-keys"><tr><td colspan="7" class="empty">جارٍ تحميل المفاتيح…</td></tr></tbody>
-      </table>
-    </div>
   </div>
 
   <div class="card">
@@ -448,6 +401,18 @@ function ago(iso) {
   if (s < 86400) return Math.round(s / 3600) + " س";
   return Math.round(s / 86400) + " ي";
 }
+// «أوّل التقاط» ≠ «بداية الدورة». `watchlist.first_seen_at` يُكتب فوقه عند كل
+// إعادة قبول بعد انتهاء النافذة، فعملة مُلتقطة منذ 7 أيام كانت تبدو عمرها 22
+// ساعة. العمر الحقيقي من `watch_windows` (سجلّ لا يُكتب فوقه)، وعمر الدورة
+// يبقى مذكوراً بعده حين يختلفان — الرقمان مختلفان المعنى وكلاهما مطلوب.
+function firstCatch(w) {
+  const ever = w.first_ever_at || w.first_seen_at;
+  const cycle = w.first_seen_at;
+  const same = !cycle || !ever || Math.abs(Date.parse(cycle) - Date.parse(ever)) < 60000;
+  if (same) return ago(ever);
+  return `${ago(ever)} <span class="meta">(دورة ${ago(cycle)})</span>`;
+}
+
 function remaining(iso) {
   const t = Date.parse(iso);
   if (isNaN(t)) return { txt: "—", frac: 0 };
@@ -1015,156 +980,21 @@ function renderWatchlist(rows) {
   const host = document.getElementById("watchlist");
   if (!rows.length) { host.innerHTML = `<div class="empty">لا عملات مراقَبة نشطة.</div>`; return; }
   host.innerHTML = `<table><thead><tr>
-      <th>العنوان</th><th>الأمان</th><th>المصدر</th><th>أوّل ظهور</th><th style="width:22%">المتبقّي من 48 ساعة</th><th>لقطات</th>
+      <th>العنوان</th><th>المصدر</th><th>أوّل التقاط</th><th style="width:22%">المتبقّي من 48 ساعة</th><th>لقطات</th>
     </tr></thead><tbody>${rows.map(w => {
       const r = remaining(w.watch_until);
       const low = r.frac < 0.15;
       return `<tr>
         <td class="mono">${extLink(fomoTokenUrl(w.token_address, w.network_id),
               esc(shortAddr(w.token_address)))}</td>
-        <td>${safetyBadge(w.combined_status)}</td>
         <td><span class="badge"><i class="key" style="background:${typeColor(w.source)}"></i>${esc(typeLabel(w.source))}</span></td>
-        <td>${ago(w.first_seen_at)}</td>
+        <td>${firstCatch(w)}</td>
         <td><div style="display:flex;align-items:center;gap:9px">
           <div class="meter" style="flex:1"><i style="width:${(r.frac * 100).toFixed(0)}%;background:${low ? "var(--warn)" : "var(--s1)"}"></i></div>
           <span class="num" style="min-width:52px;color:${low ? "var(--warn)" : "inherit"}">${esc(r.txt)}</span>
         </div></td>
         <td class="num">${num(w.tick_count)}</td></tr>`;
     }).join("")}</tbody></table>`;
-}
-
-function safetyBadge(status) {
-  if (status === "pass") return `<span class="badge good">✓ اجتازت</span>`;
-  if (status === "blocked") return `<span class="badge bad">✕ محظورة</span>`;
-  if (status === "review") return `<span class="badge warn">! مراجعة</span>`;
-  return `<span class="badge">؟ مجهولة</span>`;
-}
-
-function renderSafety(data) {
-  const c = data.counts || {};
-  const cells = [
-    ["اجتازت الطبقتين", c.pass || 0, "var(--good)"],
-    ["تحتاج مراجعة", c.review || 0, "var(--warn)"],
-    ["محظورة", c.blocked || 0, "var(--crit)"],
-    ["مجهولة/غير مكتملة", c.unknown || 0, "var(--muted)"],
-  ];
-  document.getElementById("safety").innerHTML = `
-    <div class="summary">${cells.map(x => `<div class="cell">
-      <div class="l">${x[0]}</div><div class="v" style="color:${x[2]}">${num(x[1])}</div>
-    </div>`).join("")}</div>
-    <p class="note" style="margin:12px 0 0">الاجتياز ليس ضمان ربح ولا إثبات بيع DEX؛ هو غياب مانع معروف في الفحصين لحظة القياس.</p>`;
-}
-
-function keyDate(value) {
-  if (value == null) return "—";
-  const date = new Date(value);
-  return isNaN(date) ? "—" : date.toLocaleString("ar-EG", { dateStyle: "medium", timeStyle: "short" });
-}
-
-function keyMessage(text = "", state = "") {
-  const host = document.getElementById("helius-message");
-  host.className = `key-message ${state}`.trim();
-  host.textContent = text;
-}
-
-function renderHeliusKeys(data) {
-  const summary = document.getElementById("helius-summary");
-  const body = document.getElementById("helius-keys");
-  if (!data.configured) {
-    summary.innerHTML = `<span class="badge warn">! غير مهيّأ</span>`;
-    body.innerHTML = `<tr><td colspan="7" class="empty">اضبط AOI_HELIUS_KEYS_PATH محلياً لتفعيل الإدارة.</td></tr>`;
-    document.getElementById("helius-add").disabled = true;
-    return;
-  }
-  document.getElementById("helius-add").disabled = false;
-  summary.innerHTML = `<span class="badge good">✓ ${num(data.enabled)} مفعّل</span>
-    <span class="badge${data.disabled ? " warn" : ""}">${num(data.disabled)} معطّل</span>
-    <span class="badge">${num((data.keys || []).length)} إجمالي</span>`;
-  const keys = data.keys || [];
-  if (!keys.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">لا مفاتيح محفوظة.</td></tr>`;
-    return;
-  }
-  body.innerHTML = keys.map((key, index) => `<tr data-id="${esc(key.id)}" class="${key.disabled ? "key-disabled" : ""}">
-      <td class="num">${index + 1}${key.primary ? ` <span class="badge good">أساسي</span>` : ""}</td>
-      <td>${esc(key.username)}</td>
-      <td><code class="mono">${esc(key.apiKeyMasked)}</code></td>
-      <td>${key.disabled
-        ? `<span class="badge warn" title="${esc(key.disabledReason)}">! معطّل</span>`
-        : `<span class="badge good">✓ مفعّل</span>`}</td>
-      <td class="key-verify-result">—</td>
-      <td class="meta">${esc(keyDate(key.addedAt))}</td>
-      <td><div class="key-actions">
-        <button class="btn" type="button" data-key-action="verify" data-id="${esc(key.id)}">تحقّق</button>
-        <button class="btn" type="button" data-key-action="${key.disabled ? "enable" : "disable"}" data-id="${esc(key.id)}">${key.disabled ? "تفعيل" : "تعطيل"}</button>
-        <button class="btn danger" type="button" data-key-action="delete" data-id="${esc(key.id)}">حذف</button>
-      </div></td>
-    </tr>`).join("");
-}
-
-async function loadHeliusKeys() {
-  try {
-    renderHeliusKeys(await getJSON("/api/helius-keys"));
-  } catch (error) {
-    document.getElementById("helius-keys").innerHTML =
-      `<tr><td colspan="7" class="empty">تعذّر تحميل المفاتيح: ${esc(error.message)}</td></tr>`;
-  }
-}
-
-async function addHeliusKey() {
-  const button = document.getElementById("helius-add");
-  const keyInput = document.getElementById("helius-api-key");
-  const usernameInput = document.getElementById("helius-username");
-  const apiKey = keyInput.value.trim();
-  if (!apiKey) { keyMessage("أدخل مفتاح Helius أولاً.", "bad"); return; }
-  button.disabled = true;
-  keyMessage("جارٍ حفظ المفتاح…");
-  try {
-    const data = await postJSON("/api/helius-keys", {
-      apiKey, username: usernameInput.value.trim(),
-    });
-    keyInput.value = "";
-    usernameInput.value = "";
-    renderHeliusKeys(data);
-    keyMessage(`✓ ${data.note || "أُضيف المفتاح."}`, "good");
-  } catch (error) {
-    keyMessage(`✕ ${error.message}`, "bad");
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function verifyHeliusKey(id, button) {
-  const row = [...document.querySelectorAll("#helius-keys tr")]
-    .find(item => item.dataset.id === id);
-  const cell = row?.querySelector(".key-verify-result");
-  button.disabled = true;
-  if (cell) cell.textContent = "جارٍ الفحص…";
-  try {
-    const data = await postJSON("/api/helius-keys/verify", { id });
-    if (cell) cell.innerHTML = data.ok
-      ? `<span class="badge good">✓ ${esc(data.message)}</span>`
-      : `<span class="badge ${data.status === "rate_limited" ? "warn" : "bad"}">! ${esc(data.message)}</span>`;
-  } catch (error) {
-    if (cell) cell.innerHTML = `<span class="badge bad">✕ ${esc(error.message)}</span>`;
-  } finally {
-    button.disabled = false;
-  }
-}
-
-async function changeHeliusKey(action, id) {
-  if (action === "delete" && !confirm("حذف هذا المفتاح نهائياً من التدوير؟")) return;
-  if (action === "disable" && !confirm("تعطيل هذا المفتاح واستبعاده من التدوير؟")) return;
-  const endpoint = `/api/helius-keys/${action}`;
-  keyMessage(action === "enable" ? "جارٍ التفعيل…" : action === "disable" ? "جارٍ التعطيل…" : "جارٍ الحذف…");
-  try {
-    const payload = action === "disable" ? { id, reason: "معطّل من لوحة aoi" } : { id };
-    const data = await postJSON(endpoint, payload);
-    renderHeliusKeys(data);
-    keyMessage(`✓ ${data.note}`, "good");
-  } catch (error) {
-    keyMessage(`✕ ${error.message}`, "bad");
-  }
 }
 
 function renderSignals(rows) {
@@ -1230,7 +1060,7 @@ async function tick() {
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
   try {
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, safety] = await Promise.all([
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -1242,7 +1072,6 @@ async function tick() {
       getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
       getJSON("/api/signal-timeline?hours=24"),
       getJSON("/api/control-progress"),
-      getJSON("/api/safety"),
     ]);
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
@@ -1256,7 +1085,6 @@ async function tick() {
     paint("control-progress", () => renderControlProgress(controlProgress));
     paint("timeline",     () => renderTimeline(tl));
     paint("health",    () => renderHealth(bars, storage, st));
-    paint("safety",    () => renderSafety(safety));
     paint("watchlist", () => renderWatchlist(wl.watchlist || []));
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
@@ -1312,22 +1140,8 @@ document.getElementById("theme").addEventListener("click", () => {
   if (lastRows.tl) renderTimeline(lastRows.tl);
 });
 
-document.getElementById("helius-add").addEventListener("click", addHeliusKey);
-document.getElementById("helius-api-key").addEventListener("keydown", event => {
-  if (event.key === "Enter") addHeliusKey();
-});
-document.getElementById("helius-keys").addEventListener("click", event => {
-  const button = event.target.closest("button[data-key-action]");
-  if (!button) return;
-  const { keyAction, id } = button.dataset;
-  if (keyAction === "verify") verifyHeliusKey(id, button);
-  else changeHeliusKey(keyAction, id);
-});
-
 tick();
 setInterval(tick, REFRESH_MS);
-loadHeliusKeys();
-setInterval(loadHeliusKeys, 60000);
 </script>
 </body>
 </html>

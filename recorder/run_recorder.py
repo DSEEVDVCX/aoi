@@ -32,14 +32,24 @@ def main() -> None:
     import asyncio
 
     import config  # يضيف api/src إلى sys.path عند الاستيراد
+    from keep_awake import keep_awake, release
     from recorder import main_loop
 
     cycles = None
     if len(sys.argv) > 1 and sys.argv[1].isdigit():
         cycles = int(sys.argv[1])
 
-    _log_boot(f"boot ok, db={config.DB_PATH}, cycles={cycles}")
-    asyncio.run(main_loop(cycles=cycles))
+    # قفل الاستيقاظ للحلقة اللانهائية وحدها: تشغيلٌ بعدد دورات محدّد أداةُ تحقّق
+    # يدويّة، وليس من حقّها أن تمنع الجهاز من النوم بعد أن تنتهي.
+    awake = keep_awake() if cycles is None else False
+    _log_boot(f"boot ok, db={config.DB_PATH}, cycles={cycles}, keep_awake={awake}")
+    try:
+        asyncio.run(main_loop(cycles=cycles))
+    finally:
+        # القفل يسقط مع العملية أصلاً، لكنّ الإسقاط الصريح يجعل التوقّف النظيف
+        # يعيد سلوك النوم فوراً بلا انتظار موت العملية.
+        if awake:
+            release()
 
 
 if __name__ == "__main__":

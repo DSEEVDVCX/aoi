@@ -6,6 +6,7 @@ trending item). نتحقّق من: استخراج الحقول الذهبية، 
 """
 import json
 
+import config
 import extract
 
 
@@ -95,6 +96,76 @@ def test_extract_signal_event_top_trader_matching():
     assert row["buyers_best_rank"] == 3             # أفضل (أصغر) رتبة
 
 
+# --- صدارات المدد (v7): 50 لكل مدّة، والاتّحاد يضاعف التغطية ---
+def test_period_ranks_are_separate_not_merged():
+    """رتبة 24h لا تُدمج مع رتبة totalPnL — قياسان مختلفان في عمودين."""
+    row = extract.extract_signal_event(
+        FEED_EVENT, "t",
+        rank_lookup={"trader_A": 40},
+        rank_lookups={
+            "24h": {"trader_A": 2, "trader_Z": 9},
+            "7d": {"trader_B": 11},
+            "30d": {},                      # لم تُحمّل → لا قياس
+        },
+    )
+    assert (row["top_trader_match_count"], row["buyers_best_rank"]) == (1, 40)
+    assert (row["top_trader_match_count_24h"], row["buyers_best_rank_24h"]) == (2, 2)
+    assert (row["top_trader_match_count_7d"], row["buyers_best_rank_7d"]) == (1, 11)
+    # مدّة بلا خريطة: غياب لا صفر (FR-007)
+    assert row["top_trader_match_count_30d"] is None
+    assert row["buyers_best_rank_30d"] is None
+    # عرض الحضور: all + 24h + 7d = ثلاث صدارات فيها مشترٍ
+    assert row["top_trader_periods_matched"] == 3
+
+
+def test_period_ranks_absent_lookups_stay_null():
+    """بلا rank_lookups كلّها None — لا فبركة صفر لمدّة لم تُقس."""
+    row = extract.extract_signal_event(FEED_EVENT, "t")
+    for c in (
+        "top_trader_match_count_24h", "buyers_best_rank_24h",
+        "top_trader_match_count_7d", "buyers_best_rank_7d",
+        "top_trader_match_count_30d", "buyers_best_rank_30d",
+        "top_trader_periods_matched",
+    ):
+        assert row[c] is None, c
+
+
+def test_periods_matched_counts_zero_when_measured_and_empty():
+    """مقيس ولم يطابق أحد ⇒ 0 (لا None): «قِسنا فلم نجد» معلومة."""
+    row = extract.extract_signal_event(
+        FEED_EVENT, "t",
+        rank_lookup={"someone_else": 1},
+        rank_lookups={"24h": {"other": 5}, "7d": {"other": 5}, "30d": {"other": 5}},
+    )
+    assert row["top_trader_periods_matched"] == 0
+    assert row["top_trader_match_count_24h"] == 0
+    assert row["buyers_best_rank_24h"] is None   # لا مطابقة ⇒ لا رتبة
+
+
+def test_period_matching_includes_single_buyer_id():
+    """large_buy بمشترٍ مفرد يُطابَق في المدد كما في الصدارة الأساسيّة."""
+    ev = {
+        "id": "evt_lb", "tokenAddress": "So1", "type": "large_buy",
+        "createdAt": "2026-07-25T10:00:00Z",
+        "body": {"userId": "trader_solo", "ticker": "X"},
+    }
+    row = extract.extract_signal_event(
+        ev, "t", rank_lookup={}, rank_lookups={"7d": {"trader_solo": 4}}
+    )
+    assert row["buyers_best_rank_7d"] == 4
+    assert row["top_trader_match_count_7d"] == 1
+    assert row["top_trader_periods_matched"] == 1   # all قِيست بلا مطابقة
+
+
+def test_match_ranks_by_period_pure():
+    out = extract.match_ranks_by_period(
+        ["a", "b", "c"], {"24h": {"b": 7, "c": 3}, "7d": None}
+    )
+    assert out["24h"] == (2, 3)
+    assert out["7d"] == (None, None)
+    assert out["30d"] == (None, None)
+
+
 def test_extract_signal_event_missing_id_dropped():
     bad = dict(FEED_EVENT)
     del bad["id"]
@@ -154,6 +225,57 @@ def test_false_preserved_not_nulled():
     assert extract._bool_to_int(False) == 0
     assert extract._bool_to_int(True) == 1
     assert extract._bool_to_int(None) is None
+
+
+SOL = config.SOLANA_NETWORK_ID
+
+
+def test_authority_address_means_live_authority():
+    """fomo يعيد **عنوان** السلطة لا قيمة منطقية؛ وجوده ⇒ الصلاحية قائمة (1)."""
+    addr = "ATESfxbwt3SRhSHc4nbk8BG6P8Nm8TAjsHfQCbgC2er4"
+    assert extract._authority_to_int(addr, SOL) == 1
+    assert extract._authority_to_int(addr, "8453") == 1
+
+
+def test_authority_null_on_solana_is_revoked():
+    """على سولانا null تعني السلطة مُلغاة فعلاً — صفر مقيس لا مجهول.
+    مؤكَّد من مصدر ثانٍ: قراءة السلسلة تعطي النسبة والعناوين نفسها."""
+    assert extract._authority_to_int(None, SOL) == 0
+
+
+def test_authority_null_on_evm_stays_unknown():
+    """على EVM القيمة null في 259/259 لقطة: غير مقيسة لا «آمنة».
+    إرجاع 0 هنا يفبرك أماناً لعملة لم تُقَس (FR-007)."""
+    for net in ("56", "4663", "8453", "1", ""):
+        assert extract._authority_to_int(None, net) is None
+
+
+def test_authority_blank_string_is_unknown():
+    """نصّ فارغ ليس عنواناً ولا نفياً — يبقى مجهولاً."""
+    assert extract._authority_to_int("", SOL) is None
+    assert extract._authority_to_int("   ", SOL) is None
+
+
+def test_evm_static_authorities_are_null_not_zero():
+    """اختبار تكاملي: عملة EVM بلا سلطتين تُخزَّن NULL لا 0."""
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["token"].update({"networkId": 8453, "mintable": None, "freezable": None})
+    st = extract.extract_token_static(item, "2026-07-25T10:00:00Z")
+    assert st["network_id"] == "8453"
+    assert st["mintable"] is None
+    assert st["freezable"] is None
+
+
+def test_solana_static_authorities_measured():
+    """اختبار تكاملي: على سولانا عنوان ⇒ 1 و null ⇒ 0 في الصفّ المخزَّن."""
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["token"].update({"networkId": int(SOL),
+                          "mintable": "ATESfxbwt3SRhSHc4nbk8BG6P8Nm8TAjsHfQCbgC2er4",
+                          "freezable": None})
+    st = extract.extract_token_static(item, "2026-07-25T10:00:00Z")
+    assert st["network_id"] == SOL
+    assert st["mintable"] == 1
+    assert st["freezable"] == 0
 
 
 def test_num_helpers_no_fabrication():
@@ -368,9 +490,13 @@ def test_trade_size_fields_absent_stay_none_not_zero():
 
 
 # --- الطبقة الاجتماعية ---
-def _thesis(handle, likes=0, replies=0, equity=0.0, created="2026-07-26T10:00:00Z"):
+def _thesis(handle, likes=0, replies=0, equity=0.0, created="2026-07-26T10:00:00Z",
+            amount=0.0, closed=None):
+    """أطروحة بشكل المصدر الحقيقي: المركز في `authorTrade` لا في `equity`."""
     return {"id": f"t-{handle}-{created}", "userHandle": handle, "numReplies": replies,
             "equity": equity, "createdAt": created,
+            "authorTrade": {"humanTokenAmount": amount, "usdValue": amount,
+                            "closedAt": closed},
             "comment": {"comment": "gm", "numLikes": likes}}
 
 
@@ -398,9 +524,9 @@ def test_thesis_total_falls_back_to_visible_count_when_absent():
 
 def test_extract_social_aggregates_engagement():
     raw = {"responseObject": {"items": [
-        _thesis("a", likes=7, replies=1, equity=100.0),
-        _thesis("b", likes=3, replies=0, equity=0.0, created="2026-07-26T12:00:00Z"),
-        _thesis("a", likes=5, replies=2, equity=100.0, created="2026-07-26T11:00:00Z"),
+        _thesis("a", likes=7, replies=1, amount=100.0),
+        _thesis("b", likes=3, replies=0, amount=0.0, created="2026-07-26T12:00:00Z"),
+        _thesis("a", likes=5, replies=2, amount=100.0, created="2026-07-26T11:00:00Z"),
     ]}}
     s = extract.extract_social(raw, "0xtok", "56", "now")
     assert s["thesis_count"] == 3
@@ -410,6 +536,45 @@ def test_extract_social_aggregates_engagement():
     assert s["thesis_authors"] == 2
     assert s["holder_authors"] == 1          # من يملك حصّة فعلاً
     assert s["newest_thesis_at"] == "2026-07-26T12:00:00Z"
+
+
+def test_holder_authors_reads_the_position_not_the_dead_equity_field():
+    """`equity` صفر في 28,186/28,186 أطروحة مقيسة — حقل ميت من المنبع.
+
+    قراءته أبقت العمود ثابتاً على 0 في 46,040 صفّاً: عمود بلا معلومة يتسلّل إلى
+    التدريب كأنّه قياس. المركز الحقيقي في `authorTrade.humanTokenAmount`.
+    """
+    raw = {"responseObject": {"items": [
+        # يملك فعلاً، لكن equity صفر كما يرسلها المصدر دائماً
+        _thesis("holder", equity=0.0, amount=250.0),
+        _thesis("exited", equity=0.0, amount=0.0, closed="2026-07-26T09:00:00Z"),
+    ]}}
+    s = extract.extract_social(raw, "0xtok", "56", "now")
+    assert s["thesis_authors"] == 2
+    assert s["holder_authors"] == 1
+
+
+def test_holder_authors_counts_partial_exits_that_still_hold():
+    """أُغلقت صفقة وبقيت كمية: 2,536 من 28,186 حالة مقيسة.
+
+    لو اعتمدنا `closedAt is None` وحده لسقط هؤلاء، وهم مالكون فعلاً — الكمية
+    هي المقياس المباشر لـ«يملك الآن».
+    """
+    raw = {"responseObject": {"items": [
+        _thesis("partial", amount=40.0, closed="2026-07-26T09:00:00Z"),
+    ]}}
+    assert extract.extract_social(raw, "0xtok", "56", "now")["holder_authors"] == 1
+
+
+def test_holder_authors_ignores_missing_or_malformed_position():
+    """غياب `authorTrade` لا يُعدّ ملكية ولا يرفع استثناءً."""
+    for trade in (None, "nope", {}, {"humanTokenAmount": None},
+                  {"humanTokenAmount": ""}):
+        item = _thesis("x")
+        item["authorTrade"] = trade
+        s = extract.extract_social({"responseObject": {"items": [item]}}, "a", "1", "t")
+        assert s["thesis_authors"] == 1
+        assert s["holder_authors"] == 0, trade
 
 
 def test_extract_social_silence_is_recorded_as_zeros_not_dropped():
@@ -469,3 +634,109 @@ def test_extract_thesis_items_drops_entries_without_id_or_timestamp():
 def test_extract_thesis_items_on_garbage_is_empty():
     for bad in (None, "x", {}, {"responseObject": {}}):
         assert extract.extract_thesis_items(bad, "a", "1", "t") == []
+
+
+# ---------------------------------------------------------------------------
+# الشرعية الخارجية — حقول كانت في الخام المخزّن ولا تُستخرج
+# ---------------------------------------------------------------------------
+def test_extract_static_counts_exchanges_and_keeps_names():
+    """المنصّات قائمة كائنات {name}؛ نعدّها ونحفظ الأسماء لتغيّر الشكل."""
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["exchanges"] = [{"name": "Binance"}, {"name": "MEXC"}, {"name": "Gate"}]
+    st = extract.extract_token_static(item, "t")
+    assert st["exchanges_count"] == 3
+    assert json.loads(st["exchanges_json"]) == ["Binance", "MEXC", "Gate"]
+
+
+def test_extract_static_accepts_exchange_strings():
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["exchanges"] = ["Binance", "MEXC"]
+    st = extract.extract_token_static(item, "t")
+    assert st["exchanges_count"] == 2
+    assert json.loads(st["exchanges_json"]) == ["Binance", "MEXC"]
+
+
+def test_extract_static_absent_exchanges_is_unknown_not_zero():
+    """FR-007: المفتاح غائب ⇒ None. حاضر وفارغ ⇒ صفر مقيس."""
+    st = extract.extract_token_static(TRENDING_ITEM, "t")
+    assert st["exchanges_count"] is None
+
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["exchanges"] = []
+    assert extract.extract_token_static(item, "t")["exchanges_count"] == 0
+
+
+def test_extract_static_info_signals():
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["token"]["info"].update({
+        "cmcId": "1839",
+        "description": "A community token for testing.",
+        "imageBannerUrl": "https://cdn.example/banner.png",
+        "imageThumbUrl": "https://cdn.example/thumb.png",
+    })
+    st = extract.extract_token_static(item, "t")
+    assert st["cmc_id"] == "1839"
+    assert st["description_len"] == len("A community token for testing.")
+    assert st["has_banner"] == 1
+    assert st["has_image"] == 1
+
+
+def test_extract_static_image_without_banner():
+    """صورة مصغّرة بلا بانر: has_image=1 وhas_banner=0 — علمان مستقلّان."""
+    item = json.loads(json.dumps(TRENDING_ITEM))
+    item["token"]["info"]["imageThumbUrl"] = "https://cdn.example/thumb.png"
+    st = extract.extract_token_static(item, "t")
+    assert st["has_banner"] == 0
+    assert st["has_image"] == 1
+
+
+def test_extract_static_empty_info_gives_zero_flags():
+    st = extract.extract_token_static(TRENDING_ITEM, "t")
+    assert st["cmc_id"] is None
+    assert st["description"] is None
+    assert st["description_len"] == 0
+    assert st["has_banner"] == 0
+
+
+# ---------------------------------------------------------------------------
+# تفاعل الحدث — من المستوى الأعلى لا body
+# ---------------------------------------------------------------------------
+def test_extract_signal_engagement_from_top_level():
+    event = json.loads(json.dumps(FEED_EVENT))
+    event.update({"likes": 4, "views": 91, "numReplies": 2, "pinned": True})
+    row = extract.extract_signal_event(event, "t")
+    assert row["likes"] == 4
+    assert row["views"] == 91
+    assert row["num_replies"] == 2
+    assert row["pinned"] == 1
+
+
+def test_extract_signal_engagement_zero_preserved_not_nulled():
+    """المصدر يرسل صفراً دائماً؛ صفر مقيس ≠ غائب — نميّزهما."""
+    event = json.loads(json.dumps(FEED_EVENT))
+    event.update({"likes": 0, "views": 0, "pinned": False})
+    row = extract.extract_signal_event(event, "t")
+    assert row["likes"] == 0
+    assert row["views"] == 0
+    assert row["pinned"] == 0
+    assert row["num_replies"] is None      # غائب فعلاً، بلا فبركة
+
+
+def test_extract_signal_captures_counter_asset():
+    """الطرف المقابل ملتقط لا مُفسَّر: USDC في 100% اليوم (بلا تباين)،
+    ونحفظه ليكشف بدء المصدر بتوجيه أزواج عملة↔عملة."""
+    buy = json.loads(json.dumps(FEED_EVENT))
+    buy["body"].update({"inTokenAddress": "EPjFWdd5AufqSS",
+                        "outTokenAddress": "So1111tokenAddr"})
+    row = extract.extract_signal_event(buy, "t")
+    assert row["in_token_address"] == "EPjFWdd5AufqSS"
+    assert row["out_token_address"] == "So1111tokenAddr"
+
+    sell = json.loads(json.dumps(FEED_EVENT))
+    sell["body"].update({"inTokenAddress": "So1111tokenAddr",
+                         "outTokenAddress": "EPjFWdd5AufqSS"})
+    assert extract.extract_signal_event(sell, "t")["out_token_address"] == "EPjFWdd5AufqSS"
+
+
+def test_extract_signal_missing_out_token_is_none():
+    assert extract.extract_signal_event(FEED_EVENT, "t")["out_token_address"] is None

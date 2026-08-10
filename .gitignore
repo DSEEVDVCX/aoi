@@ -22,6 +22,8 @@ captured_endpoints.json
 
 # Runtime artefacts
 *.log
+# سجلّات مُدوَّرة (server.log.1) — لا يطابقها *.log
+*.log.*
 *.db
 *.db-shm
 *.db-wal

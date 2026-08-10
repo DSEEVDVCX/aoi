@@ -52,6 +52,32 @@ def _bool_to_int(v: Any) -> int | None:
     return None
 
 
+def _authority_to_int(v: Any, network_id: Any) -> int | None:
+    """سلطة السكّ/التجميد → 0/1، مع تمييز «مُلغاة» من «مجهولة» (FR-007).
+
+    الحقل ليس منطقياً كما يوحي اسمه: fomo يعيد **عنوان** السلطة أو `null`.
+    مقيس على 571 لقطة (2026-08-09) وكان مؤكَّداً وقتها من مصدر ثانٍ مستقلّ
+    (فحص سلسلة مباشر أُزيل لاحقاً، فيبقى القياس أدناه هو المرجع):
+
+    - سولانا (1399811149): 56 عنواناً و256 `null` — للحقل معنى، و`null`
+      تعني السلطة مُلغاة فعلاً (0). قراءة السلسلة أعطت 707/4147 بالنسبة
+      نفسها (~17-18%) وبالعناوين نفسها.
+    - EVM (56 · 4663 · 8453): `null` في 259/259 بلا استثناء واحد. ليست
+      «مُلغاة» بل **غير مقيسة** — لسولانا وحدها سلطة سكّ بهذا المعنى.
+      فحص السلسلة وافق: 0 من 3,189 صفّاً EVM.
+
+    فإرجاع 0 لـ EVM يفبرك «آمن» لعملة لم تُقَس أصلاً — وهو بالضبط ما
+    يمنعه FR-007. لذا نُرجع None هناك ونترك التغطية ناقصة بصدق.
+    """
+    if isinstance(v, bool):
+        return 1 if v else 0
+    if isinstance(v, str) and v.strip():
+        return 1                      # عنوان سلطة موجود ⇒ الصلاحية قائمة
+    if v is None:
+        return 0 if _str(network_id) == config.SOLANA_NETWORK_ID else None
+    return None
+
+
 def _dumps(v: Any) -> str:
     return json.dumps(v, ensure_ascii=False)
 
@@ -85,15 +111,47 @@ def unwrap_feed(raw_envelope: Any) -> list[dict[str, Any]]:
     return []
 
 
+# مدد الصدارة التي لها أعمدة مستقلّة في signal_events. "all" ليست منها: هي
+# `top_trader_match_count`/`buyers_best_rank` بلا لاحقة (العقد القديم محفوظ).
+LEADERBOARD_PERIOD_KEYS: tuple[str, ...] = ("24h", "7d", "30d")
+
+
+def match_ranks_by_period(
+    trader_ids: Sequence[str],
+    rank_lookups: Mapping[str, Mapping[str, int]] | None,
+) -> dict[str, tuple[int | None, int | None]]:
+    """معرّفات مشترين × خرائط المدد → {period: (عدد المطابقات, أفضل رتبة)}.
+
+    مدّة غائبة أو خريطتها فارغة (لم تُحمّل بعد) ⇒ (None, None) لا (0, None):
+    «لم نقس» ليس «لم يطابق أحد» — الصفر هنا يفبرك نفياً (FR-007).
+    """
+    out: dict[str, tuple[int | None, int | None]] = {}
+    for period in LEADERBOARD_PERIOD_KEYS:
+        lut = (rank_lookups or {}).get(period)
+        if not lut:
+            out[period] = (None, None)
+            continue
+        ranks = [lut[t] for t in trader_ids if t in lut]
+        out[period] = (len(ranks), min(ranks) if ranks else None)
+    return out
+
+
 def extract_signal_event(
     event: Mapping[str, Any],
     recorded_at: str,
     rank_lookup: Mapping[str, int] | None = None,
+    rank_lookups: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, Any] | None:
     """حدث feed خام → صفّ signal_events. يحتاج id و tokenAddress (وإلا None).
 
     rank_lookup: خريطة trader_id → رتبة صدارة (من leaderboard_cache) لحساب
     top_trader_match_count و buyers_best_rank. غيابها لا يُفشل الاستخراج.
+
+    rank_lookups: خرائط المدد {period → {id → rank}} — المصدر يسقّف الصدارة
+    الأساسيّة عند 50، لكنّ صدارات المدد (24h/7d/30d) تعيد كلٌّ 100 فاتّحادها 214
+    متداولاً (تغطية المطابقة 3.68% ← 15.26% مقيسة على 7,200 حدثاً). تبقى منفصلة
+    لا مدموجة: رتبة 7 في 24h ليست رتبة 7 في totalPnL. مدّة بلا خريطة محمّلة
+    تبقى None في أعمدتها — غائب ≠ صفر (FR-007).
     """
     ev_id = _str(event.get("id"))
     token_address = _str(event.get("tokenAddress"))
@@ -128,6 +186,16 @@ def extract_signal_event(
         match_count = len(ranks)
         best_rank = min(ranks) if ranks else None
 
+    # مطابقة المدد: كلٌّ مستقلّة. المدّة الفارغة (لم تُحمّل قطّ) تبقى None.
+    per_period = match_ranks_by_period(all_ids, rank_lookups)
+    matched_flags = [
+        c for c in (match_count, *(per_period[p][0] for p in LEADERBOARD_PERIOD_KEYS))
+        if c is not None
+    ]
+    periods_matched = (
+        sum(1 for c in matched_flags if c > 0) if matched_flags else None
+    )
+
     return {
         "id": ev_id,
         "token_address": token_address,
@@ -148,6 +216,17 @@ def extract_signal_event(
         "top_trader_ids_json": _dumps(top_ids),
         "top_trader_match_count": match_count,
         "buyers_best_rank": best_rank,
+        # صدارات المدد — تضاعف التغطية وتفصل «متصدّر اليوم» عن «متصدّر الأبد».
+        "top_trader_match_count_24h": per_period["24h"][0],
+        "buyers_best_rank_24h": per_period["24h"][1],
+        "top_trader_match_count_7d": per_period["7d"][0],
+        "buyers_best_rank_7d": per_period["7d"][1],
+        "top_trader_match_count_30d": per_period["30d"][0],
+        "buyers_best_rank_30d": per_period["30d"][1],
+        # في كم مدّة ظهر مشترٍ واحد على الأقل (0-4): عرض الحضور لا عمقه —
+        # متصدّر في الأربع كلّها حيوان آخر عن متصدّر في 24h وحدها.
+        "top_trader_periods_matched": periods_matched,
+
         # حقول الشراء المفرد (large_buy) — None في multi_user_buy، وهذا صحيح (FR-007).
         "buyer_id": buyer_id,
         "buyer_handle": _str(body.get("userHandle")),
@@ -158,12 +237,29 @@ def extract_signal_event(
         # حجم الصفقة — أثمن ما في large_buy وكان مُهدراً بالكامل.
         # `currentSizeUsd` حجم المركز بعد الشراء، و`inHumanAmount` ما دُفع فعلاً؛
         # الفرق بينهما يميّز "أضاف 3آلاف إلى مركز 42ألف" عن "دخل بـ 45ألف دفعة".
+        # `outTokenAddress` يكمل `inTokenAddress`. مقيس على 51,066 حدثاً معبّأً:
+        # الطرف المقابل **USDC في 100%** والاتجاه يحدّده `signal_type` وحده
+        # (كل large_buy: out=العملة، كل large_sell: out=USDC). أي أنّه بلا تباين
+        # اليوم فلا نبني عليه فيتشر — نلتقطه لأنّه رخيص ويكشف اللحظة التي يبدأ
+        # فيها المصدر بتوجيه أزواج غير USDC (عملة↔عملة) فينقلب مفيداً.
         "size_usd": _num(body.get("currentSizeUsd")),
         "in_amount": _num(body.get("inHumanAmount")),
         "in_token_address": _str(body.get("inTokenAddress")),
         "out_amount": _num(body.get("outHumanAmount")),
+        "out_token_address": _str(body.get("outTokenAddress")),
         "token_amount": _num(body.get("humanTokenAmount")),
         "realized_pnl_usd": _num(body.get("realizedPnlUsd")),
+        # التفاعل على الحدث نفسه — من **المستوى الأعلى** لا body.
+        # مقيس على 51,062 حدثاً بعد التعبئة الرجعية: الحقول موجودة في 100% من
+        # الأحداث وقيمتها **صفر دائماً** (likes/views/pinned بلا أي تباين،
+        # وnumReplies صفر في 238 صفّاً وغائب في الباقي). المصدر يرسل الهيكل ولا
+        # يعبّئه، وميزة بلا تباين لا تُعلّم النموذج شيئاً — فنُبقي الالتقاط
+        # (رخيص، ويكشف اللحظة التي يبدأ المصدر فيها بالتعبئة) ولا نبني عليه
+        # فيتشر. `numReplies` يبقى None حيث غاب بلا فبركة (FR-007).
+        "likes": _int(event.get("likes")),
+        "views": _int(event.get("views")),
+        "num_replies": _int(event.get("numReplies")),
+        "pinned": _bool_to_int(event.get("pinned")),
         "raw_json": _dumps(event),
     }
 
@@ -267,16 +363,42 @@ def extract_token_static(
     tok = _token_obj(item)
     socials = tok.get("socialLinks") if isinstance(tok.get("socialLinks"), Mapping) else {}
     launchpad = tok.get("launchpad") if isinstance(tok.get("launchpad"), Mapping) else {}
+    info = tok.get("info") if isinstance(tok.get("info"), Mapping) else {}
+
+    # إشارات شرعية خارجية — كانت تُهدر بالكامل. المنصّات قائمة كائنات
+    # {name} أو سلاسل؛ نعدّها ونحفظ الأسماء (المصدر قد يغيّر الشكل).
+    exchanges = item.get("exchanges")
+    if isinstance(exchanges, list):
+        names: list[str] = []
+        for e in exchanges:
+            name = _str(e.get("name")) if isinstance(e, Mapping) else _str(e)
+            if name:
+                names.append(name)
+        exchanges_json = _dumps(names)
+        exchanges_count = len(names)
+    else:
+        exchanges_json = _dumps([])
+        exchanges_count = None   # غائب ≠ صفر (FR-007)
+
+    desc = _str(info.get("description"))
+    banner = info.get("imageBannerUrl")
+    has_image = any(
+        info.get(k) for k in (
+            "imageBannerUrl", "imageLargeUrl", "imageSmallUrl", "imageThumbUrl",
+        )
+    )
+
+    network_id = _str(tok.get("networkId")) or _str(item.get("networkId")) or ""
 
     return {
         "token_address": address,
-        "network_id": _str(tok.get("networkId")) or _str(item.get("networkId")) or "",
+        "network_id": network_id,
         "recorded_at": recorded_at,
         "name": _str(tok.get("name")),
         "symbol": _str(tok.get("symbol")),
         "decimals": _int(tok.get("decimals")),
-        "mintable": _bool_to_int(tok.get("mintable")),
-        "freezable": _bool_to_int(tok.get("freezable")),
+        "mintable": _authority_to_int(tok.get("mintable"), network_id),
+        "freezable": _authority_to_int(tok.get("freezable"), network_id),
         "is_scam": _bool_to_int(tok.get("isScam")),
         "creator_address": _str(tok.get("creatorAddress")),
         "launchpad_name": _str(launchpad.get("launchpadName")),
@@ -287,6 +409,13 @@ def extract_token_static(
         "website": _str(socials.get("website")),
         "discord": _str(socials.get("discord")),
         "token_created_at": _str(tok.get("createdAt")),
+        "exchanges_count": exchanges_count,
+        "exchanges_json": exchanges_json,
+        "cmc_id": _str(info.get("cmcId")),
+        "description": desc,
+        "description_len": len(desc) if desc else 0,
+        "has_banner": 1 if banner else 0,
+        "has_image": 1 if has_image else 0,
         "raw_json": _dumps(item),
     }
 
@@ -506,7 +635,12 @@ def bars_status(raw_envelope: Any) -> str | None:
 # الطبقة الاجتماعية — GET /feed/token/thesis
 # المغلّف: responseObject.items[] (أو .feed) وكل عنصر:
 #   {id, type, comment{comment, numLikes}, numReplies, equity, userHandle,
-#    createdAt, ticker, tokenAddress, networkId}
+#    createdAt, ticker, tokenAddress, networkId, authorTrade{...}}
+# حقلان ميتان من المنبع لا تعوّل عليهما (مقيسان على 28,186 أطروحة 2026-08-09):
+#   `equity` = 0 في 100% من العناصر — المركز الحقيقي في `authorTrade`.
+#   `numReplies` = 0 في 100% — والردود لا تصل أصلاً (كل parentId فارغ).
+# و`comment.reactions.counts.likeCount` صفر دائماً لأنه حالة **القارئ** لا العدّ
+# العام؛ العدّ العام هو `comment.numLikes` (غير صفري في 46.7%).
 # ---------------------------------------------------------------------------
 def unwrap_thesis(raw_envelope: Any) -> list[dict[str, Any]]:
     """يستخرج قائمة الأطروحات من المغلّف الخام. غياب → []."""
@@ -579,8 +713,17 @@ def extract_social(
     """مغلّف الأطروحات الخام → صفّ token_social (مجاميع + الخام).
 
     نعدّ الكتّاب المميّزين لا الأطروحات وحدها: عشر أطروحات من شخص واحد ليست
-    زخماً اجتماعياً. و`holder_authors` يميّز من يملك حصّة فعلاً (equity>0) —
-    الترويج ممّن يملك مختلف عن الترويج ممّن لا يملك.
+    زخماً اجتماعياً. و`holder_authors` يميّز من يملك حصّة فعلاً — الترويج ممّن
+    يملك مختلف عن الترويج ممّن لا يملك.
+
+    **مصدر الحصّة**: `authorTrade.humanTokenAmount` لا `equity`. الحقل `equity`
+    موجود في المغلّف لكنّه ميت من المنبع: صفر صحيح في 28,186 من 28,186 أطروحة
+    مقيسة (2026-08-09)، فكان العمود ثابتاً على 0 في 46,040 صفّاً — عمود بلا
+    معلومة. مركز الصفقة الحقيقي في `authorTrade`، ومقيسٌ فيه تباين فعلي:
+    15,249/28,186 (54.1%) يملكون كمية موجبة. `closedAt is None` يطابق
+    «كمية موجبة» تماماً للمراكز المفتوحة (12,713 كلاهما، وصفر مفتوح بكمية
+    صفر) لكنّه يفوّت 2,536 أغلقوا صفقة وما زالوا يملكون بقيّة — فالكمية هي
+    المقياس المباشر لـ«يملك الآن».
 
     **تحذير للقارئ لاحقاً**: `thesis_total` هو العدد الحقيقي من المغلّف، أمّا
     `thesis_likes/replies/authors` فمحسوبة على **أحدث 100 أطروحة فقط** (سقف
@@ -601,7 +744,8 @@ def extract_social(
         handle = _str(it.get("userHandle"))
         if handle:
             authors.add(handle)
-            if (_num(it.get("equity")) or 0) > 0:
+            trade = it.get("authorTrade") if isinstance(it.get("authorTrade"), Mapping) else {}
+            if (_num(trade.get("humanTokenAmount")) or 0) > 0:
                 holders.add(handle)
         created = _str(it.get("createdAt"))
         if created and (newest is None or created > newest):
@@ -621,81 +765,6 @@ def extract_social(
         "thesis_authors": len(authors),
         "holder_authors": len(holders),
         "newest_thesis_at": newest,
-        "raw_json": _dumps(raw_envelope),
-    }
-
-
-# ---------------------------------------------------------------------------
-# بوابة مخاطر التداول: responseObject{disableBuying, disableSelling, warnings[]}
-# ---------------------------------------------------------------------------
-def extract_risk_assessment(
-    raw_envelope: Any,
-    token_address: str,
-    network_id: str,
-    recorded_at: str,
-    watch_first_seen_at: str,
-    entry_signal_id: str | None,
-    is_control: int = 0,
-) -> dict[str, Any] | None:
-    """مغلّف tokenWarnings → لقطة قابلة للتدقيق، من دون افتراض أن الغائب آمن.
-
-    `pass` هنا نتيجة غربلة المزود فقط. لا نسمّيها sellable لأن إثبات البيع
-    يحتاج محاكاة معاملة وفحص صلاحيات العقد/Token-2022 بصورة مستقلة.
-    """
-    if not isinstance(raw_envelope, Mapping):
-        return None
-    ro = raw_envelope.get("responseObject")
-    if not isinstance(ro, Mapping):
-        return None
-
-    disable_buying = _bool_to_int(ro.get("disableBuying"))
-    disable_selling = _bool_to_int(ro.get("disableSelling"))
-    warnings_raw = ro.get("warnings")
-    warnings_known = isinstance(warnings_raw, list)
-    warnings = warnings_raw if warnings_known else []
-
-    types: set[str] = set()
-    severe_count = 0
-    high_count = 0
-    for warning in warnings:
-        if not isinstance(warning, Mapping):
-            continue
-        warning_type = _str(warning.get("type"))
-        if warning_type:
-            types.add(warning_type)
-        severity = (_str(warning.get("severity")) or "").strip().upper()
-        if severity in {"SEVERE", "CRITICAL"}:
-            severe_count += 1
-        elif severity == "HIGH":
-            high_count += 1
-
-    if disable_buying == 1 or disable_selling == 1:
-        gate_status = "blocked"
-    elif disable_buying is None or disable_selling is None or not warnings_known:
-        gate_status = "unknown"
-    # بوابة تنفيذ محافظة: وجود تحذير من المزوّد يكفي لإيقاف القبول الآلي، حتى
-    # لو صُنّف MODERATE (مثال حيّ: TOKEN_MINTABLE يسمح بتخفيف الحيازة،
-    # وTOKEN_FREEZABLE يسمح بمنع البيع). الشدة تبقى محفوظة للتحليل اللاحق.
-    elif warnings:
-        gate_status = "review"
-    else:
-        gate_status = "pass"
-
-    return {
-        "token_address": token_address,
-        "network_id": network_id,
-        "recorded_at": recorded_at,
-        "watch_first_seen_at": watch_first_seen_at,
-        "entry_signal_id": entry_signal_id,
-        "is_control": 1 if is_control else 0,
-        "disable_buying": disable_buying,
-        "disable_selling": disable_selling,
-        "warning_count": len(warnings),
-        "severe_count": severe_count,
-        "high_count": high_count,
-        "gate_status": gate_status,
-        "warning_types_json": _dumps(sorted(types)),
-        "warnings_json": _dumps(warnings),
         "raw_json": _dumps(raw_envelope),
     }
 
@@ -822,3 +891,143 @@ def extract_activity_event(ev: Mapping[str, Any], recorded_at: str) -> dict[str,
         "ticker": _coalesce(_str(ev.get("ticker")), _str(body.get("ticker"))),
         "raw_json": _dumps(ev),
     }
+
+
+# ---------------------------------------------------------------------------
+# تركّز الحيازة وتموضع الحشد — POST /proxy/tokenDetails و GET /hodlers/top
+#
+# **لماذا مصدران**: `market_ticks.top10_holders_pct` عمود ميّت (صفر من 1.43
+# مليون صفّ) لأنّ قوائم trending/verified لا تحمل المفتاح إطلاقاً. وفحص
+# السلسلة يغطّي Solana وحدها (2,929 من 3,044) ويصمت كلياً على EVM (صفر من
+# 2,378). فالتركّز — أقوى مؤشّر rug — مفقود لكل عملة EVM في الأرشيف.
+#
+# المصدران **يقيسان شيئين مختلفين**، وهذا مؤكَّد حيّاً 2026-08-09 لا مفترَضاً:
+#
+# - `tokenDetails` → تركّز السلسلة: `top10HoldersPercent` جاهز (شوهد 83.6% و
+#   90.1% و21.9%) مع `holders` الكلّي. يعمل على EVM وSolana معاً — وهو الإصلاح
+#   المباشر للعمود الميّت.
+# - `/hodlers/top` → **ليس تركّزاً إطلاقاً**: يعيد مستخدمي fomo الحائزين للعملة
+#   (276 من 947 · 118 من 14,371) بلا أي نسبة من المعروض، لكن مع تكلفة كل
+#   مركز وربحه غير المحقّق ومدّة حمله وعلَم `isDev`. أي أنّه **تموضع الحشد**:
+#   «هل حاملو المنصّة تحت الماء؟» سؤال مختلف عن «هل الملكية مركَّزة؟».
+#   قياس أوّليّ: 50 من 50 حائزاً تحت الماء في عملة، مقابل 12 من 49 في أخرى.
+#
+# لذلك لكل مصدر مستخرِج مستقلّ وصفّ مستقلّ (`source` داخل المفتاح الأساسي)،
+# فلا يُحسب مقياس مكان الآخر ولا يطمس أحدهما نتيجة الثاني.
+# ---------------------------------------------------------------------------
+def extract_token_details_holders(
+    raw_envelope: Any,
+    token_address: str,
+    network_id: str,
+    recorded_at: str,
+    watch_first_seen_at: str,
+    entry_signal_id: str | None,
+    is_control: int = 0,
+) -> dict[str, Any] | None:
+    """`tokenDetails` خام → صفّ تركّز سلسلة. بلا مغلّف صالح → None."""
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, Mapping):
+        return None
+
+    top10_pct = _num(ro.get("top10HoldersPercent"))
+    holder_count = _int(ro.get("holders"))
+    if top10_pct is None and holder_count is None:
+        return None  # لا معلومة حيازة — لا نكتب صفّاً فارغاً (FR-007)
+
+    return {
+        "token_address": token_address,
+        "network_id": network_id,
+        "recorded_at": recorded_at,
+        "watch_first_seen_at": watch_first_seen_at,
+        "entry_signal_id": entry_signal_id,
+        "is_control": 1 if is_control else 0,
+        "source": "token_details",
+        "top10_pct": top10_pct,
+        "holder_count": holder_count,
+        # حقول الحشد لا معنى لها هنا: هذا المصدر لا يعرف مستخدمي المنصّة.
+        "platform_holders": None,
+        "platform_holders_listed": None,
+        "platform_value_usd": None,
+        "platform_underwater": None,
+        "platform_median_hold_seconds": None,
+        "platform_dev_holding": None,
+        "top_holders_json": None,
+        "raw_json": _dumps(raw_envelope),
+    }
+
+
+def extract_platform_holders(
+    raw_envelope: Any,
+    token_address: str,
+    network_id: str,
+    recorded_at: str,
+    watch_first_seen_at: str,
+    entry_signal_id: str | None,
+    is_control: int = 0,
+) -> dict[str, Any] | None:
+    """`/hodlers/top` خام → صفّ تموضع حشد المنصّة. بلا مغلّف صالح → None.
+
+    `responseObject` قائمة عنصر لكل عملة مطلوبة، وكلّ عنصر يحمل `topHolders`
+    (مراكز مستخدمي fomo) و`totalHolders`. النِّسب غائبة تماماً، فلا نشتقّ
+    تركّزاً من هنا ولا نخمّنه.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, list) or not ro:
+        return None
+    entry = next((e for e in ro if isinstance(e, Mapping)), None)
+    if entry is None:
+        return None
+
+    raw_holders = entry.get("topHolders")
+    holders = [h for h in raw_holders if isinstance(h, Mapping)] if isinstance(raw_holders, list) else []
+    total = _int(entry.get("totalHolders"))
+    if total is None and not holders:
+        return None
+
+    values = [v for v in (_num(h.get("value")) for h in holders) if v is not None]
+    # «تحت الماء» = ربح غير محقّق سالب. الغائب لا يُحسب في البسط ولا المقام.
+    unreal = [u for u in (_num(h.get("unrealizedPnl")) for h in holders) if u is not None]
+    holds = sorted(
+        t for t in (_num(h.get("averageHoldTimeSeconds")) for h in holders) if t is not None
+    )
+    median_hold = holds[len(holds) // 2] if holds else None
+    dev = 1 if any(h.get("isDev") for h in holders) else (0 if holders else None)
+
+    return {
+        "token_address": token_address,
+        "network_id": network_id,
+        "recorded_at": recorded_at,
+        "watch_first_seen_at": watch_first_seen_at,
+        "entry_signal_id": entry_signal_id,
+        "is_control": 1 if is_control else 0,
+        "source": "hodlers_top",
+        # التركّز مجهول من هذا المصدر — يبقى NULL ولا يُفبرك (FR-007).
+        "top10_pct": None,
+        "holder_count": None,
+        "platform_holders": total,
+        "platform_holders_listed": len(holders) or None,
+        "platform_value_usd": sum(values) if values else None,
+        "platform_underwater": sum(1 for u in unreal if u < 0) if unreal else None,
+        "platform_median_hold_seconds": median_hold,
+        "platform_dev_holding": dev,
+        # نحفظ المراكز بلا كتلة `user` الضخمة: المُعرّف والمقبض يكفيان للربط
+        # بالمتصدّرين لاحقاً، والباقي يبقى في raw_json على أي حال.
+        "top_holders_json": _dumps([
+            {
+                "user_id": _str((h.get("user") or {}).get("id")) if isinstance(h.get("user"), Mapping) else None,
+                "handle": _str((h.get("user") or {}).get("userHandle")) if isinstance(h.get("user"), Mapping) else None,
+                "value": _num(h.get("value")),
+                "cost_basis": _num(h.get("costBasis")),
+                "unrealized_pnl": _num(h.get("unrealizedPnl")),
+                "hold_seconds": _num(h.get("averageHoldTimeSeconds")),
+                "is_dev": 1 if h.get("isDev") else 0,
+            }
+            for h in holders[:50]
+        ]),
+        "raw_json": _dumps(raw_envelope),
+    }
+

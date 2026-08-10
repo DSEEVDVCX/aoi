@@ -283,7 +283,62 @@ def test_active_watchlist_counts_ticks(db_path):
     assert len(wl) == 1                            # النشط فقط
     assert wl[0]["token_address"] == "tokA"
     assert wl[0]["tick_count"] == 3
-    assert wl[0]["combined_status"] is None
+    conn.close()
+
+
+def test_active_watchlist_first_ever_from_watch_windows(db_path):
+    """أوّل التقاط من السجلّ غير القابل للكتابة فوقه، لا من الصفّ الحيّ.
+
+    `upsert_watch` يكتب فوق `watchlist.first_seen_at` عند كل إعادة قبول، فعملة
+    مُلتقطة منذ أسبوع تظهر بعمر ساعات. `watch_windows` يحفظ كل نافذة.
+    """
+    c = sqlite3.connect(db_path)
+    c.execute(
+        "INSERT INTO watchlist(token_address, network_id, source, first_seen_at,"
+        " watch_until, active) VALUES('tokA','56','feed',"
+        "'2026-08-08T23:17:00Z','2026-08-10T23:17:00Z',1)"
+    )
+    for ts in ("2026-08-02T22:42:13Z", "2026-08-05T10:00:00Z", "2026-08-08T23:17:00Z"):
+        c.execute("INSERT INTO watch_windows VALUES('tokA','56',?,3)", (ts,))
+    c.commit(); c.close()
+    conn = _conn(db_path)
+    row = dao.active_watchlist(conn)[0]
+    assert row["first_ever_at"] == "2026-08-02T22:42:13Z"   # أوّل نافذة
+    assert row["first_seen_at"] == "2026-08-08T23:17:00Z"   # الدورة الحالية تبقى
+    conn.close()
+
+
+def test_active_watchlist_first_ever_ignores_other_token(db_path):
+    """النافذة تُنسب بالعنوان والشبكة معاً، فلا تُخلط عملة بأخرى."""
+    c = sqlite3.connect(db_path)
+    c.execute(
+        "INSERT INTO watchlist(token_address, network_id, source, first_seen_at,"
+        " watch_until, active) VALUES('tokA','56','feed',"
+        "'2026-08-08T00:00:00Z','2026-08-10T00:00:00Z',1)"
+    )
+    c.execute("INSERT INTO watch_windows VALUES('tokB','56','2026-07-01T00:00:00Z',3)")
+    c.execute("INSERT INTO watch_windows VALUES('tokA','99','2026-07-02T00:00:00Z',3)")
+    c.execute("INSERT INTO watch_windows VALUES('tokA','56','2026-08-08T00:00:00Z',3)")
+    c.commit(); c.close()
+    conn = _conn(db_path)
+    row = dao.active_watchlist(conn)[0]
+    assert row["first_ever_at"] == "2026-08-08T00:00:00Z"
+    conn.close()
+
+
+def test_active_watchlist_first_ever_falls_back_without_window(db_path):
+    """عملة بلا نافذة مسجّلة (ما قبل الجدول) تعود إلى طابعها الحيّ لا NULL."""
+    c = sqlite3.connect(db_path)
+    c.execute(
+        "INSERT INTO watchlist(token_address, network_id, source, first_seen_at,"
+        " watch_until, active) VALUES('tokA','56','feed',"
+        "'2026-08-08T00:00:00Z','2026-08-10T00:00:00Z',1)"
+    )
+    c.commit(); c.close()
+    conn = _conn(db_path)
+    row = dao.active_watchlist(conn)[0]
+    assert row["first_ever_at"] is None       # MIN على لا شيء
+    assert row["first_seen_at"] == "2026-08-08T00:00:00Z"
     conn.close()
 
 
@@ -592,7 +647,6 @@ def test_every_dao_read_runs_against_the_real_recorder_schema(tmp_path):
         assert dao.active_watch_count(c) == 0
         assert dao.recent_signals(c, 10) == []
         assert dao.active_watchlist(c) == []
-        assert dao.safety_summary(c)["active"] == 0
         assert dao.ticks_summary(c)["total"] == 0
         assert dao.bars_coverage(c, 0)["candles"] == 0
         assert dao.watch_performance(c, 10) == []
@@ -602,50 +656,6 @@ def test_every_dao_read_runs_against_the_real_recorder_schema(tmp_path):
         assert dao.storage_stats(p, c)["bytes"] > 0
     finally:
         c.close()
-
-
-def test_safety_summary_combines_provider_and_chain_fail_closed(tmp_path):
-    p = str(tmp_path / "safety.db")
-    conn = sqlite3.connect(p)
-    with open(REAL_SCHEMA, encoding="utf-8") as fh:
-        conn.executescript(fh.read())
-    conn.execute(
-        """INSERT INTO watchlist(token_address,network_id,first_seen_at,source,
-                                  watch_until,active,is_control)
-           VALUES('tok','56','t0','large_buy','t1',1,0)"""
-    )
-    conn.execute(
-        """INSERT INTO token_risk_assessments(
-               token_address,network_id,recorded_at,watch_first_seen_at,is_control,
-               disable_buying,disable_selling,warning_count,severe_count,high_count,
-               gate_status,warning_types_json,warnings_json,raw_json)
-           VALUES('tok','56','t2','t0',0,0,0,0,0,0,'pass','[]','[]','{}')"""
-    )
-    conn.execute(
-        """INSERT INTO token_chain_assessments(
-               token_address,network_id,recorded_at,watch_first_seen_at,is_control,
-               chain_kind,rpc_chain_id,gate_status,reason_codes_json,
-               dangerous_capabilities_json,transfer_simulation_status,details_json,raw_json)
-           VALUES('tok','56','t2','t0',0,'evm','56','blocked','[]',
-                  '[]','failed','{}','{}')"""
-    )
-    conn.commit()
-    conn.close()
-
-    ro = _conn(p)
-    try:
-        summary = dao.safety_summary(ro)
-        assert summary == {
-            "active": 1,
-            "assessed": 1,
-            "counts": {"pass": 0, "review": 0, "blocked": 1, "unknown": 0},
-        }
-        row = dao.active_watchlist(ro)[0]
-        assert row["provider_status"] == "pass"
-        assert row["chain_status"] == "blocked"
-        assert row["combined_status"] == "blocked"
-    finally:
-        ro.close()
 
 
 # --- المجموعة الضابطة ---

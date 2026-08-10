@@ -79,40 +79,9 @@ class RecorderDB:
             raise
         with open(schema_path, "r", encoding="utf-8") as fh:
             self._conn.executescript(fh.read())
-        self._normalize_risk_assessments()
         self._backfill_watch_windows()
         self._quarantine_legacy_outcomes()
         self._conn.commit()
-
-    def _normalize_risk_assessments(self) -> None:
-        """يعيد اشتقاق القرار المحافظ للصفوف السابقة بعد تشديد البوابة.
-
-        `gate_status` مشتقّ لا خام؛ الخام والتحذيرات لا يتغيّران. سبق أن مرّ
-        تحذير MODERATE مثل TOKEN_MINTABLE كـpass، وهذا غير صالح للتنفيذ الآلي.
-        """
-        exists = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            ("token_risk_assessments",),
-        ).fetchone()
-        if not exists:
-            return
-        self._conn.execute(
-            """UPDATE token_risk_assessments
-                  SET gate_status='review'
-                WHERE gate_status='pass' AND warning_count > 0"""
-        )
-        self._conn.execute(
-            """UPDATE risk_fetch_state AS s
-                  SET last_status='review'
-                WHERE last_status='ok'
-                  AND EXISTS (
-                      SELECT 1 FROM token_risk_assessments a
-                       WHERE a.token_address=s.token_address
-                         AND a.network_id=s.network_id
-                         AND a.recorded_at=s.last_fetch_at
-                         AND a.gate_status='review'
-                  )"""
-        )
 
     def _quarantine_legacy_outcomes(self) -> None:
         """يعزل كل نتيجة watch أقدم من تصميم المقارنة الحالي."""
@@ -594,93 +563,45 @@ class RecorderDB:
         ).fetchone()
         return int(row["n"])
 
-    # --- token_risk_assessments ---
-    def insert_risk_assessment(self, row: Mapping[str, Any]) -> bool:
-        """لقطة بوابة مخاطر؛ الخام مضغوط والمفتاح يمنع تكرار الدورة نفسها."""
-        cols = _RISK_COLUMNS
+    # --- token_holders ---
+    def insert_holders(self, row: Mapping[str, Any]) -> bool:
+        """لقطة تركّز حيازة؛ المفتاح يشمل source فلا يطمس مصدرٌ الآخر."""
+        cols = _HOLDERS_COLUMNS
         sql = (
-            f"INSERT OR IGNORE INTO token_risk_assessments({', '.join(cols)}) "
+            f"INSERT OR IGNORE INTO token_holders({', '.join(cols)}) "
             f"VALUES({', '.join(f':{c}' for c in cols)})"
         )
         cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
         self._commit()
         return cur.rowcount > 0
 
-    def set_risk_state(
+    def set_holders_state(
         self, token_address: str, network_id: str, status: str,
-        warnings: int, now_iso: str,
+        top10_pct: float | None, now_iso: str,
     ) -> None:
         self._conn.execute(
-            """INSERT INTO risk_fetch_state(
-                   token_address, network_id, last_fetch_at, last_status, warnings, attempts)
+            """INSERT INTO holders_fetch_state(
+                   token_address, network_id, last_fetch_at, last_status,
+                   top10_pct, attempts)
                VALUES(?, ?, ?, ?, ?, 1)
                ON CONFLICT(token_address, network_id) DO UPDATE SET
                    last_fetch_at = excluded.last_fetch_at,
                    last_status   = excluded.last_status,
-                   warnings      = excluded.warnings,
-                   attempts      = risk_fetch_state.attempts + 1""",
-            (token_address, network_id, now_iso, status, warnings),
+                   top10_pct     = excluded.top10_pct,
+                   attempts      = holders_fetch_state.attempts + 1""",
+            (token_address, network_id, now_iso, status, top10_pct),
         )
         self._commit()
 
-    def risk_fetch_due(
+    def holders_fetch_due(
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
     ) -> list[dict[str, Any]]:
-        """المراقَبات المستحقّة لفحص الخطر؛ الجديدة أولاً والإشارات قبل الضابطة."""
+        """المراقَبات المستحقّة لقياس التركّز؛ الجديدة أولاً والإشارات قبل الضابطة."""
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, w.first_seen_at,
                       w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
                  FROM watchlist w
-                 LEFT JOIN risk_fetch_state s
-                   ON s.token_address=w.token_address AND s.network_id=w.network_id
-                WHERE w.active=1
-                  AND (s.last_fetch_at IS NULL
-                       OR (s.last_status='error' AND s.last_fetch_at < ?)
-                       OR (COALESCE(s.last_status, '') <> 'error'
-                           AND s.last_fetch_at < ?))
-                ORDER BY s.last_fetch_at IS NOT NULL,
-                         w.is_control,
-                         s.last_fetch_at,
-                         w.first_seen_at DESC
-                LIMIT ?""",
-            (error_stale_before_iso, stale_before_iso, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    # --- token_chain_assessments ---
-    def insert_chain_assessment(self, row: Mapping[str, Any]) -> bool:
-        cols = _CHAIN_ASSESSMENT_COLUMNS
-        sql = (
-            f"INSERT OR IGNORE INTO token_chain_assessments({', '.join(cols)}) "
-            f"VALUES({', '.join(f':{c}' for c in cols)})"
-        )
-        cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
-        self._commit()
-        return cur.rowcount > 0
-
-    def set_chain_state(
-        self, token_address: str, network_id: str, status: str, now_iso: str,
-    ) -> None:
-        self._conn.execute(
-            """INSERT INTO chain_fetch_state(
-                   token_address, network_id, last_fetch_at, last_status, attempts)
-               VALUES(?, ?, ?, ?, 1)
-               ON CONFLICT(token_address, network_id) DO UPDATE SET
-                   last_fetch_at=excluded.last_fetch_at,
-                   last_status=excluded.last_status,
-                   attempts=chain_fetch_state.attempts + 1""",
-            (token_address, network_id, now_iso, status),
-        )
-        self._commit()
-
-    def chain_fetch_due(
-        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
-    ) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            """SELECT w.token_address, w.network_id, w.first_seen_at,
-                      w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
-                 FROM watchlist w
-                 LEFT JOIN chain_fetch_state s
+                 LEFT JOIN holders_fetch_state s
                    ON s.token_address=w.token_address AND s.network_id=w.network_id
                 WHERE w.active=1
                   AND (s.last_fetch_at IS NULL
@@ -1035,6 +956,7 @@ _COLUMN_MIGRATIONS = (
     ("signal_events", "in_amount", "in_amount REAL"),
     ("signal_events", "in_token_address", "in_token_address TEXT"),
     ("signal_events", "out_amount", "out_amount REAL"),
+    ("signal_events", "out_token_address", "out_token_address TEXT"),
     ("signal_events", "token_amount", "token_amount REAL"),
     ("signal_events", "realized_pnl_usd", "realized_pnl_usd REAL"),
     # العدد الحقيقي للأطروحات — أُضيف بعد اكتشاف تشبّع العدّ عند 100
@@ -1059,6 +981,68 @@ _COLUMN_MIGRATIONS = (
     ("outcomes", "design_version", "design_version INTEGER NOT NULL DEFAULT 1"),
     ("outcomes", "analysis_eligible", "analysis_eligible INTEGER NOT NULL DEFAULT 0"),
     ("outcomes", "exclusion_reason", "exclusion_reason TEXT"),
+    # التفاعل على حدث الإشارة — كان في الخام (100% تغطية) ولا يُستخرج.
+    # يُملأ رجعياً من raw_json عبر backfill_engagement.py (لا شبكة).
+    ("signal_events", "likes", "likes INTEGER"),
+    ("signal_events", "views", "views INTEGER"),
+    ("signal_events", "num_replies", "num_replies INTEGER"),
+    ("signal_events", "pinned", "pinned INTEGER"),
+    # إشارات الشرعية الخارجية — كذلك من الخام المحفوظ، بلا شبكة.
+    ("token_static", "exchanges_count", "exchanges_count INTEGER"),
+    ("token_static", "exchanges_json", "exchanges_json TEXT"),
+    ("token_static", "cmc_id", "cmc_id TEXT"),
+    ("token_static", "description", "description TEXT"),
+    ("token_static", "description_len", "description_len INTEGER"),
+    ("token_static", "has_banner", "has_banner INTEGER"),
+    ("token_static", "has_image", "has_image INTEGER"),
+    # تموضع حشد المنصّة من /hodlers/top. أُضيفت بعد قياس حيّ أثبت أنّ المصدر
+    # لا يعطي نِسب معروض إطلاقاً (فلا top1_pct منه)، بل مراكز مستخدمي fomo.
+    # الجدول قد يكون أُنشئ بالشكل الأول، فالترحيل يكمله بلا فقد بيانات.
+    ("token_holders", "platform_holders", "platform_holders INTEGER"),
+    ("token_holders", "platform_holders_listed", "platform_holders_listed INTEGER"),
+    ("token_holders", "platform_value_usd", "platform_value_usd REAL"),
+    ("token_holders", "platform_underwater", "platform_underwater INTEGER"),
+    ("token_holders", "platform_median_hold_seconds",
+     "platform_median_hold_seconds REAL"),
+    ("token_holders", "platform_dev_holding", "platform_dev_holding INTEGER"),
+    # ميزات الإصدار 4 على صفوف التدريب القائمة (20,303 صفّاً). الصفوف القديمة
+    # تبقى NULL هنا — غائب ≠ صفر، والفارز يميّز feature_version.
+    ("training_rows", "exchanges_count", "exchanges_count INTEGER"),
+    ("training_rows", "listed_on_exchange", "listed_on_exchange INTEGER"),
+    ("training_rows", "has_cmc_id", "has_cmc_id INTEGER"),
+    ("training_rows", "description_len", "description_len INTEGER"),
+    ("training_rows", "has_banner", "has_banner INTEGER"),
+    ("training_rows", "chain_top10_pct", "chain_top10_pct REAL"),
+    ("training_rows", "chain_holder_count", "chain_holder_count INTEGER"),
+    ("training_rows", "holders_age_min", "holders_age_min REAL"),
+    ("training_rows", "platform_holders", "platform_holders INTEGER"),
+    ("training_rows", "platform_penetration", "platform_penetration REAL"),
+    ("training_rows", "platform_underwater_ratio", "platform_underwater_ratio REAL"),
+    ("training_rows", "platform_value_usd", "platform_value_usd REAL"),
+    ("training_rows", "platform_median_hold_h", "platform_median_hold_h REAL"),
+    ("training_rows", "platform_dev_holding", "platform_dev_holding INTEGER"),
+    # صدارات المدد (v7): سقف المصدر 50 في الصدارة الأساسيّة وكل صيغ الترقيم
+    # مُهمَلة بصمت، لكنّ /24h و/7d و/30d تعيد كلٌّ 100 فاتّحاد الأربع 214 متداولاً
+    # (المطابقة 3.68% ← 15.26% على 7,200 حدثاً). لا سبيل لتعبئة الماضي: الأرشيف
+    # حفظ totalPnL وحدها فلا تاريخ لرتب المدد — الصفوف القديمة تبقى NULL بحقّ،
+    # وprune_dead_features يُسقط العائلة حتى تُقاس في نصفَي المجموعة (نمط حِقبة،
+    # لا ميزة).
+    ("signal_events", "top_trader_match_count_24h", "top_trader_match_count_24h INTEGER"),
+    ("signal_events", "buyers_best_rank_24h", "buyers_best_rank_24h INTEGER"),
+    ("signal_events", "top_trader_match_count_7d", "top_trader_match_count_7d INTEGER"),
+    ("signal_events", "buyers_best_rank_7d", "buyers_best_rank_7d INTEGER"),
+    ("signal_events", "top_trader_match_count_30d", "top_trader_match_count_30d INTEGER"),
+    ("signal_events", "buyers_best_rank_30d", "buyers_best_rank_30d INTEGER"),
+    ("signal_events", "top_trader_periods_matched", "top_trader_periods_matched INTEGER"),
+    ("training_rows", "top_trader_match_count_24h", "top_trader_match_count_24h INTEGER"),
+    ("training_rows", "buyers_best_rank_24h", "buyers_best_rank_24h INTEGER"),
+    ("training_rows", "top_trader_match_count_7d", "top_trader_match_count_7d INTEGER"),
+    ("training_rows", "buyers_best_rank_7d", "buyers_best_rank_7d INTEGER"),
+    ("training_rows", "top_trader_match_count_30d", "top_trader_match_count_30d INTEGER"),
+    ("training_rows", "buyers_best_rank_30d", "buyers_best_rank_30d INTEGER"),
+    ("training_rows", "top_trader_periods_matched", "top_trader_periods_matched INTEGER"),
+    ("training_rows", "top_trader_any_period", "top_trader_any_period INTEGER"),
+    ("training_rows", "best_rank_any_period", "best_rank_any_period INTEGER"),
 )
 
 _BAR_COLUMNS = (
@@ -1071,9 +1055,14 @@ _SIGNAL_COLUMNS = (
     "ticker", "price_usd", "fdv", "market_cap", "num_trades", "unique_traders",
     "minutes", "price_change_pct", "total_volume", "are_top_traders",
     "top_trader_ids_json", "top_trader_match_count", "buyers_best_rank",
+    "top_trader_match_count_24h", "buyers_best_rank_24h",
+    "top_trader_match_count_7d", "buyers_best_rank_7d",
+    "top_trader_match_count_30d", "buyers_best_rank_30d",
+    "top_trader_periods_matched",
     "buyer_id", "buyer_handle", "num_swaps", "is_first_buy", "buyer_pnl_pct",
     "avg_cost", "size_usd", "in_amount", "in_token_address", "out_amount",
-    "token_amount", "realized_pnl_usd", "raw_json",
+    "out_token_address", "token_amount", "realized_pnl_usd", "likes", "views",
+    "num_replies", "pinned", "raw_json",
 )
 
 _OUTCOME_COLUMNS = (
@@ -1107,26 +1096,18 @@ _SOCIAL_COLUMNS = (
     "newest_thesis_at", "raw_json",
 )
 
-_RISK_COLUMNS = (
-    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
-    "entry_signal_id", "is_control", "disable_buying", "disable_selling",
-    "warning_count", "severe_count", "high_count", "gate_status",
-    "warning_types_json", "warnings_json", "raw_json",
-)
-
-_CHAIN_ASSESSMENT_COLUMNS = (
-    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
-    "entry_signal_id", "is_control", "chain_kind", "rpc_chain_id", "gate_status",
-    "reason_codes_json", "contract_exists", "token_standard",
-    "program_or_implementation", "owner_authority", "owner_renounced",
-    "mint_authority", "freeze_authority", "paused", "upgradeable",
-    "dangerous_capabilities_json", "transfer_simulation_status",
-    "top1_account_pct", "top10_accounts_pct", "details_json", "raw_json",
-)
-
 _STATIC_COLUMNS = (
     "token_address", "network_id", "recorded_at", "name", "symbol", "decimals",
     "mintable", "freezable", "is_scam", "creator_address", "launchpad_name",
     "migrated", "graduation_percent", "twitter", "telegram", "website", "discord",
-    "token_created_at", "raw_json",
+    "token_created_at", "exchanges_count", "exchanges_json", "cmc_id",
+    "description", "description_len", "has_banner", "has_image", "raw_json",
+)
+
+_HOLDERS_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control", "source", "top10_pct", "holder_count",
+    "platform_holders", "platform_holders_listed", "platform_value_usd",
+    "platform_underwater", "platform_median_hold_seconds",
+    "platform_dev_holding", "top_holders_json", "raw_json",
 )

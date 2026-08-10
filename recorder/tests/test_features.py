@@ -189,6 +189,53 @@ def test_event_features_missing_stay_none_not_zero():
     assert f["rank_le_10"] is None          # لا رتبة ⇒ لا علم (لا صفر)
 
 
+# --- عائلة صدارات المدد (v7) ---
+def test_period_rank_features_pass_through_and_aggregate():
+    """الرتب المفصّلة تُمرَّر، والمجمَّع يأخذ أفضلها عبر المدد كلّها."""
+    f = features.event_features({
+        "signal_type": "large_buy",
+        "buyers_best_rank": 40,
+        "buyers_best_rank_24h": 3,
+        "top_trader_match_count_24h": 1,
+        "buyers_best_rank_7d": 12,
+        "top_trader_match_count_7d": 2,
+        "top_trader_periods_matched": 3,
+    }, T0)
+    assert f["buyers_best_rank_24h"] == 3
+    assert f["top_trader_match_count_7d"] == 2
+    assert f["best_rank_any_period"] == 3     # أفضل ما في الأربع
+    assert f["top_trader_periods_matched"] == 3
+    assert f["top_trader_any_period"] == 1
+
+
+def test_period_rank_features_absent_stay_none():
+    f = features.event_features({"signal_type": "large_buy"}, T0)
+    for c in (
+        "buyers_best_rank_24h", "top_trader_match_count_24h",
+        "buyers_best_rank_7d", "buyers_best_rank_30d",
+        "top_trader_periods_matched", "top_trader_any_period",
+        "best_rank_any_period",
+    ):
+        assert f[c] is None, c
+
+
+def test_any_period_zero_is_measured_not_missing():
+    """قِيست الصدارات ولم يطابق أحد ⇒ 0 لا None، وأفضل رتبة تبقى غائبة."""
+    f = features.event_features({
+        "signal_type": "large_buy", "top_trader_periods_matched": 0,
+    }, T0)
+    assert f["top_trader_any_period"] == 0
+    assert f["best_rank_any_period"] is None
+
+
+def test_best_rank_any_period_ignores_missing_periods():
+    """مدّة واحدة مقيسة تكفي — min على قائمة فيها None لا يرمي ولا يفبرك."""
+    f = features.event_features({
+        "signal_type": "large_buy", "buyers_best_rank_30d": 9,
+    }, T0)
+    assert f["best_rank_any_period"] == 9
+
+
 def test_price_history_computes_returns_and_flatness(db):
     _bars(db, T0 - 86400, 288, c=1.0, grow=0.0)     # مسطّح تماماً
     f = features.price_history_features(db, TOK, NET, T0)
@@ -728,3 +775,178 @@ def test_creator_prior_tokens_with_numeric_timestamps(db):
             "telegram": None, "website": None, "discord": None,
             "token_created_at": created, "raw_json": "{}"})
     assert features.static_features(db, TOK, NET, T0)["creator_prior_tokens"] == 1
+
+
+# ---------------------------------------------------------------------------
+# عائلة هـ٢ — الملكية: تركّز السلسلة + تموضع حشد المنصّة
+# ---------------------------------------------------------------------------
+def _holders(db, epoch, source, tok=TOK, net=NET, **kw):
+    """صفّ حيازة. `source` داخل المفتاح الأساسي فلا يطمس مصدرٌ الآخر."""
+    row = {
+        "token_address": tok, "network_id": net, "recorded_at": _iso(epoch),
+        "watch_first_seen_at": _iso(epoch), "entry_signal_id": None,
+        "is_control": 0, "source": source,
+        "top10_pct": None, "holder_count": None, "platform_holders": None,
+        "platform_holders_listed": None, "platform_value_usd": None,
+        "platform_underwater": None, "platform_median_hold_seconds": None,
+        "platform_dev_holding": None, "top_holders_json": None, "raw_json": "{}",
+    }
+    row.update(kw)
+    db.insert_holders(row)
+    return row
+
+
+def test_holders_ignores_measurements_after_t0(db):
+    """حرس تسرّب: قياس التركّز بعد القرار غير معروف عنده."""
+    _holders(db, T0 - 600, "token_details", top10_pct=22.0, holder_count=900)
+    before = features.holders_features(db, TOK, NET, T0)
+    _holders(db, T0 + 600, "token_details", top10_pct=99.0, holder_count=5)
+    assert features.holders_features(db, TOK, NET, T0) == before
+    assert before["chain_top10_pct"] == 22.0
+
+
+def test_holders_uses_latest_measurement_at_or_before_t0(db):
+    _holders(db, T0 - 7200, "token_details", top10_pct=10.0, holder_count=100)
+    _holders(db, T0 - 600, "token_details", top10_pct=38.42, holder_count=947)
+    f = features.holders_features(db, TOK, NET, T0)
+    assert f["chain_top10_pct"] == 38.42
+    assert f["chain_holder_count"] == 947
+    assert f["holders_age_min"] == pytest.approx(10.0)
+
+
+def test_each_source_keeps_its_own_latest_row(db):
+    """المصدران يقيسان شيئين مختلفين — أحدهما الأحدث لا يطمس الآخر."""
+    _holders(db, T0 - 3600, "token_details", top10_pct=83.24, holder_count=937)
+    _holders(db, T0 - 300, "hodlers_top", platform_holders=274,
+             platform_holders_listed=50, platform_underwater=50,
+             platform_value_usd=7990.77, platform_median_hold_seconds=24773,
+             platform_dev_holding=0)
+    f = features.holders_features(db, TOK, NET, T0)
+    assert f["chain_top10_pct"] == 83.24              # لم يُطمس بصفّ الحشد
+    assert f["chain_holder_count"] == 937
+    assert f["platform_holders"] == 274
+    assert f["platform_value_usd"] == 7990.77
+    assert f["holders_age_min"] == pytest.approx(5.0)  # أحدث الختمين
+
+
+def test_platform_penetration_needs_both_sources(db):
+    """نصيب المنصّة من حائزي السلسلة اشتقاق لا يعطيه مصدر منفرد."""
+    _holders(db, T0 - 300, "hodlers_top", platform_holders=274)
+    assert features.holders_features(db, TOK, NET, T0)["platform_penetration"] is None
+
+    _holders(db, T0 - 300, "token_details", top10_pct=83.24, holder_count=937)
+    f = features.holders_features(db, TOK, NET, T0)
+    assert f["platform_penetration"] == pytest.approx(274 / 937)
+
+
+def test_penetration_none_when_chain_count_absent(db):
+    """قسمة على غائب ≠ صفر — لا نفبرك نسبة (FR-007)."""
+    _holders(db, T0 - 300, "token_details", top10_pct=50.0)   # holder_count غائب
+    _holders(db, T0 - 300, "hodlers_top", platform_holders=100)
+    f = features.holders_features(db, TOK, NET, T0)
+    assert f["chain_top10_pct"] == 50.0
+    assert f["platform_holders"] == 100
+    assert f["platform_penetration"] is None
+
+
+def test_underwater_ratio_and_median_hold_hours(db):
+    _holders(db, T0 - 300, "hodlers_top", platform_holders=274,
+             platform_holders_listed=50, platform_underwater=12,
+             platform_median_hold_seconds=36000)
+    f = features.holders_features(db, TOK, NET, T0)
+    assert f["platform_underwater_ratio"] == pytest.approx(0.24)
+    assert f["platform_median_hold_h"] == pytest.approx(10.0)
+
+
+def test_fully_underwater_crowd_is_one_not_missing(db):
+    """كل الحاملين خاسرين = 1.0 (عرض زائد محتمل) لا None."""
+    _holders(db, T0 - 300, "hodlers_top", platform_holders=274,
+             platform_holders_listed=49, platform_underwater=49)
+    assert features.holders_features(db, TOK, NET, T0)["platform_underwater_ratio"] == 1.0
+
+
+def test_no_holders_measurement_leaves_family_null(db):
+    """الصفوف قبل إطلاق الدورة: NULL يعني «لم نقس» لا «صفر»."""
+    f = features.holders_features(db, TOK, NET, T0)
+    assert set(f) == {
+        "chain_top10_pct", "chain_holder_count", "holders_age_min",
+        "platform_holders", "platform_penetration", "platform_underwater_ratio",
+        "platform_value_usd", "platform_median_hold_h", "platform_dev_holding",
+    }
+    assert all(v is None for v in f.values())
+
+
+def test_holders_of_other_token_do_not_leak(db):
+    _holders(db, T0 - 300, "token_details", tok="0xother",
+             top10_pct=99.0, holder_count=3)
+    assert features.holders_features(db, TOK, NET, T0)["chain_top10_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# الشرعية الخارجية — كانت في raw_json من اليوم الأوّل بلا استخراج
+# ---------------------------------------------------------------------------
+def _static(db, epoch=None, **kw):
+    row = {
+        "token_address": TOK, "network_id": NET,
+        "recorded_at": _iso(T0 - 3600 if epoch is None else epoch),
+        "name": "A", "symbol": "A", "decimals": 18, "mintable": None,
+        "freezable": None, "is_scam": None, "creator_address": None,
+        "launchpad_name": None, "migrated": None, "graduation_percent": None,
+        "twitter": None, "telegram": None, "website": None, "discord": None,
+        "token_created_at": None, "exchanges_count": None,
+        "exchanges_json": None, "cmc_id": None, "description": None,
+        "description_len": None, "has_banner": None, "has_image": None,
+        "raw_json": "{}",
+    }
+    row.update(kw)
+    db.upsert_static(row)
+    return row
+
+
+def test_listed_on_exchange_derived_from_count(db):
+    _static(db, exchanges_count=8, cmc_id="1839", description_len=120, has_banner=1)
+    f = features.static_features(db, TOK, NET, T0)
+    assert f["exchanges_count"] == 8
+    assert f["listed_on_exchange"] == 1
+    assert f["has_cmc_id"] == 1
+    assert f["description_len"] == 120
+    assert f["has_banner"] == 1
+
+
+def test_zero_exchanges_is_measured_zero_not_missing(db):
+    """«فُحص ولا منصّة» تختلف عن «لم يُفحص» — صفر حقيقيّ لا None."""
+    _static(db, exchanges_count=0)
+    f = features.static_features(db, TOK, NET, T0)
+    assert f["exchanges_count"] == 0
+    assert f["listed_on_exchange"] == 0
+
+
+def test_absent_exchange_count_stays_unknown(db):
+    """غائب ≠ صفر (FR-007): لقطة قديمة بلا العمود تبقى مجهولة لا صفراً."""
+    _static(db, exchanges_count=None)
+    f = features.static_features(db, TOK, NET, T0)
+    assert f["exchanges_count"] is None
+    assert f["listed_on_exchange"] is None
+
+
+def test_snapshot_without_cmc_id_is_measured_absence(db):
+    """لقطة موجودة بلا cmc_id = «فُحص وغير مدرج» ⇒ صفر لا مجهول."""
+    _static(db, cmc_id=None)
+    assert features.static_features(db, TOK, NET, T0)["has_cmc_id"] == 0
+
+
+def test_legitimacy_unknown_before_any_snapshot(db):
+    """بلا أي لقطة لا شيء مقيس — كل الأعلام مجهولة بما فيها الثنائيّة."""
+    f = features.static_features(db, TOK, NET, T0)
+    for key in ("exchanges_count", "listed_on_exchange", "has_cmc_id",
+                "description_len", "has_banner"):
+        assert f[key] is None, key
+
+
+def test_legitimacy_snapshot_after_t0_is_invisible(db):
+    """حرس تسرّب: إدراج منصّة بعد الإشارة ليس معلوماً عندها."""
+    _static(db, epoch=T0 + 600, exchanges_count=8, cmc_id="1839", has_banner=1)
+    f = features.static_features(db, TOK, NET, T0)
+    assert f["exchanges_count"] is None
+    assert f["listed_on_exchange"] is None
+    assert f["has_cmc_id"] is None

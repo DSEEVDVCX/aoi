@@ -1,9 +1,9 @@
-"""خادم اللوحة: قاعدة البيانات read-only وإدارة محلية محمية لمفاتيح Helius.
+"""خادم اللوحة: قراءة فقط من قاعدة بيانات المسجّل.
 
-- لا كتابة إطلاقاً على القاعدة (dao يفتحها mode=ro)؛ الكتابة الوحيدة إلى مخزن
-  المفاتيح الذي اختاره المستخدم صراحةً عبر AOI_HELIUS_KEYS_PATH.
+- لا كتابة إطلاقاً: `dao` يفتح القاعدة بـmode=ro ولا مسار كتابة في الخادم.
 - الاستماع على 127.0.0.1 فقط (محلّي).
-- Host guard + CSRF لكل طلب يغيّر الحالة.
+- Host guard + CSRF يبقيان: يمنعان DNS rebinding ويؤمّنان أي طلب يغيّر الحالة
+  لو أُضيف لاحقاً — الحارس أرخص من تذكّر إعادته عند أوّل مسار كتابة.
 """
 from __future__ import annotations
 
@@ -15,14 +15,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
 import config
 import dao
-import helius_keys
 
 app = FastAPI(title="Fomo Recorder Dashboard", docs_url=None, redoc_url=None)
 _DASHBOARD_TOKEN = secrets.token_hex(32)
@@ -60,48 +58,9 @@ async def local_security_guard(request: Request, call_next):
         if not sent or not hmac.compare_digest(sent, _DASHBOARD_TOKEN):
             return JSONResponse({"error": "رمز حماية اللوحة مفقود أو خاطئ"}, status_code=403)
     response = await call_next(request)
-    if request.url.path == "/" or request.url.path.startswith("/api/helius-keys"):
+    if request.url.path == "/":
         response.headers["Cache-Control"] = "no-store"
     return response
-
-
-class KeyAddRequest(BaseModel):
-    username: str = ""
-    api_key: str = Field(alias="apiKey")
-
-
-class KeyActionRequest(BaseModel):
-    id: str
-
-
-class KeyDisableRequest(KeyActionRequest):
-    reason: str = "نفدت الحصّة"
-
-
-def _key_store_path() -> str:
-    if not config.HELIUS_KEYS_PATH:
-        raise HTTPException(503, "مسار مخزن مفاتيح Helius غير مضبوط")
-    return config.HELIUS_KEYS_PATH
-
-
-def _keys_payload(store: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    keys = helius_keys.list_masked(store, config.SOLANA_RPC_URL)
-    return {
-        "configured": True,
-        "keys": keys,
-        "enabled": sum(not item["disabled"] for item in keys),
-        "disabled": sum(item["disabled"] for item in keys),
-    }
-
-
-def _raise_store_error(exc: Exception) -> None:
-    if isinstance(exc, helius_keys.StoreLockTimeout):
-        raise HTTPException(503, str(exc)) from exc
-    if isinstance(exc, helius_keys.KeyStoreError):
-        raise HTTPException(500, str(exc)) from exc
-    if isinstance(exc, ValueError):
-        raise HTTPException(400, str(exc)) from exc
-    raise exc
 
 
 def _with_conn(fn):
@@ -175,113 +134,6 @@ def api_signals(limit: int = 50) -> dict[str, Any]:
 def api_watchlist() -> dict[str, Any]:
     rows = _with_conn(dao.active_watchlist)
     return {"watchlist": rows}
-
-
-@app.get("/api/safety")
-def api_safety() -> dict[str, Any]:
-    return _with_conn(dao.safety_summary)
-
-
-@app.get("/api/helius-keys")
-def api_helius_keys() -> dict[str, Any]:
-    if not config.HELIUS_KEYS_PATH:
-        return {"configured": False, "keys": [], "enabled": 0, "disabled": 0}
-    try:
-        return _keys_payload(helius_keys.load_store(config.HELIUS_KEYS_PATH))
-    except Exception as exc:  # noqa: BLE001 — نحوّل أخطاء المخزن إلى HTTP آمن
-        _raise_store_error(exc)
-        raise AssertionError("unreachable")
-
-
-@app.post("/api/helius-keys")
-def api_helius_key_add(body: KeyAddRequest) -> dict[str, Any]:
-    try:
-        store, _ = helius_keys.update_store(
-            _key_store_path(),
-            lambda current: helius_keys.add_key(
-                current, body.username, body.api_key
-            ),
-        )
-        return {
-            **_keys_payload(store),
-            "note": "أُضيف المفتاح؛ سيظهر في دورة الفحص التالية.",
-        }
-    except Exception as exc:  # noqa: BLE001
-        _raise_store_error(exc)
-        raise AssertionError("unreachable")
-
-
-@app.post("/api/helius-keys/delete")
-def api_helius_key_delete(body: KeyActionRequest) -> dict[str, Any]:
-    try:
-        store, removed = helius_keys.update_store(
-            _key_store_path(),
-            lambda current: helius_keys.remove_key(current, body.id),
-        )
-        if not removed:
-            raise HTTPException(404, "المفتاح غير موجود")
-        return {
-            **_keys_payload(store),
-            "note": "حُذف المفتاح من التدوير.",
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _raise_store_error(exc)
-        raise AssertionError("unreachable")
-
-
-@app.post("/api/helius-keys/disable")
-def api_helius_key_disable(body: KeyDisableRequest) -> dict[str, Any]:
-    try:
-        store, changed = helius_keys.update_store(
-            _key_store_path(),
-            lambda current: helius_keys.set_key_disabled(
-                current, body.id, True, body.reason
-            ),
-        )
-        if not changed:
-            raise HTTPException(404, "المفتاح غير موجود")
-        return {**_keys_payload(store), "note": "عُطّل المفتاح واستُبعد من التدوير."}
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _raise_store_error(exc)
-        raise AssertionError("unreachable")
-
-
-@app.post("/api/helius-keys/enable")
-def api_helius_key_enable(body: KeyActionRequest) -> dict[str, Any]:
-    try:
-        store, changed = helius_keys.update_store(
-            _key_store_path(),
-            lambda current: helius_keys.set_key_disabled(
-                current, body.id, False
-            ),
-        )
-        if not changed:
-            raise HTTPException(404, "المفتاح غير موجود")
-        return {**_keys_payload(store), "note": "أُعيد تفعيل المفتاح."}
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _raise_store_error(exc)
-        raise AssertionError("unreachable")
-
-
-@app.post("/api/helius-keys/verify")
-async def api_helius_key_verify(body: KeyActionRequest) -> dict[str, Any]:
-    try:
-        store = helius_keys.load_store(_key_store_path())
-        key = helius_keys.find_key(store, body.id)
-        if key is None:
-            raise HTTPException(404, "المفتاح غير موجود")
-        return await helius_keys.verify_key(key["apiKey"])
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _raise_store_error(exc)
-        raise AssertionError("unreachable")
 
 
 @app.get("/api/ticks-summary")

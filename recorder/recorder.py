@@ -10,6 +10,7 @@ leaderboard). لا نداء يكتب حالة حساب أو تداول.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import random
 import time
@@ -19,7 +20,6 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import config
-import chain_security
 import extract
 from db import RecorderDB, utcnow_iso
 from leaderboard_cache import LeaderboardCache
@@ -353,15 +353,28 @@ async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) ->
     return await client._get(settings.upstream_feed_token_thesis_path, params)
 
 
-async def _fetch_risk_raw(client: Any, token_address: str, network_id: str) -> Any:
-    """خام POST /proxy/tokenWarnings — بوابات الشراء/البيع والتحذيرات."""
+async def _fetch_token_details_raw(client: Any, token_address: str, network_id: str) -> Any:
+    """خام POST /proxy/tokenDetails — يحمل top10HoldersPercent وعدد الحائزين.
+
+    `tokenId` **يجب** أن يكون "address:networkId" كـgetBarsNew؛ العنوان المجرّد
+    يجعل الخادم يرمي 502 من Cloudflare (يبدو عطلاً وهو طلب مشوّه).
+    """
     from fomo_api.config import settings
 
-    body = {
-        "address": token_address,
-        "networkId": int(network_id) if str(network_id).isdigit() else network_id,
-    }
-    return await client._post(settings.upstream_token_warnings_path, body)
+    body = {"tokenId": f"{token_address}:{network_id}" if network_id else token_address}
+    return await client._post(settings.upstream_token_details_path, body)
+
+
+async def _fetch_hodlers_raw(client: Any, token_address: str, network_id: str) -> Any:
+    """خام GET /hodlers/top — تفصيل كبار الحائزين (يعطي top1 أيضاً).
+
+    المعامل `tokens` سلسلة JSON لقائمة كائنات، وهو شكل المصدر لا عنوان مفرد.
+    """
+    from fomo_api.config import settings
+
+    net: Any = int(network_id) if str(network_id).isdigit() else network_id
+    params = {"tokens": json.dumps([{"address": token_address, "networkId": net}])}
+    return await client._get(settings.upstream_hodlers_top_path, params)
 
 
 async def refresh_leaderboard(
@@ -373,11 +386,27 @@ async def refresh_leaderboard(
     وتُرمى كل ساعة. وبلا تسجيل الفشل يبقى ركود الخريطة (تحديث فاشل أو مغلّف
     فارغ ⇒ الخريطة القديمة) صامتاً إلى الأبد: `last_error_leaderboard` معروض
     في اللوحة كبقيّة المصادر.
+
+    **خام كل مدّة في مصدر مستقلّ** (`leaderboard` / `leaderboard_24h` …): دمجها
+    في مصدر واحد يخلط أربع قوائم مختلفة في أرشيف لا يُفكّ. `raw_by_period`
+    تعيد المدد الطازجة (آخر محاولة) فحسب — أرشفة مغلّف قديم بتوقيت جديد تضع في
+    الأرشيف صدارةً لم نجلبها قطّ. ومدّة فشلت وأخواتها نجحت لا تُفشل الدورة،
+    لكنّها تُسجَّل كي لا يصمت العطل الجزئيّ.
     """
     was_stale = lb.is_stale(now_mono)
     refreshed = await lb.maybe_refresh(now_mono)
-    if refreshed and lb.last_raw is not None:
-        db.insert_snapshot("leaderboard", lb.last_raw, recorded_at)
+    if refreshed:
+        for period, raw in lb.raw_by_period.items():
+            if raw is None:
+                continue
+            source = "leaderboard" if period == "all" else f"leaderboard_{period}"
+            db.insert_snapshot(source, raw, recorded_at)
+        missing = lb.failed_periods()
+        if missing:
+            db.set_meta(
+                "last_error_leaderboard",
+                f"{recorded_at}: periods without a lookup: {', '.join(missing)}",
+            )
     elif was_stale and not refreshed:
         db.set_meta(
             "last_error_leaderboard",
@@ -475,21 +504,40 @@ async def run_social_cycle(
     return stats
 
 
-async def run_risk_cycle(
+async def run_holders_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """يفحص مخاطر التداول زمنياً؛ الخطأ أو الحقول الناقصة لا تتحول إلى أمان."""
+    """يقيس تركيز الملكية وتموضع الحشد زمنياً من مصدرين متكاملين.
+
+    `market_ticks.top10_holders_pct` ميت (صفر من 1,430,475): قوائم
+    trending/verified لا تحمل المفتاح أصلاً. وفحص السلسلة يغطّي Solana وحدها
+    (2,929 من 3,044) وصامت تماماً عن EVM (صفر من 2,378) — فالتركيز مجهول
+    لكل عملة إيثيريوم عندنا. المصدران هنا يعملان على الشبكتين ويقيسان شيئين
+    مختلفين (مؤكَّد حيّاً 2026-08-09 لا مفترَضاً):
+
+    - `tokenDetails`: تركّز السلسلة — `top10HoldersPercent` + `holders` على
+      السلسلة كلّها (شوهد 83.6% و90.1% و21.9%). يعمل على EVM وSolana معاً
+      — وهو الإصلاح المباشر للعمود الميّت.
+    - `hodlers/top`: تموضع الحشد — مستخدمو fomo الحائزون (276 من 947؛ 118 من
+      14,371) بلا أي نسبة من المعروض، لكن مع تكلفة كل مركز وربحه غير المحقّق
+      ومدّة حمله وعلَم `isDev`. «هل حاملو المنصّة تحت الماء؟» سؤال مختلف عن
+      «هل الملكية مركَّزة؟». قياس أوّليّ: 50 من 50 حائزاً خاسراً في عملة،
+      مقابل 12 من 49 في أخرى.
+
+    كلٌّ يُخزَّن بصفّه (`source` داخل المفتاح الأساسي) فلا يطمس أحدهما قياس
+    الآخر، ولا نفبرك قيمة غائبة (FR-007). فشل مصدر لا يُسقط الثاني.
+    """
     stats = {
-        "risk_tokens": 0, "risk_blocked": 0, "risk_review": 0,
-        "risk_unknown": 0, "risk_warnings": 0, "risk_errors": 0,
+        "holders_tokens": 0, "holders_details": 0,
+        "holders_top": 0, "holders_errors": 0,
     }
     now_dt = datetime.fromisoformat(recorded_at)
-    stale_before = (now_dt - timedelta(seconds=config.RISK_REFRESH_SECONDS)).isoformat()
+    stale_before = (now_dt - timedelta(seconds=config.HOLDERS_REFRESH_SECONDS)).isoformat()
     error_stale_before = (
-        now_dt - timedelta(seconds=config.RISK_ERROR_RETRY_SECONDS)
+        now_dt - timedelta(seconds=config.HOLDERS_ERROR_RETRY_SECONDS)
     ).isoformat()
-    due = db.risk_fetch_due(
-        limit=config.RISK_PER_CYCLE,
+    due = db.holders_fetch_due(
+        limit=config.HOLDERS_PER_CYCLE,
         stale_before_iso=stale_before,
         error_stale_before_iso=error_stale_before,
     )
@@ -497,121 +545,40 @@ async def run_risk_cycle(
     for i, w in enumerate(due):
         addr = w["token_address"]
         net = str(w["network_id"] or "")
-        try:
-            raw = await _fetch_risk_raw(client, addr, net)
-            row = extract.extract_risk_assessment(
-                raw, addr, net, recorded_at, w["first_seen_at"],
-                w.get("entry_signal_id"), int(w.get("is_control") or 0),
-            )
-            if row is None:
-                raise ValueError("tokenWarnings responseObject is missing")
-            db.insert_risk_assessment(row)
-            gate = row["gate_status"]
-            db.set_risk_state(addr, net, gate if gate != "pass" else "ok",
-                              row["warning_count"], recorded_at)
-            stats["risk_tokens"] += 1
-            stats["risk_warnings"] += row["warning_count"]
-            if gate == "blocked":
-                stats["risk_blocked"] += 1
-            elif gate == "review":
-                stats["risk_review"] += 1
-            elif gate == "unknown":
-                stats["risk_unknown"] += 1
-        except Exception as exc:  # noqa: BLE001 — فشل عملة لا يمنع الباقي
-            stats["risk_errors"] += 1
-            db.set_risk_state(addr, net, "error", 0, recorded_at)
-            db.set_meta("last_error_risk", f"{recorded_at}: {type(exc).__name__}: {exc}")
-        if i + 1 < len(due):
-            await sleep(config.RISK_PACING_SECONDS)
-    return stats
+        first_seen = w["first_seen_at"]
+        sig = w.get("entry_signal_id")
+        is_control = int(w.get("is_control") or 0)
+        top10: float | None = None
+        got = 0
 
-
-async def run_chain_security_cycle(
-    db: RecorderDB, recorded_at: str
-) -> dict[str, int]:
-    """يشغّل فحص السلسلة بالتوازي المحدود ثم يحفظ النتائج تسلسلياً في SQLite."""
-    stats = {
-        "chain_tokens": 0, "chain_pass": 0, "chain_review": 0,
-        "chain_blocked": 0, "chain_unknown": 0, "chain_errors": 0,
-    }
-    if not config.CHAIN_SECURITY_ENABLED:
-        return stats
-    now_dt = datetime.fromisoformat(recorded_at)
-    stale_before = (
-        now_dt - timedelta(seconds=config.CHAIN_SECURITY_REFRESH_SECONDS)
-    ).isoformat()
-    error_stale_before = (
-        now_dt - timedelta(seconds=config.CHAIN_SECURITY_ERROR_RETRY_SECONDS)
-    ).isoformat()
-    due = db.chain_fetch_due(
-        config.CHAIN_SECURITY_PER_CYCLE, stale_before, error_stale_before
-    )
-    if not due:
-        return stats
-
-    import httpx
-
-    semaphore = asyncio.Semaphore(config.CHAIN_SECURITY_CONCURRENCY)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0)) as http:
-        async def scan(watch: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-            async with semaphore:
-                result = await chain_security.scan_chain_token(
-                    watch["token_address"], str(watch["network_id"] or ""), client=http
+        for source, fetch_fn, extract_fn in (
+            ("token_details", _fetch_token_details_raw, extract.extract_token_details_holders),
+            ("hodlers_top", _fetch_hodlers_raw, extract.extract_platform_holders),
+        ):
+            try:
+                raw = await fetch_fn(client, addr, net)
+                row = extract_fn(raw, addr, net, recorded_at, first_seen, sig, is_control)
+                if row is None:
+                    continue
+                db.insert_holders(row)
+                got += 1
+                if source == "token_details":
+                    stats["holders_details"] += 1
+                else:
+                    stats["holders_top"] += 1
+                if top10 is None:
+                    top10 = row["top10_pct"]
+            except Exception as exc:  # noqa: BLE001 — مصدر واحد لا يُسقط الباقي
+                stats["holders_errors"] += 1
+                db.set_meta(
+                    "last_error_holders",
+                    f"{recorded_at}: {source}: {type(exc).__name__}: {exc}",
                 )
-                return watch, result
+            await sleep(config.HOLDERS_PACING_SECONDS)
 
-        scans = await asyncio.gather(*(scan(w) for w in due))
-
-    for watch, result in scans:
-        addr = watch["token_address"]
-        net = str(watch["network_id"] or "")
-        gate = str(result.get("gate_status") or "unknown")
-        reason_codes = result.get("reason_codes") or []
-        row = {
-            "token_address": addr,
-            "network_id": net,
-            "recorded_at": recorded_at,
-            "watch_first_seen_at": watch["first_seen_at"],
-            "entry_signal_id": watch.get("entry_signal_id"),
-            "is_control": int(watch.get("is_control") or 0),
-            "chain_kind": result.get("chain_kind") or "unsupported",
-            "rpc_chain_id": result.get("rpc_chain_id"),
-            "gate_status": gate,
-            "reason_codes_json": chain_security.dumps_compact(reason_codes),
-            "contract_exists": result.get("contract_exists"),
-            "token_standard": result.get("token_standard"),
-            "program_or_implementation": result.get("program_or_implementation"),
-            "owner_authority": result.get("owner_authority"),
-            "owner_renounced": result.get("owner_renounced"),
-            "mint_authority": result.get("mint_authority"),
-            "freeze_authority": result.get("freeze_authority"),
-            "paused": result.get("paused"),
-            "upgradeable": result.get("upgradeable"),
-            "dangerous_capabilities_json": chain_security.dumps_compact(
-                result.get("dangerous_capabilities") or []
-            ),
-            "transfer_simulation_status": result.get("transfer_simulation_status")
-            or "not_attempted",
-            "top1_account_pct": result.get("top1_account_pct"),
-            "top10_accounts_pct": result.get("top10_accounts_pct"),
-            "details_json": chain_security.dumps_compact(result.get("details") or {}),
-            "raw_json": chain_security.dumps_compact(result.get("raw") or {}),
-        }
-        db.insert_chain_assessment(row)
-        error = "scanner_error" in reason_codes
-        db.set_chain_state(addr, net, "error" if error else ("ok" if gate == "pass" else gate),
-                           recorded_at)
-        stats["chain_tokens"] += 1
-        if gate == "pass":
-            stats["chain_pass"] += 1
-        elif gate == "review":
-            stats["chain_review"] += 1
-        elif gate == "blocked":
-            stats["chain_blocked"] += 1
-        else:
-            stats["chain_unknown"] += 1
-        if error:
-            stats["chain_errors"] += 1
+        if got:
+            stats["holders_tokens"] += 1
+        db.set_holders_state(addr, net, "ok" if got else "error", top10, recorded_at)
     return stats
 
 
@@ -628,10 +595,7 @@ async def run_cycle(
         "signals": 0, "watch_added": 0, "comparison_signal_added": 0,
         "control_added": 0, "ticks": 0, "static": 0,
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
-        "risk_tokens": 0, "risk_blocked": 0, "risk_review": 0,
-        "risk_unknown": 0, "risk_warnings": 0,
-        "chain_tokens": 0, "chain_pass": 0, "chain_review": 0,
-        "chain_blocked": 0, "chain_unknown": 0,
+        "holders_tokens": 0, "holders_details": 0, "holders_top": 0,
         "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
 
@@ -663,7 +627,9 @@ async def run_cycle(
                 if newest:
                     db.set_meta("last_feed_event_at", newest)
                 for ev in events:
-                    row = extract.extract_signal_event(ev, recorded_at, lb.lookup)
+                    row = extract.extract_signal_event(
+                        ev, recorded_at, lb.lookup, lb.lookups
+                    )
                     if row is None:
                         continue
                     if db.insert_signal(row):
@@ -742,28 +708,16 @@ async def run_cycle(
         except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
             _fail("control", exc)
 
-    # 2.4) بوابة مخاطر التداول. توضع بعد قبول الإشارة مباشرة وقبل بقية الطبقات
-    # حتى يكون recorded_at أقرب ما يمكن إلى قرار الدخول، مع بقائها مشاهدة لاحقة.
+    # 2.42) تركيز الملكية من المصدرين — تركيز عالٍ = خطر تصريف، وهو مجهول اليوم
+    # لكل عملة EVM عندنا.
     try:
-        risk = await run_risk_cycle(client, db, recorded_at)
-        for key in ("risk_tokens", "risk_blocked", "risk_review",
-                    "risk_unknown", "risk_warnings"):
-            stats[key] = risk[key]
-        if risk["risk_errors"]:
-            stats["errors"] += risk["risk_errors"]
+        hold = await run_holders_cycle(client, db, recorded_at)
+        for key in ("holders_tokens", "holders_details", "holders_top"):
+            stats[key] = hold[key]
+        if hold["holders_errors"]:
+            stats["errors"] += hold["holders_errors"]
     except Exception as exc:  # noqa: BLE001
-        _fail("risk", exc)
-
-    # 2.45) تحقق مستقلّ من السلسلة: صلاحيات Token-2022/عقد EVM ومحاكاة نقل.
-    try:
-        chain = await run_chain_security_cycle(db, recorded_at)
-        for key in ("chain_tokens", "chain_pass", "chain_review",
-                    "chain_blocked", "chain_unknown"):
-            stats[key] = chain[key]
-        if chain["chain_errors"]:
-            stats["errors"] += chain["chain_errors"]
-    except Exception as exc:  # noqa: BLE001
-        _fail("chain_security", exc)
+        _fail("holders", exc)
 
     # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
     try:
@@ -856,7 +810,11 @@ async def main_loop(cycles: int | None = None) -> None:
     current_token = _load_access_token()
     client = _build_client(current_token)
     lb = LeaderboardCache(
-        client, size=config.LEADERBOARD_SIZE, refresh_seconds=config.LEADERBOARD_REFRESH_SECONDS
+        client,
+        size=config.LEADERBOARD_SIZE,
+        refresh_seconds=config.LEADERBOARD_REFRESH_SECONDS,
+        periods=config.LEADERBOARD_PERIODS,
+        pacing_seconds=config.LEADERBOARD_PACING_SECONDS,
     )
     db.set_meta("schema_version", "1")
     # يوثّق أنّ raw_json يُكتب مضغوطاً — أي قارئ لاحق يمرّ عبر db.decode_raw.

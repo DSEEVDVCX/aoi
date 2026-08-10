@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS signal_events (
     top_trader_ids_json    TEXT,                 -- topTraders[].id كمصفوفة JSON
     top_trader_match_count INTEGER,              -- كم منهم في صدارتنا (المطابقة)
     buyers_best_rank       INTEGER,              -- أفضل (أصغر) رتبة بين المشترين
+    -- صدارات المدد: المصدر يسقّف الصدارة الأساسيّة عند 50 ويُهمل كل صيغ الترقيم
+    -- بصمت، لكنّ /24h و/7d و/30d تعيد كلٌّ 100 — الاتّحاد 214 متداولاً مميّزاً
+    -- ومقيس على 7,200 حدث شراء: المطابقة 3.68% ← 15.26% (×4.15). تبقى منفصلة لا
+    -- مدموجة: رتبة 7 في 24h ليست رتبة 7 في totalPnL، والدمج يخلط قياسين.
+    -- NULL في كل الصفوف السابقة لإضافة الأعمدة — غائب ≠ صفر (FR-007).
+    top_trader_match_count_24h INTEGER,
+    buyers_best_rank_24h   INTEGER,
+    top_trader_match_count_7d  INTEGER,
+    buyers_best_rank_7d    INTEGER,
+    top_trader_match_count_30d INTEGER,
+    buyers_best_rank_30d   INTEGER,
+    top_trader_periods_matched INTEGER,          -- في كم صدارة (0-4) ظهر مشترٍ
     -- حقول الشراء المفرد (large_buy): مشترٍ واحد بدل topTraders[].
     buyer_id               TEXT,                 -- userId للمشتري (مطابَق بالصدارة أيضاً)
     buyer_handle           TEXT,
@@ -85,8 +97,20 @@ CREATE TABLE IF NOT EXISTS signal_events (
     in_amount              REAL,                 -- inHumanAmount: ما دفعه فعلاً
     in_token_address       TEXT,                 -- بماذا دفع (USDC/عملة أخرى)
     out_amount             REAL,                 -- outHumanAmount: ما استلمه
+    -- ماذا استلم. مقيس على 51,066 حدثاً: الطرف المقابل USDC في 100% والاتجاه
+    -- يحدّده signal_type وحده — بلا تباين فلا فيتشر عليه. نلتقطه ليكشف بدء
+    -- المصدر بتوجيه أزواج عملة↔عملة (غير USDC) فينقلب مفيداً.
+    out_token_address      TEXT,
     token_amount           REAL,                 -- humanTokenAmount: إجمالي ما يملكه
     realized_pnl_usd       REAL,                 -- realizedPnlUsd وقت الحدث
+    -- التفاعل الاجتماعي على الحدث نفسه — متاح في 100% من أحداث الـ feed وكان
+    -- مُهدَراً بالكامل. `likes`/`views` يقيسان انتشار الإشارة لا قوّتها المالية:
+    -- شراء بـ3,000$ شوهده 40,000 مستخدم يفوق أثره شراءً بـ30,000$ لم يره أحد.
+    -- `pinned` قرار تحريريّ من fomo (تثبيت الحدث) = تضخيم مقصود للانتشار.
+    likes                  INTEGER,              -- likes (المستوى الأعلى للحدث)
+    views                  INTEGER,              -- views (المستوى الأعلى للحدث)
+    num_replies            INTEGER,              -- numReplies إن وُجد
+    pinned                 INTEGER,              -- مثبَّت من fomo (bool)
     raw_json               TEXT NOT NULL         -- الحدث الخام كاملاً
 );
 CREATE INDEX IF NOT EXISTS idx_signal_token ON signal_events (token_address, network_id);
@@ -159,6 +183,20 @@ CREATE TABLE IF NOT EXISTS token_static (
     website            TEXT,
     discord            TEXT,
     token_created_at   TEXT,                     -- createdAt للعملة من fomo
+    -- إشارات شرعية خارجية: كانت في الخام ولا تُستخرج. عملة مدرَجة في
+    -- CoinMarketCap أو متداولة على عدّة منصّات ليست عملة أُطلقت قبل ساعة.
+    -- نخزّن الأسماء لا العدد وحده: «Uniswap» ليست «PumpSwap».
+    exchanges_count    INTEGER,                  -- كم منصّة تتداولها
+    exchanges_json     TEXT,                     -- أسماء المنصّات (مصفوفة JSON)
+    cmc_id             TEXT,                     -- معرّف CoinMarketCap (إدراج خارجي)
+    -- الوصف والصور: **وجودها** إشارة جدّية لا محتواها. مقيس بعد التعبئة الرجعية
+    -- على 517 عملة (لا على عيّنة الـ45 الأولى): وصف في 217 (42%) وبانر في 181
+    -- (35%) — تباين صالح للتعلّم. أمّا `has_image` فثابت: 1 في 517 من 517، فلا
+    -- تميّز فيه ⇒ يُؤرشف ولا يصير ميزة (كما `out_token_address`).
+    description        TEXT,
+    description_len    INTEGER,                  -- طول الوصف (0 = لا وصف)
+    has_banner         INTEGER,                  -- imageBannerUrl موجود (bool)
+    has_image          INTEGER,                  -- أي صورة للعملة موجودة (bool)
     raw_json           TEXT NOT NULL,
     PRIMARY KEY (token_address, network_id)
 );
@@ -237,7 +275,7 @@ CREATE TABLE IF NOT EXISTS historical_bars_state (
 --
 -- عملات الميم تحرّكها الحشود لا الأساسيات، وهذا البُعد كان غائباً كلياً: نسجّل
 -- السعر والحجم والحائزين، ولا نسجّل كم شخصاً يتحدّث عن العملة ولا كم يُعجَب
--- بحديثه. `equity` = حصّة كاتب الأطروحة نفسه فيها (هل يروّج لما يملك؟).
+-- بحديثه. ونميّز **هل يروّج لما يملك؟** من مركز الكاتب نفسه في المغلّف.
 -- سلسلة زمنية: الفرق بين لقطتين يعطي **تسارع** الزخم الاجتماعي، وهو أهمّ من
 -- المستوى المطلق.
 CREATE TABLE IF NOT EXISTS token_social (
@@ -253,9 +291,12 @@ CREATE TABLE IF NOT EXISTS token_social (
     thesis_count     INTEGER,                    -- = thesis_sampled (توافق قديم)
     -- ما يلي محسوب على **العيّنة** (أحدث 100) لا على الكلّ:
     thesis_likes     INTEGER,                    -- مجموع الإعجابات
-    thesis_replies   INTEGER,                    -- مجموع الردود
+    thesis_replies   INTEGER,                    -- مجموع الردود (ميت من المنبع: 0 دائماً)
     thesis_authors   INTEGER,                    -- كتّاب مميّزون (لا تكرار)
-    holder_authors   INTEGER,                    -- منهم من يملك حصّة (equity>0)
+    -- منهم من يملك كمية موجبة الآن (authorTrade.humanTokenAmount > 0).
+    -- **ليس** `equity`: ذاك الحقل موجود في المغلّف وقيمته صفر في 28,186/28,186
+    -- أطروحة مقيسة، فكان هذا العمود ثابتاً على 0 حتى 2026-08-09.
+    holder_authors   INTEGER,
     newest_thesis_at TEXT,                       -- أحدث أطروحة (طزاجة النقاش)
     raw_json         TEXT NOT NULL,
     PRIMARY KEY (token_address, network_id, recorded_at)
@@ -371,134 +412,6 @@ CREATE TABLE IF NOT EXISTS social_fetch_state (
     PRIMARY KEY (token_address, network_id)
 );
 
--- لقطات بوابة مخاطر التداول من POST /proxy/tokenWarnings.
---
--- هذه **مشاهدة زمنية بعد القبول** وليست ميزة معروفة بأثر رجعي عند t0. لذلك
--- نحفظ first_seen_at/entry_signal_id كي يستطيع التحليل اللاحق ضبط زمن الدخول
--- على recorded_at (اكتمال الفحص)، ولا يلصق التحذير لاحقاً بصفّ الإشارة القديم
--- فينشأ تسرّب للمستقبل.
---
--- `gate_status='pass'` يعني أن مزوّد التحذيرات لم يمنع الشراء/البيع ولم يرجع
--- تحذيراً عالي الخطورة في تلك اللحظة؛ لا يعني أن البيع مثبت بمحاكاة معاملة.
-CREATE TABLE IF NOT EXISTS token_risk_assessments (
-    token_address       TEXT NOT NULL,
-    network_id          TEXT NOT NULL,
-    recorded_at         TEXT NOT NULL,
-    watch_first_seen_at TEXT NOT NULL,
-    entry_signal_id     TEXT,
-    is_control          INTEGER NOT NULL DEFAULT 0,
-    disable_buying      INTEGER,                 -- NULL = لم يصرّح المزود
-    disable_selling     INTEGER,                 -- NULL = مجهول، لا نفترض False
-    warning_count       INTEGER NOT NULL,
-    severe_count        INTEGER NOT NULL,
-    high_count          INTEGER NOT NULL,
-    gate_status         TEXT NOT NULL,           -- pass / blocked / review / unknown
-    warning_types_json  TEXT NOT NULL,
-    warnings_json       TEXT NOT NULL,
-    raw_json            BLOB NOT NULL,
-    PRIMARY KEY (token_address, network_id, recorded_at)
-);
-CREATE INDEX IF NOT EXISTS idx_risk_token_ts
-    ON token_risk_assessments (token_address, network_id, recorded_at);
-CREATE INDEX IF NOT EXISTS idx_risk_gate_ts
-    ON token_risk_assessments (gate_status, recorded_at);
-
--- حالة الجدولة الدوّارة لبوابة المخاطر. الخطأ يُعاد سريعاً، لأن غياب نتيجة
--- الفحص يجب أن يبقى `unknown` ولا يجوز أن يمرّ كعملة آمنة.
-CREATE TABLE IF NOT EXISTS risk_fetch_state (
-    token_address TEXT NOT NULL,
-    network_id    TEXT NOT NULL,
-    last_fetch_at TEXT,
-    last_status   TEXT,                          -- ok / blocked / review / unknown / error
-    warnings      INTEGER,
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (token_address, network_id)
-);
-
--- فحص مباشر على السلسلة، منفصل عن تحذيرات مزوّد Fomo. يشمل صلاحيات SPL/
--- Token-2022، كود ERC-20/proxy/owner، ومحاكاة نقل حائز حين تتاح. لا نسمّيها
--- sell simulation: نقل التوكن لا يثبت مسار بيع DEX ورسومه وسيولته.
-CREATE TABLE IF NOT EXISTS token_chain_assessments (
-    token_address              TEXT NOT NULL,
-    network_id                 TEXT NOT NULL,
-    recorded_at                TEXT NOT NULL,
-    watch_first_seen_at        TEXT NOT NULL,
-    entry_signal_id            TEXT,
-    is_control                 INTEGER NOT NULL DEFAULT 0,
-    chain_kind                 TEXT NOT NULL,       -- solana / evm / unsupported
-    rpc_chain_id               TEXT,                -- قد يختلف عن networkId (1337→999)
-    gate_status                TEXT NOT NULL,       -- pass/review/blocked/unknown/unsupported
-    reason_codes_json          TEXT NOT NULL,
-    contract_exists            INTEGER,
-    token_standard             TEXT,
-    program_or_implementation  TEXT,
-    owner_authority            TEXT,
-    owner_renounced            INTEGER,
-    mint_authority             TEXT,
-    freeze_authority           TEXT,
-    paused                     INTEGER,
-    upgradeable                INTEGER,
-    dangerous_capabilities_json TEXT NOT NULL,
-    transfer_simulation_status TEXT NOT NULL,
-    top1_account_pct           REAL,
-    top10_accounts_pct         REAL,
-    details_json               TEXT NOT NULL,
-    raw_json                   BLOB NOT NULL,
-    PRIMARY KEY (token_address, network_id, recorded_at)
-);
-CREATE INDEX IF NOT EXISTS idx_chain_assessment_token_ts
-    ON token_chain_assessments (token_address, network_id, recorded_at);
-CREATE INDEX IF NOT EXISTS idx_chain_assessment_gate_ts
-    ON token_chain_assessments (gate_status, recorded_at);
-
-CREATE TABLE IF NOT EXISTS chain_fetch_state (
-    token_address TEXT NOT NULL,
-    network_id    TEXT NOT NULL,
-    last_fetch_at TEXT,
-    last_status   TEXT,                            -- ok/review/blocked/unknown/error/unsupported
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (token_address, network_id)
-);
-
--- أحدث حكم مركّب صالح للعرض/بوابة التنفيذ. النجاح يحتاج نجاح المصدرين؛ غياب
--- أحدهما أو unsupported يبقى unknown (fail-closed).
-CREATE VIEW IF NOT EXISTS latest_token_safety AS
-WITH provider_latest AS (
-    SELECT token_address, network_id, MAX(recorded_at) AS recorded_at
-      FROM token_risk_assessments GROUP BY token_address, network_id
-), provider AS (
-    SELECT a.token_address, a.network_id, a.recorded_at, a.gate_status
-      FROM token_risk_assessments a JOIN provider_latest l
-        ON l.token_address=a.token_address AND l.network_id=a.network_id
-       AND l.recorded_at=a.recorded_at
-), chain_latest AS (
-    SELECT token_address, network_id, MAX(recorded_at) AS recorded_at
-      FROM token_chain_assessments GROUP BY token_address, network_id
-), chain_scan AS (
-    SELECT a.token_address, a.network_id, a.recorded_at, a.gate_status
-      FROM token_chain_assessments a JOIN chain_latest l
-        ON l.token_address=a.token_address AND l.network_id=a.network_id
-       AND l.recorded_at=a.recorded_at
-)
-SELECT w.token_address, w.network_id, w.first_seen_at, w.entry_signal_id,
-       w.is_control, p.recorded_at AS provider_recorded_at,
-       p.gate_status AS provider_status, c.recorded_at AS chain_recorded_at,
-       c.gate_status AS chain_status,
-       CASE
-         WHEN p.gate_status='blocked' OR c.gate_status='blocked' THEN 'blocked'
-         WHEN p.gate_status IS NULL OR c.gate_status IS NULL THEN 'unknown'
-         WHEN p.gate_status='unknown'
-           OR c.gate_status IN ('unknown','unsupported') THEN 'unknown'
-         WHEN p.gate_status='review' OR c.gate_status='review' THEN 'review'
-         WHEN p.gate_status='pass' AND c.gate_status='pass' THEN 'pass'
-         ELSE 'unknown'
-       END AS combined_status
-  FROM watchlist w
-  LEFT JOIN provider p
-    ON p.token_address=w.token_address AND p.network_id=w.network_id
-  LEFT JOIN chain_scan c
-    ON c.token_address=w.token_address AND c.network_id=w.network_id;
-
 -- النتائج (labels): يملؤها الـ labeler (عملية FomoLabeler المنفصلة)، لا المسجّل
 -- — المسجّل يسجّل خاماً فقط (منع تسرّب المستقبل)، والتوسيم لا يجري إلّا بعد
 -- اكتمال نافذة الـ48 ساعة.
@@ -611,6 +524,19 @@ CREATE TABLE IF NOT EXISTS training_rows (
     buyers_best_rank INTEGER,
     rank_le_10       INTEGER,
     rank_le_50       INTEGER,
+    -- عائلة صدارات المدد (v7): رتبة كل مدّة قياس مستقلّ، وعرض الحضور
+    -- (periods_matched) يميّز متصدّر الأربع كلّها من متصدّر 24h وحدها.
+    -- كلّها NULL في الصفوف المبنيّة قبل تشغيل الجمع — نمط حِقبة يكشفه
+    -- prune_dead_features ويُسقط العائلة تلقائياً حتى تُقاس في نصفَي المجموعة.
+    top_trader_match_count_24h INTEGER,
+    buyers_best_rank_24h INTEGER,
+    top_trader_match_count_7d INTEGER,
+    buyers_best_rank_7d INTEGER,
+    top_trader_match_count_30d INTEGER,
+    buyers_best_rank_30d INTEGER,
+    top_trader_periods_matched INTEGER,
+    top_trader_any_period INTEGER,
+    best_rank_any_period INTEGER,
     ticker_len       INTEGER,
     ticker_has_digit INTEGER,
     ticker_non_ascii INTEGER,
@@ -630,6 +556,12 @@ CREATE TABLE IF NOT EXISTS training_rows (
     name_len         INTEGER,
     name_non_ascii   INTEGER,
     decimals         INTEGER,
+    -- شرعية خارجية: إدراج مركزيّ ومعرّف CMC لا يمنحهما المطلق لنفسه بضغطة زرّ
+    exchanges_count  INTEGER,
+    listed_on_exchange INTEGER,
+    has_cmc_id       INTEGER,
+    description_len  INTEGER,
+    has_banner       INTEGER,
     -- ج) الزخم الاجتماعيّ: عدّ تاريخيّ (عيّنة) + لقطة حقيقية قبل t0
     -- (بلا إعجابات الأطروحات — ممنوعة: قيمتها وقت السحب لا الكتابة)
     thesis_counted   INTEGER,
@@ -686,6 +618,16 @@ CREATE TABLE IF NOT EXISTS training_rows (
     volume_to_liquidity REAL,
     liquidity_to_mcap REAL,
     float_ratio      REAL,
+    -- هـ٢) الملكية: تركيز السلسلة (يُصلح top10_holders_pct الميّت) وتموضع الحشد
+    chain_top10_pct  REAL,                 -- أكبر 10 % من المعروض (token_details)
+    chain_holder_count INTEGER,            -- حائزو السلسلة الكلّي
+    holders_age_min  REAL,                 -- طزاجة أحدث قياس حيازة
+    platform_holders INTEGER,              -- حائزو fomo (hodlers/top)
+    platform_penetration REAL,             -- حائزو المنصّة ÷ حائزي السلسلة
+    platform_underwater_ratio REAL,        -- نصيب المراكز الخاسرة (عرض زائد)
+    platform_value_usd REAL,               -- مجموع قيمة مراكز المنصّة
+    platform_median_hold_h REAL,           -- وسيط مدّة الحمل (ساعات)
+    platform_dev_holding INTEGER,          -- 1 = المطوّر بين الحائزين
     -- و) النظام السوقيّ
     sol_ret_4h       REAL,
     sol_ret_24h      REAL,
@@ -729,7 +671,65 @@ SELECT * FROM training_rows
           AND earlier_event.signal_type = current_event.signal_type
           AND earlier_event.id < current_event.id
         WHERE current_event.id = training_rows.key
+   )
+   -- إشارات متزامنة لنفس العملة واللحظة تُعدّ مكررة: نحتفظ بأصغر key فقط.
+   AND training_rows.key = (
+       SELECT MIN(t2.key)
+         FROM training_rows t2
+        WHERE t2.kind = 'signal'
+          AND t2.is_live = 1
+          AND t2.asset_class = 'meme'
+          AND t2.status = 'ok'
+          AND t2.is_independent = 1
+          AND t2.feature_version >= 2
+          AND t2.token_address = training_rows.token_address
+          AND COALESCE(t2.network_id, '') =
+              COALESCE(training_rows.network_id, '')
+          AND t2.entry_ts = training_rows.entry_ts
    );
+
+-- تركّز الحيازة وتموضع الحشد — مقياس خطر rug وكانا مفقودين كلياً.
+-- `market_ticks.top10_holders_pct` ميّت: المصدر لا يوفّر المفتاح إطلاقاً
+-- (0 من 1,430,475 صف). فحص السلسلة يغطّي Solana وحدها وصامت عن EVM كله.
+-- المصدران هنا يعملان على الشبكتين لكنّهما يقيسان شيئين مختلفين (مؤكَّد حيّاً):
+-- tokenDetails يعطي تركّز السلسلة (top10HoldersPercent+holders)، و/hodlers/top
+-- يعطي مراكز مستخدمي fomo بلا نسبة من المعروض — تموضع الحشد لا التركّز.
+-- كلٌّ في صفّ مستقلّ (source داخل المفتاح) فلا يُحسب مقياس مكان الآخر.
+CREATE TABLE IF NOT EXISTS token_holders (
+    token_address       TEXT NOT NULL,
+    network_id          TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    watch_first_seen_at TEXT NOT NULL,
+    entry_signal_id     TEXT,
+    is_control          INTEGER NOT NULL DEFAULT 0,
+    source              TEXT NOT NULL,               -- token_details / hodlers_top
+    -- تركّز السلسلة — من token_details وحده؛ NULL من المصدر الآخر
+    top10_pct           REAL,                        -- أكبر 10 % من المعروض
+    holder_count        INTEGER,                     -- إجمالي الحائزين على السلسلة
+    -- تموضع حشد المنصّة — من hodlers_top وحده؛ NULL من الآخر
+    platform_holders             INTEGER,            -- totalHolders على المنصّة
+    platform_holders_listed      INTEGER,            -- المُفصَّل في الردّ (~50)
+    platform_value_usd           REAL,               -- مجموع قيمة المراكز
+    platform_underwater          INTEGER,            -- عدد المراكز الخاسرة
+    platform_median_hold_seconds REAL,               -- وسيط مدّة الحمل
+    platform_dev_holding         INTEGER,            -- 1 = المطوّر بين الحائزين
+    top_holders_json    TEXT,                        -- مراكز مُلخَّصة (بلا كتلة user)
+    raw_json            BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at, source)
+);
+CREATE INDEX IF NOT EXISTS idx_holders_token_ts
+    ON token_holders (token_address, network_id, recorded_at);
+
+-- حالة الجدولة الدوّارة لتركّز الحيازة. الخطأ يُعاد سريعاً (مجهول ≠ آمن).
+CREATE TABLE IF NOT EXISTS holders_fetch_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                              -- ok / empty / error
+    top10_pct     REAL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
 
 -- حالة التشغيل: آخر تشغيل، عدّادات، حالة getBars، إصدار المخطّط.
 CREATE TABLE IF NOT EXISTS meta (

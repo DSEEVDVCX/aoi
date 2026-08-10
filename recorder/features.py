@@ -28,7 +28,31 @@ from extract import classify_asset
 # فيتوقّف العدّ عند ~400 لعملة قد تحمل 29,595 أطروحة حقيقية. الصفوف عند السقف
 # تُعلَّم بـ`thesis_counted_capped` كي لا يقرأ النموذج عدداً مشبَّعاً كأنّه قياس.
 _THESIS_PAGE_CAP = 380
-FEATURE_VERSION = 3
+# 4: عائلة الملكية (تركيز السلسلة + تموضع حشد المنصّة) وشرعية خارجية
+#    (منصّات/CMC/وصف/بانر) — استعلامات التدريب تشترط feature_version >= 2،
+#    والصفوف القديمة تبقى صالحة مع NULL في الجديد (غائب ≠ صفر).
+# 5: تصحيح mintable/freezable. كانا NULL في 100% من الصفوف: المصدر يعيد
+#    **عنوان** سلطة السكّ/التجميد لا قيمة منطقية، والمحوِّل السابق كان يُسقط
+#    كل نصّ إلى None. بعد التصحيح: سولانا 312/312 مقيسة (56 بسلطة سكّ قائمة،
+#    19 بسلطة تجميد)، وEVM تبقى NULL بحقّ — لا سلطة بهذا المعنى هناك، فالصفر
+#    كان سيفبرك «آمن» لعملة لم تُقَس (FR-007).
+# 6: تصحيح holder_authors ⇒ social_holder_authors و social_holder_ratio. كانا
+#    ثابتين على صفر في 46,040 صفّاً لأنّ المستخرِج قرأ `equity` وهو صفر صحيح في
+#    28,186/28,186 أطروحة مقيسة (حقل ميت من المنبع). المركز الحقيقي في
+#    `authorTrade.humanTokenAmount`: بعد التعبئة الرجعية 99 قيمة مميّزة على مدى
+#    0-100، و95.3% من اللقطات فيها حائز واحد على الأقل. عمودان بلا معلومة صارا
+#    قياساً — والنسبة موزّعة فعلاً (قمّة 30-60%، وذيل 906 لقطة كلّ كتّابها مالكون).
+# 7: عائلة صدارات المدد. سقف المصدر 50 متصدّراً في الصدارة الأساسيّة وكل صيغ
+#    الترقيم مُهمَلة بصمت (مقيس: تسع صيغ، قوائم متطابقة بايتاً)، لكنّ /24h و/7d
+#    و/30d تعيد كلٌّ **100** فاتّحاد الأربع 214 متداولاً (164 لا تعرفهم
+#    الأساسيّة) — على 7,200 حدث شراء حقيقيّ من ثلاثة أيام: مطابقة 265 (3.68%)
+#    ← 1,099 (15.26%)، أي ×4.15. الرتب **منفصلة بالمدّة** لا مدموجة (رتبة 7 في
+#    24h ليست رتبة 7 في totalPnL)، ومداها هنا 1-100 لا 1-50 فـ`rank_le_50`
+#    يستعيد تباينه على `best_rank_any_period`. الماضي لا يُعبّأ: الأرشيف حفظ
+#    totalPnL وحدها فلا تاريخ لرتب المدد، والصفوف القديمة تبقى NULL بحقّ —
+#    وهذا بالضبط نمط الحِقبة الذي يكشفه prune_dead_features، فالعائلة تُسقَط
+#    تلقائياً من التدريب حتى تُقاس في نصفَي المجموعة (أسابيع).
+FEATURE_VERSION = 7
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +98,16 @@ def _div(a: Any, b: Any) -> float | None:
     return float(a) / float(b)
 
 
+def _min_or_none(*values: Any) -> int | float | None:
+    """أصغر قيمة رقمية موجودة، أو None إن غابت كلّها.
+
+    لازمة لتجميع الرتب عبر المدد: `min()` على قائمة فيها None يرفع TypeError،
+    و`min(x or inf ...)` يفبرك رقماً حيث لم نقس (FR-007).
+    """
+    nums = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return min(nums) if nums else None
+
+
 def _ret(new: Any, old: Any) -> float | None:
     if not isinstance(new, (int, float)) or not isinstance(old, (int, float)) or old <= 0:
         return None
@@ -109,6 +143,9 @@ def event_features(row: dict[str, Any], t0: int) -> dict[str, Any]:
         size = row.get("usd_amount")
     top_ids = _json_list(row.get("top_trader_ids_json"))
     ticker = row.get("ticker")
+    # عرض الحضور عبر الصدارات. مخزَّن في الحدث (يحسبه المستخرِج وقت الالتقاط
+    # حيث الخرائط حاضرة)؛ الصفوف الأقدم من العائلة تبقى None بلا فبركة.
+    periods_matched = row.get("top_trader_periods_matched")
     return {
         "signal_type": row.get("signal_type") or row.get("event_type"),
         "size_usd": size,
@@ -145,6 +182,29 @@ def event_features(row: dict[str, Any], t0: int) -> dict[str, Any]:
         "buyers_best_rank": rank,
         "rank_le_10": (1 if rank <= 10 else 0) if isinstance(rank, int) else None,
         "rank_le_50": (1 if rank <= 50 else 0) if isinstance(rank, int) else None,
+        # صدارات المدد: كل رتبة قياس مستقلّ — الرابع في 24h ليس الرابع في
+        # totalPnL. تُمرّر كما هي، والصفوف المبنيّة قبل تشغيل الجمع تبقى NULL.
+        "top_trader_match_count_24h": row.get("top_trader_match_count_24h"),
+        "buyers_best_rank_24h": row.get("buyers_best_rank_24h"),
+        "top_trader_match_count_7d": row.get("top_trader_match_count_7d"),
+        "buyers_best_rank_7d": row.get("buyers_best_rank_7d"),
+        "top_trader_match_count_30d": row.get("top_trader_match_count_30d"),
+        "buyers_best_rank_30d": row.get("buyers_best_rank_30d"),
+        # عرض الحضور: في كم صدارة (0-4) ظهر مشترٍ. متصدّر الأربع كلّها حيوان
+        # آخر عن متصدّر 24h وحدها — الأوّل سِجلّ، والثاني قد يكون ضربة حظّ.
+        "top_trader_periods_matched": periods_matched,
+        "top_trader_any_period": (
+            (1 if periods_matched > 0 else 0)
+            if isinstance(periods_matched, int) else None
+        ),
+        # أفضل رتبة عبر المدد كلّها: أقوى دليل «نخبة اشترت» بأوسع تغطية،
+        # مع بقاء الرتب المفصّلة للنموذج كي يفصل المدد إن شاء.
+        "best_rank_any_period": _min_or_none(
+            rank,
+            row.get("buyers_best_rank_24h"),
+            row.get("buyers_best_rank_7d"),
+            row.get("buyers_best_rank_30d"),
+        ),
         # نصّ الرمز: مقيس في مشاريع مشابهة كإشارة جودة/انتحال
         "ticker_len": len(ticker) if isinstance(ticker, str) else None,
         "ticker_has_digit": (
@@ -179,6 +239,9 @@ def static_features(
         "freezable": None, "socials_count": None, "has_twitter": None,
         "creator_prior_tokens": None, "decimals": None, "name_len": None,
         "name_non_ascii": None,
+        # شرعية خارجية — كانت في الخام منذ اليوم الأول ولا تُستخرج
+        "exchanges_count": None, "listed_on_exchange": None, "has_cmc_id": None,
+        "description_len": None, "has_banner": None,
     }
     if row is None:
         return out
@@ -208,6 +271,19 @@ def static_features(
             1 if isinstance(name, str) and any(ord(ch) > 127 for ch in name) else
             (0 if isinstance(name, str) else None)
         ),
+        # شرعية خارجية: إدراج في منصّة مركزية أو معرّف CoinMarketCap لا يمنحهما
+        # مطلقُ عملةٍ لنفسه بضغطة زرّ — بعكس تويتر وموقع الويب. مقيس على 516
+        # عملة: exchanges_count متاح في 516 (حتى 8 منصّات)، وcmc_id في 123،
+        # ووصف في 217، وبانر في 181. كلّها كانت في raw_json ولا تُقرأ.
+        "exchanges_count": row["exchanges_count"],
+        "listed_on_exchange": (
+            1 if (row["exchanges_count"] or 0) > 0
+            else (0 if row["exchanges_count"] is not None else None)
+        ),
+        "has_cmc_id": 1 if row["cmc_id"] else 0,
+        # طول الوصف: صفر يعني مشروعاً لم يكتب سطراً عن نفسه (بذل الجهد إشارة)
+        "description_len": row["description_len"],
+        "has_banner": row["has_banner"],
     })
     # بصمة المُنشئ: كم عملة أخرى له **ظهرت قبل t0** (منشئ متسلسل = نمط rug).
     # القيد الزمنيّ على أوّل ظهور للعملة الأخرى، وإلّا تسرّب المستقبل.
@@ -242,7 +318,8 @@ def social_features(
        مشبَّعة عند السقف (`thesis_counted_capped` يعلّمها).
     2. `token_social` — لقطة كل ~30 دقيقة تحمل `thesis_total` **الحقيقيّ** من
        المغلّف (شوهد 29,595 مقابل 400 مخزَّنة) و`thesis_authors` و
-       **`holder_authors`** (كتّاب يملكون حصّة فعلاً = جلد في اللعبة).
+       **`holder_authors`** (كتّاب يملكون كمية موجبة فعلاً = جلد في اللعبة؛
+       مصدره `authorTrade` لا `equity` — انظر تعليق FEATURE_VERSION 6).
 
     اللقطة تُقرأ **عند/قبل t0 حصراً**، فليست تسرّباً: المنع كان لاستعمال قيمة
     اليوم لحدث الماضي (README §9)، لا لقيمة قِيست قبل القرار.
@@ -488,6 +565,74 @@ def market_features(
 
 
 # ---------------------------------------------------------------------------
+# عائلة هـ٢ — الملكية: تركيز السلسلة + تموضع حشد المنصّة
+# ---------------------------------------------------------------------------
+def holders_features(
+    db: RecorderDB, token: str, network: str, t0: int
+) -> dict[str, Any]:
+    """أحدث قياس حيازة **عند/قبل t0** من مصدرين يقيسان شيئين مختلفين.
+
+    `market_ticks.top10_holders_pct` أعلاه ميّت (صفر من 1,430,475): قوائم
+    trending/verified لا تحمل المفتاح إطلاقاً. وفحص السلسلة يغطّي Solana وحدها
+    ويصمت عن EVM كلّه. دورة الحائزين تُصلح الاثنين عبر:
+
+    - `token_details` ⇒ **تركيز السلسلة**: أكبر 10 % من المعروض + عدد الحائزين
+      الكلّي، على EVM وSolana معاً (مقيس حيّاً: 83.2% لعملة و21.9% لأخرى).
+      أقوى مؤشّر rug منفرد.
+    - `hodlers/top` ⇒ **تموضع الحشد**: مستخدمو fomo الحائزون فعلاً (274 من 937،
+      و118 من 14,371) بتكلفة كل مركز وربحه غير المحقّق ومدّة حمله. لا نسب
+      معروض هنا إطلاقاً، فلا نشتقّ تركيزاً منه ولا نخمّنه.
+
+    `platform_penetration` هو الاشتقاق الذي لا يعطيه أي مصدر منفرداً: نصيب
+    المنصّة من حائزي السلسلة. عالٍ = حركة يقودها حشد fomo (قابلة للانعكاس حين
+    يخرج)، منخفض = طلب خارجيّ أوسع.
+
+    `platform_underwater_ratio` عرضٌ زائد محتمل: حاملون خاسرون يبيعون عند أوّل
+    تعافٍ. مقيس حيّاً 49 من 49 خاسراً في عملة، مقابل 6 من 50 في أخرى.
+
+    كل الصفوف قبل 2026-08-09 ستكون None هنا (الدورة جديدة) — وهذا مقصود:
+    NULL يعني «لم نقس» لا «صفر» (FR-007).
+    """
+    out: dict[str, Any] = {
+        "chain_top10_pct": None, "chain_holder_count": None,
+        "holders_age_min": None, "platform_holders": None,
+        "platform_penetration": None, "platform_underwater_ratio": None,
+        "platform_value_usd": None, "platform_median_hold_h": None,
+        "platform_dev_holding": None,
+    }
+    q = """SELECT *, CAST(strftime('%s', recorded_at) AS INTEGER) e
+             FROM token_holders
+            WHERE token_address=? AND network_id=? AND source=?
+              AND CAST(strftime('%s', recorded_at) AS INTEGER) <= ?
+            ORDER BY e DESC LIMIT 1"""
+    det = db._conn.execute(q, (token, network, "token_details", t0)).fetchone()
+    plat = db._conn.execute(q, (token, network, "hodlers_top", t0)).fetchone()
+    if det is None and plat is None:
+        return out
+
+    if det is not None:
+        out["chain_top10_pct"] = det["top10_pct"]
+        out["chain_holder_count"] = det["holder_count"]
+    if plat is not None:
+        out["platform_holders"] = plat["platform_holders"]
+        out["platform_value_usd"] = plat["platform_value_usd"]
+        out["platform_dev_holding"] = plat["platform_dev_holding"]
+        out["platform_underwater_ratio"] = _div(
+            plat["platform_underwater"], plat["platform_holders_listed"]
+        )
+        secs = plat["platform_median_hold_seconds"]
+        out["platform_median_hold_h"] = secs / 3600 if secs is not None else None
+        if det is not None:
+            out["platform_penetration"] = _div(
+                plat["platform_holders"], det["holder_count"]
+            )
+    # طزاجة القياس: أحدث ختم من المصدرين (كلٌّ يُجدَّد بدورته)
+    stamps = [r["e"] for r in (det, plat) if r is not None]
+    out["holders_age_min"] = (t0 - max(stamps)) / 60 if stamps else None
+    return out
+
+
+# ---------------------------------------------------------------------------
 # عائلة و — النظام السوقيّ (شموع الماكرو الساعية)
 # ---------------------------------------------------------------------------
 def macro_features(db: RecorderDB, t0: int) -> dict[str, Any]:
@@ -575,11 +720,17 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "volume_per_trader", "are_top_traders", "top_trader_match_count",
     "top_traders_listed", "top_trader_match_ratio",
     "buyers_best_rank", "rank_le_10", "rank_le_50",
+    "top_trader_match_count_24h", "buyers_best_rank_24h",
+    "top_trader_match_count_7d", "buyers_best_rank_7d",
+    "top_trader_match_count_30d", "buyers_best_rank_30d",
+    "top_trader_periods_matched", "top_trader_any_period", "best_rank_any_period",
     "ticker_len", "ticker_has_digit", "ticker_non_ascii", "hour_utc", "dow",
     # ب — الثوابت والمُنشئ
     "token_age_h", "launchpad_name", "migrated", "graduation_percent", "is_scam",
     "mintable", "freezable", "socials_count", "has_twitter", "creator_prior_tokens",
     "name_len", "name_non_ascii", "decimals",
+    "exchanges_count", "listed_on_exchange", "has_cmc_id", "description_len",
+    "has_banner",
     # ج — الاجتماعيّ (عدّ تاريخيّ + لقطة حقيقية قبل t0)
     "thesis_counted", "thesis_counted_capped", "thesis_authors_before",
     "thesis_1h", "thesis_24h", "thesis_accel", "hours_since_last_thesis",
@@ -599,6 +750,10 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "tick_age_min", "tick_change_1h", "tick_change_4h", "tick_change_24h",
     "tick_volume_1h", "tick_volume_4h", "tick_txn_1h", "tick_txn_24h",
     "volume_to_liquidity", "liquidity_to_mcap", "float_ratio",
+    # هـ٢ — الملكية: تركيز السلسلة (يُصلح top10_holders_pct الميّت) وتموضع الحشد
+    "chain_top10_pct", "chain_holder_count", "holders_age_min",
+    "platform_holders", "platform_penetration", "platform_underwater_ratio",
+    "platform_value_usd", "platform_median_hold_h", "platform_dev_holding",
     # و — الماكرو
     "sol_ret_4h", "sol_ret_24h", "eth_ret_24h",
     # ز — الكثافة
@@ -630,6 +785,7 @@ def build_features(
     out.update(social_features(db, token, network, t0))
     out.update(price_history_features(db, token, network, t0))
     out.update(market_features(db, token, network, t0))
+    out.update(holders_features(db, token, network, t0))
     out.update(macro_features(db, t0))
     out.update(density_features(db, token, network, t0, exclude_key))
     return {k: out.get(k) for k in FEATURE_COLUMNS}
