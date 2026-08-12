@@ -539,6 +539,15 @@ async def run_social_cycle(
     return stats
 
 
+# مصدرا الحائزين ثابتاً وحدَه لا مضمَّناً في الحلقة، ليُعرَف طولهما فيُحرَس النوم
+# بعد آخر نداء: التمهّل فاصل **بين** النداءات، ونوم بعد آخرها يقتطع من فسحة
+# الدورة بلا مقابل (نفس حرس `if i + 1 < len(due)` في دورتَي الشموع والسوشيال).
+_HOLDERS_SOURCES: tuple[tuple[str, Any, Any], ...] = (
+    ("token_details", _fetch_token_details_raw, extract.extract_token_details_holders),
+    ("hodlers_top", _fetch_hodlers_raw, extract.extract_platform_holders),
+)
+
+
 async def run_holders_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
@@ -592,10 +601,7 @@ async def run_holders_cycle(
         top10: float | None = None
         got = 0
 
-        for source, fetch_fn, extract_fn in (
-            ("token_details", _fetch_token_details_raw, extract.extract_token_details_holders),
-            ("hodlers_top", _fetch_hodlers_raw, extract.extract_platform_holders),
-        ):
+        for j, (source, fetch_fn, extract_fn) in enumerate(_HOLDERS_SOURCES):
             raw: Any = None  # يبقى None لو رمى الجلب — يُقرأ في فرع التدفّق أدناه
             try:
                 raw = await fetch_fn(client, addr, net)
@@ -633,7 +639,9 @@ async def run_holders_cycle(
                         "last_error_holders",
                         f"{recorded_at}: flow: {type(exc).__name__}: {exc}",
                     )
-            await sleep(config.HOLDERS_PACING_SECONDS)
+            # فاصل **بين** النداءات لا بعد آخرها.
+            if i + 1 < len(due) or j + 1 < len(_HOLDERS_SOURCES):
+                await sleep(config.HOLDERS_PACING_SECONDS)
 
         if got:
             stats["holders_tokens"] += 1
@@ -707,7 +715,10 @@ async def run_filter_tokens_cycle(
                 "last_error_filter",
                 f"{recorded_at}: {type(exc).__name__}: {exc}",
             )
-        await sleep(config.FILTER_TOKENS_PACING_SECONDS)
+        # فاصل **بين** الدفعات لا بعد آخرها. وفي الحالة الغالبة (≈53 عنواناً ⇒
+        # دفعة واحدة) كان هذا النوم كلّه ضائعاً بلا نداء بعده.
+        if start + config.FILTER_TOKENS_BATCH < len(missing):
+            await sleep(config.FILTER_TOKENS_PACING_SECONDS)
     return stats
 
 
@@ -739,7 +750,7 @@ async def run_traders_cycle(
         min_events=config.TRADERS_MIN_EVENTS,
     )
 
-    for w in due:
+    for i, w in enumerate(due):
         tid = w["trader_id"]
         status = "error"
         try:
@@ -762,7 +773,9 @@ async def run_traders_cycle(
                 f"{recorded_at}: {type(exc).__name__}: {exc}",
             )
         db.set_trader_state(tid, status, recorded_at)
-        await sleep(config.TRADERS_PACING_SECONDS)
+        # فاصل **بين** النداءات لا بعد آخرها.
+        if i + 1 < len(due):
+            await sleep(config.TRADERS_PACING_SECONDS)
     return stats
 
 
