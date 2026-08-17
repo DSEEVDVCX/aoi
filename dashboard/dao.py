@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -183,26 +184,125 @@ def recorder_status(
     }
 
 
-def recorder_errors(conn: sqlite3.Connection, sources: tuple[str, ...]) -> list[dict[str, Any]]:
+def recorder_errors(
+    conn: sqlite3.Connection,
+    sources: tuple[str, ...],
+    ok_stamps: dict[str, tuple[str, ...]] | None = None,
+    recorder_stamps: tuple[str, ...] = ("started_at", "last_ok_cycle_at"),
+) -> list[dict[str, Any]]:
     """آخر خطأ لكل مصدر من meta (last_error_<src>). غياب = لا خطأ لذلك المصدر.
 
     ملاحظة: `last_error_<src>` قيمة meta ثابتة — تُكتب عند كل فشل ولا تُمسح عند
     النجاح، فتبقى تعرض آخر خطأ حتى لو تعافى المصدر. لذلك نُعلّم الخطأ بأنّه
-    **قديم (stale)** إن كان ختمه الزمني أقدم من `started_at` (أي من عملية مسجّل
-    ماتت) أو أقدم من آخر دورة ناجحة — فلا يُعرض خطأ متعافٍ كأنّه حالي.
+    **قديم (stale)** إن سبق ختمَ نجاحٍ لاحقاً.
+
+    **والحدُّ لكل مصدر حدُّه.** كان حدّاً واحداً للجميع مبنيّاً على `started_at`
+    و`last_ok_cycle_at`، ولا يكتبهما إلّا `recorder.py`؛ فحين مات المسجّل ٣س١٤د
+    يوم 2026-08-17 تجمّد الحدُّ فبقيت شارات chain/chain_auth/evm حمراء وأخطاؤها
+    قد شُفيت — و`FomoChain` تُتمّ دوراتها النظيفة بلا أن يعنيَ ذلك شيئاً. فصار
+    لكلّ طابورٍ ختمُ نجاحٍ من كاتبه (`chain_last_ok_at`…)، ويُضاف إليه حدُّ
+    المسجّل كي لا يخسر خطأٌ قديمٌ سبيلَ الشفاء قبل أن يُكتب ختمُه أوّل مرّة.
     """
     meta = all_meta(conn)
-    started_dt = _parse_iso(meta.get("started_at"))
-    # آخر دورة نجحت كلياً (errors==0) تُبطل كل الأخطاء الأقدم منها.
-    last_ok_dt = _parse_iso(meta.get("last_ok_cycle_at"))
-    boundary = max((d for d in (started_dt, last_ok_dt) if d is not None), default=None)
+    stamps = ok_stamps or {}
+
+    def _boundary(keys: tuple[str, ...]) -> datetime | None:
+        moments = [_parse_iso(meta.get(key)) for key in keys]
+        return max((m for m in moments if m is not None), default=None)
+
+    recorder_boundary = _boundary(recorder_stamps)
     out = []
     for src in sources:
         val = meta.get(f"last_error_{src}")
         # الختم في القيمة بصيغة "<iso>: <msg>" — نفصله على أول ": ".
         err_dt = _parse_iso(val.split(": ", 1)[0]) if val else None
+        own = _boundary(stamps.get(src, ()))
+        boundary = max(
+            (d for d in (own, recorder_boundary) if d is not None), default=None,
+        )
         stale = bool(val) and boundary is not None and err_dt is not None and err_dt < boundary
-        out.append({"source": src, "last_error": val, "stale": stale})
+        out.append({
+            "source": src,
+            "last_error": val,
+            "stale": stale,
+            # مِن أين جاء الحدّ: تشخيصُ «لماذا ما زال أحمر؟» بلا قراءة meta يدوياً.
+            "ok_at": own.isoformat() if own else None,
+        })
+    return out
+
+
+def provider_keys(
+    conn: sqlite3.Connection,
+    prefix: str = "provider_keys_",
+    min_keys: int = 2,
+    stale_seconds: float = 2400.0,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """حالةُ أحواض مفاتيح المزوّدين كما ختمتها كل عمليّة في `meta`.
+
+    **بلا أيّ قيمة مفتاح** (FR-013): الكاتب لا يكتب إلّا أعداداً ومؤشّرات، وهذه
+    الدالّة تقرأ ما كُتب — فلا سبيل لعرض مفتاح ولا كسرٍ منه أصلاً.
+
+    صفٌّ لكل (مالك، مزوّد) لا صفٌّ لكل مزوّد: حوض GoldRush يوجد في `FomoChain`
+    و`FomoEVMReplay` معاً بحالتين مستقلّتين (عمليّتان، ذاكرتان)، ودمجُهما كان
+    سيخفي نفادَ رصيدٍ في إحداهما تحت سلامة الأخرى.
+
+    و`stale` هنا عن **التقرير** لا عن المفاتيح: تقريرٌ متجمّد يعني أنّ العمليّة
+    المالكة لم تُتمّ دورة، وأعدادُه أرقامٌ من الماضي لا وصفٌ للحاضر.
+    """
+    moment = now or datetime.now(UTC)
+
+    def _count(value: object) -> int:
+        """عددٌ من JSON كتبته عمليّةٌ أخرى: نسخةٌ أقدم قد تُغفل مفتاحاً."""
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+
+    out: list[dict[str, Any]] = []
+    for key, raw in all_meta(conn).items():
+        if not key.startswith(prefix) or not raw:
+            continue
+        try:
+            report = json.loads(raw)
+            pools = report["pools"]
+        except (ValueError, TypeError, KeyError):
+            continue
+        owner = str(report.get("owner") or key[len(prefix):])
+        at = report.get("at")
+        at_dt = _parse_iso(at)
+        age = (moment - at_dt).total_seconds() if at_dt else None
+        stale = age is None or age > stale_seconds
+        for provider, pool in sorted((pools or {}).items()):
+            if not isinstance(pool, dict):
+                continue
+            keys = _count(pool.get("keys"))
+            blocked = _count(pool.get("blocked"))
+            available = _count(pool.get("available"))
+            out.append({
+                "owner": owner,
+                "provider": str(provider),
+                "keys": keys,
+                "blocked": blocked,
+                "available": available,
+                "index": _count(pool.get("index")),
+                "rotations": _count(pool.get("rotations")),
+                "cooldown_seconds": pool.get("cooldown_seconds"),
+                # مزوّدٌ مُسكَت لبقيّة عمر العمليّة (نفاد رصيد GoldRush ⇒ 402):
+                # الأحواض تبدو سليمة والمزوّد معطَّل، فيُقال صراحةً.
+                "disabled": bool(pool.get("disabled")),
+                "at": at,
+                "age_seconds": age,
+                "stale": stale,
+                # المستويات الثلاثة: معطَّل/بلا متاح ⇒ خطأ، مفتاحٌ واحد أو
+                # مبرَّدٌ الآن ⇒ تحذير، وإلّا سليم.
+                "level": (
+                    "bad" if (pool.get("disabled") or (keys and not available) or not keys)
+                    else "warn" if (keys < min_keys or blocked)
+                    else "good"
+                ),
+            })
+    out.sort(key=lambda row: (row["provider"], row["owner"]))
     return out
 
 

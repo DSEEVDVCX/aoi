@@ -53,6 +53,30 @@ def test_schema_creates_all_tables(db):
         assert t in names
 
 
+def test_evm_snapshot_due_filters_completed_ledgers_before_limit(db):
+    now = "2026-08-17T12:00:00+00:00"
+    for i in range(25):
+        token = f"0x{i:040x}"
+        db.upsert_watch(token, "8453", "large_buy", f"sig-{i}", 48, now)
+        db.set_evm_backfill_state(
+            "8453", token, "partial", now, from_block=100, to_block=200,
+        )
+    ready = "0x" + "f" * 40
+    db.upsert_watch(ready, "8453", "large_buy", "sig-ready", 48, now)
+    db.set_evm_backfill_state(
+        "8453", ready, "done", now, from_block=201, to_block=200,
+    )
+
+    due = db.evm_snapshot_due(
+        limit=20,
+        stale_before_iso="2026-08-17T11:55:00+00:00",
+        error_stale_before_iso="2026-08-17T11:55:00+00:00",
+        networks=["8453"],
+    )
+
+    assert [row["token_address"] for row in due] == [ready]
+
+
 def test_insert_signal_idempotent(db):
     assert db.insert_signal(_signal()) is True
     assert db.insert_signal(_signal()) is False   # نفس id → يُتجاهل
@@ -230,6 +254,14 @@ def test_compression_is_lossless_and_smaller(db):
     plain = json.dumps(payload, ensure_ascii=False).encode()
     assert decode_raw(encode_raw(payload)) == payload
     assert len(encode_raw(payload)) < len(plain) / 2
+
+
+def test_raw_encoding_preserves_lone_unicode_surrogate_as_json_escape():
+    raw_text = '{"comment":"broken \\ud83d emoji","normal":"مرحبا"}'
+
+    encoded = encode_raw(raw_text)
+
+    assert decode_raw(encoded) == json.loads(raw_text)
 
 
 def test_decode_raw_reads_legacy_plaintext_rows(db):
@@ -597,3 +629,30 @@ def test_schema_gives_up_after_three_races(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         RecorderDB(path, SCHEMA)
     assert made[0].scripts == 3               # لا حلقة لا نهائية
+
+
+# ---------------------------------------------------------------------------
+# note_error: ختمٌ دفتريّ لا يُسقط مَن يكتبه (قِيس 2026-08-17)
+# ---------------------------------------------------------------------------
+def test_note_error_writes_like_set_meta_when_the_database_is_healthy(db):
+    assert db.note_error("last_error_x", "2026-08-17: boom") is True
+    assert db.get_meta("last_error_x") == "2026-08-17: boom"
+
+
+def test_note_error_returns_false_instead_of_raising_on_a_locked_database(db, monkeypatch):
+    """`set_meta` ترفع فتُسقط معالجَ الخطأ؛ `note_error` تُبلّغ بالقيمة لا بالرفع."""
+    def _locked(_key, _value):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "set_meta", _locked)
+    assert db.note_error("last_error_x", "boom") is False
+
+
+def test_note_error_swallows_any_write_failure_not_only_locks(db, monkeypatch):
+    """القاعدة قد تفشل بغير القفل (قرص ممتلئ، اتصال مُغلق) — نفس الحكم."""
+    def _closed(_key, _value):
+        raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+
+    monkeypatch.setattr(db, "set_meta", _closed)
+    assert db.note_error("last_error_x", "boom") is False
+

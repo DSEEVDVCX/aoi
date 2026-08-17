@@ -158,3 +158,70 @@ async def test_small_range_falls_back_to_normal_rpc(monkeypatch):
         await rpc.aclose()
 
     assert result == (["fallback"], 1, True, 99)
+
+
+async def test_credit_exhaustion_disables_goldrush_and_falls_back(monkeypatch, tmp_path):
+    key_path = tmp_path / "keys.json"
+    key_path.write_text(json.dumps({"goldrush_api_key": "secret"}))
+    monkeypatch.setattr(goldrush_rpc.config, "chain_keys_path", lambda: str(key_path))
+    goldrush_calls = 0
+    fallback_calls = []
+
+    def handler(_request):
+        nonlocal goldrush_calls
+        goldrush_calls += 1
+        return httpx.Response(402, json={
+            "data": None,
+            "error": True,
+            "error_message": "Credit limit exceeded for your account.",
+        })
+
+    async def fallback(_self, network_id, addresses, from_block, to_block, **kwargs):
+        fallback_calls.append((network_id, tuple(addresses), from_block, to_block))
+        return [{"blockNumber": hex(from_block)}], 1, True, to_block
+
+    monkeypatch.setattr(evm_rpc.EVMRPC, "get_logs_paged", fallback)
+    rpc = goldrush_rpc.GoldRushReplayRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        first = await rpc.get_logs_paged(NET, [TOK], 0, 9_999, max_calls=5, sleep=_noop)
+        second = await rpc.get_logs_paged(NET, [TOK], 10_000, 19_999, max_calls=5, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+    assert goldrush_calls == 1
+    assert fallback_calls == [
+        (NET, (TOK,), 0, 9_999),
+        (NET, (TOK,), 10_000, 19_999),
+    ]
+    assert first == ([{"blockNumber": "0x0"}], 2, True, 9_999)
+    assert second == ([{"blockNumber": hex(10_000)}], 1, True, 19_999)
+
+
+async def test_goldrush_rotates_to_second_key_before_rpc_fallback(monkeypatch, tmp_path):
+    key_path = tmp_path / "keys.json"
+    key_path.write_text(json.dumps({"goldrush_api_keys": ["bad-key", "good-key"]}))
+    monkeypatch.setattr(goldrush_rpc.config, "chain_keys_path", lambda: str(key_path))
+    seen = []
+
+    def handler(request):
+        auth = request.headers["authorization"]
+        seen.append(auth)
+        if auth == "Bearer bad-key":
+            return httpx.Response(402, json={"error": True, "error_message": "credits exhausted"})
+        return httpx.Response(200, json={"error": False, "data": {"items": [_event(10)]}})
+
+    rpc = goldrush_rpc.GoldRushReplayRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        end = goldrush_rpc.config.GOLDRUSH_BLOCK_CHUNK - 1
+        logs, calls, complete, resume = await rpc.get_logs_paged(
+            NET, [TOK], 0, end, max_calls=5, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert seen == ["Bearer bad-key", "Bearer good-key"]
+    assert (len(logs), calls, complete, resume) == (1, 2, True, end)

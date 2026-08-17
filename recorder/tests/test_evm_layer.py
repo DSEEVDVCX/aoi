@@ -7,6 +7,7 @@
 import os
 import sqlite3
 
+import httpx
 import pytest
 
 import config
@@ -43,6 +44,65 @@ def _watch(db, token=TOK, *, network=NET, control=False):
             (token,),
         )
         db._conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# العطل العابر: مهلة القراءة انتظارٌ لا عطب (مقيس على 4663 يوم 2026-08-17)
+# ---------------------------------------------------------------------------
+def _mock_rpc(handler):
+    rpc = evm_rpc.EVMRPC(urls={NET: "https://node.test/rpc"})
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return rpc
+
+
+async def test_read_timeout_is_classified_as_rate_limit_not_hard_error():
+    """كان يسقط في `except Exception` العامّ ⇒ EVMRPCError لا يُعاد أبداً."""
+    def handler(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    rpc = _mock_rpc(handler)
+    try:
+        with pytest.raises(evm_rpc.EVMRateLimit):
+            await rpc._call(NET, "eth_getLogs", [])
+    finally:
+        await rpc.aclose()
+
+
+async def test_block_number_retries_a_transient_read_timeout(monkeypatch):
+    """مرساة الشبكة: فشلها يُسقط مسح 4663 كلّه لا عملةً واحدة."""
+    monkeypatch.setattr(config, "EVM_RATE_LIMIT_BACKOFF_SECONDS", 0)
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x64"})
+
+    rpc = _mock_rpc(handler)
+    try:
+        assert await rpc.block_number(NET) == 100
+    finally:
+        await rpc.aclose()
+    assert len(calls) == 2
+
+
+async def test_block_number_gives_up_after_the_configured_retries(monkeypatch):
+    monkeypatch.setattr(config, "EVM_RATE_LIMIT_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(config, "EVM_HEAD_RETRIES", 2)
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    rpc = _mock_rpc(handler)
+    try:
+        with pytest.raises(evm_rpc.EVMRateLimit):
+            await rpc.block_number(NET)
+    finally:
+        await rpc.aclose()
+    assert len(calls) == 3          # محاولة + إعادتان، ثمّ يُرفع لا يُصمت
 
 
 def _topic(addr):
@@ -642,6 +702,57 @@ async def test_base_backfill_starts_at_contract_creation_block(db, monkeypatch):
     assert db.evm_top_balances(net, TOK, 10) == [(A, 700)]
 
 
+async def test_empty_partial_backfill_rechecks_contract_creation(db, monkeypatch):
+    """حالة قديمة فارغة تبدأ من إنشاء العقد حتى لو حفظت نقطة صغيرة سابقاً."""
+    net = "8453"
+    creation = 850
+    _watch(db, network=net)
+    db.set_evm_cursor(net, 988, NOW, "ok")
+    db.set_evm_backfill_state(
+        net, TOK, "partial", NOW, from_block=100, to_block=988,
+        transfers=0, calls=24,
+    )
+    monkeypatch.setattr(config, "EVM_NETWORKS", (net,))
+    monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (net,))
+
+    class _CreationRPC(_CycleRPC):
+        async def contract_creation_block(self, network_id, address, head):
+            return creation
+
+    rpc = _CreationRPC(
+        head=1_000,
+        logs=[_log(ZERO, A, 700, creation, token=TOK)],
+    )
+
+    await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert rpc.ranges[0][2:] == (creation, 988)
+    assert db.evm_top_balances(net, TOK, 10) == [(A, 700)]
+
+
+async def test_zero_net_ledger_with_applied_transfers_keeps_saved_resume(db, monkeypatch):
+    """صافي أرصدة صفر لا يعني أن المدى السابق فارغ أو يجوز تطبيقه ثانية."""
+    net = "8453"
+    _watch(db, network=net)
+    db.set_evm_cursor(net, 988, NOW, "ok")
+    db.set_evm_backfill_state(
+        net, TOK, "partial", NOW, from_block=500, to_block=988,
+        transfers=2, calls=24,
+    )
+    monkeypatch.setattr(config, "EVM_NETWORKS", (net,))
+    monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (net,))
+
+    class _CreationRPC(_CycleRPC):
+        async def contract_creation_block(self, *_args):
+            raise AssertionError("لا يجب إعادة اكتشاف البداية بعد تطبيق تحويلات")
+
+    rpc = _CreationRPC(head=1_000)
+
+    await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert rpc.ranges[0][2] == 500
+
+
 async def test_apply_uses_only_common_completed_prefix_across_address_batches(
     db, monkeypatch,
 ):
@@ -785,28 +896,85 @@ async def test_partial_backfill_blocks_snapshot(db):
     assert state["from_block"] > 0                    # يُستأنف لا يُعاد من الصفر
 
 
+def test_snapshot_helper_rejects_partial_backfill(db):
+    """الحارس داخل الكاتب نفسه، لا في المنسّق وحده، يمنع لقطة دفتر ناقص."""
+    _watch(db)
+    db.set_evm_backfill_state(
+        NET, TOK, "partial", NOW, from_block=100, to_block=988,
+        transfers=1, calls=1,
+    )
+    watch = db.evm_watched([NET])[0]
+    stats = {"evm_snapshots": 0, "evm_snap_empty": 0}
+
+    with pytest.raises(ValueError, match="غير مكتمل"):
+        evm_layer._snapshot_token(db, watch, NOW, stats)
+
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM chain_concentration"
+    ).fetchone()[0] == 0
+
+
 async def test_completed_old_backfill_catches_up_before_done(db):
-    """عملة مستثناة من التطبيق الحي تلحق ما تقدم أثناء تعبئتها قبل اللقطة."""
+    """عملة مستثناة من التطبيق الحي تلحق مؤشر بداية الدورة قبل اللقطة."""
     _watch(db)
     db.set_evm_cursor(NET, 200, NOW, "ok")
     db.set_evm_backfill_state(
         NET, TOK, "partial", NOW, from_block=50, to_block=100,
     )
-    rpc = _CycleRPC(head=300, logs=[_log(ZERO, A, 700, 75)])
+    rpc = _CycleRPC(
+        head=300,
+        logs=[_log(ZERO, A, 700, 75), _log(A, B, 200, 250)],
+    )
 
-    first = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+    stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
-    state = db.evm_backfill_state(NET, TOK)
-    assert first["evm_backfill_partial"] == 1
-    assert state["status"] == "partial"
-    assert (state["from_block"], state["to_block"]) == (101, 288)
-    assert first["evm_snapshots"] == 0
-
-    rpc._logs.append(_log(A, B, 200, 250))
-    second = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
-    assert second["evm_backfilled"] == 1
+    assert stats["evm_backfilled"] == 1
     assert db.evm_backfill_state(NET, TOK)["status"] == "done"
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 500), (B, 200)]
+
+
+async def test_backfill_commits_when_network_cursor_moves_concurrently(db):
+    """تقدّم مؤشر عملة مكتملة أخرى لا يلغي دفتر العملة الجزئية."""
+    _watch(db)
+    db.set_evm_cursor(NET, 200, NOW, "ok")
+    rpc = _CycleRPC(head=300, logs=[_log(ZERO, A, 700, 250)])
+
+    async def _logs(network_id, addresses, from_block, to_block, **kwargs):
+        db.set_evm_cursor(NET, 300, NOW, "ok")
+        return [_log(ZERO, A, 700, 250)], 1, True, to_block
+
+    rpc.get_logs_paged = _logs
+    stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert stats["evm_backfill_partial"] == 1
+    state = db.evm_backfill_state(NET, TOK)
+    assert (state["status"], state["from_block"], state["to_block"]) == (
+        "partial", 289, 300,
+    )
+    assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
+
+
+async def test_backfill_done_aborts_if_cursor_moves_after_catchup_check(db, monkeypatch):
+    """حركة المؤشر في نافذة التثبيت لا تترك فجوة بين backfill والتطبيق الحي."""
+    _watch(db)
+    db.set_evm_cursor(NET, 200, NOW, "ok")
+    rpc = _CycleRPC(head=300, logs=[_log(ZERO, A, 700, 150)])
+    original = db.assert_evm_backfill_state
+    moved = False
+
+    def _move_then_assert(*args, **kwargs):
+        nonlocal moved
+        original(*args, **kwargs)
+        if not moved:
+            moved = True
+            db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    monkeypatch.setattr(db, "assert_evm_backfill_state", _move_then_assert)
+    stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert stats["evm_backfilled"] == 0
+    assert db.evm_backfill_state(NET, TOK) is None
+    assert db.evm_ledger_stats(NET, TOK)["supply"] == 0
 
 
 async def test_incomplete_apply_pulls_cursor_back(db):

@@ -11,6 +11,7 @@ import sys
 import time
 
 import evm_replay
+import evm_layer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
@@ -38,8 +39,53 @@ def _next_network(db, networks: tuple[str, ...]) -> tuple[str, str]:
     return current, following
 
 
+def _stamp(db, pairs: dict) -> None:
+    """أختامٌ دفتريّة تُكتب إن أمكن ولا تُسقط دورةً نجحت.
+
+    `set_meta` عاريةً هنا كانت تجعل قفلَ القاعدة يُسجَّل «cycle crashed» عن دورةٍ
+    تمّت وكُتبت صفوفُها فعلاً. أسوأُ ما تفقده هذه الطريقة هو موضعُ الدوران بين
+    الشبكات، فتُعاد نفس الشبكة مرّةً — وهو أرخص من كذبةٍ في السجلّ واللوحة.
+    """
+    for key, value in pairs.items():
+        db.note_error(key, value)
+
+
+# ما ليس عدّاد عمل: اسمُ الشبكة، عددُ الشبكات المطلوبة، المرفوضة منها، والزمن.
+_NOT_WORK = frozenset({"network", "networks", "refused_networks", "seconds"})
+
+
+def _worked(stats: dict) -> bool:
+    """هل جرى عملٌ أو خطأ في هذه الدورة؟ **بالاستثناء لا بالتعداد**.
+
+    كان الشرط `stats["tokens"] or stats["errors"]`، وفرعُ المساعدة الحيّة يعيد
+    مفاتيح أخرى تماماً (`evm_backfill_*`) ويرجع قبل أن يصل إلى تلك — فبقي السجلّ
+    صامتاً أربع ساعات والعامل يعمل سليماً، واحتاج التشخيص قراءة `meta` بدلاً منه.
+    قائمةُ مفاتيحٍ مسموحة كانت ستُكرّر العطب عند أوّل مفتاح جديد، فنستثني ما ليس
+    عدّاداً ونعدّ الباقي: المفتاح الجديد يُحسب تلقائياً.
+    """
+    for key, value in stats.items():
+        if key in _NOT_WORK or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value:
+            return True
+    return False
+
+
 async def run_cycle(rpc, db) -> dict:
     import config
+
+    assist = await evm_layer.run_evm_backfill_assist(
+        rpc, db, networks=config.EVM_BACKFILL_ASSIST_NETWORKS,
+        recorded_at=__import__("db").utcnow_iso(),
+    )
+    if assist["evm_backfill_due"]:
+        now = __import__("db").utcnow_iso()
+        _stamp(db, {
+            "evm_replay_last_run_at": now,
+            "evm_replay_last_stats": str({**assist, "network": "live"}),
+            **({} if assist.get("evm_backfill_errors") else {"evm_replay_last_ok_at": now}),
+        })
+        return {**assist, "network": "live"}
 
     networks = tuple(str(network) for network in config.EVM_REPLAY_NETWORKS)
     if not networks:
@@ -54,22 +100,29 @@ async def run_cycle(rpc, db) -> dict:
         log=_log,
         budget_seconds=config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE,
     )
-    db.set_meta("evm_replay_next_network", following)
-    db.set_meta("evm_replay_last_run_at", __import__("db").utcnow_iso())
-    db.set_meta("evm_replay_last_stats", str({**stats, "network": network}))
+    now = __import__("db").utcnow_iso()
+    _stamp(db, {
+        "evm_replay_next_network": following,
+        "evm_replay_last_run_at": now,
+        "evm_replay_last_stats": str({**stats, "network": network}),
+        **({} if stats.get("errors") else {"evm_replay_last_ok_at": now}),
+    })
     return {**stats, "network": network}
 
 
 def _check_config() -> int:
     import config
     from db import RecorderDB
+    from provider_keys import read_keys
 
     for name in (
         "EVM_REPLAY_NETWORKS", "EVM_REPLAY_INTERVAL_SECONDS",
         "EVM_REPLAY_TOKENS_PER_CYCLE", "EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE",
-        "EVM_REPLAY_RUN_LOG_PATH", "GOLDRUSH_REPLAY_CHAINS",
+        "EVM_REPLAY_RUN_LOG_PATH", "EVM_REPLAY_HEARTBEAT_SECONDS",
+        "GOLDRUSH_REPLAY_CHAINS",
         "GOLDRUSH_BLOCK_CHUNK", "GOLDRUSH_RETRIES",
-        "GOLDRUSH_MIN_RANGE",
+        "GOLDRUSH_MIN_RANGE", "EVM_CREATION_BLOCK_NETWORKS",
+        "EVM_BACKFILL_ASSIST_NETWORKS",
     ):
         if not hasattr(config, name):
             print(f"config.{name} مفقود", file=sys.stderr)
@@ -77,15 +130,12 @@ def _check_config() -> int:
     if not config.EVM_REPLAY_NETWORKS:
         print("لا توجد شبكات إعادة EVM مفعَّلة", file=sys.stderr)
         return 1
+    goldrush_keys: list[str] = []
     if config.GOLDRUSH_REPLAY_CHAINS:
-        try:
-            import json
-
-            with open(config.chain_keys_path(), encoding="utf-8") as fh:
-                goldrush_ok = bool((json.load(fh) or {}).get("goldrush_api_key"))
-        except Exception:  # noqa: BLE001
-            goldrush_ok = False
-        if not goldrush_ok:
+        goldrush_keys = read_keys(
+            "goldrush_api_keys", "goldrush_api_key", "GOLDRUSH_API_KEY",
+        )
+        if not goldrush_keys:
             print("مفتاح GoldRush مفقود للإعادة التاريخية", file=sys.stderr)
             return 1
     if not os.path.exists(config.DB_PATH):
@@ -100,33 +150,71 @@ def _check_config() -> int:
         )
     finally:
         db.close()
+    # **عدد المفاتيح لا قيمتها** (FR-013). ونفادُ رصيد مفتاحٍ واحد يُسكِت
+    # GoldRush لبقيّة عمر العمليّة، فقلّةُ العدد تُقال قبل الجدولة لا بعدها.
+    keys_note = (
+        "—" if not config.GOLDRUSH_REPLAY_CHAINS
+        else f"{len(goldrush_keys)}"
+        + (" (بلا بديل عند نفاد الرصيد)" if len(goldrush_keys) == 1 else "")
+    )
     print(
         f"ok · شبكات: {','.join(map(str, config.EVM_REPLAY_NETWORKS))}"
         f" · عملة/دورة: {config.EVM_REPLAY_TOKENS_PER_CYCLE}"
         f" · معلّق: {pending}"
+        f" · مفاتيح goldrush: {keys_note}"
+        f" · نبضة السجلّ: {config.EVM_REPLAY_HEARTBEAT_SECONDS}ث"
     )
     return 0
 
 
 async def _main(cycles: int | None = None) -> None:
     import config
-    from db import RecorderDB
+    from db import RecorderDB, utcnow_iso
     from goldrush_rpc import GoldRushReplayRPC
+    from provider_keys import write_pool_report
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     rpc = GoldRushReplayRPC()
     count = 0
+    # `None` لا `monotonic()`: أوّل دورة تسجّل دائماً مهما كانت خاملة، فسطرُ
+    # الإقلاع هو الدليل الوحيد على أنّ العامل نهض بعد إعادة التشغيل.
+    last_logged: float | None = None
     try:
         while cycles is None or count < cycles:
             started = time.monotonic()
             try:
                 stats = await run_cycle(rpc, db)
-                if stats.get("tokens") or stats.get("errors"):
+                if _worked(stats):
                     _log(f"cycle: {stats}")
-            except Exception:  # noqa: BLE001 - one cycle must not kill the worker
+                    last_logged = started
+                elif last_logged is None or (
+                    started - last_logged >= config.EVM_REPLAY_HEARTBEAT_SECONDS
+                ):
+                    # نبضة: «حيٌّ ولا عمل مستحقّ». الصمت التامّ يشبه الموت تماماً.
+                    _log(f"idle: {stats}")
+                    last_logged = started
+            except Exception as exc:  # noqa: BLE001 - one cycle must not kill the worker
                 import traceback
 
                 _log("cycle crashed:\n" + traceback.format_exc())
+                # وفي `meta` أيضاً: السجلُّ ملفٌّ على القرص لا يقرأه أحد، واللوحة
+                # كانت تعرض كل طابور إلّا هذا — فتعثّرٌ دائم هنا كان صامتاً
+                # مرّتين. سطرٌ واحد بالنوع والرسالة، والأثر الكامل في السجلّ.
+                db.note_error(
+                    "last_error_evm_replay",
+                    f"{utcnow_iso()}: {type(exc).__name__}: {exc}"[:400],
+                )
+                # التعثّر سطرٌ أيضاً ⇒ يؤجّل النبضة: أثرُ الانهيار أبلغ منها.
+                last_logged = started
+            # تقرير الحوض خارج الحرس: حالةُ المفاتيح أهمّ ما يُقرأ حين تتعثّر
+            # الدورة. وحوض GoldRush هنا **غير** حوضِه في `FomoChain` (عمليّتان،
+            # ذاكرتان) فلكلٍّ صفُّه: `provider_keys_replay` مقابل `_chain`.
+            try:
+                write_pool_report(
+                    db, "replay", {"goldrush": rpc.key_stats()}, utcnow_iso(),
+                )
+            except Exception:  # noqa: BLE001 — تقريرٌ لا قياس
+                pass
             count += 1
             if cycles is not None and count >= cycles:
                 break

@@ -1,4 +1,4 @@
-"""GoldRush event-log adapter used only by the historical EVM replay worker."""
+"""GoldRush event-log adapter for initial and historical EVM backfills."""
 from __future__ import annotations
 
 import json
@@ -10,20 +10,51 @@ import httpx
 
 import config
 import evm_rpc
+from provider_keys import KeyPool, read_keys
+
+
+class GoldRushCreditError(evm_rpc.EVMRPCError):
+    def __init__(self, message: str, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts = attempts
 
 
 class GoldRushReplayRPC(evm_rpc.EVMRPC):
     """Use paginated GoldRush events where configured, normal RPC elsewhere."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._goldrush_disabled = False
+        self._goldrush_keys = KeyPool(self._keys_from_disk())
+
+    @staticmethod
+    def _keys_from_disk() -> list[str]:
+        return read_keys("goldrush_api_keys", "goldrush_api_key", "GOLDRUSH_API_KEY")
+
+    def _refresh_keys(self) -> None:
+        before = tuple(self._goldrush_keys.keys)
+        self._goldrush_keys.refresh(self._keys_from_disk())
+        if tuple(self._goldrush_keys.keys) != before:
+            self._goldrush_disabled = False
+
     def _key(self) -> str:
+        self._refresh_keys()
+        if not self._goldrush_keys.keys:
+            raise evm_rpc.EVMRPCError(f"مفتاح GoldRush غائب: {config.chain_keys_path()}")
+        return self._goldrush_keys.current()
+
+    def key_stats(self) -> dict[str, Any]:
+        """صورةُ حوض مفاتيح GoldRush للرصد — أعدادٌ فقط، بلا أي قيمة (FR-013).
+
+        `disabled` هو ما لا يقوله عددُ المفاتيح: نفادُ رصيد **كلّها** (402)
+        يُسكِت المزوّد لبقيّة العمر ويسقط إلى RPC العادي، فتبدو الأحواض سليمة
+        والمزوّد معطَّل. ولا يعود إلّا بتغيّر المفاتيح على القرص.
+        """
         try:
-            with open(config.chain_keys_path(), encoding="utf-8") as fh:
-                key = str((json.load(fh) or {}).get("goldrush_api_key") or "").strip()
-        except (OSError, ValueError, TypeError):
-            key = ""
-        if not key:
-            raise evm_rpc.EVMRPCError("مفتاح GoldRush غائب")
-        return key
+            self._refresh_keys()
+        except Exception:  # noqa: BLE001 — قراءةُ قرصٍ فاشلة لا تُسقط تقريراً
+            pass
+        return {**self._goldrush_keys.stats(), "disabled": bool(self._goldrush_disabled)}
 
     @staticmethod
     def _event_log(item: Any, token: str) -> dict[str, Any] | None:
@@ -62,8 +93,10 @@ class GoldRushReplayRPC(evm_rpc.EVMRPC):
     ) -> tuple[list[dict[str, Any]], int]:
         url = f"https://api.covalenthq.com/v1/{chain}/events/"
         attempts = 0
+        keys_tried = 0
         while True:
             attempts += 1
+            key = self._key()
             try:
                 response = await self._client.get(
                     url,
@@ -73,8 +106,18 @@ class GoldRushReplayRPC(evm_rpc.EVMRPC):
                         "address": token, "topics": evm_rpc.TRANSFER_TOPIC,
                         "skip-decode": "true",
                     },
-                    headers={"authorization": f"Bearer {self._key()}"},
+                    headers={"authorization": f"Bearer {key}"},
                 )
+                if response.status_code in (401, 402, 403, 429):
+                    keys_tried += 1
+                    if keys_tried < len(self._goldrush_keys.keys):
+                        self._goldrush_keys.rotate(block_current=True)
+                        continue
+                    if response.status_code == 402:
+                        raise GoldRushCreditError(
+                            f"GoldRush [{chain}] HTTP 402: نفد رصيد كل المفاتيح",
+                            attempts,
+                        )
                 if response.status_code == 429 or response.status_code >= 500:
                     raise evm_rpc.EVMRateLimit(
                         f"GoldRush [{chain}] HTTP {response.status_code}"
@@ -123,8 +166,14 @@ class GoldRushReplayRPC(evm_rpc.EVMRPC):
         deadline: float | None = None,
     ) -> tuple[list[dict[str, Any]], int, bool, int]:
         net = str(network_id)
+        self._refresh_keys()
         chain = config.GOLDRUSH_REPLAY_CHAINS.get(net)
-        if not chain or len(addresses) != 1 or int(to_block) - int(from_block) < config.GOLDRUSH_MIN_RANGE:
+        if (
+            self._goldrush_disabled
+            or not chain
+            or len(addresses) != 1
+            or int(to_block) - int(from_block) < config.GOLDRUSH_MIN_RANGE
+        ):
             return await super().get_logs_paged(
                 net, addresses, from_block, to_block, topics=topics,
                 max_calls=max_calls, sleep=sleep or __import__("asyncio").sleep,
@@ -146,7 +195,22 @@ class GoldRushReplayRPC(evm_rpc.EVMRPC):
                 return out, calls, False, lo
             if calls:
                 await pause(config.EVM_PACING_SECONDS)
-            logs, attempts = await self._chunk(chain, token, lo, hi)
+            try:
+                logs, attempts = await self._chunk(chain, token, lo, hi)
+            except evm_rpc.EVMRPCError as exc:
+                if not isinstance(exc, GoldRushCreditError):
+                    raise
+                self._goldrush_disabled = True
+                failed_attempts = exc.attempts
+                remaining = cap - calls - failed_attempts
+                if remaining <= 0:
+                    return out, calls + failed_attempts, False, lo
+                fallback, used, complete, resume = await super().get_logs_paged(
+                    net, addresses, lo, end, topics=topics,
+                    max_calls=remaining, sleep=pause, deadline=deadline,
+                )
+                out.extend(fallback)
+                return out, calls + used + failed_attempts, complete, resume
             calls += attempts
             out.extend(logs)
             lo = hi + 1

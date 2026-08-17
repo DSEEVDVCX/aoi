@@ -126,6 +126,18 @@ async def test_social_slice_is_capped_and_respects_refresh_window(db):
     assert len(client.calls) == config.SOCIAL_PER_CYCLE + 3
 
 
+def test_social_error_retry_window_is_shorter_than_success_window(db):
+    _watch(db, "error-token")
+    db.set_social_state("error-token", "56", "error", 0, "2026-08-17T11:54:00+00:00")
+
+    due = db.social_fetch_due(
+        limit=10,
+        stale_before_iso="2026-08-17T11:30:00+00:00",
+        error_stale_before_iso="2026-08-17T11:55:00+00:00",
+    )
+
+    assert [row["token_address"] for row in due] == ["error-token"]
+
 async def test_social_builds_a_time_series_per_token(db):
     """سلسلة زمنية: الفرق بين لقطتين يعطي تسارع الزخم لا مستواه فقط."""
     _watch(db, "tokA")

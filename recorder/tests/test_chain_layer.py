@@ -2,6 +2,7 @@
 import os
 from datetime import datetime, timedelta
 
+import httpx
 import pytest
 
 import chain_layer
@@ -185,10 +186,144 @@ def test_redact_scrubs_url_even_when_key_rotated():
     assert "&x=1" in out                              # الشطب لا يبتلع بقيّة النصّ
 
 
-def test_read_key_prefers_environment(monkeypatch):
+def test_read_keys_prefers_environment(monkeypatch):
+    """البيئة تسبق الملف، والقيمة تُعاد في **قائمة** (الحوض لا يقبل مفرداً)."""
     monkeypatch.setenv("HELIUS_API_KEY", "env-secret")
     monkeypatch.setattr(config, "chain_keys_path", lambda: "missing.json")
-    assert solana_rpc._read_key() == "env-secret"
+    assert solana_rpc._read_keys() == ["env-secret"]
+
+
+def test_read_keys_splits_multiple_environment_keys(monkeypatch):
+    """مفتاحان في البيئة بفاصلة ⇒ حوضٌ بمفتاحين، لا سلسلةٌ واحدة عجيبة."""
+    monkeypatch.setenv("HELIUS_API_KEY", "one, two ,one")
+    monkeypatch.setattr(config, "chain_keys_path", lambda: "missing.json")
+    assert solana_rpc._read_keys() == ["one", "two"]   # مع إسقاط المكرّر
+
+
+async def test_helius_rotates_to_second_key_on_retryable_rpc_error(monkeypatch):
+    monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["bad-key", "good-key"])
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if "bad-key" in str(request.url):
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": 1,
+                "error": {"code": -32603, "message": "account index service overloaded"},
+            })
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "ok"})
+
+    rpc = solana_rpc.SolanaRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await rpc._post({"jsonrpc": "2.0", "id": 1, "method": "test"})
+    finally:
+        await rpc.aclose()
+
+    assert result["result"] == "ok"
+    assert len(seen) == 2
+    assert "bad-key" in seen[0] and "good-key" in seen[1]
+
+
+# ---------------------------------------------------------------------------
+# العطل العابر ≠ رفض مفتاح: يُمهَل بنفس المفتاح ولا يُبرَّد (مقيس 2026-08-17)
+# ---------------------------------------------------------------------------
+async def test_helius_retries_transient_522_with_a_single_key(monkeypatch):
+    """522 مهلة Cloudflare إلى الأصل: كانت خطأً نهائيّاً ثمنه 15 دقيقة تقادماً."""
+    monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["only-key"])
+    monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(522, text="error code: 522")
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "ok"})
+
+    rpc = solana_rpc.SolanaRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await rpc._post({"jsonrpc": "2.0", "id": 1, "method": "test"})
+    finally:
+        await rpc.aclose()
+
+    assert result["result"] == "ok"
+    assert len(seen) == 2
+    # المفتاح سليم ⇒ يُعاد استخدامه ولا يُدخَل فترة تهدئة تحرمنا منه دقيقة.
+    assert all("only-key" in url for url in seen)
+    assert rpc._keys._blocked_until == {}
+
+
+async def test_helius_retries_read_timeout_with_a_single_key(monkeypatch):
+    monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["only-key"])
+    monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "ok"})
+
+    rpc = solana_rpc.SolanaRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await rpc._post({"jsonrpc": "2.0", "id": 1, "method": "test"})
+    finally:
+        await rpc.aclose()
+
+    assert result["result"] == "ok"
+    assert len(calls) == 2
+
+
+async def test_helius_deprioritized_retries_when_there_is_no_second_key(monkeypatch):
+    """«Slow down requests» إشارةُ حمل: بمفتاح واحد كانت المحاولة واحدة بلا تمهّل."""
+    monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["only-key"])
+    monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {
+                "code": -32600,
+                "message": "Request deprioritized due to number of accounts requested",
+            }})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "ok"})
+
+    rpc = solana_rpc.SolanaRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await rpc._post({"jsonrpc": "2.0", "id": 1, "method": "test"})
+    finally:
+        await rpc.aclose()
+
+    assert result["result"] == "ok"
+    assert len(calls) == 2
+
+
+async def test_helius_transient_failure_message_still_hides_the_key(monkeypatch):
+    """الإعادة لا تُضعف FR-013: نصّ ReadTimeout يحمل الرابط كاملاً."""
+    monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["s3cret-key"])
+    monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
+
+    def handler(request):
+        raise httpx.ReadTimeout(f"timed out for {request.url}", request=request)
+
+    rpc = solana_rpc.SolanaRPC()
+    await rpc._client.aclose()
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(solana_rpc.ChainRPCError) as err:
+            await rpc._post({"jsonrpc": "2.0", "id": 1, "method": "test"})
+    finally:
+        await rpc.aclose()
+
+    assert "s3cret-key" not in str(err.value)
 
 
 async def test_concentration_rejects_materially_different_slots(monkeypatch):
@@ -406,3 +541,62 @@ async def test_empty_networks_tuple_fetches_nothing(db, monkeypatch):
 
     assert rpc.calls == []
     assert stats["chain_due"] == 0
+
+
+# --- أختام «آخر نجاح» لكل طابور (حدُّ التقادم في اللوحة) ---
+def test_ok_stamps_are_written_per_queue_not_once_for_the_process():
+    """اللوحة كانت تُشفي أخطاء chain/evm بحدِّ **المسجّل** وهو لا يكتبه غيره؛
+    فموتُ المسجّل جمّد الحدَّ وبقيت الشارات حمراء. الآن لكلٍّ ختمُه من كاتبه."""
+    import run_chain
+
+    stats = {
+        "chain_errors": 0, "auth_errors": 0, "evm_errors": 0,
+        "evm_backfill_errors": 0, "evm_contract_errors": 0, "bsc_errors": 0,
+    }
+
+    assert run_chain._ok_stamps(stats, NOW) == {
+        "chain_last_ok_at": NOW, "chain_auth_last_ok_at": NOW,
+        "evm_last_ok_at": NOW, "evm_contract_last_ok_at": NOW,
+        "bsc_nodereal_last_ok_at": NOW,
+    }
+
+
+def test_a_failing_queue_gets_no_stamp_while_its_neighbours_do():
+    """نجاح طابورٍ لا يشفي خطأ آخر: ختمُ الفاشل يُحجب وحده."""
+    import run_chain
+
+    out = run_chain._ok_stamps({
+        "chain_errors": 2, "auth_errors": 0, "evm_errors": 0,
+        "evm_backfill_errors": 0,
+    }, NOW)
+
+    assert "chain_last_ok_at" not in out
+    assert out["chain_auth_last_ok_at"] == NOW
+    assert out["evm_last_ok_at"] == NOW
+
+
+def test_evm_stamp_waits_on_backfill_errors_too():
+    """`last_error_evm` يكتبه فرعُ التعبئة أيضاً ⇒ ختمُه يشترط صفاءَ العدّادين."""
+    import run_chain
+
+    assert "evm_last_ok_at" not in run_chain._ok_stamps(
+        {"evm_errors": 0, "evm_backfill_errors": 1}, NOW,
+    )
+
+
+def test_absent_counter_yields_no_stamp():
+    """دورةٌ لم تُشغّل طابوراً (استثناءٌ قطعها) لا تختم له نجاحاً كاذباً."""
+    import run_chain
+
+    assert run_chain._ok_stamps({}, NOW) == {}
+
+
+def test_stamps_survive_a_locked_database():
+    """قفلُ القاعدة عند الختم لا يرفع: الدورة نجحت فعلاً ولا تُسجَّل «تعثّرت»."""
+    import run_chain
+
+    class _Locked:
+        def note_error(self, _key, _value):
+            return False
+
+    run_chain._stamp(_Locked(), {"chain_last_run_at": NOW})   # لا استثناء

@@ -287,11 +287,11 @@ async def run_evm_contract_cycle(
             # `EVM_CONTRACT_ERROR_RETRY_SECONDS` (15 دقيقة) بلا ذنب، وهي بلا حالة
             # تبقى أوّل المستحقّين في الدورة القادمة ⇒ تقدّمٌ مضمون بلا حلقة.
             stats["evm_contract_throttled"] = len(due) - i
-            db.set_meta("evm_contract_last_throttle_at", recorded_at)
+            db.note_error("evm_contract_last_throttle_at", recorded_at)
             break
         except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الدورة
             stats["evm_contract_errors"] += 1
-            db.set_meta(
+            db.note_error(
                 "last_error_evm_contract",
                 f"{recorded_at}: {addr}: {type(exc).__name__}: {exc}"[:400],
             )

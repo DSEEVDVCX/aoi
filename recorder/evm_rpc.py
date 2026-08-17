@@ -162,6 +162,12 @@ class EVMRPC:
             body = resp.json()
         except EVMRPCError:
             raise
+        except httpx.TransportError as exc:
+            # مهلة قراءة أو انقطاع اتّصال: انتظارٌ لا عطب — وهو ما كان يُسقط
+            # النداء نهائيّاً (شوهد `eth_blockNumber [4663] ReadTimeout` 2026-08-17)
+            # لأنّه يقع في `except Exception` العامّ. تصنيفه كتماً يُشغّل التمهّل
+            # الموجود في `get_logs_paged` بدل تسليم المدى — وتسليمه ثغرة دائمة.
+            raise EVMRateLimit(f"{method} [{network_id}] {type(exc).__name__}") from None
         except Exception as exc:  # noqa: BLE001
             raise EVMRPCError(f"{method} [{network_id}] {type(exc).__name__}: {exc}") from None
         if not isinstance(body, dict):
@@ -193,10 +199,25 @@ class EVMRPC:
         return body["result"]
 
     async def block_number(self, network_id: str) -> int:
-        block = _num(await self._call(network_id, "eth_blockNumber", []))
-        if block is None:
-            raise EVMRPCError(f"eth_blockNumber [{network_id}]: رقم كتلة غير مفهوم")
-        return block
+        """رأس السلسلة — **مرساة** الدورة، فيُعاد عند الكتم والعطل العابر.
+
+        فشله لا يُسقط عملةً بل مسحَ الشبكة بأسره (`evm_layer._apply_live`)، ونداءٌ
+        واحد رخيص لا يستحقّ ذلك الثمن. راجع `EVM_HEAD_RETRIES`.
+        """
+        attempts = int(config.EVM_HEAD_RETRIES) + 1
+        for attempt in range(attempts):
+            try:
+                raw = await self._call(network_id, "eth_blockNumber", [])
+            except EVMRateLimit:
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(config.EVM_RATE_LIMIT_BACKOFF_SECONDS)
+                continue
+            block = _num(raw)
+            if block is None:
+                raise EVMRPCError(f"eth_blockNumber [{network_id}]: رقم كتلة غير مفهوم")
+            return block
+        raise EVMRateLimit(f"eth_blockNumber [{network_id}]: تعذّر بعد {attempts} محاولات")
 
     async def block_timestamp(self, network_id: str, block: int) -> int | None:
         """طابع كتلة واحدة بالثواني. لازم للإعادة الرجعيّة وحدها.

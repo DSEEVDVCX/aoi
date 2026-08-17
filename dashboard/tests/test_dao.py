@@ -3,6 +3,7 @@
 نبني قاعدة صغيرة بنفس أعمدة recorder.db، نملؤها، ثم نتحقّق أن دوال القراءة
 الخالصة تعيد ما هو متوقّع — بما في ذلك منطق "حيّ خلال المهلة" ومطابقة meta.
 """
+import json
 import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -227,6 +228,135 @@ def test_recorder_errors_stale_when_older_than_last_ok_cycle(db_path):
     conn = _conn(db_path)
     tr = next(e for e in dao.recorder_errors(conn, ("trending",)) if e["source"] == "trending")
     assert tr["stale"] is True
+    conn.close()
+
+
+def test_chain_error_heals_from_its_own_stamp_when_the_recorder_is_dead(db_path):
+    """العطبُ المقيس يوم 2026-08-17: مات المسجّل ٣س١٤د فتجمّد حدُّ التقادم
+    (`last_ok_cycle_at` لا يكتبه غيره)، فبقيت شارة chain حمراء وخطؤها قد شُفي
+    و`FomoChain` تُتمّ دوراتها النظيفة. الآن ختمُ الطابور نفسه هو الحدّ."""
+    _seed_meta(
+        db_path,
+        started_at="2026-08-17T10:00:00+00:00",
+        last_ok_cycle_at="2026-08-17T16:00:00+00:00",     # المسجّل مات هنا
+        last_error_chain="2026-08-17T18:23:34+00:00: ChainRPCError: -32600",
+        chain_last_ok_at="2026-08-17T19:30:00+00:00",     # وFomoChain تعمل
+    )
+    conn = _conn(db_path)
+    row = next(
+        e for e in dao.recorder_errors(
+            conn, ("chain",), ok_stamps={"chain": ("chain_last_ok_at",)},
+        ) if e["source"] == "chain"
+    )
+    assert row["stale"] is True
+    assert row["ok_at"] == "2026-08-17T19:30:00+00:00"
+    conn.close()
+
+
+def test_one_queue_stamp_does_not_heal_another_queues_error(db_path):
+    """نجاح طابور التركّز لا يعني نجاح طابور الصلاحيات — ختمٌ لكلٍّ منهما."""
+    _seed_meta(
+        db_path,
+        chain_last_ok_at="2026-08-17T19:30:00+00:00",
+        last_error_chain_auth="2026-08-17T18:00:00+00:00: HTTP 522",
+    )
+    conn = _conn(db_path)
+    stamps = {"chain": ("chain_last_ok_at",), "chain_auth": ("chain_auth_last_ok_at",)}
+    row = next(
+        e for e in dao.recorder_errors(conn, ("chain_auth",), ok_stamps=stamps)
+        if e["source"] == "chain_auth"
+    )
+    assert row["stale"] is False
+    assert row["ok_at"] is None
+    conn.close()
+
+
+def test_recorder_boundary_still_heals_a_source_that_has_no_own_stamp_yet(db_path):
+    """قبل أن تُكتب الأختام الجديدة أوّل مرّة، حدُّ المسجّل يبقى سبيلَ الشفاء."""
+    _seed_meta(
+        db_path,
+        last_ok_cycle_at="2026-08-17T19:00:00+00:00",
+        last_error_evm="2026-08-17T16:41:20+00:00: ReadTimeout",
+    )
+    conn = _conn(db_path)
+    row = next(
+        e for e in dao.recorder_errors(
+            conn, ("evm",), ok_stamps={"evm": ("evm_last_ok_at",)},
+        ) if e["source"] == "evm"
+    )
+    assert row["stale"] is True
+    conn.close()
+
+
+# --- provider keys ---
+def _seed_pool(db_path, owner, pools, at="2026-08-17T20:00:00+00:00"):
+    _seed_meta(db_path, **{
+        f"provider_keys_{owner}": json.dumps({"at": at, "owner": owner, "pools": pools}),
+    })
+
+
+def test_provider_keys_warns_when_a_pool_has_no_spare_key(db_path):
+    """مفتاحٌ واحد: التدوير موجود في الكود ولا ينفع بحوضٍ من واحد ⇒ تحذير."""
+    _seed_pool(db_path, "chain", {
+        "helius": {"keys": 1, "blocked": 0, "available": 1, "index": 0, "rotations": 0},
+        "nodereal": {"keys": 3, "blocked": 0, "available": 3, "index": 1, "rotations": 4},
+    })
+    conn = _conn(db_path)
+    rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 1, tzinfo=UTC))
+    by_provider = {r["provider"]: r for r in rows}
+    assert by_provider["helius"]["level"] == "warn"
+    assert by_provider["nodereal"]["level"] == "good"
+    assert by_provider["nodereal"]["rotations"] == 4
+    conn.close()
+
+
+def test_provider_keys_flags_a_pool_whose_keys_are_all_cooling_down(db_path):
+    _seed_pool(db_path, "chain", {
+        "helius": {"keys": 2, "blocked": 2, "available": 0, "index": 0, "rotations": 9},
+    })
+    conn = _conn(db_path)
+    rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 1, tzinfo=UTC))
+    assert rows[0]["level"] == "bad"
+    conn.close()
+
+
+def test_provider_keys_flags_a_provider_disabled_for_the_process_lifetime(db_path):
+    """نفادُ رصيد GoldRush (402) يُسكِته لبقيّة العمر: أحواضٌ سليمة ومزوّدٌ ميت."""
+    _seed_pool(db_path, "replay", {
+        "goldrush": {"keys": 2, "blocked": 0, "available": 2, "disabled": True},
+    })
+    conn = _conn(db_path)
+    rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 1, tzinfo=UTC))
+    assert (rows[0]["level"], rows[0]["disabled"]) == ("bad", True)
+    conn.close()
+
+
+def test_provider_keys_keeps_the_two_goldrush_pools_apart(db_path):
+    """حوضان لنفس المزوّد في عمليّتين: دمجُهما يخفي عطبَ إحداهما تحت الأخرى."""
+    _seed_pool(db_path, "chain", {"goldrush": {"keys": 2, "available": 2}})
+    _seed_pool(db_path, "replay", {"goldrush": {"keys": 2, "available": 0}})
+    conn = _conn(db_path)
+    rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 1, tzinfo=UTC))
+    assert [(r["owner"], r["level"]) for r in rows] == [("chain", "good"), ("replay", "bad")]
+    conn.close()
+
+
+def test_provider_keys_marks_a_frozen_report_as_stale(db_path):
+    """تقريرٌ متجمّد = العمليّة المالكة لم تُتمّ دورة؛ أعدادُه ماضٍ لا حاضر."""
+    _seed_pool(db_path, "chain", {"helius": {"keys": 2, "available": 2}},
+               at="2026-08-17T10:00:00+00:00")
+    conn = _conn(db_path)
+    rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 0, tzinfo=UTC))
+    assert rows[0]["stale"] is True
+    assert rows[0]["age_seconds"] == 36000
+    conn.close()
+
+
+def test_provider_keys_ignores_a_corrupt_report_instead_of_failing(db_path):
+    """سطرٌ نصفُ مكتوب لا يُفرغ اللوحة كلّها."""
+    _seed_meta(db_path, provider_keys_chain="{not json")
+    conn = _conn(db_path)
+    assert dao.provider_keys(conn) == []
     conn.close()
 
 

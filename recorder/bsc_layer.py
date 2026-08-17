@@ -120,11 +120,13 @@ async def run_bsc_cycle(
             db.set_chain_state(token, config.BSC_NODEREAL_NETWORK, "ok", row["top1_pct"], recorded_at)
         except NodeRealRateLimit as exc:
             stats["bsc_rate_limits"] += 1
-            db.set_meta("last_error_bsc_nodereal", f"{recorded_at}: {type(exc).__name__}")
+            # `note_error`: كتابةٌ دفتريّة داخل معالج خطأ ⇒ قفلُ القاعدة عندها
+            # كان سيُسقط بقيّة الشريحة بدل عملةٍ واحدة (انظر `db.note_error`).
+            db.note_error("last_error_bsc_nodereal", f"{recorded_at}: {type(exc).__name__}")
             db.set_chain_state(token, config.BSC_NODEREAL_NETWORK, "error", None, recorded_at)
         except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تسقط الشريحة
             stats["bsc_errors"] += 1
-            db.set_meta("last_error_bsc_nodereal", f"{recorded_at}: {type(exc).__name__}: {exc}")
+            db.note_error("last_error_bsc_nodereal", f"{recorded_at}: {type(exc).__name__}: {exc}")
             db.set_chain_state(token, config.BSC_NODEREAL_NETWORK, "error", None, recorded_at)
         if index + 1 < len(due):
             await _maybe_sleep(sleep, config.BSC_NODEREAL_PACING_SECONDS)

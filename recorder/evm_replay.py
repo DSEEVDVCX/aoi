@@ -557,10 +557,15 @@ async def replay_token(
         # لا يثبتان الاكتمال: حائز استلم قبل النافذة ولم يتحرك بعدها يختفي بصمت.
         # نبدأ من genesis ونستأنف عبر checkpoint؛ أبطأ لكنه الدليل الوحيد الكامل.
         from_block = 0
-        if net in config.EVM_HISTORICAL_RPC_URLS:
-            creation = await rpc.contract_creation_block(net, token, to_block)
-            if creation is not None:
-                from_block = creation
+    checkpoint_balances = (checkpoint or {}).get("balances", {})
+    if (
+        net in config.EVM_CREATION_BLOCK_NETWORKS
+        and not checkpoint_balances
+        and int(watch.get("replay_transfers") or 0) == 0
+    ):
+        creation = await rpc.contract_creation_block(net, token, to_block)
+        if creation is not None:
+            from_block = max(from_block, creation)
 
     rows: list[dict[str, Any]] = []
     meta: dict[str, int] = {"events": 0, "skipped": 0, "empty": 0,
@@ -733,6 +738,11 @@ async def run_replay(
             w for w in db.evm_replay_targets([net])
             if redo or (w.get("replay_status") or None) not in _FINAL_STATUSES
         ]
+        if not redo:
+            targets.sort(key=lambda w: (
+                w.get("replay_last_try_at") or "",
+                w.get("first_seen_at") or "",
+            ))
         if token:
             targets = [w for w in targets if w["token_address"].lower() == token.lower()]
         if not targets:

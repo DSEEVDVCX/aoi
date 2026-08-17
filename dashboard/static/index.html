@@ -411,6 +411,14 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="body flush" id="errors"></div>
   </div>
 
+  <div class="card" data-view-section="health">
+    <header>
+      <h2>مفاتيح المزوّدين الخارجيّين</h2>
+      <span class="note">أعداد فقط — لا تُعرض قيمة مفتاح ولا جزء منها</span>
+    </header>
+    <div class="body flush" id="provider-keys"></div>
+  </div>
+
   <section data-view-section="networks" hidden>
     <div class="network-grid" id="network-summary">
       <div class="card"><div class="body empty">جارٍ تحميل ملخص الشبكات…</div></div>
@@ -1150,10 +1158,44 @@ function renderErrors(rows) {
         <span class="mono" style="margin-inline-start:8px">${esc(r.last_error)}</span></div>`).join("")
     : `<div class="errline"><span class="badge good">✓ سليم</span>
         <span style="margin-inline-start:8px;color:var(--muted)">كل المصادر تعمل بلا أخطاء حاليّة.</span></div>`;
-  // أخطاء أقدم من آخر دورة ناجحة: سياق تاريخي لا إنذار قائم
+  // أخطاء أقدم من آخر نجاحٍ **لمصدرها**: سياق تاريخي لا إنذار قائم. والختم
+  // مذكور لأنّ «تعافى» بلا «متى» لا يُميَّز من «حدُّ التقادم معطّل».
   html += healed.map(r => `<div class="errline resolved"><span class="badge good">✓ تعافى</span>
-      <span class="mono" style="margin-inline-start:8px">${esc(r.source)} — ${esc(r.last_error)}</span></div>`).join("");
+      <span class="mono" style="margin-inline-start:8px">${esc(r.source)} — ${esc(r.last_error)}</span>
+      ${r.ok_at ? `<span style="margin-inline-start:8px;color:var(--muted)">نجح قبل ${ago(r.ok_at)}</span>` : ""}</div>`).join("");
   host.innerHTML = html;
+}
+
+/* مفاتيح المزوّدين: **أعدادٌ ومؤشّرات فقط** (FR-013). الخادم لا يرسل قيمة
+   مفتاح ولا كسراً منها أصلاً — فلا يوجد ما يُشطب هنا. والغرض سؤالان لا يجيبهما
+   سجلٌّ نصّيّ: «هل هناك بديل إن رُفض مفتاح؟» و«هل واحدٌ منها مرفوض الآن؟» */
+function renderProviderKeys(data) {
+  const host = document.getElementById("provider-keys");
+  const rows = data.pools || [];
+  if (!rows.length) {
+    host.innerHTML = `<div class="errline"><span class="badge warn">؟ لا تقرير</span>
+      <span style="margin-inline-start:8px;color:var(--muted)">لم تختم أي عمليّة حالة أحواضها بعد —
+      تظهر بعد أوّل دورة من <span class="mono">FomoChain</span> و<span class="mono">FomoEVMReplay</span>.</span></div>`;
+    return;
+  }
+  const min = data.min_keys || 2;
+  host.innerHTML = rows.map(r => {
+    const mark = r.level === "bad" ? "✕" : r.level === "warn" ? "!" : "✓";
+    // سببٌ واحد صريح لا لونٌ وحده: أيّهما أهمّ يسبق.
+    const why = r.disabled ? "معطَّل — نفد رصيد كل المفاتيح"
+      : !r.keys ? "لا مفاتيح على القرص"
+      : !r.available ? `كل المفاتيح مبرَّدة الآن (${r.keys})`
+      : r.blocked ? `${r.blocked} من ${r.keys} مبرَّد الآن`
+      : r.keys < min ? "مفتاح واحد — لا بديل عند الرفض"
+      : `${r.keys} مفاتيح، كلّها متاحة`;
+    return `<div class="errline${r.stale ? " resolved" : ""}">
+      <span class="badge ${r.level}">${mark} ${esc(r.provider)}</span>
+      <span style="margin-inline-start:8px">${esc(why)}</span>
+      <span class="mono" style="margin-inline-start:8px;color:var(--muted)">
+        ${esc(r.owner)} · مستعمل #${r.index + 1} · تدوير ${num(r.rotations)}
+        ${r.stale ? "· تقريرٌ متجمّد" : ""} · ${ago(r.at)}</span>
+    </div>`;
+  }).join("");
 }
 
 const NETWORK_META = {
@@ -1192,10 +1234,11 @@ function renderNetworks(rows) {
       { label: "Top 10 · FOMO", value: row.details_top10_rows, available: detailsAvailable },
       { label: "عدد الحائزين", value: row.details_holder_rows, available: detailsAvailable },
     ];
-    const stateLabel = directAvailable ? "تركيز كامل" : detailsAvailable ? "Top 10 + حائزون" : "بيانات سوق";
+    const noActive = total === 0;
+    const stateLabel = noActive ? "لا مراقبات نشطة" : directAvailable ? "تركيز كامل" : detailsAvailable ? "Top 10 + حائزون" : "بيانات سوق";
     return `<article class="network-item">
       <header><div><h3>${esc(meta.name)}</h3><span class="meta">${esc(meta.source)} · ID ${esc(row.network_id)}</span></div>
-        <span class="badge ${directAvailable ? "good" : detailsAvailable ? "warn" : "bad"}">${stateLabel}</span></header>
+        <span class="badge ${noActive ? "" : directAvailable ? "good" : detailsAvailable ? "warn" : "bad"}">${stateLabel}</span></header>
       <div class="network-metrics">
         <div class="network-metric"><span>مراقبة نشطة</span><strong>${num(row.active_watches)}</strong></div>
         <div class="network-metric"><span>لقطات سوق</span><strong>${compact(row.tick_rows)}</strong></div>
@@ -1265,7 +1308,7 @@ async function tick() {
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
   try {
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks] = await Promise.all([
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -1278,6 +1321,8 @@ async function tick() {
       getJSON("/api/signal-timeline?hours=24"),
       getJSON("/api/control-progress"),
       getOptionalJSON("/api/networks", { networks: [] }),
+      // اختياريّ: صفحةٌ محمَّلة قبل تحديث الخادم لا تفقد بقيّة اللوحات لأجل هذه.
+      getOptionalJSON("/api/provider-keys", { pools: [] }),
     ]);
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
@@ -1294,6 +1339,7 @@ async function tick() {
     paint("watchlist", () => renderWatchlist(wl.watchlist || []));
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
+    paint("provider-keys", () => renderProviderKeys(keys));
     paint("network-summary", () => renderNetworks(networks.networks || []));
     renderStatus(st);
     renderApi(api);

@@ -43,7 +43,9 @@ def utcnow_iso() -> str:
 def encode_raw(raw: Any) -> bytes:
     """أي كائن (أو نصّ JSON جاهز) → BLOB مضغوط للتخزين في عمود raw_json."""
     text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-    return zlib.compress(text.encode("utf-8"), _ZLIB_LEVEL)
+    # بعض تعليقات المنبع تحمل نصف زوج UTF-16 مثل `\ud83d`. هذا ليس Unicode
+    # صالحاً للـUTF-8، لكن تمثيله كـJSON escape يحفظ الخام ولا يسقط لقطة العملة.
+    return zlib.compress(text.encode("utf-8", errors="backslashreplace"), _ZLIB_LEVEL)
 
 
 def decode_raw(value: Any) -> Any:
@@ -230,6 +232,23 @@ class RecorderDB:
     def get_meta(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def note_error(self, key: str, value: str) -> bool:
+        """ختمٌ دفتريّ لا يجوز أن يُسقط مَن يكتبه. يعيد True إن كُتب.
+
+        `set_meta` العاديّة تُستعمل لحالةٍ يُعتمد عليها (`schema_version`، أختام
+        الدورات، جيل الدفتر) فيجب أن يُسمَع فشلها. أمّا أسطر `last_error_*` فهي
+        **وصفٌ لفشلٍ وقع أصلاً**، وتُكتب من داخل معالج الاستثناء — فإن كانت
+        القاعدة هي المورد المتعطّل رفعت هي أيضاً، فأسقطت المعالجَ ومعه ما بقي
+        من الدورة، ثم أسقطت درع الحلقة نفسه. قِيس 2026-08-17: `database is
+        locked` بهذا الطريق أخرج المسجّل بالرمز 1 فبقيت المهمّة `Ready` ثلاث
+        ساعات صامتة. فقدُ سطرٍ وصفيّ أرخص من فقد الدورة، والقياس لا يُكتب بهذه.
+        """
+        try:
+            self.set_meta(key, value)
+            return True
+        except Exception:  # noqa: BLE001 — دفترٌ لا قياس
+            return False
 
     def evm_ledger_generation(self) -> int:
         value = self.get_meta("evm_ledger_generation")
@@ -630,22 +649,29 @@ class RecorderDB:
         )
         self._commit()
 
-    def social_fetch_due(self, limit: int, stale_before_iso: str) -> list[dict[str, Any]]:
+    def social_fetch_due(
+        self, limit: int, stale_before_iso: str,
+        error_stale_before_iso: str | None = None,
+    ) -> list[dict[str, Any]]:
         """العملات المستحقّة للقطة اجتماعية — الأقدم سحباً أوّلاً.
 
         بخلاف الشموع لا نستبعد العملة الفارغة: غياب النقاش **إشارة بذاته**
         وتغيّره عبر الزمن هو المطلوب، فلا معنى لإسقاط عملة صامتة اليوم.
         """
+        error_stale = error_stale_before_iso or stale_before_iso
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, s.last_fetch_at
                FROM watchlist w
                LEFT JOIN social_fetch_state s
-                 ON s.token_address = w.token_address AND s.network_id = w.network_id
+                  ON s.token_address = w.token_address AND s.network_id = w.network_id
                WHERE w.active = 1
-                 AND (s.last_fetch_at IS NULL OR s.last_fetch_at < ?)
+                 AND (s.last_fetch_at IS NULL
+                      OR (s.last_status='error' AND s.last_fetch_at < ?)
+                      OR (COALESCE(s.last_status, '') <> 'error'
+                          AND s.last_fetch_at < ?))
                ORDER BY s.last_fetch_at IS NOT NULL, s.last_fetch_at
                LIMIT ?""",
-            (stale_before_iso, limit),
+            (error_stale, stale_before_iso, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -866,6 +892,39 @@ class RecorderDB:
             (*nets, error_stale_before_iso, stale_before_iso, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def evm_snapshot_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+        networks: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """عملات EVM ذات دفتر مكتمل والمستحقّة للقطة، مع التصفية قبل `LIMIT`."""
+        nets = [str(n) for n in networks]
+        if not nets:
+            return []
+        marks = ", ".join("?" for _ in nets)
+        rows = self._conn.execute(
+            f"""SELECT w.token_address, w.network_id, w.first_seen_at,
+                       w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
+                  FROM watchlist w
+                  JOIN evm_backfill_state b
+                    ON b.token_address=w.token_address AND b.network_id=w.network_id
+                   AND b.status='done'
+                  LEFT JOIN chain_fetch_state s
+                    ON s.token_address=w.token_address AND s.network_id=w.network_id
+                 WHERE w.active=1
+                   AND w.network_id IN ({marks})
+                   AND (s.last_fetch_at IS NULL
+                        OR (s.last_status='error' AND s.last_fetch_at < ?)
+                        OR (COALESCE(s.last_status, '') <> 'error'
+                            AND s.last_fetch_at < ?))
+                 ORDER BY s.last_fetch_at IS NOT NULL,
+                          w.is_control,
+                          s.last_fetch_at,
+                          w.first_seen_at DESC
+                 LIMIT ?""",
+            (*nets, error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # --- chain_authority (الطبقة البطيئة: صلاحيات وقابليّة تعديل) ---
     def insert_chain_authority(self, row: Mapping[str, Any]) -> bool:
@@ -1158,6 +1217,8 @@ class RecorderDB:
             f"""SELECT w.token_address, w.network_id, w.first_seen_at,
                        w.entry_signal_id, w.is_control,
                        b.status AS backfill_status, b.from_block, b.to_block,
+                       b.transfers AS backfill_transfers,
+                       b.calls AS backfill_calls,
                        b.last_try_at AS backfill_last_try_at
                   FROM watchlist w
                   LEFT JOIN evm_backfill_state b

@@ -82,17 +82,56 @@ def _write_log(path: str, msg: str) -> None:
         pass
 
 
-async def _evm_tick(evm_rpc_client, db, utcnow_iso) -> None:
+def _stamp(db, pairs: dict[str, str]) -> None:
+    """أختامٌ دفتريّة تُكتب إن أمكن ولا تُسقط دورةً نجحت.
+
+    كانت `set_meta` عاريةً في جسم الدورة: قفلُ القاعدة عندها يقفز إلى الحرس
+    فيُسجَّل «تعثّرت» ويُكتب `last_error_*` عن دورةٍ **تمّت فعلاً** — كذبٌ في
+    اللوحة فوق فقدِ الختم. وبنفس هذا الطريق خرج المسجّل بالرمز 1 يوم
+    2026-08-17 (انظر `db.note_error`).
+    """
+    for key, value in pairs.items():
+        db.note_error(key, value)
+
+
+def _ok_stamps(stats: dict, at: str) -> dict[str, str]:
+    """ختمُ «آخر نجاح» لكل طابور على حِدة — لا ختمٌ واحد للعمليّة.
+
+    اللوحة تُعلّم خطأً بأنّه متعافٍ إن سبق آخرَ نجاحٍ لمصدره. وكان الحدُّ
+    المستعمل حدَّ **المسجّل** (`last_ok_cycle_at`) وهو لا يكتبه إلّا
+    `recorder.py`؛ فموتُ المسجّل جمّد الحدَّ فبقيت شارات chain/evm حمراء إلى
+    الأبد مهما أتمّت `FomoChain` دوراتٍ نظيفة. فلكلّ طابورٍ ختمُه من كاتبه.
+
+    القاعدة: صفرُ أخطاءٍ في ذلك الطابور ⇒ ختم — بصرف النظر عن حجم ما استحقّ
+    العمل، وهي نفس قاعدة `last_ok_cycle_at` عند المسجّل. اشتراطُ عملٍ فعليّ
+    كان سيُبقي طابوراً خامداً (لا عملات على شبكته) أحمرَ للأبد بلا سبيل تعافٍ.
+    """
+    def _clean(*counters: str) -> bool:
+        return not any(int(stats.get(name) or 0) for name in counters)
+
+    out: dict[str, str] = {}
+    if "chain_errors" in stats and _clean("chain_errors"):
+        out["chain_last_ok_at"] = at
+    if "auth_errors" in stats and _clean("auth_errors"):
+        out["chain_auth_last_ok_at"] = at
+    if "evm_errors" in stats and _clean("evm_errors", "evm_backfill_errors"):
+        out["evm_last_ok_at"] = at
+    if "evm_contract_errors" in stats and _clean("evm_contract_errors"):
+        out["evm_contract_last_ok_at"] = at
+    if "bsc_errors" in stats and _clean("bsc_errors"):
+        out["bsc_nodereal_last_ok_at"] = at
+    return out
+
+
+async def _evm_tick(evm_rpc_client, nodereal, db, utcnow_iso) -> None:
     """دورة EVM كاملة في حرسها الخاصّ. لا تُسقط طبقة سولانا ولا تُسقَط بها."""
     import time
 
     from evm_contract import run_evm_contract_cycle
     from evm_layer import run_evm_cycle
     from bsc_layer import run_bsc_cycle
-    from nodereal_rpc import NodeRealRPC
 
     started = time.time()
-    nodereal = NodeRealRPC()
     try:
         stats = await run_evm_cycle(evm_rpc_client, db, utcnow_iso())
         stats.update(await run_bsc_cycle(nodereal, db, utcnow_iso()))
@@ -100,8 +139,11 @@ async def _evm_tick(evm_rpc_client, db, utcnow_iso) -> None:
         # لكل عملة في دقيقة تحمل ثمانية أصلاً.
         stats.update(await run_evm_contract_cycle(evm_rpc_client, db, utcnow_iso()))
         stats["seconds"] = round(time.time() - started, 1)
-        db.set_meta("evm_last_run_at", utcnow_iso())
-        db.set_meta("evm_last_stats", str(stats))
+        now = utcnow_iso()
+        _stamp(db, {
+            "evm_last_run_at": now, "evm_last_stats": str(stats),
+            **_ok_stamps(stats, now),
+        })
         # نسجّل حين يجري عمل فقط — سطر كل دقيقة إلى الأبد ضجيج.
         if stats["evm_calls"] or stats["evm_snapshots"] or stats["evm_backfill_due"] \
                 or stats["evm_contract_due"] or stats["evm_errors"] \
@@ -112,9 +154,8 @@ async def _evm_tick(evm_rpc_client, db, utcnow_iso) -> None:
         import traceback
 
         _log_evm("evm cycle crashed:\n" + traceback.format_exc())
-        db.set_meta("last_error_evm", f"{utcnow_iso()}: دورة EVM تعثّرت (انظر evm.log)")
-    finally:
-        await nodereal.aclose()
+        # `note_error` لا `set_meta`: القاعدة قد تكون هي سببَ التعثّر نفسه.
+        db.note_error("last_error_evm", f"{utcnow_iso()}: دورة EVM تعثّرت (انظر evm.log)")
 
 
 async def main_loop(cycles: int | None = None) -> None:
@@ -126,18 +167,24 @@ async def main_loop(cycles: int | None = None) -> None:
     from chain_layer import run_chain_auth_cycle, run_chain_cycle
     from db import RecorderDB, utcnow_iso
     from goldrush_rpc import GoldRushReplayRPC
+    from nodereal_rpc import NodeRealRPC
+    from provider_keys import write_pool_report
     from solana_rpc import ChainKeyMissing, SolanaRPC
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     rpc = SolanaRPC()
     evm = GoldRushReplayRPC()
+    # عميل NodeReal يعيش عمر الحلقة كبقيّة العملاء: كان يُبنى ويُغلق كل دقيقة،
+    # فيدفع مصافحة TLS جديدة لكل دورة — والأهمّ أنّ عدّاد تدوير مفاتيحه كان
+    # يُصفَّر معها، فلا يظهر في التقرير إلّا تدويرُ الدقيقة الأخيرة.
+    nodereal = NodeRealRPC()
     n = 0
     try:
         while cycles is None or n < cycles:
             started = time.time()
             # EVM أوّلاً وبلا شرط: بلا مفتاح، فلا يصحّ أن يمنعها فرعُ «مفتاح
             # سولانا غائب» أدناه (وهو ينام دقيقة كاملة).
-            await _evm_tick(evm, db, utcnow_iso)
+            await _evm_tick(evm, nodereal, db, utcnow_iso)
             try:
                 stats = await run_chain_cycle(rpc, db, utcnow_iso())
                 # الطبقة البطيئة في نفس العملية ونفس الاتّصال: طابورها الساعيّ
@@ -145,8 +192,11 @@ async def main_loop(cycles: int | None = None) -> None:
                 # عمليّةٌ كاملة مقابل ~8 ثوانٍ من دقيقة فارغة أصلاً.
                 stats.update(await run_chain_auth_cycle(rpc, db, utcnow_iso()))
                 stats["seconds"] = round(time.time() - started, 1)
-                db.set_meta("chain_last_run_at", utcnow_iso())
-                db.set_meta("chain_last_stats", str(stats))
+                now = utcnow_iso()
+                _stamp(db, {
+                    "chain_last_run_at": now, "chain_last_stats": str(stats),
+                    **_ok_stamps(stats, now),
+                })
                 # نسجّل حين يجري عمل فقط — سطر كل دقيقة إلى الأبد ضجيج.
                 if stats["chain_due"] or stats["auth_due"]:
                     _log(f"chain: {stats}")
@@ -154,12 +204,22 @@ async def main_loop(cycles: int | None = None) -> None:
                 # سطر واحد واضح ثم انتظار: الحلقة لا تموت (المفتاح قد يوضع
                 # على القرص لاحقاً بلا إعادة تشغيل المهمّة) ولا تضجّ كل دقيقة.
                 _log(f"chain key missing: {exc}")
-                db.set_meta("last_error_chain", f"{utcnow_iso()}: مفتاح السلسلة غائب")
+                db.note_error("last_error_chain", f"{utcnow_iso()}: مفتاح السلسلة غائب")
                 await asyncio.sleep(max(config.CHAIN_INTERVAL_SECONDS, 60))
             except Exception:  # noqa: BLE001 — درع الدورة؛ الحلقة لا تموت
                 import traceback
 
                 _log("chain cycle crashed:\n" + traceback.format_exc())
+            # تقرير الأحواض **خارج** حرس السلسلة: حالة المفاتيح أهمّ ما يُقرأ حين
+            # تتعثّر الدورة، فلا يصحّ أن يسقط مع الفرع الذي تعثّر.
+            try:
+                write_pool_report(db, "chain", {
+                    "helius": rpc.key_stats(),
+                    "nodereal": nodereal.key_stats(),
+                    "goldrush": evm.key_stats(),
+                }, utcnow_iso())
+            except Exception:  # noqa: BLE001 — تقريرٌ لا قياس
+                pass
             n += 1
             if cycles is not None and n >= cycles:
                 break
@@ -171,6 +231,7 @@ async def main_loop(cycles: int | None = None) -> None:
     finally:
         await rpc.aclose()
         await evm.aclose()
+        await nodereal.aclose()
         db.close()
 
 
@@ -178,11 +239,13 @@ def _check_config() -> int:
     """تحقّق قبل التسجيل في جدولة المهامّ. **لا يطبع المفتاح** (FR-013)."""
     import config
     from db import RecorderDB
+    from provider_keys import read_keys
 
     for name in (
         "CHAIN_INTERVAL_SECONDS", "CHAIN_PER_CYCLE", "CHAIN_REFRESH_SECONDS",
         "CHAIN_ERROR_RETRY_SECONDS", "CHAIN_PACING_SECONDS",
         "CHAIN_TIMEOUT_SECONDS", "CHAIN_NETWORKS", "SOLANA_RPC_URL",
+        "CHAIN_TRANSIENT_RETRIES", "CHAIN_TRANSIENT_BACKOFF_SECONDS",
         "CHAIN_MAX_SLOT_LAG",
         "CHAIN_LOG_PATH", "CHAIN_AUTH_PER_CYCLE", "CHAIN_AUTH_REFRESH_SECONDS",
         "CHAIN_AUTH_ERROR_RETRY_SECONDS",
@@ -192,7 +255,7 @@ def _check_config() -> int:
         "EVM_LOG_LIMIT", "EVM_BACKFILL_MAX_CALLS", "EVM_BACKFILL_TOKENS_PER_CYCLE",
         "EVM_BACKFILL_BUDGET_SECONDS",
         "EVM_BACKFILL_FROM_BLOCK", "EVM_APPLY_MAX_CALLS", "EVM_PACING_SECONDS",
-        "EVM_RATE_LIMIT_BACKOFF_SECONDS",
+        "EVM_RATE_LIMIT_BACKOFF_SECONDS", "EVM_HEAD_RETRIES",
         "EVM_TIMEOUT_SECONDS", "EVM_SNAPSHOT_SECONDS", "EVM_SNAPSHOT_PER_CYCLE",
         "EVM_LOG_PATH", "EVM_CONTRACT_NETWORKS", "EVM_CONTRACT_PER_CYCLE",
         "EVM_CONTRACT_REFRESH_SECONDS", "EVM_CONTRACT_ERROR_RETRY_SECONDS",
@@ -201,6 +264,7 @@ def _check_config() -> int:
         "BSC_NODEREAL_PACING_SECONDS", "BSC_NODEREAL_CALL_PACING_SECONDS",
         "GOLDRUSH_REPLAY_CHAINS", "GOLDRUSH_BLOCK_CHUNK",
         "GOLDRUSH_RETRIES", "GOLDRUSH_MIN_RANGE",
+        "EVM_CREATION_BLOCK_NETWORKS",
     ):
         if not hasattr(config, name):
             print(f"config.{name} مفقود", file=sys.stderr)
@@ -216,15 +280,12 @@ def _check_config() -> int:
         return 1
 
     key_path = config.chain_keys_path()
-    key_ok = False
-    if os.path.exists(key_path):
-        import json
-
-        try:
-            with open(key_path, "r", encoding="utf-8") as fh:
-                key_ok = bool((json.load(fh) or {}).get("helius_api_key"))
-        except Exception:  # noqa: BLE001
-            key_ok = False
+    helius_keys = read_keys("helius_api_keys", "helius_api_key", "HELIUS_API_KEY")
+    key_ok = bool(helius_keys)
+    # المزوّدان الآخران يُعدّان أيضاً: «تحقّقٌ قبل الجدولة» يفحص مفتاح Helius
+    # وحده كان يمرّ بنجاح وطبقةُ BSC تفشل كل دقيقة لغياب مفتاح NodeReal.
+    nodereal_keys = read_keys("nodereal_api_keys", "nodereal_api_key", "NODEREAL_API_KEY")
+    goldrush_keys = read_keys("goldrush_api_keys", "goldrush_api_key", "GOLDRUSH_API_KEY")
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
@@ -258,13 +319,13 @@ def _check_config() -> int:
     )
     print(
         f"{'ok' if key_ok else 'تحذير: لا مفتاح'} · مفتاح: "
-        f"{'موجود' if key_ok else 'غائب — ' + key_path} "
+        f"{str(len(helius_keys)) + ' موجود' if key_ok else 'غائب — ' + key_path} "
         f"· شبكات: {', '.join(config.CHAIN_NETWORKS)} "
         f"· نشطة عليها: {active} "
         f"· كل {config.CHAIN_INTERVAL_SECONDS}ث × {config.CHAIN_PER_CYCLE} "
-        f"⇒ مسح كامل كل ~{sweep:.1f}د (الهدف "
+        f"-> مسح كامل كل ~{sweep:.1f}د (الهدف "
         f"{config.CHAIN_REFRESH_SECONDS / 60:.0f}د)"
-        f" · البطيئة: ×{config.CHAIN_AUTH_PER_CYCLE} ⇒ ~{auth_sweep:.1f}د "
+        f" · البطيئة: ×{config.CHAIN_AUTH_PER_CYCLE} -> ~{auth_sweep:.1f}د "
         f"(الهدف {config.CHAIN_AUTH_REFRESH_SECONDS / 60:.0f}د)"
     )
     evm_sweep = (
@@ -275,11 +336,24 @@ def _check_config() -> int:
     print(
         f"evm: شبكات {', '.join(str(n) for n in config.EVM_NETWORKS) or '—'} "
         f"· نشطة عليها: {evm_active} · دفترها مكتمل: {evm_ready} "
-        f"⇒ لقطة كل ~{evm_sweep:.1f}د (الهدف "
+        f"-> لقطة كل ~{evm_sweep:.1f}د (الهدف "
         f"{config.EVM_SNAPSHOT_SECONDS / 60:.0f}د) · تعبئة ×"
         f"{config.EVM_BACKFILL_TOKENS_PER_CYCLE} في الدورة "
         f"· فحص عقد: {', '.join(str(n) for n in config.EVM_CONTRACT_NETWORKS) or '—'} "
         f"×{config.EVM_CONTRACT_PER_CYCLE} · بلا مفتاح"
+    )
+    # **أعداد فقط، بلا أي قيمة** (FR-013). ومفتاحٌ واحد يعني «لا بديل عند الرفض»
+    # فيُقال صراحةً: التعدّد موجود في الكود ولا ينفع بحوضٍ من واحد.
+    def _count(keys: list[str], *, required: bool) -> str:
+        if not keys:
+            return "غائب" if required else "غائب (اختياري)"
+        return f"{len(keys)}" + (" — بلا بديل عند الرفض" if len(keys) == 1 else "")
+
+    print(
+        f"مفاتيح: helius {_count(helius_keys, required=True)}"
+        f" · nodereal {_count(nodereal_keys, required=bool(config.BSC_NODEREAL_NETWORK))}"
+        f" · goldrush {_count(goldrush_keys, required=False)}"
+        f" · الملف: {key_path}"
     )
     return 0 if key_ok else 1
 

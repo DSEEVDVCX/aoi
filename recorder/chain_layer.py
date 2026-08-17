@@ -103,7 +103,9 @@ async def run_chain_cycle(
             stats["chain_errors"] += 1
             # الرسالة مشطوبة من المفتاح داخل `solana_rpc` قبل أن تصل هنا
             # (FR-013)، وهذا الحقل تعرضه لوحة القيادة.
-            db.set_meta(
+            # و`note_error` لا `set_meta`: قفلُ القاعدة أثناء **معالجة** خطأ عملةٍ
+            # كان سيخرج من هذا الحرس فيُسقط بقيّة الطابور في هذه الدورة كلَّها.
+            db.note_error(
                 "last_error_chain",
                 f"{recorded_at}: {addr}: {type(exc).__name__}: {exc}",
             )
@@ -187,7 +189,7 @@ async def run_chain_auth_cycle(
             raise
         except Exception as exc:  # noqa: BLE001
             stats["auth_errors"] += 1
-            db.set_meta(
+            db.note_error(
                 "last_error_chain_auth",
                 f"{recorded_at}: {addr}: {type(exc).__name__}: {exc}",
             )

@@ -894,6 +894,24 @@ async def test_limit_stops_after_one_token_and_leaves_the_next_due(db):
     assert db.evm_replay_state(TOK2, NET) is None
 
 
+async def test_limit_rotates_a_recent_partial_behind_untried_tokens(db):
+    _seed_watch(db, TOK, 7200, 2)
+    _seed_watch(db, TOK2, 3600, 1)
+    db.set_evm_replay_state(
+        TOK, NET, "partial", NOW, from_block=100, to_block=99,
+        transfers=1, snapshots=0, calls=1,
+        checkpoint={"balances": {A: "1"}, "next_grid": T0 - 3600},
+    )
+
+    stats = await evm_replay.run_replay(
+        _rpc(_story(TOK2)), db, networks=[NET], limit=1, sleep=_noop,
+    )
+
+    assert stats["tokens"] == 1
+    assert db.evm_replay_state(TOK, NET)["status"] == "partial"
+    assert db.evm_replay_state(TOK2, NET) is not None
+
+
 async def test_check_reports_without_touching_the_network(db):
     _seed_watch(db, TOK, 3600, 1)
     assert evm_replay._check(db) == 0

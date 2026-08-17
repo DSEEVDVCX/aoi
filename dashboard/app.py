@@ -223,8 +223,30 @@ def api_storage() -> dict[str, Any]:
 
 @app.get("/api/errors")
 def api_errors() -> dict[str, Any]:
-    rows = _with_conn(lambda c: dao.recorder_errors(c, config.RECORDER_SOURCES))
+    rows = _with_conn(lambda c: dao.recorder_errors(
+        c,
+        config.RECORDER_SOURCES,
+        # لكل مصدرٍ ختمُ نجاحه من كاتبه؛ حدُّ المسجّل أساسٌ لمصادر دورته وحدها.
+        ok_stamps=config.SOURCE_OK_STAMPS,
+        recorder_stamps=config.RECORDER_OK_STAMPS,
+    ))
     return {"errors": rows}
+
+
+@app.get("/api/provider-keys")
+def api_provider_keys() -> dict[str, Any]:
+    """أحواضُ مفاتيح المزوّدين — **أعدادٌ ومؤشّرات لا قيم** (FR-013).
+
+    ولا سبيل إلى القيمة من هنا: المصدر أسطرُ `meta` التي كتبتها العمليّات، وهي
+    لا تحمل مفتاحاً ولا كسراً منه أصلاً. واللوحة تفتح القاعدة بـ `mode=ro`.
+    """
+    rows = _with_conn(lambda c: dao.provider_keys(
+        c,
+        prefix=config.PROVIDER_KEY_META_PREFIX,
+        min_keys=config.PROVIDER_KEY_MIN_KEYS,
+        stale_seconds=config.PROVIDER_KEY_STALE_SECONDS,
+    ))
+    return {"pools": rows, "min_keys": config.PROVIDER_KEY_MIN_KEYS}
 
 
 @app.get("/")

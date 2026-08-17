@@ -228,6 +228,7 @@ async def _apply_network(
 async def _backfill_token(
     rpc: Any, db: RecorderDB, watch: dict[str, Any], recorded_at: str,
     stats: dict[str, int], sleep, deadline: float | None = None,
+    max_calls: int | None = None,
 ) -> None:
     """الخطوة 2 لعملة واحدة: كل تاريخها حتى المؤشّر الحاليّ.
 
@@ -245,21 +246,32 @@ async def _backfill_token(
     expected_from = watch.get("from_block")
     expected_to = watch.get("to_block")
     from_block = config.EVM_BACKFILL_FROM_BLOCK
-    if state is None and net in config.EVM_HISTORICAL_RPC_URLS:
-        creation = await rpc.contract_creation_block(net, token, to_block)
-        if creation is not None:
-            from_block = creation
     if state in ("partial", "retry") and watch.get("from_block") is not None:
         # `retry` هنا كـ`partial` **إلزاماً** لا تحسيناً: نقطة الاستئناف تبقى
         # محفوظة عند الفشل العابر (`COALESCE` في `set_evm_backfill_state`)،
         # والبدء من الصفر مع بقائها يعني إعادة تطبيق مدًى مطبَّق ⇒ **مضاعفة كل
         # رصيد فيه**. والنقطة لا تُكتب إلّا بعد نداء ناجح، فهي دائماً حدٌّ صادق.
         from_block = int(watch["from_block"])  # استئناف من حيث توقّف السقف
-        to_block = int(watch.get("to_block") or to_block)
+        # العملة الجزئية مستثناة من التطبيق الحي، لذا يجب أن تقرأ حتى مؤشر بداية
+        # هذه الدورة لا حتى هدف قديم ينمو الرأس بنفس سرعته ويبقيها `partial` أبداً.
+        to_block = max(to_block, int(watch.get("to_block") or to_block))
+    creation_due = state is None or watch.get("from_block") is None
+    if (
+        not creation_due
+        and net in config.EVM_CREATION_BLOCK_NETWORKS
+        and int(watch.get("backfill_transfers") or 0) == 0
+    ):
+        ledger = db.evm_ledger_stats(net, token, exclude=evm_rpc.BURN_ADDRESSES)
+        creation_due = int(ledger.get("holder_count") or 0) == 0
+    if creation_due and net in config.EVM_CREATION_BLOCK_NETWORKS:
+        creation = await rpc.contract_creation_block(net, token, to_block)
+        if creation is not None:
+            from_block = max(from_block, creation)
     try:
         logs, calls, complete, resume = await rpc.get_logs_paged(
             net, [token], from_block, to_block,
-            max_calls=config.EVM_BACKFILL_MAX_CALLS, sleep=sleep, deadline=deadline,
+            max_calls=(config.EVM_BACKFILL_MAX_CALLS if max_calls is None else max_calls),
+            sleep=sleep, deadline=deadline,
         )
     except EVMLogLimit as exc:
         # كتلة واحدة تفوق السقف — لا قسمة ممكنة. تُسجَّل ولا تُعاد كل دقيقة.
@@ -288,10 +300,14 @@ async def _backfill_token(
 
     with db.batch():
         db.assert_evm_ledger_generation(generation)
-        db.assert_evm_cursor(net, int(cursor["last_block"]))
         db.assert_evm_backfill_state(
             net, token, state, expected_from, expected_to,
         )
+        if caught_up:
+            # `done` ينقل ملكية الكتل اللاحقة إلى التطبيق الحي. إن تحرك المؤشر
+            # بعد فحص اللحاق وقبل التثبيت فالفجوة تضيع، لذا نحرس الانتقال النهائي
+            # فقط؛ `partial` يبقى قابلاً للتقدم بالتوازي دون تجويع.
+            db.assert_evm_cursor(net, latest_block)
         transfers = 0
         for tok, deltas in _deltas_by_token(logs).items():
             if tok != token:
@@ -305,7 +321,8 @@ async def _backfill_token(
         db.set_evm_backfill_state(
             net, token, state_status, recorded_at,
             from_block=next_from, to_block=next_to,
-            transfers=transfers, calls=calls,
+            transfers=int(watch.get("backfill_transfers") or 0) + transfers,
+            calls=calls,
         )
     stats["evm_backfill_calls"] += calls
     if caught_up:
@@ -318,6 +335,8 @@ def _snapshot_token(
     db: RecorderDB, watch: dict[str, Any], recorded_at: str, stats: dict[str, int],
 ) -> None:
     """الخطوة 3 لعملة واحدة: لقطة تركّز من الدفتر، بلا نداء شبكة."""
+    if (watch.get("backfill_status") or "") != "done":
+        raise ValueError("لا يمكن أخذ لقطة من دفتر EVM غير مكتمل")
     generation = db.evm_ledger_generation()
     net = str(watch["network_id"])
     token = watch["token_address"].lower()
@@ -384,7 +403,7 @@ async def run_evm_cycle(
         except Exception as exc:  # noqa: BLE001 — شبكة واحدة لا تُسقط الدورة
             stats["evm_errors"] += 1
             msg = f"{type(exc).__name__}: {exc}"[:300]
-            db.set_meta("last_error_evm", f"{recorded_at}: [{net}] {msg}")
+            db.note_error("last_error_evm", f"{recorded_at}: [{net}] {msg}")
 
     watched = db.evm_watched(networks)
 
@@ -432,7 +451,7 @@ async def run_evm_cycle(
             except StaleEVMState:
                 stats["evm_backfill_retry"] -= 1
                 continue
-            db.set_meta(
+            db.note_error(
                 "last_error_evm",
                 f"{recorded_at}: {w['token_address']}: {type(exc).__name__}: {exc}",
             )
@@ -450,7 +469,7 @@ async def run_evm_cycle(
         datetime.fromisoformat(recorded_at)
         - timedelta(seconds=config.EVM_SNAPSHOT_SECONDS)
     ).isoformat()
-    due = db.chain_fetch_due(
+    due = db.evm_snapshot_due(
         limit=config.EVM_SNAPSHOT_PER_CYCLE,
         stale_before_iso=stale_before,
         error_stale_before_iso=stale_before,
@@ -468,8 +487,78 @@ async def run_evm_cycle(
             continue
         except Exception as exc:  # noqa: BLE001
             stats["evm_errors"] += 1
-            db.set_meta(
+            db.note_error(
                 "last_error_evm",
                 f"{recorded_at}: {w['token_address']}: {type(exc).__name__}: {exc}",
             )
     return stats
+
+
+async def run_evm_backfill_assist(
+    rpc: Any, db: RecorderDB, networks: Sequence[str], recorded_at: str | None = None,
+    sleep=asyncio.sleep,
+) -> dict[str, int]:
+    """تعبئة الدفاتر الحيّة فقط، لتعمل كأولوية قبل الإعادة التاريخية.
+
+    لا يطبّق السجلّ الدوري ولا يكتب لقطات؛ `FomoChain` يبقى مالك هاتين الخطوتين.
+    هذا العامل يسرّع العملات الجديدة من دون إنشاء مسار ثانٍ لتطبيق نفس المدى.
+    """
+    now = recorded_at or utcnow_iso()
+    stats = {
+        "evm_backfill_due": 0, "evm_backfilled": 0, "evm_backfill_partial": 0,
+        "evm_backfill_calls": 0, "evm_backfill_retry": 0,
+        "evm_backfill_errors": 0, "evm_backfill_skipped": 0,
+    }
+    watched = db.evm_watched([str(n) for n in networks])
+    pending = [
+        w for w in watched
+        if (w.get("backfill_status") or "") in ("", "partial", "retry")
+    ]
+    pending.sort(key=_assist_priority)
+    stats["evm_backfill_due"] = len(pending)
+    deadline = time.monotonic() + config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE
+    for index, watch in enumerate(pending[:config.EVM_BACKFILL_TOKENS_PER_CYCLE]):
+        if index and time.monotonic() >= deadline:
+            stats["evm_backfill_skipped"] += 1
+            continue
+        generation = db.evm_ledger_generation()
+        try:
+            await _backfill_token(
+                rpc, db, watch, now, stats, sleep, deadline,
+                max_calls=config.EVM_REPLAY_MAX_CALLS,
+            )
+        except StaleEVMState:
+            continue
+        except Exception as exc:  # noqa: BLE001 - the next cycle retries this token
+            stats["evm_backfill_retry"] += 1
+            try:
+                with db.batch():
+                    db.assert_evm_ledger_generation(generation)
+                    db.assert_evm_backfill_state(
+                        watch["network_id"], watch["token_address"],
+                        watch.get("backfill_status"), watch.get("from_block"),
+                        watch.get("to_block"),
+                    )
+                    db.set_evm_backfill_state(
+                        watch["network_id"], watch["token_address"], "retry", now,
+                        last_error=f"{type(exc).__name__}: {exc}"[:300],
+                    )
+            except StaleEVMState:
+                stats["evm_backfill_retry"] -= 1
+        if index + 1 < min(len(pending), config.EVM_BACKFILL_TOKENS_PER_CYCLE):
+            await sleep(config.EVM_PACING_SECONDS)
+    return stats
+
+
+def _assist_priority(watch: dict[str, Any]) -> tuple[int, int, int, str]:
+    """الجديد أولاً، ثم الأقل كلفة والأقرب؛ العامل الحي يحافظ على الدوران العادل."""
+    if not watch.get("backfill_status"):
+        return (0, 0, 0, "")
+    start = watch.get("from_block")
+    end = watch.get("to_block")
+    remaining = (
+        max(0, int(end) - int(start) + 1)
+        if start is not None and end is not None else 2 ** 63 - 1
+    )
+    calls = int(watch.get("backfill_calls") or 2 ** 31 - 1)
+    return (1, calls, remaining, str(watch.get("backfill_last_try_at") or ""))

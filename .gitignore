@@ -26,6 +26,8 @@ recorder/chain_keys.json
 chain_keys.json
 
 # Runtime artefacts
+evm_replay_run.err
+evm_replay_run.out
 *.log
 # سجلّات مُدوَّرة (server.log.1) — لا يطابقها *.log
 *.log.*

@@ -178,8 +178,11 @@ async def run_bars_cycle(
             db.set_bars_state(addr, net, status if rows else "no_data", len(rows), recorded_at)
         except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الشريحة
             stats["bars_errors"] += 1
-            db.set_bars_state(addr, net, "error", 0, recorded_at)
-            db.set_meta("last_error_bars", f"{recorded_at}: {type(exc).__name__}: {exc}")
+            try:
+                db.set_bars_state(addr, net, "error", 0, recorded_at)
+            except Exception:  # noqa: BLE001 — جدولةُ إعادة لا قياس؛ ولو رمت هي
+                pass                        # لَما بُلِغ الختمُ أدناه أصلاً
+            db.note_error("last_error_bars", f"{recorded_at}: {type(exc).__name__}: {exc}")
         if i + 1 < len(due):
             await sleep(config.BARS_PACING_SECONDS)
     return stats
@@ -487,7 +490,7 @@ async def run_macro_bars_cycle(
                 db.recompute_bar_flags(addr, net, config.MACRO_BARS_RESOLUTION)
         except Exception as exc:  # noqa: BLE001 — أصل واحد لا يُسقط البقيّة
             stats["macro_errors"] += 1
-            db.set_meta("last_error_macro", f"{recorded_at}: {label}: {type(exc).__name__}: {exc}")
+            db.note_error("last_error_macro", f"{recorded_at}: {label}: {type(exc).__name__}: {exc}")
         if i + 1 < len(config.MACRO_BARS):
             await sleep(config.BARS_PACING_SECONDS)
     # الختم بصفوف مكتوبة فعلاً فقط: فشل كامل (انقطاع fomo) أو فراغ كامل
@@ -515,7 +518,14 @@ async def run_social_cycle(
     stats = {"social_tokens": 0, "social_items": 0, "social_errors": 0}
     now_dt = datetime.fromisoformat(recorded_at)
     stale_before = (now_dt - timedelta(seconds=config.SOCIAL_REFRESH_SECONDS)).isoformat()
-    due = db.social_fetch_due(limit=config.SOCIAL_PER_CYCLE, stale_before_iso=stale_before)
+    error_stale_before = (
+        now_dt - timedelta(seconds=config.SOCIAL_ERROR_RETRY_SECONDS)
+    ).isoformat()
+    due = db.social_fetch_due(
+        limit=config.SOCIAL_PER_CYCLE,
+        stale_before_iso=stale_before,
+        error_stale_before_iso=error_stale_before,
+    )
 
     for i, w in enumerate(due):
         addr = w["token_address"]
@@ -532,8 +542,11 @@ async def run_social_cycle(
             )
         except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الشريحة
             stats["social_errors"] += 1
-            db.set_social_state(addr, net, "error", 0, recorded_at)
-            db.set_meta("last_error_social", f"{recorded_at}: {type(exc).__name__}: {exc}")
+            try:
+                db.set_social_state(addr, net, "error", 0, recorded_at)
+            except Exception:  # noqa: BLE001 — كما في bars: لا تحجب الختمَ أدناه
+                pass
+            db.note_error("last_error_social", f"{recorded_at}: {type(exc).__name__}: {exc}")
         if i + 1 < len(due):
             await sleep(config.SOCIAL_PACING_SECONDS)
     return stats
@@ -617,7 +630,7 @@ async def run_holders_cycle(
                         top10 = row["top10_pct"]
             except Exception as exc:  # noqa: BLE001 — مصدر واحد لا يُسقط الباقي
                 stats["holders_errors"] += 1
-                db.set_meta(
+                db.note_error(
                     "last_error_holders",
                     f"{recorded_at}: {source}: {type(exc).__name__}: {exc}",
                 )
@@ -635,7 +648,7 @@ async def run_holders_cycle(
                         stats["flow_rows"] += 1
                 except Exception as exc:  # noqa: BLE001
                     stats["holders_errors"] += 1
-                    db.set_meta(
+                    db.note_error(
                         "last_error_holders",
                         f"{recorded_at}: flow: {type(exc).__name__}: {exc}",
                     )
@@ -711,7 +724,7 @@ async def run_filter_tokens_cycle(
                                                str(tick["network_id"] or ""), proto)
         except Exception as exc:  # noqa: BLE001 — دفعة واحدة لا تُسقط الباقي
             stats["filter_errors"] += 1
-            db.set_meta(
+            db.note_error(
                 "last_error_filter",
                 f"{recorded_at}: {type(exc).__name__}: {exc}",
             )
@@ -768,7 +781,7 @@ async def run_traders_cycle(
                     status = "ok"
         except Exception as exc:  # noqa: BLE001 — متداول واحد لا يُسقط الباقي
             stats["traders_errors"] += 1
-            db.set_meta(
+            db.note_error(
                 "last_error_traders",
                 f"{recorded_at}: {type(exc).__name__}: {exc}",
             )
@@ -800,8 +813,20 @@ async def run_cycle(
 
     def _fail(where: str, exc: Exception) -> None:
         stats["errors"] += 1
-        db.bump_counter("errors_total")
-        db.set_meta(f"last_error_{where}", f"{recorded_at}: {type(exc).__name__}: {exc}")
+        # **معالج الخطأ يحتاج القاعدة التي هي المورد المتعطّل.** قِيس
+        # 2026-08-17: `database is locked` في `insert_holders` رفع الاستثناء
+        # هنا أيضاً، فأسقط `_fail` ثم أسقط درع الحلقة، فخرجت العمليّة بالرمز 1
+        # وبقيت المهمّة `Ready` ثلاث ساعات صامتة. العدّ في الذاكرة يكفي لتُكمل
+        # الدورة وتُبلّغ؛ فقدُ سطرٍ في `meta` أرخص من فقد المسجّل ساعات.
+        try:
+            db.bump_counter("errors_total")
+        except Exception:  # noqa: BLE001 — عدّادٌ لا قياس
+            pass
+        note = f"{recorded_at}: {type(exc).__name__}: {exc}"
+        if not db.note_error(f"last_error_{where}", note):
+            # لا نصمت تماماً: السجلّ آخرُ ما يبقى حين تُقفل القاعدة، و`_log`
+            # نفسها محميّة فلا تُسقط الدورة.
+            _log(f"note_error failed for {where}: القاعدة لا تستجيب للكتابة")
 
     # 0) تحديث صدارة المتصدّرين (كل ساعة) + أرشفة الخام + تسجيل الفشل.
     try:
@@ -1019,7 +1044,7 @@ async def _maybe_rotate_client(
     try:
         disk_token = _load_access_token()
     except Exception as exc:  # noqa: BLE001 — قراءة القرص فشلت؛ نكمل بالحالي
-        db.set_meta("last_error_token_reload", f"{utcnow_iso()}: {type(exc).__name__}")
+        db.note_error("last_error_token_reload", f"{utcnow_iso()}: {type(exc).__name__}")
         return client, current_token
     if disk_token == current_token:
         return client, current_token
@@ -1030,7 +1055,10 @@ async def _maybe_rotate_client(
     except Exception:  # noqa: BLE001 — إغلاق العميل القديم لا يُسقط المسجّل
         pass
     lb.set_client(new_client)
-    db.set_meta("last_token_refresh_at", utcnow_iso())
+    try:
+        db.set_meta("last_token_refresh_at", utcnow_iso())
+    except Exception:  # noqa: BLE001 — التدوير نجح فعلاً، لا نهدره لأجل ختم
+        pass
     _log("token rotated → client rebuilt")  # بلا أي قيمة سرّية
     return new_client, disk_token
 
@@ -1055,14 +1083,23 @@ async def main_loop(cycles: int | None = None) -> None:
     try:
         while cycles is None or n < cycles:
             started = time.monotonic()
-            # التقط التوكن المتجدّد على القرص قبل الدورة (يمنع 401 بعد الساعة).
-            client, current_token = await _maybe_rotate_client(client, current_token, lb, db)
             try:
+                # التقط التوكن المتجدّد على القرص قبل الدورة (يمنع 401 بعد
+                # الساعة). **داخل** الدرع: كان خارجه وهو يكتب في القاعدة، فقفلٌ
+                # هناك يخرج من الحلقة كلها بلا أي معالجة.
+                client, current_token = await _maybe_rotate_client(
+                    client, current_token, lb, db
+                )
                 stats = await run_cycle(client, db, lb, now_mono=started)
                 _log(f"cycle {n}: {stats}")
             except Exception:  # noqa: BLE001 — درع أخير حول الدورة كلها
                 _log("cycle crashed:\n" + traceback.format_exc())
-                db.bump_counter("cycle_crashes")
+                # والدرع لا يجوز أن يموت بيده: هذا السطر بعينه أخرج العمليّة
+                # بالرمز 1 عند 2026-08-17T16:27 لأنّ القاعدة كانت مقفلة.
+                try:
+                    db.bump_counter("cycle_crashes")
+                except Exception as meta_exc:  # noqa: BLE001
+                    _log(f"cycle_crashes write failed: {type(meta_exc).__name__}")
             n += 1
             if cycles is not None and n >= cycles:
                 break
