@@ -170,6 +170,23 @@ improves going forward but **cannot be back-filled** — the past was never meas
 Treat low-coverage features as "too early to judge", not "no signal". Judge them again
 on a later export.
 
+## Two holder populations — do not conflate them
+
+`chain_holder_count` / `chain_top10_pct` describe **the whole token on-chain**;
+`platform_holders` and everything else prefixed `platform_` describes **fomo.family
+users only**. Measured: on-chain averages 75,121 holders against 1,970 platform users,
+and platform users are 0.0%–2.5% of the chain. So `chain_top10_pct` is the ownership
+concentration measure; nothing derived from the platform side is. `platform_penetration`
+is deliberately the ratio of the two — high means a crowd-driven move that can reverse
+when the crowd exits.
+
+`chain_holders_delta_1h` (with `_growth_1h`) is the change in on-chain holders, computed
+from two of our snapshots because the upstream exposes no deltas. **Read
+`chain_holders_span_min` alongside it**: snapshot cadence is a rigid 25 minutes, so the
+"1 hour" comparison actually spans a measured median of 75 minutes, and spans above 100
+minutes are NULL rather than misleading. There is no 5-minute equivalent and there
+cannot be — 0% of measured snapshot gaps are ≤5 min.
+
 ## The current method, for you to beat
 
 `code/train_pipeline.py`: `HistGradientBoostingClassifier`, small 3-config grid picked

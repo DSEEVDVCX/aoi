@@ -61,6 +61,90 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* --- هيكل التطبيق والتنقّل --- */
+.app-shell { min-width: 0; min-height: 100vh; }
+.sidebar {
+  position: fixed; inset-block: 0; inset-inline-start: 0; z-index: 30;
+  width: 224px; display: flex; flex-direction: column;
+  background: var(--surface); border-inline-end: 1px solid var(--line);
+}
+.side-brand { padding: 22px 20px 18px; border-bottom: 1px solid var(--line); }
+.side-brand strong { display: block; font-size: 16px; font-weight: 680; }
+.side-brand span { display: block; margin-top: 2px; color: var(--muted); font-size: 11.5px; }
+.nav-label { padding: 18px 20px 7px; color: var(--muted); font-size: 10.5px; }
+.nav { display: grid; gap: 3px; padding: 0 10px; }
+.nav-link {
+  display: flex; align-items: center; gap: 10px; min-height: 40px;
+  padding: 8px 10px; color: var(--ink-2); text-decoration: none;
+  border: 1px solid transparent; border-radius: 6px; font-size: 13px;
+}
+.nav-link:hover { color: var(--ink); background: var(--surface-2); }
+.nav-link[aria-current="page"] {
+  color: var(--ink); background: var(--surface-2); border-color: var(--line);
+}
+.nav-icon {
+  width: 22px; height: 22px; display: inline-grid; place-items: center;
+  border-radius: 4px; color: var(--muted); font-size: 12px; font-weight: 700;
+  border: 1px solid var(--line); flex: none;
+}
+.nav-link[aria-current="page"] .nav-icon { color: var(--s1); border-color: var(--s1); }
+.side-foot { margin-top: auto; padding: 14px 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.workspace { min-width: 0; min-height: 100vh; margin-inline-start: 224px; }
+.view { display: none; }
+.view.active { display: block; }
+.workspace main[data-active-view] [data-view-section] { display: none; }
+.workspace main[data-active-view="overview"] [data-view-section="overview"],
+.workspace main[data-active-view="performance"] [data-view-section="performance"],
+.workspace main[data-active-view="watchlist"] [data-view-section="watchlist"],
+.workspace main[data-active-view="signals"] [data-view-section="signals"],
+.workspace main[data-active-view="health"] [data-view-section="health"],
+.workspace main[data-active-view="networks"] [data-view-section="networks"] { display: block; }
+.workspace main[data-active-view="overview"] .overview,
+.workspace main[data-active-view="overview"] .grid2 { display: grid; }
+.page-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+.page-head h1 { margin: 0; font-size: 22px; font-weight: 660; }
+.page-head p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
+.page-kicker { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.network-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.network-item { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.network-item header { display: flex; align-items: center; justify-content: space-between; padding: 13px 14px; border-bottom: 1px solid var(--line); }
+.network-item header > div { min-width: 0; }
+.network-item h3 { margin: 0; font-size: 13px; }
+.network-metrics { display: grid; grid-template-columns: repeat(3, 1fr); }
+.network-metric { padding: 12px 14px; border-inline-start: 1px solid var(--line); }
+.network-metric:first-child { border-inline-start: 0; }
+.network-metric span { display: block; color: var(--muted); font-size: 10.5px; }
+.network-metric strong { display: block; margin-top: 3px; font-size: 17px; font-weight: 620; }
+.coverage-list { padding: 11px 14px 13px; display: grid; gap: 8px; }
+.coverage-row { display: grid; grid-template-columns: 78px minmax(60px, 1fr) 76px; align-items: center; gap: 8px; font-size: 11.5px; }
+.coverage-row .value { text-align: left; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 820px) {
+  .sidebar { position: sticky; inset: auto; top: 0; width: 100%; height: auto; }
+  .side-brand, .nav-label, .side-foot { display: none; }
+  .nav { display: flex; gap: 3px; padding: 7px 8px; overflow-x: auto; border-bottom: 1px solid var(--line); }
+  .nav-link { min-width: max-content; min-height: 36px; padding: 6px 9px; }
+  .nav-icon { display: none; }
+  .workspace { width: 100%; margin-inline-start: 0; }
+  .workspace .topbar { top: 51px; flex-wrap: nowrap; overflow-x: auto; padding: 8px 10px; }
+  .workspace .topbar .status, .workspace .topbar .meta, .workspace .topbar .btn { flex: none; }
+  .workspace .topbar .spacer { display: none; }
+  .network-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  .workspace main { width: 100%; padding: 16px 14px; }
+  .page-head { display: block; }
+  .page-kicker { display: block; margin-top: 7px; }
+  .network-item header { align-items: flex-start; gap: 10px; }
+  .network-item h3, .network-item .meta { overflow-wrap: anywhere; }
+  .network-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .network-metric { min-width: 0; padding: 10px 8px; }
+  .network-metric span { line-height: 1.35; }
+  .network-metric strong { font-size: 15px; }
+  .coverage-list { padding-inline: 10px; }
+  .coverage-row { grid-template-columns: 70px minmax(48px, 1fr) 72px; gap: 6px; }
+}
+
 /* --- شريط علوي --- */
 .topbar {
   position: sticky; top: 0; z-index: 20;
@@ -68,7 +152,7 @@ body {
   padding: 12px 22px; background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
-.brand { display: flex; align-items: baseline; gap: 10px; margin-inline-end: 4px; }
+.brand { display: none; align-items: baseline; gap: 10px; margin-inline-end: 4px; }
 .brand h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
 .brand .sub { color: var(--muted); font-size: 12px; }
 .status {
@@ -100,7 +184,7 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 /* --- بطاقات --- */
 .card {
   background: var(--surface); border: 1px solid var(--line);
-  border-radius: var(--radius); box-shadow: var(--shadow); margin-bottom: 18px;
+  border-radius: 7px; box-shadow: var(--shadow); margin-bottom: 18px;
 }
 .card > header {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -119,7 +203,7 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 /* أرقام كبيرة: أرقام متناسبة لا tabular — الأخيرة تجعل 121 يبدو مفكّكاً */
 .hero .value { font-size: 52px; font-weight: 620; letter-spacing: -.03em; line-height: 1.05; }
 .hero .delta { font-size: 12.5px; color: var(--ink-2); }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 1px; background: var(--line); border-radius: var(--radius); overflow: hidden; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 1px; background: var(--line); border-radius: 7px; overflow: hidden; }
 .tile { background: var(--surface); padding: 14px 16px; }
 .tile .l { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
 .tile .v { font-size: 21px; font-weight: 600; letter-spacing: -.02em; }
@@ -216,7 +300,21 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 </style>
 </head>
 <body>
-
+<div class="app-shell">
+<aside class="sidebar" aria-label="التنقّل الرئيسي">
+  <div class="side-brand"><strong>Fomo Recorder</strong><span>مركز المراقبة والتحليل</span></div>
+  <div class="nav-label">مساحات العمل</div>
+  <nav class="nav">
+    <a class="nav-link" href="#overview" data-view-link="overview" aria-current="page"><span class="nav-icon">01</span>نظرة عامة</a>
+    <a class="nav-link" href="#signals" data-view-link="signals"><span class="nav-icon">02</span>الإشارات</a>
+    <a class="nav-link" href="#watchlist" data-view-link="watchlist"><span class="nav-icon">03</span>المراقبة</a>
+    <a class="nav-link" href="#performance" data-view-link="performance"><span class="nav-icon">04</span>الأداء</a>
+    <a class="nav-link" href="#health" data-view-link="health"><span class="nav-icon">05</span>صحة البيانات</a>
+    <a class="nav-link" href="#networks" data-view-link="networks"><span class="nav-icon">06</span>الشبكات</a>
+  </nav>
+  <div class="side-foot">قراءة فقط · تحديث تلقائي كل 10 ثوانٍ</div>
+</aside>
+<div class="workspace">
 <div class="topbar">
   <div class="brand">
     <h1>لوحة المسجّل</h1>
@@ -231,11 +329,15 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
   <button class="btn" id="theme" title="تبديل السمة">◐</button>
 </div>
 
-<main>
+<main data-active-view="overview">
   <div id="alert"></div>
+  <div class="page-head">
+    <div><h1 id="page-title">نظرة عامة</h1><p id="page-description">حالة الالتقاط الحالية ونبض مصادر البيانات.</p></div>
+    <span class="page-kicker" id="page-kicker">آخر 24 ساعة</span>
+  </div>
 
   <!-- نظرة عامة: رقم رئيسي واحد + بطاقات -->
-  <div class="overview">
+  <div class="overview" data-view-section="overview">
     <div class="card" style="margin:0">
       <div class="body hero">
         <div class="label">إشارات مسجّلة</div>
@@ -248,7 +350,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
   </div>
 
   <!-- الرسم الأهمّ: هل الإشارة تنفع؟ -->
-  <div class="card">
+  <div class="card" data-view-section="performance">
     <header>
       <h2>أداء الإشارات منذ الدخول</h2>
       <span class="note">اضغط عنوان أي عمود للترتيب — يشمل كل العملات لا المعروضة فقط</span>
@@ -264,7 +366,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="body flush" id="perf"></div>
   </div>
 
-  <div class="grid2">
+  <div class="grid2" data-view-section="overview">
     <div class="card">
       <header>
         <h2>تدفّق الإشارات</h2>
@@ -275,13 +377,14 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       <div class="body" id="timeline"></div>
     </div>
 
-    <div class="card">
-      <header><h2>صحّة الجمع</h2></header>
-      <div class="body" id="health"></div>
-    </div>
   </div>
 
-  <div class="card">
+  <div class="card" data-view-section="health">
+    <header><h2>صحّة الجمع</h2></header>
+    <div class="body" id="health"></div>
+  </div>
+
+  <div class="card" data-view-section="performance">
     <header>
       <h2>الإشارة مقابل المجموعة الضابطة</h2>
       <span class="note">هل الإشارة تتفوّق على عملات دخلت بالاختيار العشوائي؟</span>
@@ -290,7 +393,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="body flush" id="comparison"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-view-section="watchlist">
     <header>
       <h2>قائمة المراقبة</h2>
       <span class="note">نافذة 48 ساعة لكل عملة</span>
@@ -298,18 +401,26 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="body flush tablewrap" id="watchlist"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-view-section="signals">
     <header><h2>أحدث الإشارات</h2></header>
     <div class="body flush tablewrap" id="signals"></div>
   </div>
 
-  <div class="card">
+  <div class="card" data-view-section="health">
     <header><h2>الأخطاء حسب المصدر</h2></header>
     <div class="body flush" id="errors"></div>
   </div>
+
+  <section data-view-section="networks" hidden>
+    <div class="network-grid" id="network-summary">
+      <div class="card"><div class="body empty">جارٍ تحميل ملخص الشبكات…</div></div>
+    </div>
+  </section>
 </main>
 
 <div id="tip" role="status" aria-live="polite"></div>
+</div>
+</div>
 
 <script>
 "use strict";
@@ -426,6 +537,14 @@ async function getJSON(url) {
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) throw new Error(url + " → " + r.status);
   return r.json();
+}
+
+async function getOptionalJSON(url, fallback) {
+  try { return await getJSON(url); }
+  catch (error) {
+    console.warn("optional dashboard panel failed:", url, error);
+    return fallback;
+  }
 }
 
 async function postJSON(url, payload) {
@@ -1037,6 +1156,92 @@ function renderErrors(rows) {
   host.innerHTML = html;
 }
 
+const NETWORK_META = {
+  "1399811149": { name: "Solana", source: "Helius + FOMO" },
+  "56": { name: "BNB Smart Chain", source: "NodeReal + FOMO" },
+  "8453": { name: "Base", source: "FOMO · RPC حي + GoldRush تاريخي" },
+  "4663": { name: "Robinhood Chain", source: "Public RPC + FOMO" },
+  "1": { name: "Ethereum", source: "Market feed" },
+  "143": { name: "Monad", source: "FOMO · RPC حي + GoldRush تاريخي" },
+  "1337": { name: "Hyperliquid", source: "Market feed" },
+};
+
+function coveragePct(value, total) {
+  return total > 0 ? Math.min(100, value / total * 100) : 0;
+}
+
+function renderNetworks(rows) {
+  const host = document.getElementById("network-summary");
+  if (!rows.length) {
+    host.innerHTML = `<div class="card"><div class="body empty">لا توجد بيانات شبكات بعد.</div></div>`;
+    return;
+  }
+  host.innerHTML = rows.map(row => {
+    const meta = NETWORK_META[String(row.network_id)] || {
+      name: `شبكة ${row.network_id}`,
+      source: "مصدر غير مصنّف",
+    };
+    const total = row.active_watches || 0;
+    const directAvailable = row.concentration_rows > 0;
+    const detailsAvailable = row.details_top10_rows > 0 || row.details_holder_rows > 0;
+    const coverage = [
+      { label: "Top 1 · سلسلة", value: row.top1_rows, available: directAvailable },
+      { label: "Top 5 · سلسلة", value: row.top5_rows, available: directAvailable },
+      { label: "Top 10 · سلسلة", value: row.top10_rows, available: directAvailable },
+      { label: "Top 20 · سلسلة", value: row.top20_rows, available: directAvailable },
+      { label: "Top 10 · FOMO", value: row.details_top10_rows, available: detailsAvailable },
+      { label: "عدد الحائزين", value: row.details_holder_rows, available: detailsAvailable },
+    ];
+    const stateLabel = directAvailable ? "تركيز كامل" : detailsAvailable ? "Top 10 + حائزون" : "بيانات سوق";
+    return `<article class="network-item">
+      <header><div><h3>${esc(meta.name)}</h3><span class="meta">${esc(meta.source)} · ID ${esc(row.network_id)}</span></div>
+        <span class="badge ${directAvailable ? "good" : detailsAvailable ? "warn" : "bad"}">${stateLabel}</span></header>
+      <div class="network-metrics">
+        <div class="network-metric"><span>مراقبة نشطة</span><strong>${num(row.active_watches)}</strong></div>
+        <div class="network-metric"><span>لقطات سوق</span><strong>${compact(row.tick_rows)}</strong></div>
+        <div class="network-metric"><span>لقطات تركّز</span><strong>${compact(row.concentration_rows)}</strong></div>
+      </div>
+      <div class="coverage-list">${coverage.map(metric => {
+        const p = metric.available ? coveragePct(metric.value || 0, total) : 0;
+        const value = metric.available ? `${num(metric.value)} / ${num(total)}` : "غير متاح";
+        return `<div class="coverage-row"><span>${esc(metric.label)}</span><div class="meter"><i style="width:${p}%;background:${p >= 95 ? "var(--good)" : p ? "var(--s1)" : "var(--muted)"}"></i></div><span class="value">${value}</span></div>`;
+      }).join("")}
+      <div class="meta">آخر سوق: ${ago(row.latest_tick)} · FOMO: ${ago(row.latest_details)} · تركّز كامل: ${ago(row.latest_concentration)}</div></div>
+    </article>`;
+  }).join("");
+}
+
+const VIEW_META = {
+  overview: ["نظرة عامة", "حالة الالتقاط الحالية ونبض مصادر البيانات.", "آخر 24 ساعة"],
+  signals: ["الإشارات", "آخر الإشارات المسجلة مع سياق السوق والمتداولين.", "الأحدث أولاً"],
+  watchlist: ["قائمة المراقبة", "العملات النشطة والوقت المتبقي لكل نافذة.", "نافذة 48 ساعة"],
+  performance: ["أداء الإشارات", "الحركة منذ لحظة الدخول والمقارنة مع الضابطة.", "تحليل جاري"],
+  health: ["صحة البيانات", "تغطية الشموع، أخطاء المصادر، وحالة الأرشيف.", "مراقبة تشغيلية"],
+  networks: ["الشبكات", "تغطية السوق وقياسات الحائزين والتركيز حسب الشبكة.", "تغطية فعلية"],
+};
+
+function setActiveView() {
+  const requested = location.hash.slice(1);
+  const view = Object.hasOwn(VIEW_META, requested) ? requested : "overview";
+  document.querySelector("main").dataset.activeView = view;
+  document.querySelectorAll("[data-view-section]").forEach(section => {
+    section.hidden = section.dataset.viewSection !== view;
+  });
+  let activeLink = null;
+  document.querySelectorAll("[data-view-link]").forEach(link => {
+    if (link.dataset.viewLink === view) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+    if (link.dataset.viewLink === view) activeLink = link;
+  });
+  const [title, description, kicker] = VIEW_META[view];
+  document.getElementById("page-title").textContent = title;
+  document.getElementById("page-description").textContent = description;
+  document.getElementById("page-kicker").textContent = kicker;
+  document.title = `${title} · Fomo Recorder`;
+  activeLink?.scrollIntoView({ block: "nearest", inline: "center" });
+  window.scrollTo({ top: 0, behavior: "instant" });
+}
+
 /* ---------- الحلقة ---------- */
 let paused = false, inflight = false;
 
@@ -1060,7 +1265,7 @@ async function tick() {
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
   try {
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress] = await Promise.all([
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -1072,6 +1277,7 @@ async function tick() {
       getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
       getJSON("/api/signal-timeline?hours=24"),
       getJSON("/api/control-progress"),
+      getOptionalJSON("/api/networks", { networks: [] }),
     ]);
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
@@ -1088,6 +1294,7 @@ async function tick() {
     paint("watchlist", () => renderWatchlist(wl.watchlist || []));
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
+    paint("network-summary", () => renderNetworks(networks.networks || []));
     renderStatus(st);
     renderApi(api);
     lastRows.perf = rows; lastRows.tl = tl;
@@ -1140,6 +1347,8 @@ document.getElementById("theme").addEventListener("click", () => {
   if (lastRows.tl) renderTimeline(lastRows.tl);
 });
 
+addEventListener("hashchange", setActiveView);
+setActiveView();
 tick();
 setInterval(tick, REFRESH_MS);
 </script>

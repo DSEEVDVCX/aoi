@@ -157,6 +157,31 @@ def test_readmission_clears_terminal_no_data_fetch_state(db):
     assert len(db.bars_fetch_due(10, "2026-07-28T01:00:00+00:00", 3)) == 1
 
 
+def test_evm_readmission_invalidates_stale_ledger_and_replay_state(db):
+    token = "0xaaaa000000000000000000000000000000000001"
+    network = "4663"
+    holder = "0x1111111111111111111111111111111111111111"
+    db.upsert_watch(
+        token, network, "large_buy", "s1", 48, "2026-07-25T00:00:00+00:00"
+    )
+    db.evm_apply_transfers(network, token, {holder: (100, 1)}, "2026-07-25T00:00:00+00:00")
+    db.set_evm_backfill_state(network, token, "done", "2026-07-25T00:00:00+00:00")
+    db.set_evm_replay_state(token, network, "done", "2026-07-25T00:00:00+00:00")
+    db._conn.execute(
+        "UPDATE watchlist SET active=0 WHERE token_address=? AND network_id=?",
+        (token, network),
+    )
+    db._conn.commit()
+
+    db.upsert_watch(
+        token, network, "large_buy", "s2", 48, "2026-07-28T00:00:00+00:00"
+    )
+
+    assert db.evm_backfill_state(network, token) is None
+    assert db.evm_replay_state(token, network) is None
+    assert db.evm_ledger_stats(network, token) == {"holder_count": 0, "supply": 0}
+
+
 def test_watchlist_watch_until_is_48h(db):
     now = "2026-07-25T00:00:00+00:00"
     db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, now)
@@ -239,6 +264,46 @@ def test_batch_commits_once_and_rolls_back_on_error(db):
             raise RuntimeError("boom")
     # الدفعة الفاشلة تُرجَع كاملة
     assert db._conn.execute("SELECT COUNT(*) c FROM market_ticks").fetchone()["c"] == 2
+
+
+def test_batch_preserves_an_existing_transaction(db):
+    db._conn.execute(
+        "INSERT INTO meta(key, value) VALUES('before-batch', 'pending')"
+    )
+
+    with db.batch():
+        db.set_meta("inside-batch", "ok")
+
+    assert db.get_meta("before-batch") == "pending"
+    assert db.get_meta("inside-batch") == "ok"
+
+
+def test_failed_batch_inside_an_existing_transaction_keeps_prior_work(db):
+    db._conn.execute(
+        "INSERT INTO meta(key, value) VALUES('before-batch', 'pending')"
+    )
+
+    with pytest.raises(RuntimeError):
+        with db.batch():
+            db.set_meta("inside-batch", "discarded")
+            raise RuntimeError("boom")
+
+    assert db.get_meta("before-batch") == "pending"
+    assert db.get_meta("inside-batch") is None
+
+
+def test_nested_batch_rolls_back_inner_savepoint_when_error_is_caught(db):
+    with db.batch():
+        db.set_meta("outer", "kept")
+        with pytest.raises(RuntimeError):
+            with db.batch():
+                db.set_meta("inner", "discarded")
+                raise RuntimeError("boom")
+        db.set_meta("after-inner", "kept")
+
+    assert db.get_meta("outer") == "kept"
+    assert db.get_meta("after-inner") == "kept"
+    assert db.get_meta("inner") is None
 
 
 def test_prune_snapshots_removes_only_old_rows(db):
@@ -450,3 +515,85 @@ def test_thesis_count_before_reconstructs_history(db):
     assert db.thesis_count_before("tok1", "2026-07-25T23:00:00Z") == 2
     assert db.thesis_count_before("tok1", "2026-07-27T00:00:00Z") == 3
     assert db.thesis_count_before("other", "2026-07-27T00:00:00Z") == 0
+
+
+# --- تسابق العرض عند الإقلاع المتزامن ---
+# `DROP VIEW IF EXISTS v; CREATE VIEW v` غير ذرّي بين عمليّتين، وقد أوقف
+# FomoBuildRows 13 ساعة (2026-08-13). الاختبار يحرس إعادة المحاولة.
+class _FlakyConn:
+    """اتّصال حقيقيّ يفشل `executescript` أوّل `fail_times` مرّة.
+
+    `sqlite3.Connection` نوع غير قابل للتعديل فلا يُرقَّع مباشرة؛ وكيل يفوّض
+    كل شيء آخر إلى الاتّصال الحقيقيّ.
+    """
+
+    def __init__(self, conn, message, fail_times):
+        self._c = conn
+        self._message = message
+        self._left = fail_times
+        self.scripts = 0
+
+    def executescript(self, script):
+        self.scripts += 1
+        if self._left > 0:
+            self._left -= 1
+            raise sqlite3.OperationalError(self._message)
+        return self._c.executescript(script)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def __setattr__(self, name, value):
+        if name in ("_c", "_message", "_left", "scripts"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._c, name, value)
+
+
+def _flaky_connect(monkeypatch, message, fail_times):
+    made = []
+    real = sqlite3.connect
+
+    def fake(*a, **kw):
+        conn = _FlakyConn(real(*a, **kw), message, fail_times)
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr("db.sqlite3.connect", fake)
+    monkeypatch.setattr("db.time.sleep", lambda _s: None)
+    return made
+
+
+def test_schema_retries_when_a_neighbour_created_the_view_first(tmp_path, monkeypatch):
+    path = str(tmp_path / "race.db")
+    RecorderDB(path, SCHEMA).close()          # قاعدة كاملة كما لو أكملها الجارّ
+
+    made = _flaky_connect(monkeypatch, "view phase1_watch_outcomes already exists", 1)
+
+    d = RecorderDB(path, SCHEMA)              # لا يرمي: يعيد المحاولة فينجح
+    try:
+        assert made[0].scripts == 2
+        assert d._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type='view' AND name='phase1_watch_outcomes'"
+        ).fetchone()[0] == 1
+    finally:
+        d.close()
+
+
+def test_schema_error_that_is_not_a_race_still_raises(tmp_path, monkeypatch):
+    """درع التسابق ضيّق: خطأ مخطّط حقيقيّ يجب أن يُفشل الإقلاع بصوت عالٍ."""
+    made = _flaky_connect(monkeypatch, "no such column: whatever", 1)
+    with pytest.raises(sqlite3.OperationalError):
+        RecorderDB(str(tmp_path / "bad.db"), SCHEMA)
+    assert made[0].scripts == 1               # بلا إعادة محاولة
+
+
+def test_schema_gives_up_after_three_races(tmp_path, monkeypatch):
+    path = str(tmp_path / "race2.db")
+    RecorderDB(path, SCHEMA).close()
+
+    made = _flaky_connect(monkeypatch, "view model_training_rows already exists", 99)
+    with pytest.raises(sqlite3.OperationalError):
+        RecorderDB(path, SCHEMA)
+    assert made[0].scripts == 3               # لا حلقة لا نهائية

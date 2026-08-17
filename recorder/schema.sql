@@ -631,6 +631,9 @@ CREATE TABLE IF NOT EXISTS training_rows (
     -- هـ٢) الملكية: تركيز السلسلة (يُصلح top10_holders_pct الميّت) وتموضع الحشد
     chain_top10_pct  REAL,                 -- أكبر 10 % من المعروض (token_details)
     chain_holder_count INTEGER,            -- حائزو السلسلة الكلّي
+    chain_holders_delta_1h INTEGER,        -- تغيّر حائزي السلسلة عبر ساعة
+    chain_holders_growth_1h REAL,          -- التغيّر نسبةً (مقارَن بين الأحجام)
+    chain_holders_span_min REAL,           -- المدى المقيس فعلاً (≥60د لا =60د)
     holders_age_min  REAL,                 -- طزاجة أحدث قياس حيازة
     platform_holders INTEGER,              -- حائزو fomo (hodlers/top)
     platform_penetration REAL,             -- حائزو المنصّة ÷ حائزي السلسلة
@@ -638,6 +641,55 @@ CREATE TABLE IF NOT EXISTS training_rows (
     platform_value_usd REAL,               -- مجموع قيمة مراكز المنصّة
     platform_median_hold_h REAL,           -- وسيط مدّة الحمل (ساعات)
     platform_dev_holding INTEGER,          -- 1 = المطوّر بين الحائزين
+    -- هـ٢-ب) الملكية مقيسة **من البلوك تشين** لا من FOMO (chain_concentration).
+    -- ما تفتحه ولا تفتحه العائلة أعلاه: top1 قياس لا اشتقاق (حوت مفرد خطرٌ
+    -- مختلف عن عشرة موزّعين)، وإيقاع 5 دقائق بعد أن كان 25. **الشبكتان معاً**
+    -- منذ إصدار الميزات 12: طبقة evm_layer تبني دفتر أرصدة من سجلّات Transfer
+    -- (ERC-20 لا يحمل قائمة حائزين على السلسلة، والدفتر هو الطريق الوحيد)
+    -- وتكتب في **نفس** الجدول ⇒ هذه الأعمدة تغطّي EVM بلا عمود جديد.
+    onchain_top1_pct  REAL,                -- أكبر حساب واحد % من المعروض
+    onchain_top5_pct  REAL,
+    onchain_top10_pct REAL,                -- يقابل chain_top10_pct ⇒ تحقّق متقاطع
+    onchain_top20_pct REAL,
+    onchain_top_accounts INTEGER,          -- المصدر يعيد 20 كحدّ أقصى: عملة
+                                           -- حائزوها 7 تعيد 7 وtop20 منها = الكلّ
+    onchain_age_min   REAL,                -- طزاجة قياس السلسلة
+    onchain_top1_delta_5m  REAL,           -- حركة الحوت الأكبر عبر ~5 دقائق
+    onchain_top10_delta_5m REAL,
+    onchain_delta_span_min REAL,           -- المدى المقيس فعلاً (≥4د لا =5د)
+    -- عدد الحائزين **مضبوطاً** من الدفتر بلا سقف رتبة، ونافذة خمس دقائق عليه
+    -- لا يعطيها أي مزوّد (كلّهم لقطة بلا تاريخ دخول). EVM وحدها: على سولانا
+    -- getTokenLargestAccounts يعيد 20 حساباً بحدّ أقصى ولا يعرف الإجمال ⇒ NULL.
+    onchain_holder_count     INTEGER,
+    onchain_holders_delta_5m INTEGER,      -- حائزون جدد − خارجون عبر ~5 دقائق
+    -- هـ٢-ج) خطر بنيويّ من السلسلة (chain_authority، إيقاع ساعيّ): من يستطيع
+    -- طبع معروضٍ جديد أو تجميد بيعك. مقيس: السكّ قائم في 3/48 والتجميد في 1/48
+    -- — نادران فمفرِّقان. حيازة المطوّر من السلسلة تغطية ~15% (Token-2022 يعيد
+    -- creators فارغة) وهي غياب مقيس لا صفر.
+    onchain_has_mint_authority   INTEGER,  -- 1 = باب طبعٍ مفتوح
+    onchain_has_freeze_authority INTEGER,  -- 1 = يستطيع تجميد محفظتك
+    onchain_is_mutable           INTEGER,  -- ميتاداتا قابلة للتغيير بعد البيع
+    onchain_is_token2022         INTEGER,  -- سطح خطر أوسع (امتدادات)
+    onchain_dev_holding_pct      REAL,     -- من السلسلة، ≠ platform_dev_holding
+    onchain_auth_age_min         REAL,
+    -- هـ٢-د) نظيرها على EVM (evm_contract، إيقاع ساعيّ): شكل العقد وصلاحياته من
+    -- **البايت‑كود** لا من حقل جاهز — ERC-20 لا يحمل صلاحيات معلنة، ووجود
+    -- المُعرّف في جدول التوزيع هو الدليل. eth_getCode حرٌّ ⇒ تغطية 100% مقابل
+    -- 10% لأي مزوّد تحقّق. **Base وحدها** وهذا قياس: على BSC 21/27 وكيلاً صغيراً
+    -- يشير إلى عقدَي تنفيذ فقط بلا أي مُعرّف خطر، وعلى روبن‑هود ستّة قوالب
+    -- متطابقة، أمّا Base فأحجام 135B–14.8KB وowner في 7/19 وmint في 2 ⇒ تباين.
+    onchain_code_size            INTEGER,  -- 0 = ليس عقداً (قياس لا فراغ)
+    onchain_function_count       INTEGER,  -- عدد مُعرّفات PUSH4 في التوزيع
+    onchain_is_proxy             INTEGER,  -- وكيل EIP-1167 ⇒ كل علم أدناه لا يعني
+                                           -- شيئاً (المنطق في عقد آخر قابل للتبديل)
+    onchain_owner_renounced      INTEGER,  -- NULL = لا دالّة مالك ≠ 1 = متروكة
+    onchain_has_mint_fn          INTEGER,  -- يستطيع طبع معروضٍ جديد
+    onchain_has_pause_fn         INTEGER,  -- يستطيع إيقاف التحويل
+    onchain_has_blacklist_fn     INTEGER,  -- يستطيع منع عنوانك وحده
+    onchain_has_fee_setter       INTEGER,  -- يستطيع رفع العمولة بعد شرائك
+    onchain_has_limit_setter     INTEGER,  -- يستطيع تقييد حجم بيعك
+    onchain_has_trading_switch   INTEGER,  -- التداول مرهون بمفتاح يملكه
+    onchain_contract_age_min     REAL,     -- الإيقاع ساعيّ ⇒ 55د أمرٌ عاديّ
     -- هـ٣) التدفّق (token_flow): من يشتري ومن يبيع — كل حجم آخر عندنا **مجموع**،
     -- وطبقة 5 دقائق لم نملك مثلها قطّ (أقصر ما عندنا ساعة، عمياء عن الانعطاف).
     flow_age_min     REAL,
@@ -847,6 +899,277 @@ CREATE TABLE IF NOT EXISTS traders_fetch_state (
     last_fetch_at TEXT,
     last_status   TEXT,                         -- ok / empty / error
     attempts      INTEGER NOT NULL DEFAULT 0
+);
+
+-- ═══ طبقة السلسلة: قياس مباشر من البلوك تشاين، لا من FOMO ═══
+-- تركّز الملكية الحقيقيّ. FOMO يعطي `top10HoldersPercent` وحده وكل 25 دقيقة
+-- (مقيس: وسيط الفجوة 25.0د، p25=25.0، p75=25.1 على 19,440 زوجاً) — فلا top1 ولا
+-- top5 ولا top20، ولا طبقة 5 دقائق. `getTokenLargestAccounts` يعطي الأربعة
+-- بالضبط في نداء واحد (مقيس 230ms)، ودفعة JSON-RPC تحمل معه `getTokenSupply`
+-- في **طلب HTTP واحد** (مقيس 4/4) — فالكلفة نداء واحد للعملة في الدورة.
+-- مقيس على عملات حيّة من مراقَبتنا: BABYSHIB top1=32.21% top5=45.60%
+-- top10=52.52% top20=60.60% · CHAM top1=11.64% top20=37.90%.
+--
+-- **سولانا وحدها بنيوياً، لا مؤقّتاً**: معيار ERC-20 لا يحمل قائمة حائزين
+-- إطلاقاً، فلا يوجد نداء عقدة يعطي أكبر الحائزين على BSC/روبنهود/بيس — يلزمه
+-- مزوّد مفهرس مدفوع لكل شبكة. أي عملة EVM تبقى بلا صفّ هنا، وهذا غياب مقيس
+-- لا صفر (FR-007). سولانا = 45.2% من إشاراتنا (30,931 من 68,491).
+--
+-- جدول مستقلّ لا أعمدة على `token_holders`: ذاك مصدره FOMO وإيقاعه 25 دقيقة
+-- وفيه سكّانان مختلطان أصلاً (سلسلة/منصّة) — وخلط مصدر ثالث بإيقاع مختلف فيه
+-- يكرّر الخطأ نفسه. `top10_pct` هنا وهناك يقيسان الشيء نفسه بمصدرين مستقلَّين،
+-- فتقاربهما تحقّق مجانيّ لا تكرار.
+CREATE TABLE IF NOT EXISTS chain_concentration (
+    token_address       TEXT NOT NULL,
+    network_id          TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    watch_first_seen_at TEXT NOT NULL,
+    entry_signal_id     TEXT,
+    is_control          INTEGER NOT NULL DEFAULT 0,
+    -- العرض بوحدات بشريّة (بعد القسمة على 10^decimals) — مقام كل النسب
+    supply              REAL,
+    decimals            INTEGER,
+    top1_pct            REAL,                   -- أكبر حساب واحد % من المعروض
+    top5_pct            REAL,
+    top10_pct           REAL,                   -- يقابل قياس FOMO ⇒ تحقّق متقاطع
+    top20_pct           REAL,
+    -- عدد الحائزين **المضبوط**. يُملأ من طبقة EVM وحدها (دفتر أرصدة كامل نبنيه
+    -- من كل تحويل) ويبقى NULL على سولانا: `getTokenLargestAccounts` يعيد 20
+    -- حساباً كحدّ أقصى ولا يعرف الإجمال، وعدّ حسابات المِنت كلّها غير عمليّ.
+    -- غياب مقيس لا صفر (FR-007).
+    holder_count        INTEGER,
+    -- كم حساباً رجع فعلاً. المصدر يعيد 20 كحدّ أقصى، وعملة حائزوها 7 تعيد 7 —
+    -- فـ`top20_pct` منها = مجموع الكلّ لا «أكبر 20». بلا هذا العمود يبدو
+    -- الرقمان متكافئين وهما ليسا كذلك.
+    top_accounts        INTEGER,
+    -- 1 = صفٌّ **مُعاد** لا مقيس لحظته: أُعيد تشغيل تحويلات السلسلة حتى الكتلة
+    -- التي كانت رأساً عند `recorded_at` (`evm_replay.py`). السلسلة سجلّ مؤرَّخ لا
+    -- يتغيّر فالرقم صادق لتلك اللحظة، لكنّ الفصل واجب: بلا هذا العمود لا سبيل
+    -- لقياس النموذج على المقيس حيّاً وحده، ولا لتفسير قفزة تغطية في تاريخ ما.
+    is_replay           INTEGER NOT NULL DEFAULT 0,
+    raw_json            BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_chain_conc_token_ts
+    ON chain_concentration (token_address, network_id, recorded_at);
+
+-- حالة الجدولة الدوّارة لطبقة السلسلة. نفس شكل `holders_fetch_state`،
+-- والخطأ يُعاد سريعاً (مجهول ≠ آمن).
+CREATE TABLE IF NOT EXISTS chain_fetch_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                         -- ok / empty / error
+    top1_pct      REAL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+
+-- ═══ الطبقة البطيئة: صلاحيات المِنت وقابليّة التعديل (إيقاع ساعيّ) ═══
+-- لماذا جدول ثانٍ وإيقاع آخر: التركّز يتحرّك كل دقيقة (حوت يشتري)، أمّا صلاحية
+-- السكّ/التجميد و`mutable` فتتغيّر مرّة واحدة في عمر العملة إن تغيّرت — فسؤالها
+-- كل خمس دقائق إهدار، وإغفالها خسارة. ساعيّاً وسط صادق.
+--
+-- كل عمود هنا **مقيس التباين** على 48 عملة من مراقَبتنا الحيّة (2026-08-13)،
+-- فلا عمود ميّت:
+--   token_program      : 21 spl-token · 27 spl-token-2022  (تباين قويّ)
+--   mint_authority     : مضبوطة في 3/48 — نادرة لكنّها **بابُ طبعٍ مفتوح**
+--   freeze_authority   : مضبوطة في 1/48 — من يملكها يجمّد محفظتك
+--   is_mutable         : 31 نعم · 17 لا
+--   update_authority   : موجودة في 22/48 (سلطة تعديل الميتاداتا)
+--   creator_address    : 7/48 فقط — Token-2022 يعيد `creators: []` دائماً،
+--                        فتغطية «حيازة المطوّر من السلسلة» ~15% لا أكثر، وهذا
+--                        غياب مقيس لا صفر (FR-007).
+-- وأُسقطت أعمدة قِيست **ثابتة** فلا معلومة فيها: `burnt` (0/48)،
+-- `ownership.frozen` (0/48)، `interface` (48/48 FungibleToken)؛ و`price_info`
+-- (47/48) موجود لكنّ السعر عندنا من FOMO أصلاً. كلّها محفوظة في `raw_json`
+-- على أي حال، فإسقاط العمود لا يفقد البيانات.
+CREATE TABLE IF NOT EXISTS chain_authority (
+    token_address       TEXT NOT NULL,
+    network_id          TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    watch_first_seen_at TEXT NOT NULL,
+    entry_signal_id     TEXT,
+    is_control          INTEGER NOT NULL DEFAULT 0,
+    token_program       TEXT,                   -- spl-token / spl-token-2022
+    mint_authority      TEXT,                   -- NULL = مشطوبة (لا طبع جديد)
+    freeze_authority    TEXT,                   -- NULL = لا تجميد ممكن
+    update_authority    TEXT,
+    is_mutable          INTEGER,                -- 1/0، وNULL = لم يُقس
+    creator_address     TEXT,
+    creator_count       INTEGER,
+    -- العرض من **حساب المِنت نفسه** لا من market_ticks: نفس اللحظة ونفس المصدر.
+    supply              REAL,
+    decimals            INTEGER,
+    -- حيازة المطوّر مقيسة على السلسلة (نداء ثانٍ مشروط بوجود عنوان).
+    -- `dev_owner` يقول **لِمن** قِسنا، فبلا هذا العمود الرقم غير قابل للتفسير.
+    dev_owner           TEXT,
+    dev_holding_pct     REAL,
+    raw_json            BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_chain_auth_token_ts
+    ON chain_authority (token_address, network_id, recorded_at);
+
+-- حالة الجدولة الساعيّة. جدول حالة منفصل عن `chain_fetch_state` عمداً: نافذتا
+-- الطزاجة مختلفتان، ودمجهما يجعل تحديث إحدى الطبقتين يُخفي تأخّر الأخرى.
+CREATE TABLE IF NOT EXISTS chain_auth_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                         -- ok / empty / error
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+
+-- ═══════════════ طبقة EVM: دفتر أرصدة نبنيه من التحويلات ═══════════════
+-- معيار ERC-20 لا يحمل قائمة حائزين، فلا نداء عقدة يعطيها. الطريق الوحيد إلى
+-- رقم **مضبوط** هو إعادة تشغيل كل حدث `Transfer` وحفظ الرصيد الناتج. وهذا مقيس
+-- أنّه رخيص لا مكلف: نداء `eth_getLogs` واحد بمرشّح يحمل **كل** عناوين الشبكة
+-- المراقَبة (روبن‑هود 57 عنواناً في 0.5ث، Base 22 في 0.4ث)، وتعبئة تاريخ عملة
+-- كاملة نداءٌ واحد إن كانت هادئة (مقيس: 1,814 تحويلاً عبر 1.71 مليون كتلة، 0.7ث).
+--
+-- والبديل المدفوع أسوأ في كل شيء: Blockscout 5.6ث للعملة وأعلى 50 فقط،
+-- وEtherscan V2 يرفض بلا مفتاح، وSourcify يعرف 1 من 10.
+--
+-- الرصيد **نصّ سِتّ‑عشريّ بعرض 64** لا عدد صحيح: uint256 يتجاوز 64 بتّاً
+-- (عملة بـ18 منزلة وعرض مليار = 10^27 ≫ حدّ SQLite)، والحشو بالأصفار يجعل
+-- الترتيب المعجميّ **مطابقاً** للترتيب العدديّ فيصحّ `ORDER BY balance_hex DESC`.
+CREATE TABLE IF NOT EXISTS evm_balances (
+    network_id     TEXT NOT NULL,
+    token_address  TEXT NOT NULL,               -- محفوظ بأحرف صغيرة دائماً
+    holder_address TEXT NOT NULL,               -- محفوظ بأحرف صغيرة دائماً
+    balance_hex    TEXT NOT NULL,               -- 64 خانة، محشوّة بالأصفار
+    -- أوّل كتلة استلم فيها هذا العنوان العملة. تُمكّن «حائزون جدد في 5 دقائق»،
+    -- وهو سؤال لا يجيبه أي مزوّد: كلّهم يعطون لقطة بلا تاريخ دخول.
+    first_seen_block INTEGER,
+    updated_block  INTEGER,
+    updated_at     TEXT,
+    PRIMARY KEY (network_id, token_address, holder_address)
+);
+-- ترتيب تنازليّ للرصيد: استعلام أعلى‑N هو الاستعلام الساخن في كل لقطة.
+CREATE INDEX IF NOT EXISTS idx_evm_bal_rank
+    ON evm_balances (network_id, token_address, balance_hex DESC);
+
+-- مؤشّر الكتل لكل شبكة: إلى أين وصل التطبيق. صفٌّ واحد للشبكة لا للعملة، لأنّ
+-- النداء نفسه واحد لكل الشبكة — ومؤشّر لكل عملة يعني إمّا نداءات بعدد العملات
+-- أو مؤشّرات تفترق فتُطبَّق تحويلات مرّتين.
+CREATE TABLE IF NOT EXISTS evm_block_cursor (
+    network_id     TEXT PRIMARY KEY,
+    last_block     INTEGER NOT NULL,            -- آخر كتلة **مطبَّقة** (شاملة)
+    last_run_at    TEXT,
+    last_status    TEXT,                        -- ok / error
+    logs_applied   INTEGER NOT NULL DEFAULT 0,  -- تراكميّ، للتشخيص
+    last_error     TEXT
+);
+
+-- حالة التعبئة الأوّليّة لكل عملة. لا يمكن الاعتماد على المؤشّر وحده: عملة تدخل
+-- المراقبة اليوم لها تاريخ **قبل** المؤشّر، ولو اكتفينا بالتحويلات الجديدة لكان
+-- كل رصيد ناقصاً بمقدار ما فات — وهذا خطأ صامت لا يُكتشف من الأرقام.
+CREATE TABLE IF NOT EXISTS evm_backfill_state (
+    network_id    TEXT NOT NULL,
+    token_address TEXT NOT NULL,
+    status        TEXT,                          -- partial / done / retry / error
+                                                  -- retry = عطبٌ عابر (مهلة، كتم)
+                                                  -- error = دائم: كتلة واحدة تفوق
+                                                  -- السقف فلا قسمة تنجيها
+    from_block    INTEGER,                       -- بداية المدى المعبَّأ
+    to_block      INTEGER,                       -- نهايته = مؤشّر بدء التطبيق
+    transfers     INTEGER,                       -- كم تحويلاً طُبِّق
+    calls         INTEGER,                       -- كم نداءً كلّف (تشخيص السقف)
+    last_try_at   TEXT,
+    last_error    TEXT,
+    PRIMARY KEY (network_id, token_address)
+);
+
+-- ═══ سلامة عقد EVM — Base وحدها، بقياس لا بتقصير ═══
+-- مقيس 2026-08-13 على المراقَبة الحيّة بفحص البايت‑كود (`eth_getCode`) ومطابقة
+-- مُعرّفات الدوالّ بقاموس keccak محسوب:
+--   Base 8453 : 19 من 22 عقداً كاملاً، أحجام 135B–14.8KB، `owner` في 7 من 19،
+--               `mint` في 2، `limits` في 1 ⇒ **تباين حقيقيّ ⇒ معلومة**
+--   BSC  56   : 21 من 27 وكيلاً صغيراً (EIP-1167، طابقت البادئة واللاحقة في
+--               21/21) تشير إلى **عقدَي تنفيذ** فقط، 20 منها إلى واحد،
+--               والملكيّة متروكة في كليهما ⇒ العمود ثابت لا معلومة فيه
+--   RH   4663 : 51 من 57 عقداً كاملاً لكنّ الأحجام تتكرّر في ستّة قوالب
+--               متطابقة (4830 ×10، 7154 ×6، 5274 ×6…) و`owner` في 5 من 51
+-- فالفحص يُشغَّل على `EVM_CONTRACT_NETWORKS` = Base وحدها، ويُوسَّع إن تباينت
+-- شبكة أخرى لاحقاً. صفٌّ لكل قياس لا صفٌّ واحد: تركُ الملكيّة **حدث** يقع وسط
+-- النافذة، وصفّ يُحدَّث فوق نفسه يمحو تاريخه (نفس علّة `chain_authority`).
+CREATE TABLE IF NOT EXISTS evm_contract (
+    token_address       TEXT NOT NULL,
+    network_id          TEXT NOT NULL,
+    recorded_at         TEXT NOT NULL,
+    watch_first_seen_at TEXT NOT NULL,
+    entry_signal_id     TEXT,
+    is_control          INTEGER NOT NULL DEFAULT 0,
+    code_size           INTEGER,                -- بايت. 0 = ليس عقداً
+    function_count      INTEGER,                -- مُعرّفات فريدة في جدول التوزيع
+    is_proxy            INTEGER,                -- وكيل EIP-1167 مطابق تماماً
+    impl_address        TEXT,                   -- عقد التنفيذ إن كان وكيلاً
+    -- عقود بنفس البايت‑كود لها نفس البصمة ⇒ «من أيّ مصنع خرجت» بعمود واحد،
+    -- وهو ما تبيّن أنّه المعلومة الحقيقيّة لا الدوالّ المفردة.
+    code_hash           TEXT,
+    owner_address        TEXT,                  -- من `owner()`/`getOwner()`
+    is_ownership_renounced INTEGER,             -- 1 = العنوان صفر
+    has_mint            INTEGER,
+    has_pause           INTEGER,
+    has_blacklist       INTEGER,
+    has_fee_setter      INTEGER,
+    has_limit_setter    INTEGER,
+    has_trading_switch  INTEGER,
+    raw_json            BLOB NOT NULL,
+    PRIMARY KEY (token_address, network_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_evm_contract_token_ts
+    ON evm_contract (token_address, network_id, recorded_at);
+
+CREATE TABLE IF NOT EXISTS evm_contract_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    last_fetch_at TEXT,
+    last_status   TEXT,                         -- ok / empty / error
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+
+-- مراسي الوقت↔الكتلة. لازمة لروبن‑هود وحدها: عقدتها تعيد `blockTimestamp: '0x0'`
+-- في كل سجلّ (مقيس 2026-08-13) فلا وقت في السجلّ، بينما Base وBSC تعيدان الطابع
+-- الحقيقيّ فلا مرساة لهما. والمرساة مشتركة بين كل عملات الشبكة ⇒ تُجلَب مرّة
+-- وتُقرأ ألف مرّة، وزمن كتلة روبن‑هود ثابت (0.1002ث/0.1003ث على 100 و300 ألف
+-- كتلة) فالاستقراء بين مرساتين متجاورتين خطؤه ثوانٍ.
+CREATE TABLE IF NOT EXISTS evm_block_time (
+    network_id   TEXT    NOT NULL,
+    block_number INTEGER NOT NULL,
+    block_ts     INTEGER NOT NULL,              -- ثوانٍ منذ 1970 (من العقدة)
+    fetched_at   TEXT,
+    PRIMARY KEY (network_id, block_number)
+);
+
+-- حالة الإعادة الرجعيّة لكل عملة. مهمّة تدوم ساعات ⇒ الحالة هي ما يجعل القطع
+-- مجّانيّاً: العملة المكتملة لا تُعاد، والمتعثّرة تُعرف بعطبها.
+CREATE TABLE IF NOT EXISTS evm_replay_state (
+    token_address TEXT NOT NULL,
+    network_id    TEXT NOT NULL,
+    status        TEXT,                          -- done / partial / error / empty
+    from_block    INTEGER,                       -- أوّل كتلة قُرئت فعلاً
+    to_block      INTEGER,                       -- آخر كتلة قُرئت
+    transfers     INTEGER,                       -- كم تحويلاً أُعيد تشغيله
+    snapshots     INTEGER,                       -- كم صفّ تركّز كُتب
+    calls         INTEGER,
+    -- هل قُرئ تاريخ العملة من أوّله؟ الفحص **ليس** «مجموع الأرصدة صفر»: مجموع
+    -- التحويلات صفرٌ دائماً بحكم البناء (كل تحويل ‎+v‎ لواحد و‎−v‎ لآخر) فلا يخبر
+    -- بشيء. الفحص الحقيقيّ: **أيّ رصيد سالب لعنوان عاديّ** يعني أنّ العنوان أرسل
+    -- ما لم نره يستلمه ⇒ بدأنا متأخّرين، والأرقام كاذبة لا ناقصة. والطبقة الحيّة
+    -- تُثبّت السالب عند صفر (لا خيار: العمود نصّ سِتّينيّ) — فهنا لا يُثبَّت بل
+    -- يُكشَف، ولا يُكتب صفٌّ واحد حتى يزول.
+    balance_check TEXT,                          -- ok / negative
+    last_try_at   TEXT,
+    last_error    TEXT,
+    -- حالة الرصيد عند `from_block - 1` ونقطة الشبكة التالية. مضغوطة مثل الخام؛
+    -- تجعل `partial` استئنافاً حقيقياً بدل إعادة المدى نفسه أو فقد التراكم.
+    checkpoint_json BLOB,
+    revision       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
 );
 
 -- حالة التشغيل: آخر تشغيل، عدّادات، حالة getBars، إصدار المخطّط.

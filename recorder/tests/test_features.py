@@ -824,6 +824,65 @@ def test_incremental_builder_rebuild_does_not_repeat_current_version(db):
     assert pending_outcomes(db, rebuild=False, limit=10) == []
 
 
+def test_dry_rebuild_never_deletes_existing_training_rows(db):
+    import build_training_rows
+
+    _signal(db, "s1", T0)
+    _outcome(db, key="s1")
+    built = build_training_rows.build(db, False, 10, False)
+    assert built["built"] == 1
+
+    build_training_rows.build(db, True, 10, True)
+
+    assert db._conn.execute("SELECT COUNT(*) FROM training_rows").fetchone()[0] == 1
+
+
+def test_incremental_builder_blocks_evm_rows_until_rebuild_is_ready(db, monkeypatch):
+    from build_training_rows import pending_outcomes
+
+    _signal(db, "s1", T0)
+    _outcome(db, key="s1")
+    monkeypatch.setattr(features.config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(features.config, "EVM_REPLAY_NETWORKS", (NET,))
+    db.set_meta("evm_ledger_rebuild_required", "1")
+    db.set_meta("evm_training_rebuild_started", "0")
+
+    assert pending_outcomes(db, rebuild=False, limit=10) == []
+
+    db.set_meta("evm_training_rebuild_started", "1")
+    assert [row["key"] for row in pending_outcomes(db, False, 10)] == ["s1"]
+
+
+def test_incremental_builder_rejects_rows_computed_before_finalization(
+    db, monkeypatch,
+):
+    import build_training_rows
+    from db import StaleEVMState
+
+    _signal(db, "s1", T0)
+    _outcome(db, key="s1")
+    db.set_meta("evm_ledger_rebuild_required", "1")
+    db.set_meta("evm_training_rebuild_started", "1")
+    db_path = db._conn.execute("PRAGMA database_list").fetchone()["file"]
+    other = RecorderDB(db_path, SCHEMA)
+    original = features.build_training_row
+
+    def _finalize_during_compute(current_db, outcome):
+        row = original(current_db, outcome)
+        other.set_meta("evm_training_rebuild_started", "0")
+        other.set_meta("evm_ledger_rebuild_required", "0")
+        return row
+
+    monkeypatch.setattr(features, "build_training_row", _finalize_during_compute)
+    try:
+        with pytest.raises(StaleEVMState, match="إعادة بناء التدريب"):
+            build_training_rows.build(db, False, 10, False)
+    finally:
+        other.close()
+
+    assert db._conn.execute("SELECT COUNT(*) FROM training_rows").fetchone()[0] == 0
+
+
 def test_incremental_builder_can_limit_work_to_live_independent_signals(db):
     from build_training_rows import pending_outcomes
 
@@ -994,6 +1053,8 @@ def test_no_holders_measurement_leaves_family_null(db):
     f = features.holders_features(db, TOK, NET, T0)
     assert set(f) == {
         "chain_top10_pct", "chain_holder_count", "holders_age_min",
+        "chain_holders_delta_1h", "chain_holders_growth_1h",
+        "chain_holders_span_min",
         "platform_holders", "platform_penetration", "platform_underwater_ratio",
         "platform_value_usd", "platform_median_hold_h", "platform_dev_holding",
     }
@@ -1004,6 +1065,367 @@ def test_holders_of_other_token_do_not_leak(db):
     _holders(db, T0 - 300, "token_details", tok="0xother",
              top10_pct=99.0, holder_count=3)
     assert features.holders_features(db, TOK, NET, T0)["chain_top10_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# الملكية من **السلسلة** (onchain_*) — قياس لا يمرّ بـFOMO إطلاقاً
+#
+# كانت سولانا وحدها بنيوياً (ERC-20 بلا قائمة حائزين على السلسلة)، ومنذ إصدار
+# الميزات 12 يكتب دفتر `evm_layer` في **نفس** الجدول ⇒ الشبكتان معاً. فأكثر
+# الاختبارات هنا على شبكة سولانا، وقسمٌ في آخر القسم على EVM لأنّ عمودَي
+# `holder_count` لا يعطيهما إلّا الدفتر.
+# ---------------------------------------------------------------------------
+SOLTOK, SOLNET = "SoLmint1111111111111111111111111111111111", "1399811149"
+
+
+def _conc(db, epoch, tok=SOLTOK, net=SOLNET, **kw):
+    row = {
+        "token_address": tok, "network_id": net, "recorded_at": _iso(epoch),
+        "watch_first_seen_at": _iso(T0 - 7200), "entry_signal_id": "sig-1",
+        "is_control": 0, "supply": 1_000_000_000.0, "decimals": 6,
+        "top1_pct": None, "top5_pct": None, "top10_pct": None, "top20_pct": None,
+        "top_accounts": 20, "raw_json": "{}",
+    }
+    row.update(kw)
+    db.insert_chain_concentration(row)
+    return row
+
+
+def test_onchain_features_read_latest_snapshot(db):
+    _conc(db, T0 - 3600, top1_pct=5.0, top10_pct=20.0)          # أقدم
+    _conc(db, T0 - 120, top1_pct=32.21, top5_pct=46.31,
+          top10_pct=53.16, top20_pct=60.99, top_accounts=20)
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_pct"] == pytest.approx(32.21)
+    assert f["onchain_top5_pct"] == pytest.approx(46.31)
+    assert f["onchain_top10_pct"] == pytest.approx(53.16)
+    assert f["onchain_top20_pct"] == pytest.approx(60.99)
+    assert f["onchain_top_accounts"] == 20
+    assert f["onchain_age_min"] == pytest.approx(2.0)
+
+
+def test_onchain_snapshot_after_t0_never_leaks(db):
+    """حرس التسرّب: قياس بعد لحظة القرار لا يغيّر الصفّ."""
+    _conc(db, T0 - 300, top1_pct=10.0, top10_pct=30.0)
+    before = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    _conc(db, T0 + 60, top1_pct=90.0, top10_pct=99.0)           # المستقبل
+    assert features.onchain_features(db, SOLTOK, SOLNET, T0) == before
+
+
+def test_onchain_delta_over_five_minutes(db):
+    """أوّل نافذة خمس‑دقائق على حركة الحيتان: حوت يكبر 3 نقاط في 5.5 دقيقة."""
+    _conc(db, T0 - 390, top1_pct=29.0, top10_pct=50.0)
+    _conc(db, T0 - 60, top1_pct=32.0, top10_pct=53.5)
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_delta_5m"] == pytest.approx(3.0)
+    assert f["onchain_top10_delta_5m"] == pytest.approx(3.5)
+    assert f["onchain_delta_span_min"] == pytest.approx(5.5)
+
+
+def test_onchain_delta_skips_snapshot_closer_than_four_minutes(db):
+    """لقطة قبل 240ث ليست «قبل خمس دقائق» — الاستعلام يتخطّاها إلى ما قبلها."""
+    _conc(db, T0 - 420, top1_pct=20.0)      # قبل 6 دقائق من الحاضر — المرجع
+    _conc(db, T0 - 120, top1_pct=25.0)      # قبل دقيقتين — قريبة جدّاً
+    _conc(db, T0 - 10, top1_pct=26.0)       # الحاضر
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_delta_5m"] == pytest.approx(6.0)      # 26 − 20
+    assert f["onchain_delta_span_min"] == pytest.approx(410 / 60)
+
+
+def test_onchain_delta_none_when_previous_snapshot_too_old(db):
+    """فجوة 20 دقيقة نافذة أخرى: النِّسب الحاضرة تبقى، والفرق None لا رقم مضلّل."""
+    _conc(db, T0 - 1260, top1_pct=10.0)
+    _conc(db, T0 - 60, top1_pct=40.0)
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_pct"] == pytest.approx(40.0)
+    assert f["onchain_top1_delta_5m"] is None
+    assert f["onchain_delta_span_min"] is None
+
+
+def test_onchain_unchanged_concentration_is_measured_zero(db):
+    """تركّز ثابت = صفر مقيس لا «لم نقس» (FR-007)."""
+    _conc(db, T0 - 390, top1_pct=15.0, top10_pct=40.0)
+    _conc(db, T0 - 60, top1_pct=15.0, top10_pct=40.0)
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_delta_5m"] == 0.0
+    assert f["onchain_top10_delta_5m"] == 0.0
+
+
+def test_onchain_burned_supply_keeps_row_with_null_ratios(db):
+    """معروض صفريّ: الصفّ موجود بلا نِسب — ولا يُقرأ الغياب صفراً."""
+    _conc(db, T0 - 60, supply=0.0, top_accounts=1)
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_pct"] is None
+    assert f["onchain_top_accounts"] == 1
+    assert f["onchain_age_min"] == pytest.approx(1.0)
+
+
+def test_no_onchain_measurement_leaves_family_null(db):
+    """صفوف EVM وكل ما قبل إطلاق الطبقة: NULL «لا يمكن قياسه» لا صفر."""
+    f = features.onchain_features(db, TOK, NET, T0)
+    assert set(f) == {
+        "onchain_top1_pct", "onchain_top5_pct", "onchain_top10_pct",
+        "onchain_top20_pct", "onchain_top_accounts", "onchain_age_min",
+        "onchain_top1_delta_5m", "onchain_top10_delta_5m",
+        "onchain_delta_span_min",
+        # عمودا الدفتر (إصدار 12): يعطيهما دفتر EVM وحده — سولانا تبقى NULL
+        # فيهما لأنّ مصدرها يعيد 20 حساباً بحدّ أقصى فلا عدد حائزين مضبوط.
+        "onchain_holder_count", "onchain_holders_delta_5m",
+    }
+    assert all(v is None for v in f.values())
+
+
+def test_onchain_of_other_token_does_not_leak(db):
+    _conc(db, T0 - 60, tok="SoLother", top1_pct=99.0)
+    assert features.onchain_features(db, SOLTOK, SOLNET, T0)["onchain_top1_pct"] is None
+
+
+def test_onchain_family_is_in_feature_columns(db):
+    """العمود الغائب من FEATURE_COLUMNS يُحسب ثم يُرمى بصمت — الحرس هنا."""
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert set(f) <= set(features.FEATURE_COLUMNS)
+
+
+# --- عمودا الدفتر: EVM وحدها (سولانا بسقف 20 حساباً فلا إجمال) ---------------
+def test_onchain_holder_count_comes_from_the_evm_ledger(db):
+    """`holder_count` مضبوط لأنّ الدفتر يعرف كل عنوان لا أعلى عشرين."""
+    _conc(db, T0 - 60, tok=TOK, net=NET, top1_pct=12.5, top_accounts=20,
+          holder_count=1_843)
+    f = features.onchain_features(db, TOK, NET, T0)
+    assert f["onchain_holder_count"] == 1_843
+    assert f["onchain_top_accounts"] == 20          # الرتبة ≠ الإجمال
+
+
+def test_onchain_holders_delta_over_five_minutes(db):
+    """أوّل نافذة خمس‑دقائق على **عدد** الحائزين في المشروع (FOMO إيقاعها 25د)."""
+    _conc(db, T0 - 390, tok=TOK, net=NET, holder_count=1_800)
+    _conc(db, T0 - 60, tok=TOK, net=NET, holder_count=1_843)
+    f = features.onchain_features(db, TOK, NET, T0)
+    assert f["onchain_holders_delta_5m"] == 43
+    assert f["onchain_delta_span_min"] == pytest.approx(5.5)
+
+
+def test_onchain_holders_delta_can_be_negative(db):
+    """خروج حائزين معلومة كدخولهم: الإشارة تُحفظ ولا تُثبَّت عند صفر."""
+    _conc(db, T0 - 390, tok=TOK, net=NET, holder_count=900)
+    _conc(db, T0 - 60, tok=TOK, net=NET, holder_count=870)
+    assert features.onchain_features(db, TOK, NET, T0)["onchain_holders_delta_5m"] == -30
+
+
+def test_onchain_holders_delta_null_when_solana_has_no_count(db):
+    """سولانا: النِّسب تُقاس والعدد لا ⇒ العمود NULL لا صفر (FR-007)."""
+    _conc(db, T0 - 390, top1_pct=20.0)
+    _conc(db, T0 - 60, top1_pct=25.0)
+    f = features.onchain_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_top1_delta_5m"] == pytest.approx(5.0)
+    assert f["onchain_holder_count"] is None
+    assert f["onchain_holders_delta_5m"] is None
+
+
+# ---------------------------------------------------------------------------
+# شكل عقد EVM وصلاحياته (onchain_contract_*) — من البايت‑كود، Base وحدها
+#
+# إيقاع ساعيّ فالعمر يُقاس بالدقائق العشرات لا بالوحدات. والفرق الحرج نفس فرق
+# `evm_contract`: راية غائبة من عقد مقروء = **صفر مقيس**، وعقد لم يُفحَص = None.
+# ---------------------------------------------------------------------------
+BASETOK, BASENET = "0xbase01", "8453"
+
+
+def _contract(db, epoch, tok=BASETOK, net=BASENET, **kw):
+    row = {
+        "token_address": tok, "network_id": net, "recorded_at": _iso(epoch),
+        "watch_first_seen_at": _iso(T0 - 7200), "entry_signal_id": "sig-1",
+        "is_control": 0, "code_size": 4_096, "code_hash": "0x" + "ab" * 32,
+        "function_count": 37, "is_proxy": 0, "impl_address": None,
+        "owner_address": None, "is_ownership_renounced": None,
+        "has_mint": 0, "has_pause": 0, "has_blacklist": 0, "has_fee_setter": 0,
+        "has_limit_setter": 0, "has_trading_switch": 0, "raw_json": "{}",
+    }
+    row.update(kw)
+    db.insert_evm_contract(row)
+    return row
+
+
+def test_contract_features_read_latest_scan(db):
+    _contract(db, T0 - 7_000, code_size=1, function_count=1)      # أقدم
+    _contract(db, T0 - 3_300, code_size=14_812, function_count=61,
+              has_mint=1, has_limit_setter=1, is_ownership_renounced=0)
+    f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
+    assert f["onchain_code_size"] == 14_812
+    assert f["onchain_function_count"] == 61
+    assert f["onchain_has_mint_fn"] == 1
+    assert f["onchain_has_limit_setter"] == 1
+    assert f["onchain_has_pause_fn"] == 0            # مقروء وغائب = صفر مقيس
+    assert f["onchain_owner_renounced"] == 0
+    assert f["onchain_contract_age_min"] == pytest.approx(55.0)
+
+
+def test_contract_scan_after_t0_never_leaks(db):
+    """حرس التسرّب: شطبُ الملكيّة بعد لحظة القرار لا يدخل الصفّ."""
+    _contract(db, T0 - 600, is_ownership_renounced=0)
+    before = features.onchain_contract_features(db, BASETOK, BASENET, T0)
+    _contract(db, T0 + 60, is_ownership_renounced=1)
+    assert features.onchain_contract_features(db, BASETOK, BASENET, T0) == before
+
+
+def test_contract_owner_renounced_null_is_not_renounced(db):
+    """«لا دالّة مالك» ≠ «الملكيّة متروكة» — والعمود يحفظ الفرق."""
+    _contract(db, T0 - 600, owner_address=None, is_ownership_renounced=None)
+    f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
+    assert f["onchain_owner_renounced"] is None
+    assert f["onchain_code_size"] == 4_096          # وقد قُرِئ العقد فعلاً
+
+
+def test_contract_non_contract_address_is_a_measured_zero(db):
+    """`0x` ⇒ ليس عقداً: صفر حجم قياسٌ، وعدد الدوالّ يبقى NULL لا صفراً."""
+    _contract(db, T0 - 600, code_size=0, code_hash=None, function_count=None,
+              has_mint=None, has_pause=None, has_blacklist=None,
+              has_fee_setter=None, has_limit_setter=None, has_trading_switch=None)
+    f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
+    assert f["onchain_code_size"] == 0
+    assert f["onchain_function_count"] is None
+    assert f["onchain_has_mint_fn"] is None
+
+
+def test_contract_proxy_flag_survives(db):
+    """على وكيل، كل راية خطر أدناه لا تعني شيئاً — فالعلم نفسه يجب أن يصل."""
+    _contract(db, T0 - 600, code_size=45, is_proxy=1,
+              impl_address="0x" + "12" * 20, function_count=0)
+    f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
+    assert f["onchain_is_proxy"] == 1
+    assert f["onchain_function_count"] == 0
+
+
+def test_no_contract_scan_leaves_family_null(db):
+    """BSC وروبن‑هود (وكل ما قبل الطبقة): NULL «لم يُفحَص» لا صفر."""
+    f = features.onchain_contract_features(db, TOK, NET, T0)
+    assert set(f) == {
+        "onchain_code_size", "onchain_function_count", "onchain_is_proxy",
+        "onchain_owner_renounced", "onchain_has_mint_fn", "onchain_has_pause_fn",
+        "onchain_has_blacklist_fn", "onchain_has_fee_setter",
+        "onchain_has_limit_setter", "onchain_has_trading_switch",
+        "onchain_contract_age_min",
+    }
+    assert all(v is None for v in f.values())
+
+
+def test_contract_of_other_token_does_not_leak(db):
+    _contract(db, T0 - 600, tok="0xother", has_mint=1)
+    assert features.onchain_contract_features(
+        db, BASETOK, BASENET, T0
+    )["onchain_has_mint_fn"] is None
+
+
+def test_contract_family_is_in_feature_columns(db):
+    """العمود الغائب من FEATURE_COLUMNS يُحسب ثم يُرمى بصمت — الحرس هنا."""
+    _contract(db, T0 - 600)
+    f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
+    assert set(f) <= set(features.FEATURE_COLUMNS)
+
+
+# ---------------------------------------------------------------------------
+# الصلاحيات من السلسلة (onchain_has_* / is_mutable / dev) — الطبقة البطيئة
+#
+# طابور مستقلّ وإيقاع ساعيّ، فالعمر هنا يُقاس بالساعات لا بالدقائق. والفرق
+# الحرج: راية `has_*` تصير **صفراً مقيساً** حين وُجد صفّ وسلطته NULL (السلطة
+# مشطوبة فعلاً)، وتبقى None حين لا صفّ إطلاقاً (لم نقس).
+# ---------------------------------------------------------------------------
+def _auth(db, epoch, tok=SOLTOK, net=SOLNET, **kw):
+    row = {
+        "token_address": tok, "network_id": net, "recorded_at": _iso(epoch),
+        "watch_first_seen_at": _iso(T0 - 7200), "entry_signal_id": "sig-1",
+        "is_control": 0, "token_program": "spl-token-2022",
+        "mint_authority": None, "freeze_authority": None, "update_authority": None,
+        "is_mutable": None, "creator_address": None, "creator_count": None,
+        "supply": 999673699.453014, "decimals": 6,
+        "dev_owner": None, "dev_holding_pct": None, "raw_json": "{}",
+    }
+    row.update(kw)
+    db.insert_chain_authority(row)
+    return row
+
+
+def test_onchain_authority_reads_latest_row(db):
+    _auth(db, T0 - 7200, mint_authority="Old", is_mutable=1)     # أقدم
+    _auth(db, T0 - 1800, mint_authority="DevWa11et", freeze_authority="FrzAuth",
+          is_mutable=1, dev_holding_pct=4.25)
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_has_mint_authority"] == 1
+    assert f["onchain_has_freeze_authority"] == 1
+    assert f["onchain_is_mutable"] == 1
+    assert f["onchain_is_token2022"] == 1
+    assert f["onchain_dev_holding_pct"] == pytest.approx(4.25)
+    assert f["onchain_auth_age_min"] == pytest.approx(30.0)
+
+
+def test_onchain_authority_row_after_t0_never_leaks(db):
+    _auth(db, T0 - 1800, mint_authority="Now")
+    before = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    _auth(db, T0 + 60, mint_authority="Future", is_mutable=1, dev_holding_pct=99.0)
+    assert features.onchain_authority_features(db, SOLTOK, SOLNET, T0) == before
+
+
+def test_onchain_revoked_authority_is_measured_zero(db):
+    """الحالة الغالبة (45 من 48): السلطة مشطوبة ⇒ صفر مقيس لا None (FR-007)."""
+    _auth(db, T0 - 600, is_mutable=0)
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_has_mint_authority"] == 0
+    assert f["onchain_has_freeze_authority"] == 0
+    assert f["onchain_is_mutable"] == 0
+
+
+def test_onchain_mutable_stays_null_when_das_failed(db):
+    """عمود واحد غائب لا يُعدم بقيّة الصفّ، ولا يُقرأ «غير قابلة للتعديل»."""
+    _auth(db, T0 - 600, is_mutable=None)
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_is_mutable"] is None
+    assert f["onchain_has_mint_authority"] == 0       # وهذا مقيس فعلاً
+    assert f["onchain_dev_holding_pct"] is None
+
+
+def test_onchain_legacy_token_program_flag_is_zero(db):
+    _auth(db, T0 - 600, token_program="spl-token")
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_is_token2022"] == 0
+
+
+def test_onchain_dev_holding_zero_survives(db):
+    """المطوّر باع كلّ شيء = معلومة، لا غياب."""
+    _auth(db, T0 - 600, dev_owner="Dev1", dev_holding_pct=0.0)
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_dev_holding_pct"] == 0.0
+
+
+def test_no_authority_measurement_leaves_family_null(db):
+    f = features.onchain_authority_features(db, TOK, NET, T0)
+    assert set(f) == {
+        "onchain_has_mint_authority", "onchain_has_freeze_authority",
+        "onchain_is_mutable", "onchain_is_token2022",
+        "onchain_dev_holding_pct", "onchain_auth_age_min",
+    }
+    assert all(v is None for v in f.values())
+
+
+def test_authority_of_other_token_does_not_leak(db):
+    _auth(db, T0 - 600, tok="SoLother", mint_authority="X", dev_holding_pct=50.0)
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert f["onchain_has_mint_authority"] is None
+    assert f["onchain_dev_holding_pct"] is None
+
+
+def test_authority_family_is_in_feature_columns(db):
+    f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
+    assert set(f) <= set(features.FEATURE_COLUMNS)
+
+
+def test_authority_family_reaches_build_features(db):
+    """الدالّة قد تُحسب ولا تُوصَل إلى build_features — الحرس هنا."""
+    _auth(db, T0 - 600, mint_authority="DevWa11et", is_mutable=1)
+    event = {"signal_type": "large_buy", "occurred_at": _iso(T0),
+             "token_address": SOLTOK, "network_id": SOLNET}
+    f = features.build_features(db, event, SOLTOK, SOLNET, T0)
+    assert f["onchain_has_mint_authority"] == 1
+    assert f["onchain_auth_age_min"] == pytest.approx(10.0)
 
 
 # ---------------------------------------------------------------------------

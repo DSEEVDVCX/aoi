@@ -64,4 +64,13 @@ DISK_FREE_WARN_GB = 25.0
 RECORDER_SOURCES = (
     "feed", "trending", "verified", "most_held", "leaderboard", "control",
     "bars", "social", "holders", "filter", "traders", "macro", "cleanup",
+    # "chain" ليس من دورة المسجّل بل عمليّة مستقلّة (FomoChain/run_chain.py)،
+    # لكنّه يكتب last_error_chain في نفس جدول meta ⇒ يُعرض كبقيّة المصادر.
+    # و"chain_auth" طابور ثانٍ داخل نفس العمليّة بإيقاع ساعيّ: خطؤه منفصل لأنّ
+    # نجاح طبقة التركّز لا يعني أنّ طبقة الصلاحيات نجحت.
+    "chain", "chain_auth",
+    # و"evm" و"evm_contract" طابوران آخران في نفس العمليّة، وهما بلا مفتاح
+    # فسبب فشلهما مختلف تماماً (عقدة عامّة تتعثّر لا مفتاح ينتهي) ⇒ عمودان
+    # منفصلان: نجاح سولانا لا يقول شيئاً عن دفتر أرصدة EVM.
+    "evm", "evm_contract",
 )

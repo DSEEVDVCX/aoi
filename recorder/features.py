@@ -64,7 +64,55 @@ _THESIS_PAGE_CAP = 380
 #    tokenDetails المجلوب لدورة الحائزين: صفر نداء إضافيّ، حضور 100% في 300
 #    ردّ مؤرشف. العائلة الجديدة ستُسقَط من التدريب كعلامة حقبة حتى تمتدّ
 #    تغطيتها إلى نصفَي الإطار — كما حدث لعائلة الحائزين، وهو سلوك صحيح.
-FEATURE_VERSION = 8
+# 9: `chain_holders_delta_1h` / `_growth_1h` / `_span_min` — تغيّر حائزي
+#    **السلسلة كلّها** (`tokenDetails.holders`، لا حائزي fomo: مقيس أنّ مستخدمي
+#    المنصّة 0.0–2.5% من حائزي السلسلة، ومتوسّط 1,970 مقابل 75,121). المصدر لا
+#    يعطي فرقاً، فيُقاس من لقطتين لنا على قالب `social_total_delta_1h`. مقيس على
+#    19,440 زوجاً: العدد يتغيّر في 84.9% منها ⇒ إشارة لا صفر. و`_span_min` عمود
+#    صريح لأنّ الاستعلام يضمن ≥60د لا =60د (الإيقاع 25د ⇒ الوسيط 75.1د).
+# 10: عائلة `onchain_*` — أوّل قياس في المشروع **لا يأتي من FOMO أصلاً** بل من
+#    عقدة سولانا مباشرة. تفتح ما كان مغلقاً بحدّين: FOMO يعطي `top10` وحده
+#    فـ`top1` (الحوت المفرد، خطرٌ مختلف عن عشرة موزّعين) كان مجهولاً تماماً؛
+#    وإيقاعه ~25د (مقيس: وسيط الفجوة 25.0 على 19,440 زوجاً، و**صفر% ≤5د**) فلا
+#    نافذة خمس‑دقائق. نداء العقدة الواحد يعطي الأربعة معاً — مقيس حيّاً
+#    2026-08-13 على 20 عملة مراقَبة: 19 نجحت في 16.3ث، top1 من 2.11% إلى
+#    32.21% وtop20 من 25.49% إلى 60.99% ⇒ تباين حقيقيّ لا عمود ثابت.
+#    والانفصال في عملية خاصّة هو ما جعل الإيقاع ممكناً: 73 عملة سولانا ÷ 20
+#    لكل دورة = مسح كامل كل 3.6د، مقابل 13 نداءً تتحمّلها دورة المسجّل كلّها.
+#    `onchain_top10_pct` يقابل `chain_top10_pct` عمداً (مصدران مستقلّان لنفس
+#    الشيء = تحقّق متقاطع) ولا يُدمجان. `_delta_span_min` عمود صريح لنفس سبب
+#    `chain_holders_span_min`. **سولانا وحدها بنيوياً**: معيار ERC-20 لا يحمل
+#    قائمة حائزين على السلسلة، فصفوف EVM (55% من الإشارات) تبقى NULL بحقّ —
+#    «لا يمكن قياسه» لا «صفر». والعائلة ستُسقَط من التدريب كعلامة حقبة حتى
+#    تمتدّ تغطيتها إلى نصفَي الإطار، كما حدث لعائلتَي الحائزين والتدفّق.
+# 11: `onchain_*authority*` — الطبقة البطيئة من نفس العقدة: من يستطيع **طبع
+#    معروضٍ جديد** (`mint_authority`) أو **تجميد بيعك** (`freeze_authority`)،
+#    و`mutable` و`token2022` وحيازة المطوّر من السلسلة. خطرٌ بنيويّ لا حركة
+#    سوق، ولم يكن عندنا منه شيء إطلاقاً — FOMO لا يعرض صلاحيات العقد.
+#    مقيس على 48 عملة من مراقَبتنا الحيّة (2026-08-13) قبل كتابة أي عمود:
+#    السكّ قائم في 3 والتجميد في 1 و`mutable` 31 نعم/17 لا وtoken-2022 27/48 —
+#    فكل عمود متباين. وأُسقطت `burnt` و`ownership.frozen` و`interface` لأنّها
+#    قُيست **ثابتة** على العينة كلّها (0/48، 0/48، 48/48) فلا معلومة فيها.
+#    `dev_holding_pct` تغطيته ~15% وحده (Token-2022 يعيد `creators: []`) وهذا
+#    غياب مقيس لا صفر. رفعُ الإصدار الآن أرخص ما يكون: مسح v10 لم يبلغ 3,000
+#    من 69,734 صفّاً بعد، فالإعادة تكاد لا تكلّف شيئاً.
+# 12: **EVM يدخل عائلة `onchain_*`** — كانت سولانا وحدها بنيوياً (تعليق 10)،
+#    فصفوف 55% من الإشارات NULL بحقّ. الحلّ لم يكن مزوّداً بل دفتر أرصدة نبنيه
+#    من سجلّات `Transfer` (`evm_layer.py`) يكتب في **نفس** `chain_concentration`
+#    ⇒ الأعمدة العشرة القائمة تغطّي EVM بلا عمود جديد. والجديد عمودان يعطيهما
+#    الدفتر ولا يعطيهما أي مزوّد: `onchain_holder_count` **مضبوطاً** بلا سقف
+#    رتبة (يبقى NULL على سولانا: `getTokenLargestAccounts` يعيد 20 حساباً بحدّ
+#    أقصى ولا يعرف الإجمال)، و`onchain_holders_delta_5m` — أوّل نافذة
+#    خمس‑دقائق على عدد الحائزين في المشروع (طبقة FOMO إيقاعها 25د).
+#    وعائلة `onchain_contract_*`: شكل العقد وصلاحياته من البايت‑كود مباشرة
+#    (`eth_getCode` حرٌّ ⇒ تغطية 100% مقابل 10% لـSourcify). **على Base وحدها**،
+#    وهذا قياس لا تقصير (2026-08-13): على BSC 21 من 27 وكيلاً صغيراً يشير إلى
+#    عقدَي تنفيذ فقط والملكيّة متروكة في كليهما بلا مُعرّف إيقاف أو عمولة ⇒
+#    عمود ثابت لا معلومة فيه؛ وعلى روبن‑هود ستّة قوالب متطابقة الأحجام؛ أمّا
+#    Base فـ19 من 22 عقداً كاملاً بأحجام 135B–14.8KB و`owner` في 7 و`mint` في 2
+#    ⇒ التباين حقيقيّ فالعمود يفرّق. والعائلتان ستُسقَطان من التدريب كعلامة
+#    حقبة حتى تمتدّ تغطيتهما إلى نصفَي الإطار — سلوك صحيح لا خلل.
+FEATURE_VERSION = 12
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +701,8 @@ def holders_features(
     """
     out: dict[str, Any] = {
         "chain_top10_pct": None, "chain_holder_count": None,
+        "chain_holders_delta_1h": None, "chain_holders_growth_1h": None,
+        "chain_holders_span_min": None,
         "holders_age_min": None, "platform_holders": None,
         "platform_penetration": None, "platform_underwater_ratio": None,
         "platform_value_usd": None, "platform_median_hold_h": None,
@@ -671,6 +721,28 @@ def holders_features(
     if det is not None:
         out["chain_top10_pct"] = det["top10_pct"]
         out["chain_holder_count"] = det["holder_count"]
+        # تغيّر حائزي **السلسلة كلّها** عبر ساعة: هل يدخل الناس أو يخرجون. لا
+        # يعطيه المصدر، فيُقاس من لقطتين لنا. مقيس على 19,440 زوجاً متتالياً:
+        # العدد يتغيّر فعلاً في 84.9% منها (وسيط الفرق 5 حائزين، متوسّطه 23،
+        # أقصاه 5,921) ⇒ إشارة لا صفر.
+        # طبقة 5 دقائق **مستحيلة** لا مؤجَّلة: وسيط الفجوة بين لقطتين 25.0د
+        # (p25=25.0, p75=25.1 — إيقاع ثابت لا متذبذب) و**صفر% من الفجوات ≤5د**؛
+        # وتقصيرها إلى 5 يلزمه 190/5 = 38 نداءً/دقيقة مقابل 13 نتحمّلها.
+        prev = db._conn.execute(q, (token, network, "token_details",
+                                    det["e"] - 3600)).fetchone()
+        if prev is not None:
+            span = (det["e"] - prev["e"]) / 60
+            # المدى الفعليّ عمود صريح: الاستعلام يضمن ≥60د لا =60د، ومقيس أنّ
+            # الوسيط 75.1د (p25=74.4, p75=77.0) لأنّ الإيقاع 25د فتُقفَز ثلاث
+            # خطوات. بلا العمود يُقرأ فرقُ 75 دقيقة كأنّه فرق ساعة (نفس منطق
+            # `tick_rich_age_min`). وفوق 100د اللقطة الأقدم من حقبة أخرى —
+            # الذيل يمتدّ إلى 4,834د — ⇒ None لا رقم مضلّل. الحدّ يُبقي 89.1%.
+            if span <= 100:
+                out["chain_holders_span_min"] = span
+                new, old = det["holder_count"], prev["holder_count"]
+                if isinstance(new, int) and isinstance(old, int):
+                    out["chain_holders_delta_1h"] = new - old
+                out["chain_holders_growth_1h"] = _ret(new, old)
     if plat is not None:
         out["platform_holders"] = plat["platform_holders"]
         out["platform_value_usd"] = plat["platform_value_usd"]
@@ -687,6 +759,195 @@ def holders_features(
     # طزاجة القياس: أحدث ختم من المصدرين (كلٌّ يُجدَّد بدورته)
     stamps = [r["e"] for r in (det, plat) if r is not None]
     out["holders_age_min"] = (t0 - max(stamps)) / 60 if stamps else None
+    return out
+
+
+def onchain_features(
+    db: RecorderDB, token: str, network: str, t0: int
+) -> dict[str, Any]:
+    """تركّز الملكية مقيساً **من البلوك تشين** عند/قبل t0 — لا من FOMO.
+
+    عائلة `chain_*` أعلاه مصدرها FOMO، وهي محدودة بحدّين لا يُرفعان من هناك:
+    تعطي **top10 وحده** (فلا جواب عن «حوت مفرد أم عشرة موزّعون؟» وهما خطران
+    مختلفان تماماً)، وإيقاعها ~25 دقيقة (وسيط الفجوة المقيس 25.0 على 19,440
+    زوجاً، و**صفر% من الفجوات ≤5د**) فهي عمياء عن تصريف يجري في دقائق.
+
+    نداء عقدة سولانا الواحد يعطي top1/5/10/20 معاً (مقيس 230ms)، وبإيقاع مسح
+    ~3.6 دقيقة. فهذه العائلة ليست تكراراً للتي قبلها بل ما لم تستطعه:
+    `onchain_top1_pct` قياس لا اشتقاق، و`onchain_top1_delta_5m` أوّل نافذة
+    خمس‑دقائق على حركة الحيتان في المشروع كلّه.
+
+    و`onchain_top10_pct` يقابل `chain_top10_pct` عمداً: مقياسان لنفس الشيء من
+    مصدرين مستقلّين ⇒ تحقّق متقاطع مجانيّ، ولا يُدمجان في عمود واحد.
+
+    **الشبكتان معاً منذ 2026-08-13** (كانت سولانا وحدها): طبقة `evm_layer` تبني
+    دفتر أرصدة من سجلّات `Transfer` وتكتب في **نفس الجدول**، فهذه العائلة تغطّي
+    EVM (55% من الإشارات) بلا كود ميزات جديد. والفارق الوحيد `holder_count`:
+    مضبوط على EVM (الدفتر يعرف كل عنوان) ويبقى NULL على سولانا إذ
+    `getTokenLargestAccounts` يعيد 20 حساباً بحدّ أقصى ولا يعرف الإجمال.
+
+    وعدد الحائزين يُقرأ من **لقطات** الجدول لا من الدفتر مباشرة: الدفتر يحمل
+    الحالة الآنيّة بلا تاريخ، فقراءته وقت البناء تُدخل معلومةً من المستقبل وتنقض
+    قانون النقطة الزمنيّة (مقدّمة الملفّ).
+    """
+    out: dict[str, Any] = {
+        "onchain_top1_pct": None, "onchain_top5_pct": None,
+        "onchain_top10_pct": None, "onchain_top20_pct": None,
+        "onchain_top_accounts": None, "onchain_age_min": None,
+        "onchain_top1_delta_5m": None, "onchain_top10_delta_5m": None,
+        "onchain_delta_span_min": None,
+        "onchain_holder_count": None, "onchain_holders_delta_5m": None,
+    }
+    q = """SELECT top1_pct, top5_pct, top10_pct, top20_pct, top_accounts,
+                  holder_count,
+                  CAST(strftime('%s', recorded_at) AS INTEGER) e
+             FROM chain_concentration
+            WHERE token_address=? AND network_id=?
+              AND CAST(strftime('%s', recorded_at) AS INTEGER) <= ?
+            ORDER BY e DESC LIMIT 1"""
+    cur = db._conn.execute(q, (token, network, t0)).fetchone()
+    if cur is None:
+        return out
+
+    out["onchain_top1_pct"] = cur["top1_pct"]
+    out["onchain_top5_pct"] = cur["top5_pct"]
+    out["onchain_top10_pct"] = cur["top10_pct"]
+    out["onchain_top20_pct"] = cur["top20_pct"]
+    out["onchain_top_accounts"] = cur["top_accounts"]
+    out["onchain_holder_count"] = cur["holder_count"]
+    out["onchain_age_min"] = (t0 - cur["e"]) / 60
+
+    # اللقطة السابقة: 240ث لا 300 عمداً — الإيقاع المستهدَف 300ث فالفجوة الفعلية
+    # تتذبذب حولها، وطلب ≥300 يقفز فوق اللقطة المجاورة إلى ما قبلها فيصير
+    # «فرق 5 دقائق» فرق إحدى عشرة. و`_span_min` عمود صريح لنفس سبب
+    # `chain_holders_span_min`: الاستعلام يضمن ≥4د لا =5د، وبلا العمود يُقرأ
+    # فرقُ 12 دقيقة كأنّه فرق خمس. وفوق 15د اللقطة الأقدم من نافذة أخرى ⇒ None
+    # لا رقم مضلّل (العملة كانت خارج المسح، أو الدورة تعثّرت).
+    prev = db._conn.execute(q, (token, network, cur["e"] - 240)).fetchone()
+    if prev is not None:
+        span = (cur["e"] - prev["e"]) / 60
+        if span <= 15:
+            out["onchain_delta_span_min"] = span
+            for col, src in (("onchain_top1_delta_5m", "top1_pct"),
+                             ("onchain_top10_delta_5m", "top10_pct"),
+                             ("onchain_holders_delta_5m", "holder_count")):
+                new, old = cur[src], prev[src]
+                if new is not None and old is not None:
+                    out[col] = new - old
+    return out
+
+
+def onchain_authority_features(
+    db: RecorderDB, token: str, network: str, t0: int
+) -> dict[str, Any]:
+    """صلاحيات المِنت وقابليّة التعديل وحيازة المطوّر — من `chain_authority`.
+
+    هذه أخطارٌ **بنيويّة** لا حركة سوق: سلطة سكّ قائمة تعني أنّ صاحبها يستطيع
+    طبع معروض جديد فيبخّر قيمة ما تملك، وسلطة تجميد تعني أنّه يستطيع منعك من
+    البيع. مقيس على 48 عملة من مراقَبتنا (2026-08-13): السكّ قائم في 3 والتجميد
+    في 1 — نادران، وهذا بالضبط ما يجعلهما معلومة: علمٌ يرتفع دائماً لا يفرّق
+    بين عملة وعملة.
+
+    `onchain_is_token2022` ليس تفصيلاً تقنيّاً: 27 من 48 على المعيار الجديد
+    الذي يسمح بامتدادات (رسم تحويل، مفوَّض دائم) لا وجود لها في القديم — فهو
+    وكيلٌ عن *سطح الخطر الممكن* لا عن عمر العملة.
+
+    `onchain_dev_holding_pct` مقيس على السلسلة ومختلف عن `platform_dev_holding`
+    (مصدره FOMO ونطاقه مستخدمو المنصّة). تغطيته ~15% فقط لأنّ Token-2022 يعيد
+    `creators: []`، فالغياب هنا كثير وهو غياب مقيس لا صفر (FR-007).
+    """
+    out: dict[str, Any] = {
+        "onchain_has_mint_authority": None,
+        "onchain_has_freeze_authority": None,
+        "onchain_is_mutable": None,
+        "onchain_is_token2022": None,
+        "onchain_dev_holding_pct": None,
+        "onchain_auth_age_min": None,
+    }
+    row = db._conn.execute(
+        """SELECT mint_authority, freeze_authority, is_mutable, token_program,
+                  dev_holding_pct,
+                  CAST(strftime('%s', recorded_at) AS INTEGER) e
+             FROM chain_authority
+            WHERE token_address=? AND network_id=?
+              AND CAST(strftime('%s', recorded_at) AS INTEGER) <= ?
+            ORDER BY e DESC LIMIT 1""",
+        (token, network, t0),
+    ).fetchone()
+    if row is None:
+        return out
+    # العنوان موجود ⇒ 1، وغيابه شطبٌ **مقيس** ⇒ 0 لا None: الصفّ نفسه يشهد
+    # أنّ القياس حدث.
+    out["onchain_has_mint_authority"] = 1 if row["mint_authority"] else 0
+    out["onchain_has_freeze_authority"] = 1 if row["freeze_authority"] else 0
+    out["onchain_is_mutable"] = row["is_mutable"]
+    prog = row["token_program"]
+    out["onchain_is_token2022"] = None if not prog else int(prog == "spl-token-2022")
+    out["onchain_dev_holding_pct"] = row["dev_holding_pct"]
+    out["onchain_auth_age_min"] = (t0 - row["e"]) / 60
+    return out
+
+
+def onchain_contract_features(
+    db: RecorderDB, token: str, network: str, t0: int
+) -> dict[str, Any]:
+    """شكل عقد EVM وصلاحياته — من البايت‑كود، على Base وحدها.
+
+    نظير `onchain_authority_features` على الجانب الآخر: تلك تسأل «من يستطيع طبع
+    معروض أو تجميد بيعك؟» على سولانا، وهذه تسأل نفسه على EVM — لكنّ الجواب هنا
+    لا يُقرأ من حقل جاهز (لا وجود له في ERC-20) بل من **وجود المُعرّف في جدول
+    توزيع البايت‑كود**: عقد يحمل `mint(address,uint256)` يستطيع الطبع، وعقد
+    يحمل `setMaxTxAmount` يستطيع تقييد بيعك.
+
+    `onchain_is_proxy` ليس تفصيلاً تقنيّاً: وكيل EIP-1167 يعني أنّ المنطق كلّه
+    في عقد آخر قد يُبدَّل، فكل علم خطر قرأناه من البايت‑كود **لا يعني شيئاً** —
+    وهذا بالضبط ما يجعل العمود معلومة: صفر الأعلام على وكيل ≠ صفرها على عقد
+    كامل.
+
+    و`onchain_contract_age_min` صريح لا مشتقّ: الإيقاع ساعيّ (مقابل خمس دقائق
+    في عائلة التركّز)، فقيمةٌ عمرها 55 دقيقة أمرٌ عاديّ لا شذوذ — والنموذج
+    يحتاج أن يعرف ذلك.
+
+    الشبكات غير المفحوصة (سولانا، BSC، روبن‑هود) تبقى NULL بحقّ: «لم يُقَس» لا
+    «صفر» (FR-007).
+    """
+    out: dict[str, Any] = {
+        "onchain_code_size": None, "onchain_function_count": None,
+        "onchain_is_proxy": None, "onchain_owner_renounced": None,
+        "onchain_has_mint_fn": None, "onchain_has_pause_fn": None,
+        "onchain_has_blacklist_fn": None, "onchain_has_fee_setter": None,
+        "onchain_has_limit_setter": None, "onchain_has_trading_switch": None,
+        "onchain_contract_age_min": None,
+    }
+    row = db._conn.execute(
+        """SELECT code_size, function_count, is_proxy, is_ownership_renounced,
+                  has_mint, has_pause, has_blacklist, has_fee_setter,
+                  has_limit_setter, has_trading_switch,
+                  CAST(strftime('%s', recorded_at) AS INTEGER) e
+             FROM evm_contract
+            WHERE token_address=? AND network_id=?
+              AND CAST(strftime('%s', recorded_at) AS INTEGER) <= ?
+            ORDER BY e DESC LIMIT 1""",
+        (token, network, t0),
+    ).fetchone()
+    if row is None:
+        return out
+    out["onchain_code_size"] = row["code_size"]
+    out["onchain_function_count"] = row["function_count"]
+    out["onchain_is_proxy"] = row["is_proxy"]
+    # يبقى NULL إن لم تُجب أي صيغة ملكيّة: «لا دالّة مالك» و«الملكيّة متروكة»
+    # حالتان مختلفتان (نفس علّة العمود في `evm_contract`).
+    out["onchain_owner_renounced"] = row["is_ownership_renounced"]
+    for col, src in (
+        ("onchain_has_mint_fn", "has_mint"),
+        ("onchain_has_pause_fn", "has_pause"),
+        ("onchain_has_blacklist_fn", "has_blacklist"),
+        ("onchain_has_fee_setter", "has_fee_setter"),
+        ("onchain_has_limit_setter", "has_limit_setter"),
+        ("onchain_has_trading_switch", "has_trading_switch"),
+    ):
+        out[col] = row[src]
+    out["onchain_contract_age_min"] = (t0 - row["e"]) / 60
     return out
 
 
@@ -886,8 +1147,31 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "tick_rich_age_min",
     # هـ٢ — الملكية: تركيز السلسلة (يُصلح top10_holders_pct الميّت) وتموضع الحشد
     "chain_top10_pct", "chain_holder_count", "holders_age_min",
+    # تغيّر حائزي السلسلة عبر ساعة + المدى الفعليّ المقيس (≥60د لا =60د)
+    "chain_holders_delta_1h", "chain_holders_growth_1h", "chain_holders_span_min",
     "platform_holders", "platform_penetration", "platform_underwater_ratio",
     "platform_value_usd", "platform_median_hold_h", "platform_dev_holding",
+    # هـ٢-ب — الملكية مقيسة **من السلسلة** لا من FOMO: top1 قياس لا اشتقاق
+    # (حوت مفرد ≠ عشرة موزّعين)، و`_delta_5m` أوّل نافذة خمس‑دقائق على الحيتان.
+    # الشبكتان معاً منذ v12: دفتر أرصدة من سجلّات `Transfer` يكتب نفس الجدول.
+    "onchain_top1_pct", "onchain_top5_pct", "onchain_top10_pct",
+    "onchain_top20_pct", "onchain_top_accounts", "onchain_age_min",
+    "onchain_top1_delta_5m", "onchain_top10_delta_5m", "onchain_delta_span_min",
+    # عدد الحائزين مضبوطاً من الدفتر (EVM وحدها — سولانا بسقف 20 حساباً فتبقى
+    # NULL)، ونافذة خمس دقائق عليه لا يعطيها أي مزوّد.
+    "onchain_holder_count", "onchain_holders_delta_5m",
+    # هـ٢-ج — خطر بنيويّ لا حركة سوق: من يستطيع طبع معروضٍ جديد أو تجميد بيعك.
+    # مقيس أنّ السكّ قائم في 3/48 والتجميد في 1/48 — نادران فمفرِّقان.
+    "onchain_has_mint_authority", "onchain_has_freeze_authority",
+    "onchain_is_mutable", "onchain_is_token2022", "onchain_dev_holding_pct",
+    "onchain_auth_age_min",
+    # هـ٢-د — نظيرها على EVM: من البايت‑كود لا من حقل جاهز (لا وجود له في
+    # ERC-20). Base وحدها — على BSC وروبن‑هود الأعمدة قوالب متكرّرة بلا تباين.
+    "onchain_code_size", "onchain_function_count", "onchain_is_proxy",
+    "onchain_owner_renounced", "onchain_has_mint_fn", "onchain_has_pause_fn",
+    "onchain_has_blacklist_fn", "onchain_has_fee_setter",
+    "onchain_has_limit_setter", "onchain_has_trading_switch",
+    "onchain_contract_age_min",
     # هـ٣ — التدفّق: من يشتري ومن يبيع (كل حجم آخر عندنا مجموع)، وطبقة 5 دقائق
     # لم نملك مثلها قطّ — أقصر ما عندنا ساعة، وهي عمياء عن الانعطاف السريع.
     "flow_age_min", "flow_buy_volume_5m", "flow_sell_volume_5m",
@@ -930,6 +1214,9 @@ def build_features(
     out.update(price_history_features(db, token, network, t0))
     out.update(market_features(db, token, network, t0))
     out.update(holders_features(db, token, network, t0))
+    out.update(onchain_features(db, token, network, t0))
+    out.update(onchain_authority_features(db, token, network, t0))
+    out.update(onchain_contract_features(db, token, network, t0))
     out.update(flow_features(db, token, network, t0))
     out.update(macro_features(db, t0))
     out.update(density_features(db, token, network, t0, exclude_key))

@@ -28,6 +28,16 @@ def test_index_serves_a_fresh_csrf_token():
     assert re.search(r'const DASHBOARD_TOKEN = "([0-9a-f]{64})"', response.text)
 
 
+def test_index_exposes_separate_dashboard_views():
+    client = TestClient(dashboard_app.app)
+    response = client.get("/", headers=HOST)
+
+    assert response.status_code == 200
+    for view in ("overview", "signals", "watchlist", "performance", "health", "networks"):
+        assert f'data-view-link="{view}"' in response.text
+        assert f'data-view-section="{view}"' in response.text
+
+
 def test_state_changing_request_without_token_is_refused():
     client = TestClient(dashboard_app.app)
     response = client.post("/api/anything", headers=HOST, json={})

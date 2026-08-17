@@ -705,3 +705,138 @@ def ticks_summary(conn: sqlite3.Connection) -> dict[str, Any]:
            ORDER BY m.volume_24h DESC NULLS LAST""",
     ).fetchall()
     return {"total": total, "per_token": [dict(r) for r in rows]}
+
+
+# --- network coverage ---
+def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """ملخّص تغطية كل شبكة من البيانات الحية والقياسات على السلسلة."""
+    if not _table_exists(conn, "watchlist"):
+        return []
+
+    has_concentration = _table_exists(conn, "chain_concentration")
+    concentration_columns = {
+        column: _has_column(conn, "chain_concentration", column)
+        for column in ("top1_pct", "top5_pct", "top10_pct", "top20_pct", "holder_count")
+    }
+    has_ticks = _table_exists(conn, "market_ticks")
+    empty_ticks = "SELECT CAST(NULL AS TEXT) AS network_id, 0 AS tick_rows, NULL AS latest_tick WHERE 0"
+    ticks_cte = (
+        "SELECT network_id, COUNT(*) AS tick_rows, MAX(recorded_at) AS latest_tick "
+        "FROM market_ticks WHERE network_id IS NOT NULL AND network_id != '' GROUP BY network_id"
+        if has_ticks else empty_ticks
+    )
+    has_details = _table_exists(conn, "token_holders") and all(
+        _has_column(conn, "token_holders", column)
+        for column in (
+            "token_address", "network_id", "recorded_at", "source",
+            "top10_pct", "holder_count",
+        )
+    )
+    if has_details:
+        details_cte = """SELECT h.token_address, h.network_id, h.recorded_at,
+                                h.top10_pct, h.holder_count
+                           FROM token_holders h
+                           JOIN (SELECT token_address, network_id,
+                                        MAX(recorded_at) AS recorded_at
+                                   FROM token_holders
+                                  WHERE source='token_details'
+                                  GROUP BY token_address, network_id) latest
+                             ON latest.token_address = h.token_address
+                            AND latest.network_id = h.network_id
+                            AND latest.recorded_at = h.recorded_at
+                          WHERE h.source='token_details'"""
+    else:
+        details_cte = """SELECT CAST(NULL AS TEXT) AS token_address,
+                                 CAST(NULL AS TEXT) AS network_id,
+                                 NULL AS recorded_at, NULL AS top10_pct,
+                                 NULL AS holder_count
+                            WHERE 0"""
+
+    # Use only the newest snapshot for each currently active token. Counting all
+    # historical rows made a single token with a long replay history look like
+    # thousands of covered tokens.
+    if has_concentration:
+        fields = ", ".join(
+            f"c.{column} AS {column}" if available else f"NULL AS {column}"
+            for column, available in concentration_columns.items()
+        )
+        concentration_cte = f"""SELECT c.token_address, c.network_id, c.recorded_at, {fields}
+                                  FROM chain_concentration c
+                                  JOIN (SELECT token_address, network_id, MAX(recorded_at) AS recorded_at
+                                          FROM chain_concentration
+                                         GROUP BY token_address, network_id) latest
+                                    ON latest.token_address = c.token_address
+                                   AND latest.network_id = c.network_id
+                                   AND latest.recorded_at = c.recorded_at"""
+    else:
+        concentration_cte = """SELECT CAST(NULL AS TEXT) AS token_address,
+                                      CAST(NULL AS TEXT) AS network_id,
+                                      NULL AS recorded_at,
+                                      NULL AS top1_pct, NULL AS top5_pct,
+                                      NULL AS top10_pct, NULL AS top20_pct,
+                                      NULL AS holder_count
+                                 WHERE 0"""
+
+    rows = conn.execute(
+        f"""WITH active_tokens AS (
+                 SELECT DISTINCT token_address, network_id
+                   FROM watchlist
+                  WHERE active=1 AND network_id IS NOT NULL AND network_id != ''
+             ), active AS (
+                 SELECT network_id, COUNT(*) AS active_watches
+                   FROM active_tokens GROUP BY network_id
+             ), latest_concentration AS (
+                 {concentration_cte}
+             ), conc AS (
+                 SELECT a.network_id,
+                        COUNT(lc.token_address) AS concentration_rows,
+                        COUNT(lc.top1_pct) AS top1_rows,
+                        COUNT(lc.top5_pct) AS top5_rows,
+                        COUNT(lc.top10_pct) AS top10_rows,
+                        COUNT(lc.top20_pct) AS top20_rows,
+                        COUNT(lc.holder_count) AS holder_count_rows,
+                        MAX(lc.recorded_at) AS latest_concentration
+                   FROM active_tokens a
+                   LEFT JOIN latest_concentration lc
+                     ON lc.token_address = a.token_address
+                    AND lc.network_id = a.network_id
+                  GROUP BY a.network_id
+             ), latest_details AS (
+                 {details_cte}
+             ), details AS (
+                 SELECT a.network_id,
+                        COUNT(ld.holder_count) AS details_holder_rows,
+                        COUNT(ld.top10_pct) AS details_top10_rows,
+                        MAX(ld.recorded_at) AS latest_details
+                   FROM active_tokens a
+                   LEFT JOIN latest_details ld
+                     ON ld.token_address = a.token_address
+                    AND ld.network_id = a.network_id
+                  GROUP BY a.network_id
+             ), ticks AS (
+                 {ticks_cte}
+             ), networks AS (
+                 SELECT network_id FROM active
+                 UNION SELECT network_id FROM ticks
+             )
+             SELECT networks.network_id,
+                    COALESCE(active.active_watches, 0) AS active_watches,
+                    COALESCE(conc.concentration_rows, 0) AS concentration_rows,
+                    COALESCE(conc.top1_rows, 0) AS top1_rows,
+                    COALESCE(conc.top5_rows, 0) AS top5_rows,
+                    COALESCE(conc.top10_rows, 0) AS top10_rows,
+                    COALESCE(conc.top20_rows, 0) AS top20_rows,
+                    COALESCE(conc.holder_count_rows, 0) AS holder_count_rows,
+                    COALESCE(details.details_holder_rows, 0) AS details_holder_rows,
+                    COALESCE(details.details_top10_rows, 0) AS details_top10_rows,
+                    COALESCE(ticks.tick_rows, 0) AS tick_rows,
+                    conc.latest_concentration, details.latest_details,
+                    ticks.latest_tick
+               FROM networks
+               LEFT JOIN active ON active.network_id = networks.network_id
+               LEFT JOIN conc ON conc.network_id = networks.network_id
+               LEFT JOIN details ON details.network_id = networks.network_id
+               LEFT JOIN ticks ON ticks.network_id = networks.network_id
+              ORDER BY active_watches DESC, networks.network_id"""
+    ).fetchall()
+    return [dict(row) for row in rows]

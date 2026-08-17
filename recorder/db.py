@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -28,6 +29,10 @@ from typing import Any
 _ZLIB_LEVEL = 6
 # بادئة zlib القياسية (0x78) — نميّز بها الخام المضغوط عن النصّ القديم.
 _ZLIB_MAGIC = 0x78
+
+
+class StaleEVMState(RuntimeError):
+    """تغيّرت حالة دفتر EVM أثناء نداء شبكة؛ لا يجوز تثبيت جوابه القديم."""
 
 
 def utcnow_iso() -> str:
@@ -64,6 +69,7 @@ class RecorderDB:
         self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._batching = False
+        self._savepoint_counter = 0
         self._apply_schema(schema_path)
 
     def _apply_schema(self, schema_path: str) -> None:
@@ -78,7 +84,23 @@ class RecorderDB:
             self._conn.rollback()
             raise
         with open(schema_path, "r", encoding="utf-8") as fh:
-            self._conn.executescript(fh.read())
+            script = fh.read()
+        # سبعُ عمليّات تفتح القاعدة الآن، وإقلاعها قد يتزامن (إعادة تشغيل مهمّة،
+        # أو دخول Windows). المخطّط يحوي `DROP VIEW IF EXISTS v; CREATE VIEW v`
+        # لأنّ العرض يجب أن يُعاد بناؤه كي يرى الأعمدة الجديدة — وهذا الزوج غير
+        # ذرّي بين عمليّتين: تُسقط A ثم تُسقط B ثم تنشئ A، فيفشل إنشاء B بـ
+        # "view ... already exists". حدث فعلاً: FomoBuildRows مات عند الإقلاع
+        # وبقي ميّتاً 13 ساعة (2026-08-13، 02:09 ← 15:12) بلا سطر في سجلّه
+        # الدوريّ، فالفشل كان في سجلّ الإقلاع وحده. النافذة أجزاء من الثانية
+        # فإعادة المحاولة تكفي: الجارّ يكون قد أكمل.
+        for attempt in range(3):
+            try:
+                self._conn.executescript(script)
+                break
+            except sqlite3.OperationalError as exc:
+                if "already exists" not in str(exc) or attempt == 2:
+                    raise
+                time.sleep(0.4 * (attempt + 1))
         self._backfill_watch_windows()
         self._quarantine_legacy_outcomes()
         self._conn.commit()
@@ -153,15 +175,42 @@ class RecorderDB:
         fsync في الدقيقة. الخروج بخطأ يُرجع الدفعة كاملة (rollback) — لذا
         نستعملها حول حلقات الإدراج فقط، لا حول كتابة meta الخاصّة بالأخطاء.
         """
-        if self._batching:  # متداخلة: الدفعة الخارجية تملك التثبيت
-            yield
+        if self._batching:
+            self._savepoint_counter += 1
+            savepoint = f"batch_{self._savepoint_counter}"
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
             return
+        owns_transaction = not self._conn.in_transaction
+        savepoint: str | None = None
         self._batching = True
         try:
+            # احجز الكاتب قبل أي فحص حالة داخل الدفعة. بدء المعاملة عند أول
+            # INSERT يترك نافذة بين SELECT والكتابة يستطيع فيها reset/عامل آخر
+            # تغيير المؤشر، فتُطبّق نفس السجلات مرتين.
+            if owns_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            else:
+                self._savepoint_counter += 1
+                savepoint = f"batch_{self._savepoint_counter}"
+                self._conn.execute(f"SAVEPOINT {savepoint}")
             yield
-            self._conn.commit()
+            if owns_transaction:
+                self._conn.commit()
+            else:
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         except BaseException:
-            self._conn.rollback()
+            if owns_transaction:
+                self._conn.rollback()
+            else:
+                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
         finally:
             self._batching = False
@@ -181,6 +230,50 @@ class RecorderDB:
     def get_meta(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def evm_ledger_generation(self) -> int:
+        value = self.get_meta("evm_ledger_generation")
+        return int(value) if value and value.isdigit() else 0
+
+    def assert_evm_ledger_generation(self, expected: int) -> None:
+        current = self.evm_ledger_generation()
+        if current != int(expected):
+            raise StaleEVMState(
+                f"تغيّر جيل دفتر EVM أثناء الدورة: {expected} -> {current}"
+            )
+
+    def assert_evm_cursor(self, network_id: str, expected_block: int | None) -> None:
+        row = self.evm_cursor(network_id)
+        current = int(row["last_block"]) if row is not None else None
+        if current != expected_block:
+            raise StaleEVMState(
+                f"تغيّر مؤشر EVM [{network_id}] أثناء الجلب: "
+                f"{expected_block} -> {current}"
+            )
+
+    def assert_evm_backfill_state(
+        self, network_id: str, token_address: str,
+        expected_status: str | None, expected_from: int | None,
+        expected_to: int | None,
+    ) -> None:
+        row = self.evm_backfill_state(network_id, token_address)
+        current = (
+            None if row is None else
+            (row.get("status"), row.get("from_block"), row.get("to_block"))
+        )
+        expected = (
+            None if expected_status is None and expected_from is None and expected_to is None
+            else (expected_status, expected_from, expected_to)
+        )
+        if current != expected:
+            raise StaleEVMState(
+                f"تغيّرت حالة تعبئة EVM للعملة {token_address} أثناء الجلب"
+            )
+
+    def bump_evm_ledger_generation(self) -> int:
+        current = self.evm_ledger_generation() + 1
+        self.set_meta("evm_ledger_generation", str(current))
+        return current
 
     def bump_counter(self, key: str, by: int = 1) -> None:
         cur = self.get_meta(key)
@@ -652,8 +745,8 @@ class RecorderDB:
                  LEFT JOIN traders_fetch_state s ON s.trader_id = e.buyer_id
                 WHERE (s.last_fetch_at IS NULL
                        OR (s.last_status='error' AND s.last_fetch_at < ?)
-                       OR (COALESCE(s.last_status, '') <> 'error'
-                           AND s.last_fetch_at < ?))
+                         OR (COALESCE(s.last_status, '') NOT IN ('error', 'unsupported')
+                             AND s.last_fetch_at < ?))
                 ORDER BY s.last_fetch_at IS NOT NULL,
                          s.last_fetch_at,
                          e.n DESC
@@ -703,6 +796,748 @@ class RecorderDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # --- chain_concentration (قياس السلسلة المباشر) ---
+    def insert_chain_concentration(self, row: Mapping[str, Any]) -> bool:
+        """لقطة تركّز من السلسلة. المفتاح (عنوان، شبكة، وقت) فالتكرار لا يضرّ."""
+        cols = _CHAIN_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO chain_concentration({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        payload = {c: row.get(c) for c in cols}
+        # صفر لا NULL: العمود `NOT NULL DEFAULT 0` وكاتبو الصفوف ثلاثة (سولانا،
+        # دفتر EVM الحيّ، الإعادة الرجعيّة) — والتطبيع هنا يعفيهم من تذكّره،
+        # وNULL صريح من أيّهم كان سيرفع `NOT NULL constraint failed`.
+        payload["is_replay"] = 1 if payload.get("is_replay") else 0
+        cur = self._conn.execute(sql, _with_compressed_raw(payload))
+        self._commit()
+        return cur.rowcount > 0
+
+    def set_chain_state(
+        self, token_address: str, network_id: str, status: str,
+        top1_pct: float | None, now_iso: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO chain_fetch_state(
+                   token_address, network_id, last_fetch_at, last_status,
+                   top1_pct, attempts)
+               VALUES(?, ?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_fetch_at = excluded.last_fetch_at,
+                   last_status   = excluded.last_status,
+                   top1_pct      = excluded.top1_pct,
+                   attempts      = chain_fetch_state.attempts + 1""",
+            (token_address, network_id, now_iso, status, top1_pct),
+        )
+        self._commit()
+
+    def chain_fetch_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+        networks: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """المراقَبات المستحقّة لقياس السلسلة — **من الشبكات المدعومة وحدها**.
+
+        الشبكات تُمرَّر ولا تُقرأ من `config` هنا: هذه الوحدة بلا معرفة بالمصادر
+        (انظر مقدّمة الملفّ) فتبقى قابلة للاختبار بقاعدة مؤقّتة. وقائمة فارغة
+        تعيد لا شيء بدل أن تعني «كل الشبكات» — الصمت أصدق من مسح شبكة لا
+        يعمل عليها المصدر.
+        """
+        nets = [str(n) for n in networks]
+        if not nets:
+            return []
+        marks = ", ".join("?" for _ in nets)
+        rows = self._conn.execute(
+            f"""SELECT w.token_address, w.network_id, w.first_seen_at,
+                       w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
+                  FROM watchlist w
+                  LEFT JOIN chain_fetch_state s
+                    ON s.token_address=w.token_address AND s.network_id=w.network_id
+                 WHERE w.active=1
+                   AND w.network_id IN ({marks})
+                   AND (s.last_fetch_at IS NULL
+                        OR (s.last_status='error' AND s.last_fetch_at < ?)
+                        OR (COALESCE(s.last_status, '') <> 'error'
+                            AND s.last_fetch_at < ?))
+                 ORDER BY s.last_fetch_at IS NOT NULL,
+                          w.is_control,
+                          s.last_fetch_at,
+                          w.first_seen_at DESC
+                 LIMIT ?""",
+            (*nets, error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- chain_authority (الطبقة البطيئة: صلاحيات وقابليّة تعديل) ---
+    def insert_chain_authority(self, row: Mapping[str, Any]) -> bool:
+        """لقطة صلاحيات. صفّ لكل قياس لا صفّ واحد للعملة: شطبُ صلاحية السكّ
+        **حدث** يقع وسط النافذة، وصفّ واحد يُحدَّث فوق نفسه يمحو تاريخه."""
+        cols = _CHAIN_AUTH_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO chain_authority({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        self._commit()
+        return cur.rowcount > 0
+
+    def set_chain_auth_state(
+        self, token_address: str, network_id: str, status: str, now_iso: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO chain_auth_state(
+                   token_address, network_id, last_fetch_at, last_status, attempts)
+               VALUES(?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_fetch_at = excluded.last_fetch_at,
+                   last_status   = excluded.last_status,
+                   attempts      = chain_auth_state.attempts + 1""",
+            (token_address, network_id, now_iso, status),
+        )
+        self._commit()
+
+    def chain_auth_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+        networks: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """نفس منطق `chain_fetch_due` على جدول الحالة الساعيّ.
+
+        استعلام منفصل لا معامل `table` مُصاغ في النصّ: الجدول لا يُبنى من مُدخل
+        أبداً، وتكرار عشرة أسطر أرخص من فتح باب حقن.
+        """
+        nets = [str(n) for n in networks]
+        if not nets:
+            return []
+        marks = ", ".join("?" for _ in nets)
+        rows = self._conn.execute(
+            f"""SELECT w.token_address, w.network_id, w.first_seen_at,
+                       w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
+                  FROM watchlist w
+                  LEFT JOIN chain_auth_state s
+                    ON s.token_address=w.token_address AND s.network_id=w.network_id
+                 WHERE w.active=1
+                   AND w.network_id IN ({marks})
+                   AND (s.last_fetch_at IS NULL
+                        OR (s.last_status='error' AND s.last_fetch_at < ?)
+                        OR (COALESCE(s.last_status, '') <> 'error'
+                            AND s.last_fetch_at < ?))
+                 ORDER BY s.last_fetch_at IS NOT NULL,
+                          w.is_control,
+                          s.last_fetch_at,
+                          w.first_seen_at DESC
+                 LIMIT ?""",
+            (*nets, error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- طبقة EVM: دفتر الأرصدة ومؤشّر الكتل ---
+    def evm_cursor(self, network_id: str) -> dict[str, Any] | None:
+        """مؤشّر كتل الشبكة، أو None إن لم يُبنَ بعد."""
+        row = self._conn.execute(
+            "SELECT * FROM evm_block_cursor WHERE network_id=?", (str(network_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_evm_cursor(
+        self, network_id: str, last_block: int, now_iso: str,
+        status: str, logs_applied: int = 0, last_error: str | None = None,
+    ) -> None:
+        """يحرّك المؤشّر. `logs_applied` يُجمَع تراكميّاً لا يُستبدل — رقم الدورة
+        الواحدة بلا معنى تشخيصيّ، والمجموع يقول هل الطبقة تعمل أصلاً."""
+        self._conn.execute(
+            """INSERT INTO evm_block_cursor(
+                   network_id, last_block, last_run_at, last_status,
+                   logs_applied, last_error)
+               VALUES(?, ?, ?, ?, ?, ?)
+               ON CONFLICT(network_id) DO UPDATE SET
+                   last_block   = excluded.last_block,
+                   last_run_at  = excluded.last_run_at,
+                   last_status  = excluded.last_status,
+                   logs_applied = evm_block_cursor.logs_applied + excluded.logs_applied,
+                   last_error   = excluded.last_error""",
+            (str(network_id), int(last_block), now_iso, status,
+             int(logs_applied), last_error),
+        )
+        self._commit()
+
+    def evm_apply_transfers(
+        self, network_id: str, token_address: str,
+        deltas: Mapping[str, tuple[int, ...]], now_iso: str,
+        allow_negative: Sequence[str] = (),
+    ) -> int:
+        """يطبّق تغييرات أرصدة عملة واحدة. `deltas` = عنوان ⇒ (تغيّر، رقم كتلة).
+
+        التغيّر **موقَّع** ويُجمَع على الرصيد المخزَّن بحساب بايثون لا SQL: القيم
+        uint256 تتجاوز 64 بتّاً فـ`balance_hex + ?` في SQLite يفيض بصمت. القراءة
+        والكتابة في معاملة واحدة عبر `batch()` من المُنادي.
+
+        الرصيد السالب مستحيل لعنوان عاديّ في ERC-20 صحيح؛ ظهوره يعني أنّ سجلاً
+        فُقد أو تكرّر، فيُرفع خطأ وتُرجَع المعاملة بدل تخزين دفتر يبدو سليماً.
+        وحدها عناوين السكّ/الحرق الممرّرة في `allow_negative` يجوز أن تنزل تحت
+        الصفر: رصيدها لا يدخل اللقطة أصلاً، فنثبّته عند صفر بلا إخفاء فساد حائز.
+        """
+        if not deltas:
+            return 0
+        token = token_address.lower()
+        net = str(network_id)
+        allowed = {str(a).lower() for a in allow_negative}
+        holders = list(deltas)
+        variable_limit = self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+        chunk_size = max(1, int(variable_limit) - 2)
+        current: dict[str, tuple[str, int | None]] = {}
+        for offset in range(0, len(holders), chunk_size):
+            chunk = holders[offset:offset + chunk_size]
+            marks = ", ".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"""SELECT holder_address, balance_hex, first_seen_block
+                      FROM evm_balances
+                     WHERE network_id=? AND token_address=?
+                       AND holder_address IN ({marks})""",
+                (net, token, *chunk),
+            ).fetchall()
+            current.update({
+                row["holder_address"]: (row["balance_hex"], row["first_seen_block"])
+                for row in rows
+            })
+        rows = []
+        for holder, change in deltas.items():
+            delta, block = change[:2]
+            received_block = change[2] if len(change) > 2 else None
+            prev_hex, first_block = current.get(holder, (None, None))
+            prev = int(prev_hex, 16) if prev_hex else 0
+            new = prev + int(delta)
+            if new < 0:
+                if holder.lower() not in allowed:
+                    raise ValueError(
+                        f"رصيد EVM سالب للعنوان {holder} في {token} [{net}]"
+                    )
+                new = 0
+            # أوّل استلام: تُسجَّل الكتلة مرّة واحدة ولا تُحدَّث بعدها — «حائز جديد»
+            # يعني أوّل دخول لا آخر حركة.
+            if first_block is None:
+                if received_block is not None:
+                    first_block = int(received_block)
+                elif delta > 0:
+                    first_block = int(block)
+            rows.append((net, token, holder, f"{new:064x}",
+                         first_block, int(block), now_iso))
+        self._conn.executemany(
+            """INSERT INTO evm_balances(
+                   network_id, token_address, holder_address, balance_hex,
+                   first_seen_block, updated_block, updated_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(network_id, token_address, holder_address) DO UPDATE SET
+                   balance_hex      = excluded.balance_hex,
+                   first_seen_block = COALESCE(evm_balances.first_seen_block,
+                                               excluded.first_seen_block),
+                   updated_block    = excluded.updated_block,
+                   updated_at       = excluded.updated_at""",
+            rows,
+        )
+        self._commit()
+        return len(rows)
+
+    def evm_top_balances(
+        self, network_id: str, token_address: str, limit: int,
+        exclude: Sequence[str] = (),
+    ) -> list[tuple[str, int]]:
+        """أعلى `limit` رصيداً بترتيب تنازليّ.
+
+        الترتيب معجميّ على نصّ محشوّ بعرض 64 ⇒ مطابق للترتيب العدديّ، فالفهرس
+        `idx_evm_bal_rank` يخدمه بلا فرز. الرصيد صفر يُستثنى: عنوان باع كل شيء
+        يبقى صفّه في الدفتر (تاريخه معلومة) لكنّه ليس حائزاً.
+        """
+        net, token = str(network_id), token_address.lower()
+        params: list[Any] = [net, token]
+        clause = ""
+        skip = [a.lower() for a in exclude]
+        if skip:
+            clause = f" AND holder_address NOT IN ({', '.join('?' for _ in skip)})"
+            params.extend(skip)
+        params.append(int(limit))
+        rows = self._conn.execute(
+            f"""SELECT holder_address, balance_hex FROM evm_balances
+                 WHERE network_id=? AND token_address=?
+                   AND balance_hex <> '{'0' * 64}'{clause}
+                 ORDER BY balance_hex DESC
+                 LIMIT ?""",
+            params,
+        ).fetchall()
+        return [(r["holder_address"], int(r["balance_hex"], 16)) for r in rows]
+
+    def evm_ledger_stats(
+        self, network_id: str, token_address: str, exclude: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """عدد الحائزين والمعروض المتداول من الدفتر — بنداء SQL واحد.
+
+        `supply` هنا مجموع الأرصدة الحيّة لا `totalSupply()` من العقد: عناوين
+        الحرق تُستثنى، فالنسب تُحسب على ما يمكن بيعه فعلاً. عملة حُرق نصفها
+        تظهر بتركّز حقيقيّ لا مخفَّف بالنصف الميّت.
+        """
+        net, token = str(network_id), token_address.lower()
+        params: list[Any] = [net, token]
+        clause = ""
+        skip = [a.lower() for a in exclude]
+        if skip:
+            clause = f" AND holder_address NOT IN ({', '.join('?' for _ in skip)})"
+            params.extend(skip)
+        rows = self._conn.execute(
+            f"""SELECT balance_hex FROM evm_balances
+                 WHERE network_id=? AND token_address=?
+                   AND balance_hex <> '{'0' * 64}'{clause}""",
+            params,
+        ).fetchall()
+        total = 0
+        for r in rows:
+            total += int(r["balance_hex"], 16)
+        return {"holder_count": len(rows), "supply": total}
+
+    def evm_new_holders_since(
+        self, network_id: str, token_address: str, since_block: int,
+    ) -> int:
+        """كم عنواناً استلم العملة أوّل مرّة بعد كتلة معيّنة.
+
+        هذا ما لا يعطيه أي مزوّد: كلّهم لقطة بلا تاريخ دخول. يُحسب من
+        `first_seen_block` وحده فلا يكلّف نداءً.
+        """
+        row = self._conn.execute(
+            """SELECT COUNT(*) c FROM evm_balances
+                WHERE network_id=? AND token_address=? AND first_seen_block > ?""",
+            (str(network_id), token_address.lower(), int(since_block)),
+        ).fetchone()
+        return int(row["c"] or 0)
+
+    def evm_backfill_state(
+        self, network_id: str, token_address: str,
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM evm_backfill_state
+                WHERE network_id=? AND token_address=?""",
+            (str(network_id), token_address.lower()),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_evm_backfill_state(
+        self, network_id: str, token_address: str, status: str, now_iso: str,
+        from_block: int | None = None, to_block: int | None = None,
+        transfers: int | None = None, calls: int | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO evm_backfill_state(
+                   network_id, token_address, status, from_block, to_block,
+                   transfers, calls, last_try_at, last_error)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(network_id, token_address) DO UPDATE SET
+                   status      = excluded.status,
+                   from_block  = COALESCE(excluded.from_block,
+                                          evm_backfill_state.from_block),
+                   to_block    = COALESCE(excluded.to_block,
+                                          evm_backfill_state.to_block),
+                   transfers   = COALESCE(excluded.transfers,
+                                          evm_backfill_state.transfers),
+                   calls       = COALESCE(excluded.calls, evm_backfill_state.calls),
+                   last_try_at = excluded.last_try_at,
+                   last_error  = excluded.last_error""",
+            (str(network_id), token_address.lower(), status, from_block, to_block,
+             transfers, calls, now_iso, last_error),
+        )
+        self._commit()
+
+    def evm_watched(self, networks: Sequence[str]) -> list[dict[str, Any]]:
+        """كل المراقَبات النشطة على شبكات EVM المفعَّلة، مع حالة تعبئتها.
+
+        صفٌّ واحد يجمع المراقبة والتعبئة: الطبقة تحتاج الاثنين في كل دورة (من
+        يُطبَّق عليه السجلّ، ومن ينتظر تعبئة)، ونداءان يفترقان بينهما.
+        قائمة شبكات فارغة تعيد لا شيء — لا «كل الشبكات».
+        """
+        nets = [str(n) for n in networks]
+        if not nets:
+            return []
+        marks = ", ".join("?" for _ in nets)
+        rows = self._conn.execute(
+            f"""SELECT w.token_address, w.network_id, w.first_seen_at,
+                       w.entry_signal_id, w.is_control,
+                       b.status AS backfill_status, b.from_block, b.to_block,
+                       b.last_try_at AS backfill_last_try_at
+                  FROM watchlist w
+                  LEFT JOIN evm_backfill_state b
+                    ON b.token_address=w.token_address AND b.network_id=w.network_id
+                 WHERE w.active=1 AND w.network_id IN ({marks})
+                 ORDER BY w.is_control, w.first_seen_at DESC""",
+            nets,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def assert_evm_done_tokens(
+        self, network_id: str, expected_tokens: Sequence[str],
+    ) -> None:
+        current = sorted(
+            str(row["token_address"]).lower()
+            for row in self.evm_watched([network_id])
+            if (row.get("backfill_status") or "") == "done"
+        )
+        expected = sorted(str(token).lower() for token in expected_tokens)
+        if current != expected:
+            raise StaleEVMState(
+                f"تغيّرت مجموعة دفاتر EVM المكتملة [{network_id}] أثناء الجلب"
+            )
+
+    def evm_replay_windows(
+        self, token_address: str, network_id: str,
+    ) -> list[dict[str, str]]:
+        rows = self._conn.execute(
+            """SELECT first_seen_at, watch_until FROM watch_windows
+                WHERE token_address=? AND network_id=? ORDER BY first_seen_at""",
+            (token_address.lower(), str(network_id)),
+        ).fetchall()
+        return [
+            {"first_seen_at": str(row["first_seen_at"]),
+             "watch_until": str(row["watch_until"])}
+            for row in rows
+        ]
+
+    def assert_evm_replay_windows(
+        self, token_address: str, network_id: str,
+        expected_windows: Sequence[Mapping[str, Any]],
+    ) -> None:
+        expected = sorted(
+            (str(window["first_seen_at"]), str(window["watch_until"]))
+            for window in expected_windows
+        )
+        current = sorted(
+            (window["first_seen_at"], window["watch_until"])
+            for window in self.evm_replay_windows(token_address, network_id)
+        )
+        if current != expected:
+            raise StaleEVMState(
+                f"تغيّرت نوافذ replay للعملة {token_address} أثناء الجلب"
+            )
+
+    def evm_training_rebuild_state(self) -> tuple[int, str, str]:
+        return (
+            self.evm_ledger_generation(),
+            self.get_meta("evm_ledger_rebuild_required") or "0",
+            self.get_meta("evm_training_rebuild_started") or "0",
+        )
+
+    def assert_evm_training_rebuild_state(
+        self, expected: tuple[int, str, str],
+    ) -> None:
+        if self.evm_training_rebuild_state() != expected:
+            raise StaleEVMState("تغيّرت حالة إعادة بناء التدريب أثناء حساب الدفعة")
+
+    # --- الإعادة الرجعيّة (evm_replay) ---
+    def evm_replay_targets(self, networks: Sequence[str]) -> list[dict[str, Any]]:
+        """كل نافذة مراقبة على شبكات الإعادة — **المنتهية والنشطة معاً**.
+
+        `active=1` غير مشروط هنا بخلاف `evm_watched`: العملة المنتهية هي بالضبط
+        من فاتنا قياسها (طبقة EVM وُلدت بعدها)، وصفوف تدريبها موجودة بانتظار
+        أعمدتها. وقائمة شبكات فارغة تعيد لا شيء.
+
+        الأقدم أوّلاً: تلك أبعد ما تكون عن التغطية الحيّة فلا تنافسها.
+        """
+        nets = [str(n) for n in networks]
+        if not nets:
+            return []
+        marks = ", ".join("?" for _ in nets)
+        rows = self._conn.execute(
+            f"""SELECT w.token_address, w.network_id, w.first_seen_at,
+                       w.watch_until, w.entry_signal_id, w.is_control,
+                       COALESCE(l.active, 0) AS active,
+                       r.status AS replay_status, r.last_try_at AS replay_last_try_at,
+                       r.snapshots AS replay_snapshots,
+                       r.from_block AS replay_from_block,
+                       r.to_block AS replay_to_block,
+                       r.transfers AS replay_transfers,
+                       r.calls AS replay_calls,
+                       r.checkpoint_json AS replay_checkpoint_json,
+                       r.revision AS replay_revision
+                  FROM watch_windows w
+                  LEFT JOIN watchlist l
+                    ON l.token_address=w.token_address AND l.network_id=w.network_id
+                  LEFT JOIN evm_replay_state r
+                    ON r.token_address=w.token_address AND r.network_id=w.network_id
+                 WHERE w.network_id IN ({marks})
+                 ORDER BY w.first_seen_at""",
+            nets,
+        ).fetchall()
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw in rows:
+            row = dict(raw)
+            key = (str(row["token_address"]).lower(), str(row["network_id"]))
+            current = grouped.get(key)
+            window = {
+                "first_seen_at": row["first_seen_at"],
+                "watch_until": row["watch_until"],
+            }
+            if current is None:
+                row["replay_windows"] = [window]
+                grouped[key] = row
+                continue
+            current["replay_windows"].append(window)
+            current["first_seen_at"] = min(
+                current["first_seen_at"], row["first_seen_at"]
+            )
+            current["watch_until"] = max(current["watch_until"], row["watch_until"])
+            current["is_control"] = min(
+                int(current.get("is_control") or 0), int(row.get("is_control") or 0)
+            )
+        return list(grouped.values())
+
+    def evm_replay_state(
+        self, token_address: str, network_id: str,
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """SELECT * FROM evm_replay_state
+                WHERE token_address=? AND network_id=?""",
+            (token_address.lower(), str(network_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def set_evm_replay_state(
+        self, token_address: str, network_id: str, status: str, now_iso: str,
+        from_block: int | None = None, to_block: int | None = None,
+        transfers: int | None = None, snapshots: int | None = None,
+        calls: int | None = None, balance_check: str | None = None,
+        last_error: str | None = None, checkpoint: Any = None,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO evm_replay_state(
+                   token_address, network_id, status, from_block, to_block,
+                   transfers, snapshots, calls, balance_check, last_try_at,
+                   last_error, checkpoint_json, revision)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   status        = excluded.status,
+                   from_block    = COALESCE(excluded.from_block,
+                                            evm_replay_state.from_block),
+                   to_block      = COALESCE(excluded.to_block,
+                                            evm_replay_state.to_block),
+                   transfers     = COALESCE(excluded.transfers,
+                                            evm_replay_state.transfers),
+                   snapshots     = COALESCE(excluded.snapshots,
+                                            evm_replay_state.snapshots),
+                   calls         = COALESCE(excluded.calls, evm_replay_state.calls),
+                   balance_check = COALESCE(excluded.balance_check,
+                                            evm_replay_state.balance_check),
+                   last_try_at   = excluded.last_try_at,
+                   last_error    = excluded.last_error,
+                   checkpoint_json = excluded.checkpoint_json,
+                   revision = evm_replay_state.revision + 1""",
+            (token_address.lower(), str(network_id), status, from_block, to_block,
+             transfers, snapshots, calls, balance_check, now_iso, last_error,
+             encode_raw(checkpoint) if checkpoint is not None else None),
+        )
+        self._commit()
+
+    def mark_evm_replay_error(
+        self, token_address: str, network_id: str, now_iso: str, error: str,
+    ) -> None:
+        """يسجّل خطأً عابراً مع إبقاء checkpoint ونقطة الاستئناف السابقة."""
+        self._conn.execute(
+            """INSERT INTO evm_replay_state(
+                   token_address, network_id, status, last_try_at, last_error)
+               VALUES(?, ?, 'error', ?, ?)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   status='error', last_try_at=excluded.last_try_at,
+                   last_error=excluded.last_error,
+                   revision=evm_replay_state.revision + 1""",
+            (token_address.lower(), str(network_id), now_iso, error),
+        )
+        self._commit()
+
+    def reset_evm_replay_token(self, token_address: str, network_id: str) -> None:
+        """يمحو صفوف وحالة replay لعملة واحدة كي يكون `--redo` إعادة حقيقية."""
+        token, net = token_address.lower(), str(network_id)
+        with self.batch():
+            self._conn.execute(
+                """DELETE FROM chain_concentration
+                    WHERE token_address=? AND network_id=? AND is_replay=1""",
+                (token, net),
+            )
+            self._conn.execute(
+                "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
+                (token, net),
+            )
+
+    def assert_evm_replay_state(
+        self, token_address: str, network_id: str,
+        expected_status: str | None, expected_from: int | None,
+        expected_checkpoint: Any, expected_revision: int | None,
+    ) -> None:
+        row = self.evm_replay_state(token_address, network_id)
+        current = None if row is None else (
+            row.get("status"), row.get("from_block"), row.get("checkpoint_json"),
+            row.get("revision"),
+        )
+        expected = (
+            None if expected_status is None and expected_from is None
+            and expected_checkpoint is None
+            else (
+                expected_status, expected_from, expected_checkpoint,
+                expected_revision,
+            )
+        )
+        if current != expected:
+            raise StaleEVMState(
+                f"تغيّرت حالة replay للعملة {token_address} أثناء الجلب"
+            )
+
+    def delete_evm_replay_rows(self, token_address: str, network_id: str) -> int:
+        """يحذف الصفوف المشتقّة لهذه الإعادة فقط عند اكتشاف فساد متأخر."""
+        cur = self._conn.execute(
+            """DELETE FROM chain_concentration
+                WHERE token_address=? AND network_id=? AND is_replay=1""",
+            (token_address.lower(), str(network_id)),
+        )
+        self._commit()
+        return cur.rowcount
+
+    def add_block_anchor(
+        self, network_id: str, block_number: int, block_ts: int, now_iso: str,
+    ) -> None:
+        """مرساة وقت↔كتلة. `OR IGNORE`: الكتلة لا يتغيّر طابعها أبداً."""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO evm_block_time(
+                   network_id, block_number, block_ts, fetched_at)
+               VALUES(?, ?, ?, ?)""",
+            (str(network_id), int(block_number), int(block_ts), now_iso),
+        )
+        self._commit()
+
+    def block_anchors(
+        self, network_id: str, from_block: int | None = None,
+        to_block: int | None = None,
+    ) -> list[tuple[int, int]]:
+        """المراسي مرتّبة بالكتلة، مع مرساة واحدة **خارج** كل طرف إن وُجدت.
+
+        الطرفان مقصودان: الاستقراء يحتاج مرساةً على كل جانب من الكتلة المطلوبة،
+        وقصُّ القائمة على المدى بالضبط يترك أطرافه بلا جانب فيصير الاستقراء
+        امتداداً — وهو أوسع خطأً.
+        """
+        net = str(network_id)
+        if from_block is None or to_block is None:
+            rows = self._conn.execute(
+                """SELECT block_number, block_ts FROM evm_block_time
+                    WHERE network_id=? ORDER BY block_number""", (net,),
+            ).fetchall()
+            return [(int(r["block_number"]), int(r["block_ts"])) for r in rows]
+        lo, hi = int(from_block), int(to_block)
+        out: set[tuple[int, int]] = set()
+        for sql, params in (
+            ("""SELECT block_number, block_ts FROM evm_block_time
+                 WHERE network_id=? AND block_number BETWEEN ? AND ?""",
+             (net, lo, hi)),
+            ("""SELECT block_number, block_ts FROM evm_block_time
+                 WHERE network_id=? AND block_number < ?
+                 ORDER BY block_number DESC LIMIT 1""", (net, lo)),
+            ("""SELECT block_number, block_ts FROM evm_block_time
+                 WHERE network_id=? AND block_number > ?
+                 ORDER BY block_number LIMIT 1""", (net, hi)),
+        ):
+            for r in self._conn.execute(sql, params).fetchall():
+                out.add((int(r["block_number"]), int(r["block_ts"])))
+        return sorted(out)
+
+    def chain_first_recorded_at(
+        self, token_address: str, network_id: str, live_only: bool = True,
+    ) -> str | None:
+        """أوّل لقطة تركّز موجودة لهذه العملة — حدُّ الإعادة الأعلى.
+
+        الإعادة تتوقّف حيث تبدأ التغطية الحيّة: قياسان لنفس اللحظة من طريقين
+        مختلفين (الحيّ بتأخير تأكيد، والمُعاد عند الكتلة بالضبط) يتفاوتان قليلاً،
+        وتشابكهما في سلسلة واحدة يخلق فروق خمس‑دقائق وهميّة.
+        """
+        sql = """SELECT MIN(recorded_at) m FROM chain_concentration
+                  WHERE token_address=? AND network_id=?"""
+        if live_only:
+            sql += " AND COALESCE(is_replay, 0)=0"
+        row = self._conn.execute(
+            sql, (token_address.lower(), str(network_id)),
+        ).fetchone()
+        return row["m"] if row is not None and row["m"] else None
+
+    def chain_live_coverage(
+        self, token_address: str, network_id: str,
+    ) -> dict[str, str]:
+        rows = self._conn.execute(
+            """SELECT watch_first_seen_at, MIN(recorded_at) AS first_recorded_at
+                  FROM chain_concentration
+                 WHERE token_address=? AND network_id=?
+                   AND COALESCE(is_replay, 0)=0
+                 GROUP BY watch_first_seen_at""",
+            (token_address.lower(), str(network_id)),
+        ).fetchall()
+        return {
+            str(row["watch_first_seen_at"]): str(row["first_recorded_at"])
+            for row in rows if row["first_recorded_at"]
+        }
+
+    def assert_chain_live_coverage(
+        self, token_address: str, network_id: str,
+        expected: Mapping[str, str],
+    ) -> None:
+        if self.chain_live_coverage(token_address, network_id) != dict(expected):
+            raise StaleEVMState(
+                f"تغيّرت التغطية الحيّة للعملة {token_address} أثناء الجلب"
+            )
+
+    # --- evm_contract (سلامة العقد — Base وحدها) ---
+    def insert_evm_contract(self, row: Mapping[str, Any]) -> bool:
+        cols = _EVM_CONTRACT_COLUMNS
+        sql = (
+            f"INSERT OR IGNORE INTO evm_contract({', '.join(cols)}) "
+            f"VALUES({', '.join(f':{c}' for c in cols)})"
+        )
+        cur = self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        self._commit()
+        return cur.rowcount > 0
+
+    def set_evm_contract_state(
+        self, token_address: str, network_id: str, status: str, now_iso: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO evm_contract_state(
+                   token_address, network_id, last_fetch_at, last_status, attempts)
+               VALUES(?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_fetch_at = excluded.last_fetch_at,
+                   last_status   = excluded.last_status,
+                   attempts      = evm_contract_state.attempts + 1""",
+            (token_address, network_id, now_iso, status),
+        )
+        self._commit()
+
+    def evm_contract_due(
+        self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
+        networks: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """نفس منطق `chain_auth_due` على جدول حالة العقود."""
+        nets = [str(n) for n in networks]
+        if not nets:
+            return []
+        marks = ", ".join("?" for _ in nets)
+        rows = self._conn.execute(
+            f"""SELECT w.token_address, w.network_id, w.first_seen_at,
+                       w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
+                  FROM watchlist w
+                  LEFT JOIN evm_contract_state s
+                    ON s.token_address=w.token_address AND s.network_id=w.network_id
+                 WHERE w.active=1
+                   AND w.network_id IN ({marks})
+                   AND (s.last_fetch_at IS NULL
+                        OR (s.last_status='error' AND s.last_fetch_at < ?)
+                        OR (COALESCE(s.last_status, '') <> 'error'
+                            AND s.last_fetch_at < ?))
+                 ORDER BY s.last_fetch_at IS NOT NULL,
+                          w.is_control,
+                          s.last_fetch_at,
+                          w.first_seen_at DESC
+                 LIMIT ?""",
+            (*nets, error_stale_before_iso, stale_before_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- watchlist ---
     def upsert_watch(
         self,
@@ -746,6 +1581,21 @@ class RecorderDB:
             self._conn.execute(
                 "DELETE FROM bars_fetch_state WHERE token_address=? AND network_id=?",
                 (token_address, network_id),
+            )
+            # إعادة التنشيط قد تأتي بعد فجوة كان دفتر EVM خلالها غير مراقَب.
+            # الحالة النهائية القديمة لا تثبت تغطية تلك الفجوة، لذلك نعيد دفتر
+            # العملة وreplay من genesis بدلاً من قبول رصيد ناقص بصمت.
+            self._conn.execute(
+                "DELETE FROM evm_balances WHERE token_address=? AND network_id=?",
+                (token_address.lower(), str(network_id)),
+            )
+            self._conn.execute(
+                "DELETE FROM evm_backfill_state WHERE token_address=? AND network_id=?",
+                (token_address.lower(), str(network_id)),
+            )
+            self._conn.execute(
+                "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
+                (token_address.lower(), str(network_id)),
             )
             self._insert_watch_window(
                 token_address, network_id, now, source, until, entry_signal_id, 0,
@@ -840,7 +1690,7 @@ class RecorderDB:
         design_version: int = 2,
         admission_source: str | None = None,
     ) -> None:
-        self._conn.execute(
+        cur = self._conn.execute(
             """INSERT OR IGNORE INTO watch_windows(
                    token_address, network_id, first_seen_at, source,
                    watch_until, entry_signal_id, is_control, admission_price_usd,
@@ -850,6 +1700,14 @@ class RecorderDB:
              watch_until, entry_signal_id, is_control, admission_price_usd,
              design_version, admission_source),
         )
+        if cur.rowcount > 0:
+            # حالة replay تخص اتحاد نوافذ العملة. إضافة نافذة تجعل أي حكم نهائي
+            # سابق قديماً؛ الصفوف السابقة تبقى صحيحة، والحالة وحدها تُعاد كي
+            # يضيف التشغيل التالي نقاط النافذة الجديدة بلا فجوة ولا حذف تاريخ.
+            self._conn.execute(
+                "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
+                (token_address.lower(), str(network_id)),
+            )
 
     def known_tokens(self) -> set[tuple[str, str]]:
         """كل عملة سبق أن دخلت (مُشار إليها أو ضابطة، نشطة أو منتهية).
@@ -1100,6 +1958,9 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "has_banner", "has_banner INTEGER"),
     ("training_rows", "chain_top10_pct", "chain_top10_pct REAL"),
     ("training_rows", "chain_holder_count", "chain_holder_count INTEGER"),
+    ("training_rows", "chain_holders_delta_1h", "chain_holders_delta_1h INTEGER"),
+    ("training_rows", "chain_holders_growth_1h", "chain_holders_growth_1h REAL"),
+    ("training_rows", "chain_holders_span_min", "chain_holders_span_min REAL"),
     ("training_rows", "holders_age_min", "holders_age_min REAL"),
     ("training_rows", "platform_holders", "platform_holders INTEGER"),
     ("training_rows", "platform_penetration", "platform_penetration REAL"),
@@ -1107,6 +1968,41 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "platform_value_usd", "platform_value_usd REAL"),
     ("training_rows", "platform_median_hold_h", "platform_median_hold_h REAL"),
     ("training_rows", "platform_dev_holding", "platform_dev_holding INTEGER"),
+    # الملكية من السلسلة (v10): كانت سولانا وحدها، وصارت الشبكتين معاً في v12 —
+    # دفتر أرصدة من سجلّات Transfer (evm_layer) يكتب في نفس chain_concentration.
+    ("training_rows", "onchain_top1_pct", "onchain_top1_pct REAL"),
+    ("training_rows", "onchain_top5_pct", "onchain_top5_pct REAL"),
+    ("training_rows", "onchain_top10_pct", "onchain_top10_pct REAL"),
+    ("training_rows", "onchain_top20_pct", "onchain_top20_pct REAL"),
+    ("training_rows", "onchain_top_accounts", "onchain_top_accounts INTEGER"),
+    ("training_rows", "onchain_age_min", "onchain_age_min REAL"),
+    ("training_rows", "onchain_top1_delta_5m", "onchain_top1_delta_5m REAL"),
+    ("training_rows", "onchain_top10_delta_5m", "onchain_top10_delta_5m REAL"),
+    ("training_rows", "onchain_delta_span_min", "onchain_delta_span_min REAL"),
+    # (v12) عدد الحائزين مضبوطاً من الدفتر — EVM وحدها، وسولانا تبقى NULL إذ
+    # getTokenLargestAccounts يعيد 20 حساباً بحدّ أقصى ولا يعرف الإجمال.
+    ("training_rows", "onchain_holder_count", "onchain_holder_count INTEGER"),
+    ("training_rows", "onchain_holders_delta_5m", "onchain_holders_delta_5m INTEGER"),
+    # هـ٢-ج) الخطر البنيويّ من السلسلة (chain_authority، ساعيّ).
+    ("training_rows", "onchain_has_mint_authority", "onchain_has_mint_authority INTEGER"),
+    ("training_rows", "onchain_has_freeze_authority", "onchain_has_freeze_authority INTEGER"),
+    ("training_rows", "onchain_is_mutable", "onchain_is_mutable INTEGER"),
+    ("training_rows", "onchain_is_token2022", "onchain_is_token2022 INTEGER"),
+    ("training_rows", "onchain_dev_holding_pct", "onchain_dev_holding_pct REAL"),
+    ("training_rows", "onchain_auth_age_min", "onchain_auth_age_min REAL"),
+    # هـ٢-د) نظيرها على EVM (evm_contract، ساعيّ، Base وحدها): من البايت‑كود
+    # مباشرة — ERC-20 لا يحمل صلاحيات معلنة، ووجود المُعرّف هو الدليل.
+    ("training_rows", "onchain_code_size", "onchain_code_size INTEGER"),
+    ("training_rows", "onchain_function_count", "onchain_function_count INTEGER"),
+    ("training_rows", "onchain_is_proxy", "onchain_is_proxy INTEGER"),
+    ("training_rows", "onchain_owner_renounced", "onchain_owner_renounced INTEGER"),
+    ("training_rows", "onchain_has_mint_fn", "onchain_has_mint_fn INTEGER"),
+    ("training_rows", "onchain_has_pause_fn", "onchain_has_pause_fn INTEGER"),
+    ("training_rows", "onchain_has_blacklist_fn", "onchain_has_blacklist_fn INTEGER"),
+    ("training_rows", "onchain_has_fee_setter", "onchain_has_fee_setter INTEGER"),
+    ("training_rows", "onchain_has_limit_setter", "onchain_has_limit_setter INTEGER"),
+    ("training_rows", "onchain_has_trading_switch", "onchain_has_trading_switch INTEGER"),
+    ("training_rows", "onchain_contract_age_min", "onchain_contract_age_min REAL"),
     # صدارات المدد (v7): سقف المصدر 50 في الصدارة الأساسيّة وكل صيغ الترقيم
     # مُهمَلة بصمت، لكنّ /24h و/7d و/30d تعيد كلٌّ 100 فاتّحاد الأربع 214 متداولاً
     # (المطابقة 3.68% ← 15.26% على 7,200 حدثاً). لا سبيل لتعبئة الماضي: الأرشيف
@@ -1158,6 +2054,19 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "flow_unique_ratio_5m", "flow_unique_ratio_5m REAL"),
     ("training_rows", "flow_trade_size_5m", "flow_trade_size_5m REAL"),
     ("training_rows", "flow_is_low_fees", "flow_is_low_fees INTEGER"),
+    # عدد الحائزين **المضبوط** من طبقة EVM. القاعدة الحيّة أنشأت
+    # chain_concentration قبل وجود هذه الطبقة، فبلا هذا السطر يبقى العمود
+    # مفقوداً هناك و`insert_chain_concentration` يرفع «no such column».
+    # يبقى NULL على سولانا: `getTokenLargestAccounts` يعيد 20 حساباً بحدّ أقصى
+    # ولا يعرف الإجمال (غياب مقيس لا صفر، FR-007).
+    ("chain_concentration", "holder_count", "holder_count INTEGER"),
+    # علامة الصفّ المُعاد (`evm_replay.py`). القاعدة الحيّة أنشأت الجدول قبل
+    # وجود الإعادة، و`NOT NULL DEFAULT 0` يجعل كل صفوفها القديمة «حيّة» — وهي
+    # كذلك فعلاً. بلا العمود لا يمكن تدريب النموذج على المقيس حيّاً وحده.
+    ("chain_concentration", "is_replay",
+     "is_replay INTEGER NOT NULL DEFAULT 0"),
+    ("evm_replay_state", "checkpoint_json", "checkpoint_json BLOB"),
+    ("evm_replay_state", "revision", "revision INTEGER NOT NULL DEFAULT 0"),
     # ملحوظة: `dex_protocol` و`is_top_trader_tagged` **ليسا** هنا. هما عمودا
     # جمعٍ على token_static وsignal_events (وهناك مكانهما في الهجرة أعلاه)، ولا
     # يُنتجهما `build_features`؛ فعمودٌ لهما في training_rows يبقى NULL أبداً —
@@ -1253,4 +2162,36 @@ _HOLDERS_COLUMNS = (
     "platform_holders", "platform_holders_listed", "platform_value_usd",
     "platform_underwater", "platform_median_hold_seconds",
     "platform_dev_holding", "top_holders_json", "raw_json",
+)
+
+# ترتيب أعمدة chain_concentration — يطابق schema.sql. جدول منفصل عن
+# token_holders لأنّ ذاك مصدره FOMO بإيقاع 25 دقيقة ويخلط سكانَين (السلسلة
+# كاملةً ومستخدمي المنصّة)، وهذا قياس سلسلة مباشر بإيقاع 5 دقائق.
+_CHAIN_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control", "supply", "decimals",
+    "top1_pct", "top5_pct", "top10_pct", "top20_pct", "holder_count",
+    "top_accounts", "is_replay", "raw_json",
+)
+
+# ترتيب أعمدة evm_contract — يطابق schema.sql. Base وحدها بقياس: هي الشبكة
+# الوحيدة التي تباينت فيها العقود فعلاً (19 عقداً كاملاً بأحجام 135B–14.8KB)،
+# أمّا BSC فوكلاء متطابقون وروبن‑هود ستّة قوالب مكرّرة ⇒ عمود ثابت لا معلومة.
+_EVM_CONTRACT_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control", "code_size", "function_count",
+    "is_proxy", "impl_address", "code_hash", "owner_address",
+    "is_ownership_renounced", "has_mint", "has_pause", "has_blacklist",
+    "has_fee_setter", "has_limit_setter", "has_trading_switch", "raw_json",
+)
+
+# ترتيب أعمدة chain_authority — يطابق schema.sql. الطبقة البطيئة (ساعيّة):
+# صلاحية السكّ/التجميد و`mutable` تتغيّر مرّة في العمر، فلا معنى لسؤالها بإيقاع
+# التركّز.
+_CHAIN_AUTH_COLUMNS = (
+    "token_address", "network_id", "recorded_at", "watch_first_seen_at",
+    "entry_signal_id", "is_control", "token_program", "mint_authority",
+    "freeze_authority", "update_authority", "is_mutable", "creator_address",
+    "creator_count", "supply", "decimals", "dev_owner", "dev_holding_pct",
+    "raw_json",
 )

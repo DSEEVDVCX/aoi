@@ -535,7 +535,77 @@ def test_flow_columns_registered_in_feature_columns():
     empty = RecorderDB(":memory:", SCHEMA)
     try:
         f_keys = set(features.flow_features(empty, "x", "1", NOW_TS))
+        h_keys = set(features.holders_features(empty, "x", "1", NOW_TS))
     finally:
         empty.close()
     assert f_keys <= set(features.FEATURE_COLUMNS)
+    assert h_keys <= set(features.FEATURE_COLUMNS)
     assert "tick_rich_age_min" in features.FEATURE_COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# تغيّر حائزي السلسلة عبر ساعة — من لقطتين لنا، فالمصدر لا يعطي فرقاً
+# ---------------------------------------------------------------------------
+def _holders(db, at, count, *, source="token_details", top10=42.0):
+    db.insert_holders({
+        "token_address": "tok", "network_id": "56", "recorded_at": at,
+        "watch_first_seen_at": NOW, "entry_signal_id": "sig", "is_control": 0,
+        "source": source, "top10_pct": top10, "holder_count": count,
+        "raw_json": "{}",
+    })
+
+
+def test_holders_delta_measures_chain_not_platform(db):
+    """الإيقاع 25د ⇒ السابقة بساعة+ تبعد 75د، والمدى عمود صريح لا مفترض."""
+    _holders(db, "2026-08-10T10:45:00+00:00", 900)
+    _holders(db, "2026-08-10T12:00:00+00:00", 1000)      # +100 عبر 75د
+    f = features.holders_features(db, "tok", "56", NOW_TS)
+
+    assert f["chain_holder_count"] == 1000
+    assert f["chain_holders_delta_1h"] == 100
+    assert f["chain_holders_growth_1h"] == pytest.approx(100 / 900)
+    assert f["chain_holders_span_min"] == pytest.approx(75.0)
+
+
+def test_holders_delta_absent_prior_stays_null(db):
+    """لقطة واحدة: الفرق None لا صفر — «لم نقس» ليس «لم يتغيّر» (FR-007)."""
+    _holders(db, "2026-08-10T12:00:00+00:00", 1000)
+    f = features.holders_features(db, "tok", "56", NOW_TS)
+
+    assert f["chain_holder_count"] == 1000
+    assert f["chain_holders_delta_1h"] is None
+    assert f["chain_holders_growth_1h"] is None
+    assert f["chain_holders_span_min"] is None
+
+
+def test_holders_delta_rejects_stale_prior(db):
+    """فوق 100د اللقطة من حقبة أخرى: الذيل المقيس يمتدّ إلى 4,834د."""
+    _holders(db, "2026-08-10T06:00:00+00:00", 500)        # قبل 360د
+    _holders(db, "2026-08-10T12:00:00+00:00", 1000)
+    f = features.holders_features(db, "tok", "56", NOW_TS)
+
+    assert f["chain_holders_span_min"] is None
+    assert f["chain_holders_delta_1h"] is None
+
+
+def test_holders_delta_zero_change_is_measured(db):
+    """صفر مقيس ≠ غائب: 15.1% من الأزواج لا يتغيّر فيها العدد فعلاً."""
+    _holders(db, "2026-08-10T10:45:00+00:00", 900)
+    _holders(db, "2026-08-10T12:00:00+00:00", 900)
+    f = features.holders_features(db, "tok", "56", NOW_TS)
+
+    assert f["chain_holders_delta_1h"] == 0
+    assert f["chain_holders_growth_1h"] == 0.0
+
+
+def test_holders_delta_ignores_future_and_platform_rows(db):
+    """قانون النقطة الزمنية + المصدر: hodlers_top لا يلوّث عدّ السلسلة."""
+    _holders(db, "2026-08-10T10:45:00+00:00", 900)
+    _holders(db, "2026-08-10T12:00:00+00:00", 1000)
+    before = features.holders_features(db, "tok", "56", NOW_TS)
+    _holders(db, "2026-08-10T12:30:00+00:00", 9999)                    # بعد t0
+    _holders(db, "2026-08-10T11:50:00+00:00", 7, source="hodlers_top")  # منصّة
+    after = features.holders_features(db, "tok", "56", NOW_TS)
+
+    assert before["chain_holders_delta_1h"] == after["chain_holders_delta_1h"] == 100
+    assert after["chain_holder_count"] == 1000

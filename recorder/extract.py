@@ -1190,3 +1190,265 @@ def extract_trader(
         "raw_json": _dumps(raw_envelope),
     }
 
+
+# ---------------------------------------------------------------------------
+# تركّز الملكية من **السلسلة** (Solana RPC) — لا من FOMO
+#
+# FOMO يعطي `top10HoldersPercent` وحده وكل ~25 دقيقة (وسيط الفجوة المقيس 25.0
+# على 19,440 زوجاً). السلسلة تعطي top1/5/10/20 في نداء واحد (مقيس 230ms)،
+# فيصير top1 — الحوت المفرد — مقيساً لا مُشتقّاً، ويصير الإيقاع 5 دقائق.
+#
+# **الحساب بأعداد صحيحة في الوحدات الأساسية** لا بالعشريّات الجاهزة
+# (`uiAmount`): المصدر يعيد `amount` سلسلةَ عدد صحيح بنفس `decimals` للعرض
+# وللحسابات، وأعداد بايثون الصحيحة بلا حدّ دقّة — بينما `uiAmount` عدد عائم
+# يفقد أرقاماً عند معروض بـ18 منزلة. بسط ومقام من نفس الدفعة ⇒ نفس اللحظة.
+#
+# `top_accounts` عمود لازم لا تزيين: المصدر يعيد **20 حساباً كحدّ أقصى**، فعملة
+# حائزوها سبعة تعيد سبعة و`top20_pct` منها = مجموع الكلّ (100%) لا «أكبر 20».
+# بلا هذا العمود لا يستطيع أحد التمييز بين تركّز حقيقيّ وعملة بلا حائزين.
+# ---------------------------------------------------------------------------
+_CHAIN_TIERS = ((1, "top1_pct"), (5, "top5_pct"), (10, "top10_pct"), (20, "top20_pct"))
+
+
+def extract_chain_concentration(
+    raw_envelope: Any,
+    token_address: str,
+    network_id: str,
+    recorded_at: str,
+    watch_first_seen_at: str,
+    entry_signal_id: str | None,
+    is_control: int = 0,
+) -> dict[str, Any] | None:
+    """مغلّف `{supply, largest}` من `SolanaRPC` → صفّ `chain_concentration`.
+
+    بلا مغلّف صالح، أو بلا عرضٍ ولا حسابات → `None` (لا صفّ مفبرك، FR-007).
+    عرضٌ صفريّ (حرق كامل) يبقي الصفّ — الصفر هنا **قياس** — لكن النِّسب تبقى
+    `NULL` لأنّ القسمة على صفر لا نتيجة لها.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return None
+
+    supply_v = raw_envelope.get("supply")
+    supply_v = supply_v.get("value") if isinstance(supply_v, Mapping) else None
+    largest_v = raw_envelope.get("largest")
+    largest_v = largest_v.get("value") if isinstance(largest_v, Mapping) else None
+
+    supply_base: int | None = None
+    supply_ui: float | None = None
+    decimals: int | None = None
+    if isinstance(supply_v, Mapping):
+        decimals = _int(supply_v.get("decimals"))
+        supply_base = _int(supply_v.get("amount"))
+        if supply_base is not None and decimals is not None and decimals >= 0:
+            supply_ui = supply_base / (10 ** decimals)
+        else:
+            supply_ui = _num(supply_v.get("uiAmount"))
+
+    amounts: list[int] = []
+    if isinstance(largest_v, Sequence) and not isinstance(largest_v, (str, bytes)):
+        for acc in largest_v:
+            if not isinstance(acc, Mapping):
+                continue
+            amt = _int(acc.get("amount"))
+            if amt is not None:
+                amounts.append(amt)
+    # المصدر يعيدها مرتّبة تنازلياً، والترتيب هنا تحصينٌ لا ثقة: الترتيب هو
+    # كلّ المعنى في «أكبر واحد».
+    amounts.sort(reverse=True)
+
+    if supply_base is None and not amounts:
+        return None  # لا قياس إطلاقاً
+
+    row: dict[str, Any] = {
+        "token_address": token_address,
+        "network_id": network_id,
+        "recorded_at": recorded_at,
+        "watch_first_seen_at": watch_first_seen_at,
+        "entry_signal_id": entry_signal_id,
+        "is_control": 1 if is_control else 0,
+        "supply": supply_ui,
+        "decimals": decimals,
+        "top_accounts": len(amounts),
+        "raw_json": _dumps(raw_envelope),
+    }
+    for n, col in _CHAIN_TIERS:
+        row[col] = None
+    if supply_base and amounts:              # صفر أو None ⇒ لا نسبة
+        for n, col in _CHAIN_TIERS:
+            row[col] = 100.0 * sum(amounts[:n]) / supply_base
+    return row
+
+
+# ---------------------------------------------------------------------------
+# الطبقة البطيئة: صلاحيات المِنت وقابليّة التعديل وحيازة المنشئ
+#
+# مصدران في دفعة واحدة لأنّ أيّاً منهما لا يكفي (مقيس على 48 عملة حيّة،
+# 2026-08-13): `getAccountInfo` يعطي `mintAuthority`/`freezeAuthority` والعرض
+# ولا يعرف `mutable`؛ و`getAsset` يعطي `mutable` والمنشئين ولا يعطي صلاحية
+# السكّ. و21 من 48 على `spl-token` القديم (بلا امتداد ميتاداتا) و27 على
+# `spl-token-2022` (سلطة التعديل داخل حساب المِنت) — فموضع سلطة التعديل نفسه
+# يختلف بين العملتين وقراءتها تحتاج المسارين.
+#
+# **سلطة السكّ قائمة = بابُ طبعٍ مفتوح** (مقيس: 3 من 48)، و**سلطة التجميد قائمة
+# = من يملكها يجمّد محفظتك** (1 من 48). نادرتان، وهذا بالضبط ما يجعلهما
+# معلومة: العلم الذي يرتفع في 6% من الحالات يفرّق، والذي يرتفع دائماً لا يفرّق.
+# ---------------------------------------------------------------------------
+def _mint_info(raw_envelope: Mapping[str, Any]) -> dict[str, Any]:
+    """`{program, info}` من ردّ `getAccountInfo` — أو فارغ إن غاب الحساب."""
+    val = raw_envelope.get("mint")
+    val = val.get("value") if isinstance(val, Mapping) else None
+    if not isinstance(val, Mapping):
+        return {}
+    data = val.get("data")
+    if not isinstance(data, Mapping):
+        return {}
+    parsed = data.get("parsed")
+    info = parsed.get("info") if isinstance(parsed, Mapping) else None
+    return {
+        "program": data.get("program"),
+        "info": info if isinstance(info, Mapping) else {},
+    }
+
+
+def _token2022_update_authority(info: Mapping[str, Any]) -> str | None:
+    """سلطة تعديل الميتاداتا من امتداد `tokenMetadata` (Token-2022 وحده)."""
+    exts = info.get("extensions")
+    if not isinstance(exts, Sequence) or isinstance(exts, (str, bytes)):
+        return None
+    for ext in exts:
+        if not isinstance(ext, Mapping) or ext.get("extension") != "tokenMetadata":
+            continue
+        state = ext.get("state")
+        if isinstance(state, Mapping):
+            ua = state.get("updateAuthority")
+            return ua if isinstance(ua, str) and ua else None
+    return None
+
+
+def _das_authority(asset: Mapping[str, Any]) -> str | None:
+    """أوّل سلطة من `authorities[]` في ردّ DAS (نمط spl-token القديم)."""
+    auths = asset.get("authorities")
+    if not isinstance(auths, Sequence) or isinstance(auths, (str, bytes)):
+        return None
+    for a in auths:
+        if isinstance(a, Mapping):
+            addr = a.get("address")
+            if isinstance(addr, str) and addr:
+                return addr
+    return None
+
+
+def _das_creators(asset: Mapping[str, Any]) -> list[str]:
+    out: list[str] = []
+    creators = asset.get("creators")
+    if isinstance(creators, Sequence) and not isinstance(creators, (str, bytes)):
+        for c in creators:
+            if isinstance(c, Mapping):
+                addr = c.get("address")
+                if isinstance(addr, str) and addr:
+                    out.append(addr)
+    return out
+
+
+def pick_dev_owner(raw_envelope: Any) -> str | None:
+    """عنوان «المطوّر» الذي نقيس رصيده — أو `None` فلا نداء ثانياً.
+
+    الأولويّة: منشئ مُعلَن (`creators[0]`) ثم سلطة التعديل. المنشئ أصدق لكنّه
+    **مقيس في 7 من 48 فقط** لأنّ Token-2022 يعيد `creators: []` دائماً؛ فسلطة
+    التعديل بديل معقول، ولذلك يُخزَّن `dev_owner` مع النسبة — رقم بلا صاحبه
+    غير قابل للتفسير.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    asset = raw_envelope.get("asset")
+    asset = asset if isinstance(asset, Mapping) else {}
+    creators = _das_creators(asset)
+    if creators:
+        return creators[0]
+    mint = _mint_info(raw_envelope)
+    ua = _token2022_update_authority(mint.get("info") or {})
+    return ua or _das_authority(asset)
+
+
+def extract_chain_authority(
+    raw_envelope: Any,
+    token_address: str,
+    network_id: str,
+    recorded_at: str,
+    watch_first_seen_at: str,
+    entry_signal_id: str | None,
+    is_control: int = 0,
+) -> dict[str, Any] | None:
+    """مغلّف `{mint, asset, owner_accounts?}` → صفّ `chain_authority`.
+
+    بلا حساب مِنت صالح → `None`: غياب الحساب يعني أنّ القياس لم يحدث، وصفّ
+    كلّه NULL يوهم بأنّ العملة «بلا صلاحيات» وهي أخطر قراءة ممكنة.
+
+    `is_mutable` يبقى `None` إن فشل DAS وحده — لا `0`: «لم نقس» ليست «غير
+    قابلة للتعديل» (FR-007).
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return None
+    mint = _mint_info(raw_envelope)
+    info = mint.get("info") or {}
+    if not info:
+        return None
+
+    asset = raw_envelope.get("asset")
+    asset = asset if isinstance(asset, Mapping) else {}
+
+    decimals = _int(info.get("decimals"))
+    supply_base = _int(info.get("supply"))
+    supply_ui: float | None = None
+    if supply_base is not None and decimals is not None and decimals >= 0:
+        supply_ui = supply_base / (10 ** decimals)
+
+    creators = _das_creators(asset)
+    update_authority = (
+        _token2022_update_authority(info) or _das_authority(asset)
+    )
+    mutable = asset.get("mutable")
+
+    # حيازة المطوّر: مجموع أرصدة حساباته من هذه العملة ÷ العرض. عنوان بلا
+    # حساب رمز = صفر **مقيس** (باع أو لم يحتفظ) لا غياب — فالتمييز هنا بين
+    # «سألنا فلم نجد حساباً» و«لم نسأل أصلاً».
+    dev_owner = raw_envelope.get("dev_owner")
+    dev_owner = dev_owner if isinstance(dev_owner, str) and dev_owner else None
+    dev_pct: float | None = None
+    accounts = raw_envelope.get("owner_accounts")
+    accounts = accounts.get("value") if isinstance(accounts, Mapping) else accounts
+    if dev_owner and isinstance(accounts, Sequence) and not isinstance(accounts, (str, bytes)):
+        held = 0
+        for acc in accounts:
+            if not isinstance(acc, Mapping):
+                continue
+            parsed = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {})
+            amt = _int(((parsed.get("info") or {}).get("tokenAmount") or {}).get("amount"))
+            if amt is not None:
+                held += amt
+        if supply_base:
+            dev_pct = 100.0 * held / supply_base
+
+    return {
+        "token_address": token_address,
+        "network_id": network_id,
+        "recorded_at": recorded_at,
+        "watch_first_seen_at": watch_first_seen_at,
+        "entry_signal_id": entry_signal_id,
+        "is_control": 1 if is_control else 0,
+        "token_program": mint.get("program"),
+        "mint_authority": info.get("mintAuthority") or None,
+        "freeze_authority": info.get("freezeAuthority") or None,
+        "update_authority": update_authority,
+        "is_mutable": None if mutable is None else (1 if mutable else 0),
+        "creator_address": creators[0] if creators else None,
+        # `0` منشئين قياسٌ صحيح (Token-2022 يعيد `creators: []` فعلاً)، لكنّه
+        # قياس **فقط إن ردّ DAS**؛ إن فشل وحده فالعدد غير معلوم لا صفر.
+        "creator_count": len(creators) if asset else None,
+        "supply": supply_ui,
+        "decimals": decimals,
+        "dev_owner": dev_owner,
+        "dev_holding_pct": dev_pct,
+        "raw_json": _dumps(raw_envelope),
+    }
+

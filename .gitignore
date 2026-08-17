@@ -20,6 +20,11 @@ privy_storage_dump.json
 privy_refresh_call.json
 captured_endpoints.json
 
+# مفاتيح مزوّدي البلوك تشين (Helius): مفتاح واحد في نصّ صريح — يُقرأ من القرص
+# كل نداء ولا يُطبع ولا يُسجَّل، ولا يُلتزَم إطلاقاً.
+recorder/chain_keys.json
+chain_keys.json
+
 # Runtime artefacts
 *.log
 # سجلّات مُدوَّرة (server.log.1) — لا يطابقها *.log

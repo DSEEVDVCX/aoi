@@ -50,25 +50,35 @@ def pending_outcomes(
     limit: int,
     model_candidates_only: bool = False,
 ) -> list[dict]:
-    candidate_filter = ""
+    filters: list[str] = []
+    params: list[object] = []
     if model_candidates_only:
-        candidate_filter = """
-        AND o.kind = 'signal'
-        AND o.is_independent = 1
-        AND o.entry_ts >= ?"""
-    where = """
-        AND NOT EXISTS (SELECT 1 FROM training_rows r
-                         WHERE r.kind = o.kind AND r.key = o.key
-                           AND r.feature_version = ?)"""
-    params: tuple[int, ...]
-    if model_candidates_only:
-        params = (config.LIVE_START_TS, features.FEATURE_VERSION, limit)
-    else:
-        params = (features.FEATURE_VERSION, limit)
+        filters.append(
+            "AND o.kind = 'signal' AND o.is_independent = 1 AND o.entry_ts >= ?"
+        )
+        params.append(config.LIVE_START_TS)
+    rebuild_required = db.get_meta("evm_ledger_rebuild_required") == "1"
+    rebuild_started = db.get_meta("evm_training_rebuild_started") == "1"
+    if rebuild_required and not rebuild_started:
+        evm_networks = sorted({
+            *(str(network) for network in config.EVM_NETWORKS),
+            *(str(network) for network in config.EVM_REPLAY_NETWORKS),
+        })
+        if evm_networks:
+            filters.append(
+                "AND COALESCE(o.network_id, '') NOT IN ("
+                + ", ".join("?" for _ in evm_networks) + ")"
+            )
+            params.extend(evm_networks)
+    filters.append(
+        """AND NOT EXISTS (SELECT 1 FROM training_rows r
+             WHERE r.kind = o.kind AND r.key = o.key AND r.feature_version = ?)"""
+    )
+    params.extend((features.FEATURE_VERSION, int(limit)))
     rows = db._conn.execute(
         f"""SELECT o.* FROM outcomes o
              WHERE o.status IN ('ok', 'no_bars')
-             {candidate_filter} {where}
+             {' '.join(filters)}
              ORDER BY o.entry_ts LIMIT ?""",
         params,
     ).fetchall()
@@ -84,11 +94,12 @@ def build(
 ) -> dict:
     if rebuild and model_candidates_only:
         raise ValueError("--rebuild and --model-candidates-only cannot be combined")
-    if rebuild:
+    if rebuild and not dry:
         # Rebuild is a one-time reset. Subsequent invocations can resume by
         # selecting rows missing the current feature version.
         db._conn.execute("DELETE FROM training_rows")
         db._conn.commit()
+    expected_rebuild_state = db.evm_training_rebuild_state()
     stats = {"built": 0, "skipped_no_event": 0}
     rows: list[dict] = []
     for out in pending_outcomes(db, rebuild, limit, model_candidates_only):
@@ -101,6 +112,7 @@ def build(
     if rows and not dry:
         cols = features.ROW_COLUMNS
         with db.batch():
+            db.assert_evm_training_rebuild_state(expected_rebuild_state)
             db._conn.executemany(
                 f"INSERT OR REPLACE INTO training_rows({', '.join(cols)}) "
                 f"VALUES({', '.join(f':{c}' for c in cols)})",

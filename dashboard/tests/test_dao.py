@@ -42,6 +42,15 @@ CREATE TABLE outcomes (
   analysis_eligible INTEGER, entry_ts INTEGER
 );
 CREATE TABLE snapshots (id INTEGER PRIMARY KEY, recorded_at TEXT, source TEXT, raw_json TEXT);
+CREATE TABLE chain_concentration (
+  token_address TEXT, network_id TEXT, recorded_at TEXT,
+  top1_pct REAL, top5_pct REAL, top10_pct REAL, top20_pct REAL,
+  holder_count INTEGER
+);
+CREATE TABLE token_holders (
+  token_address TEXT, network_id TEXT, recorded_at TEXT, source TEXT,
+  top10_pct REAL, holder_count INTEGER
+);
 """
 
 # مسار مخطّط المسجّل الحقيقي — يُستعمل في اختبار انجراف المخطّط أدناه.
@@ -219,6 +228,105 @@ def test_recorder_errors_stale_when_older_than_last_ok_cycle(db_path):
     tr = next(e for e in dao.recorder_errors(conn, ("trending",)) if e["source"] == "trending")
     assert tr["stale"] is True
     conn.close()
+
+
+def test_network_summary_reports_chain_coverage(db_path):
+    c = sqlite3.connect(db_path)
+    c.executemany(
+        "INSERT INTO watchlist VALUES(?,?,?,?,?,?,?,?)",
+        [
+            ("sol", "1399811149", "t", "large_buy", "t2", "s", 1, 0),
+            ("bsc", "56", "t", "large_buy", "t2", "s", 1, 0),
+            ("old", "56", "t", "large_buy", "t2", "s", 0, 0),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO token_holders VALUES(?,?,?,?,?,?)",
+        [
+            ("sol", "1399811149", "2026-08-14T00:00:00+00:00", "token_details", 30, 500),
+            ("bsc", "56", "2026-08-14T00:00:00+00:00", "token_details", 31, 100),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO chain_concentration VALUES(?,?,?,?,?,?,?,?)",
+        [
+            ("sol", "1399811149", "2026-08-14T00:00:00+00:00", 10, 20, 30, 40, None),
+            ("bsc", "56", "2026-08-13T00:00:00+00:00", 1, 2, 3, 4, 90),
+            ("bsc", "56", "2026-08-14T00:00:00+00:00", 11, 21, 31, 41, 100),
+            ("old", "56", "2026-08-14T00:00:00+00:00", 12, 22, 32, 42, 200),
+        ],
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    result = {row["network_id"]: row for row in dao.network_summary(conn)}
+    conn.close()
+
+    assert result["56"]["active_watches"] == 1
+    assert result["56"]["concentration_rows"] == 1
+    assert result["56"]["holder_count_rows"] == 1
+    assert result["56"]["details_holder_rows"] == 1
+    assert result["1399811149"]["top20_rows"] == 1
+    assert result["1399811149"]["details_holder_rows"] == 1
+
+
+def test_network_summary_tolerates_pre_chain_schema(tmp_path):
+    p = str(tmp_path / "old.db")
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE watchlist (token_address TEXT, network_id TEXT, active INTEGER)")
+    c.execute("INSERT INTO watchlist VALUES('token', '56', 1)")
+    c.commit()
+    c.close()
+
+    conn = _conn(p)
+    result = dao.network_summary(conn)
+    conn.close()
+
+    assert result == [{
+        "network_id": "56", "active_watches": 1, "concentration_rows": 0,
+        "top1_rows": 0, "top5_rows": 0, "top10_rows": 0, "top20_rows": 0,
+        "holder_count_rows": 0, "details_holder_rows": 0,
+        "details_top10_rows": 0, "tick_rows": 0,
+        "latest_concentration": None, "latest_details": None, "latest_tick": None,
+    }]
+
+
+def test_network_summary_tolerates_missing_holder_count_column(tmp_path):
+    p = str(tmp_path / "old-chain.db")
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE watchlist (token_address TEXT, network_id TEXT, active INTEGER)")
+    c.execute("""CREATE TABLE chain_concentration (
+        token_address TEXT, network_id TEXT, recorded_at TEXT,
+        top1_pct REAL, top5_pct REAL, top10_pct REAL, top20_pct REAL
+    )""")
+    c.execute("INSERT INTO watchlist VALUES('token', '56', 1)")
+    c.execute("INSERT INTO chain_concentration VALUES('token','56','t',1,2,3,4)")
+    c.commit()
+    c.close()
+
+    conn = _conn(p)
+    row = dao.network_summary(conn)[0]
+    conn.close()
+
+    assert row["concentration_rows"] == 1
+    assert row["top20_rows"] == 1
+    assert row["holder_count_rows"] == 0
+
+
+def test_network_summary_excludes_null_network_ticks(db_path):
+    c = sqlite3.connect(db_path)
+    c.execute(
+        "INSERT INTO market_ticks(token_address, network_id, recorded_at) VALUES('x', NULL, 't')"
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    rows = dao.network_summary(conn)
+    conn.close()
+
+    assert rows == []
 
 
 def test_recorder_errors_active_when_newer_than_boundary(db_path):
@@ -648,6 +756,7 @@ def test_every_dao_read_runs_against_the_real_recorder_schema(tmp_path):
         assert dao.recent_signals(c, 10) == []
         assert dao.active_watchlist(c) == []
         assert dao.ticks_summary(c)["total"] == 0
+        assert dao.network_summary(c) == []
         assert dao.bars_coverage(c, 0)["candles"] == 0
         assert dao.watch_performance(c, 10) == []
         assert dao.performance_summary(c)["count"] == 0

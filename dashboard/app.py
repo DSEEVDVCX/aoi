@@ -141,6 +141,11 @@ def api_ticks_summary() -> dict[str, Any]:
     return _with_conn(dao.ticks_summary)
 
 
+@app.get("/api/networks")
+def api_networks() -> dict[str, Any]:
+    return _with_conn(lambda c: {"networks": dao.network_summary(c)})
+
+
 @app.get("/api/counts")
 def api_counts() -> dict[str, Any]:
     return _with_conn(dao.table_counts)
