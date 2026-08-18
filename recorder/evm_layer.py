@@ -33,7 +33,7 @@ from typing import Any, Sequence
 
 import config
 import evm_rpc
-from db import RecorderDB, StaleEVMState
+from db import RecorderDB, StaleEVMState, utcnow_iso
 from evm_rpc import EVMLogLimit
 
 _CHAIN_TIERS = ((1, "top1_pct"), (5, "top5_pct"), (10, "top10_pct"), (20, "top20_pct"))

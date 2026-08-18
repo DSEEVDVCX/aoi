@@ -954,6 +954,14 @@ async def test_backfill_commits_when_network_cursor_moves_concurrently(db):
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
 
 
+async def test_backfill_assist_supplies_its_own_timestamp_when_omitted(db):
+    stats = await evm_layer.run_evm_backfill_assist(
+        _CycleRPC(), db, networks=[], sleep=_noop,
+    )
+
+    assert stats["evm_backfill_due"] == 0
+
+
 async def test_backfill_done_aborts_if_cursor_moves_after_catchup_check(db, monkeypatch):
     """حركة المؤشر في نافذة التثبيت لا تترك فجوة بين backfill والتطبيق الحي."""
     _watch(db)
