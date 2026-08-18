@@ -241,7 +241,9 @@ def provider_keys(
     """حالةُ أحواض مفاتيح المزوّدين كما ختمتها كل عمليّة في `meta`.
 
     **بلا أيّ قيمة مفتاح** (FR-013): الكاتب لا يكتب إلّا أعداداً ومؤشّرات، وهذه
-    الدالّة تقرأ ما كُتب — فلا سبيل لعرض مفتاح ولا كسرٍ منه أصلاً.
+    الدالّة تقرأ ما كُتب — فلا سبيل لعرض مفتاح ولا كسرٍ منه أصلاً. (أسماءُ
+    الحسابات وآخرُ أربعة أحرف تأتي من طريقٍ آخر تماماً: `keystore` يقرأ الملفّ.
+    فلا يُخلط الطريقان — هذا الصفُّ يبقى صالحاً للسجلّ، وذاك لا.)
 
     صفٌّ لكل (مالك، مزوّد) لا صفٌّ لكل مزوّد: حوض GoldRush يوجد في `FomoChain`
     و`FomoEVMReplay` معاً بحالتين مستقلّتين (عمليّتان، ذاكرتان)، ودمجُهما كان
@@ -258,6 +260,24 @@ def provider_keys(
             return int(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return 0
+
+    def _indices(value: object, limit: int) -> list[int]:
+        """مواضعُ صحيحة داخل المدى فقط.
+
+        تقريرُ عمليّةٍ أخرى قد يكون من نسخةٍ أقدم أو أحدث؛ موضعٌ خارج المدى
+        كان سيُلوّن سطراً لا يقابله، أو يرفع في العرض. نُسقطه بصمت.
+        """
+        if not isinstance(value, list):
+            return []
+        out: list[int] = []
+        for item in value:
+            try:
+                index = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < limit and index not in out:
+                out.append(index)
+        return sorted(out)
 
     out: list[dict[str, Any]] = []
     for key, raw in all_meta(conn).items():
@@ -286,6 +306,11 @@ def provider_keys(
                 "blocked": blocked,
                 "available": available,
                 "index": _count(pool.get("index")),
+                # مواضعُ المبرَّدة لا عددُها: العددُ يقول «واحدٌ من ثلاثة مرفوض»
+                # ولا يقول أيُّها، فتُلوَّن الثلاثةُ حمراء ويُلام السليم. مؤشّرٌ
+                # في قائمة، لا قيمة ولا طولها (FR-013). نسخةٌ أقدم من الكاتب لا
+                # ترسله ⇒ قائمةٌ فارغة، فيبقى `blocked` هو المعنى المتاح.
+                "blocked_index": _indices(pool.get("blocked_index"), keys),
                 "rotations": _count(pool.get("rotations")),
                 "cooldown_seconds": pool.get("cooldown_seconds"),
                 # مزوّدٌ مُسكَت لبقيّة عمر العمليّة (نفاد رصيد GoldRush ⇒ 402):

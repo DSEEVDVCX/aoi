@@ -5,6 +5,12 @@
 واحدٌ منها مرفوض الآن؟» إلّا بقراءة سجلٍّ نصّيّ. ولذلك `KeyPool.stats()`
 و`pool_report()`: **أعدادٌ ومؤشّرات فقط، بلا أي قيمة مفتاح ولا كسرٍ منها**
 (FR-013) — العدد لا يُعاد بناؤه إلى مفتاح، والبصمة تُعاد مطابقتها فلا نصدرها.
+
+وهذا الحدُّ حدُّ *هذا الطريق*: ما يُكتب في `meta` يُنسخ احتياطيّاً ويُقرأ في
+سجلّات، فلا يحمل شيئاً من السرّ أبداً. وللوحة طريقٌ ثانٍ منفصل (`keystore` يقرأ
+الملفّ مباشرةً) تعرض فيه اسمَ الحساب وآخرَ أربعة أحرف بطلب المستخدم — يُحسب
+لحظةَ الطلب ولا يُكتب في `meta` ولا في سجلّ. فلا يُخلط الطريقان: ما يجوز عرضُه
+على الشاشة ليس بالضرورة ما يجوز تسجيلُه.
 """
 from __future__ import annotations
 
@@ -15,25 +21,26 @@ from collections.abc import Mapping
 from typing import Any
 
 import config
-
-
-def _values(data: Mapping[str, object], plural: str, singular: str) -> list[str]:
-    raw = data.get(plural)
-    candidates = raw if isinstance(raw, list) else [data.get(singular)]
-    return [value.strip() for value in candidates if isinstance(value, str) and value.strip()]
+import key_file
 
 
 def read_keys(plural: str, singular: str, env_name: str | None = None) -> list[str]:
+    """قيمُ مفاتيح مزوّدٍ واحد للحوض — **المفعّلة منها فقط**.
+
+    صيغةُ الملفّ نفسها معرّفةٌ في `key_file` وحدَه (تقرأها اللوحة أيضاً وتكتبها،
+    فمصدرُ حقيقةٍ واحد لا اثنان). وما يزيده هذا الموضع شيئان: تقدّمُ متغيّر
+    البيئة، وتصفيةُ `enabled` — فالمفتاح الموقوف مؤقّتاً يبقى في الملفّ لتراه
+    اللوحة وتُعيد تشغيله، ولا يدخل الحوض فلا يُنادى به.
+    """
     if env_name:
         env = os.environ.get(env_name, "").strip()
         if env:
             return list(dict.fromkeys(value.strip() for value in env.split(",") if value.strip()))
-    try:
-        with open(config.chain_keys_path(), encoding="utf-8") as fh:
-            data = json.load(fh) or {}
-    except (OSError, ValueError, TypeError):
-        return []
-    return list(dict.fromkeys(_values(data, plural, singular)))
+    return [
+        row["key"]
+        for row in key_file.load_entries(config.chain_keys_path(), plural, singular)
+        if row["enabled"]
+    ]
 
 
 class KeyPool:
@@ -90,17 +97,32 @@ class KeyPool:
             1 for key in self.keys if moment < self._blocked_until.get(key, 0.0)
         )
 
+    def blocked_indices(self, *, now: float | None = None) -> list[int]:
+        """مواضعُ المبرَّدة في القائمة — لتلوين مفتاحٍ بعينه في اللوحة.
+
+        العددُ وحده لا يكفي: «واحدٌ من ثلاثة مبرَّد» لا يقول أيُّها، فتُعرض
+        الثلاثةُ بلونٍ واحد ويُلام السليمُ منها. والموضعُ رقمٌ في قائمة، لا
+        يدلّ على قيمةٍ ولا على طولها (FR-013)، وترتيبُ القائمة هو ترتيبُ
+        المفعّلة في الملفّ — فتتطابق مع ما تعرضه اللوحة سطراً بسطر.
+        """
+        moment = time.monotonic() if now is None else now
+        return [
+            index for index, key in enumerate(self.keys)
+            if moment < self._blocked_until.get(key, 0.0)
+        ]
+
     def stats(self, *, now: float | None = None) -> dict[str, Any]:
         """صورةُ الحوض للكتابة في `meta` — **أعدادٌ ومؤشّرات لا قيم** (FR-013).
 
         `index` مؤشّرٌ في قائمة، لا يدلّ على قيمةٍ ولا على طولها. و`available`
         محسوبٌ لا مستقلّ كي لا يتناقض الرقمان في العرض.
         """
-        blocked = self.blocked_count(now=now)
+        blocked = self.blocked_indices(now=now)
         return {
             "keys": len(self.keys),
-            "blocked": blocked,
-            "available": max(0, len(self.keys) - blocked),
+            "blocked": len(blocked),
+            "available": max(0, len(self.keys) - len(blocked)),
+            "blocked_index": blocked,
             "index": (self._index % len(self.keys)) if self.keys else 0,
             "rotations": self._rotations,
             "cooldown_seconds": round(float(self.cooldown_seconds), 1),

@@ -1,6 +1,7 @@
 import json
 import time
 
+import key_file
 import provider_keys
 
 
@@ -21,6 +22,52 @@ def test_read_keys_supports_comma_separated_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(tmp_path / "missing"))
 
     assert provider_keys.read_keys("unused", "unused", "TEST_PROVIDER_KEYS") == ["a", "b"]
+
+
+def test_read_keys_skips_keys_the_dashboard_paused(monkeypatch, tmp_path):
+    """الإيقاف المؤقّت: يبقى في الملفّ لتعيده اللوحة، ولا يدخل الحوض فلا يُنادى."""
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps({"helius_api_keys": [
+        {"key": "live-one", "label": "الرئيسي"},
+        {"key": "paused-one", "enabled": False},
+        {"key": "live-two"},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(path))
+
+    assert provider_keys.read_keys("helius_api_keys", "helius_api_key") == ["live-one", "live-two"]
+
+
+def test_what_the_dashboard_writes_is_exactly_what_the_pool_reads(monkeypatch, tmp_path):
+    """الكاتبُ والقارئ مربوطان في اختبارٍ واحد — وإلّا فالعطبُ عطلٌ كامل.
+
+    الشكلُ القديم كان يُبقي النصوص فقط (`isinstance(value, str)`)، فأوّلُ كتابةٍ
+    باللوحة على عمليّةٍ تشغّل ذلك الكود كانت ستُرجع **صفرَ مفاتيح**: لا مفتاحٌ
+    واحدٌ يفشل بل الطبقةُ كلّها تتوقّف. هذا الاختبار يمرّ بالكاتب الحقيقيّ
+    (`key_file.save_entries`) لا بملفٍّ مكتوبٍ بيدٍ في الاختبار، فأيّ تباعدٍ
+    بين الشكلين يسقط هنا لا في الإنتاج.
+    """
+    path = tmp_path / "keys.json"
+    monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(path))
+
+    key_file.save_entries(str(path), "helius_api_keys", "helius_api_key", [
+        {"key": "dashboard-added-1", "label": "حسابٌ أضافته اللوحة"},
+        {"key": "dashboard-paused", "label": "موقوف", "enabled": False},
+    ])
+
+    assert provider_keys.read_keys("helius_api_keys", "helius_api_key") == ["dashboard-added-1"]
+
+
+def test_read_keys_reflects_an_edit_made_while_the_process_runs(monkeypatch, tmp_path):
+    """مفتاحٌ يُضاف من اللوحة يجب أن يعمل بلا إعادة تشغيل: القراءة من القرص كلَّ نداء."""
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps({"helius_api_keys": ["first-key"]}), encoding="utf-8")
+    monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(path))
+    assert provider_keys.read_keys("helius_api_keys", "helius_api_key") == ["first-key"]
+
+    path.write_text(json.dumps({"helius_api_keys": ["first-key", "added-later"]}), encoding="utf-8")
+    assert provider_keys.read_keys("helius_api_keys", "helius_api_key") == [
+        "first-key", "added-later",
+    ]
 
 
 def test_key_pool_rotates_and_cools_down_current_key(monkeypatch):
@@ -52,6 +99,29 @@ def test_blocked_count_forgets_keys_whose_cooldown_expired():
     assert pool.blocked_count() == 1
     # ساعةٌ لاحقاً على نفس الساعة الرتيبة ⇒ لا شيء مبرَّد.
     assert pool.blocked_count(now=time.monotonic() + 3600) == 0
+
+
+def test_stats_says_which_key_is_cooled_not_just_how_many():
+    """«واحدٌ من ثلاثة مرفوض» لا يقول أيُّها ⇒ ثلاثُ نقاطٍ حمراء ويُلام السليم."""
+    pool = provider_keys.KeyPool(["a", "b", "c"], cooldown_seconds=60)
+    pool.rotate(block_current=True)   # يبرّد "a" وينتقل إلى "b"
+
+    stats = pool.stats()
+    assert stats["blocked_index"] == [0]
+    assert stats["index"] == 1
+    # العددُ والقائمة وجهان لحقيقةٍ واحدة، فلا يتناقضان في العرض.
+    assert stats["blocked"] == len(stats["blocked_index"])
+    assert pool.stats(now=time.monotonic() + 3600)["blocked_index"] == []
+
+
+def test_blocked_index_positions_match_the_order_the_dashboard_shows():
+    """الموضعُ يقابل سطرَ اللوحة: ترتيبُ القائمة هو ترتيبُ المفعّلة في الملفّ."""
+    pool = provider_keys.KeyPool(["a", "b", "c"], cooldown_seconds=60)
+    pool.rotate(block_current=True)          # a مبرَّد، المؤشّر على b
+    pool.rotate(block_current=True)          # b مبرَّد أيضاً، المؤشّر على c
+
+    assert pool.stats()["blocked_index"] == [0, 1]
+    assert pool.current() == "c"
 
 
 def test_stats_never_leaks_a_key_value_or_a_fragment_of_one():

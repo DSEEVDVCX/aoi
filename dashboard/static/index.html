@@ -295,6 +295,44 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .errline { padding: 10px 18px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
 .errline:last-child { border-bottom: none; }
 .errline.resolved { opacity: .5; }
+
+/* --- مفاتيح المزوّدين --- */
+/* نموذجُ الإضافة مكتوبٌ في HTML لا يُولَّد بـJS: اللوحة تُعيد الرسم كل 10ث،
+   ورسمُ الحقل من جديد كان سيمحو مفتاحاً نصفَ ملصوق أثناء الكتابة. */
+.keyform { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.keyform select, .keyform input {
+  font: inherit; font-size: 12.5px; padding: 6px 10px; border-radius: 7px;
+  background: var(--surface-2); color: var(--ink); border: 1px solid var(--line);
+}
+.keyform input { min-width: 190px; flex: 1 1 190px; }
+.keyform input::placeholder { color: var(--muted); }
+.keyform select:focus-visible, .keyform input:focus-visible, .keybtn:focus-visible {
+  outline: 2px solid var(--s1); outline-offset: 1px;
+}
+.keybtn {
+  font: inherit; font-size: 12px; padding: 5px 11px; border-radius: 7px; cursor: pointer;
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line);
+}
+.keybtn:hover:not(:disabled) { color: var(--ink); border-color: color-mix(in srgb, var(--s1) 45%, var(--line)); }
+.keybtn:disabled { opacity: .45; cursor: default; }
+.keybtn.go { color: var(--ink); border-color: color-mix(in srgb, var(--s1) 55%, var(--line)); }
+.keybtn.danger:hover:not(:disabled) { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 55%, var(--line)); }
+.keymsg { font-size: 12px; }
+.keymsg.bad { color: var(--crit); } .keymsg.good { color: var(--good); } .keymsg.warn { color: var(--warn); }
+/* النقطة: دائرةٌ لا مربّع — «أمامه نقطة خضراء» كما طُلبت، وبحدٍّ لتُرى على
+   أيّ خلفيّة. والحالةُ ليست لوناً وحده: بجانبها نصٌّ يقول السبب، فمن لا يميّز
+   الأحمر من الأخضر يقرأه. */
+.keydot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block;
+  border: 1px solid color-mix(in srgb, var(--ink) 22%, transparent); }
+.keydot.good { background: var(--good); } .keydot.bad { background: var(--crit); }
+.keydot.warn { background: var(--warn); } .keydot.off { background: var(--muted); }
+.keyrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 9px 18px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.keyrow:last-child { border-bottom: none; }
+.keyrow.off { opacity: .55; }
+.keyrow .grow { flex: 1 1 auto; min-width: 40px; }
+.keyhead { padding: 8px 18px; border-bottom: 1px solid var(--line);
+  background: var(--surface-2); font-size: 12px; color: var(--muted); }
 .banner { padding: 10px 14px; border-radius: 9px; background: color-mix(in srgb, var(--crit) 14%, transparent); border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent); color: var(--ink); font-size: 12.5px; margin-bottom: 18px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
@@ -414,8 +452,19 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
   <div class="card" data-view-section="health">
     <header>
       <h2>مفاتيح المزوّدين الخارجيّين</h2>
-      <span class="note">أعداد فقط — لا تُعرض قيمة مفتاح ولا جزء منها</span>
+      <span class="note">اسم الحساب وآخر 4 أحرف فقط — القيمة لا تُعرض ولا تُسجَّل</span>
     </header>
+    <form class="body keyform" id="key-add" autocomplete="off">
+      <select id="key-provider" aria-label="المزوّد"></select>
+      <input id="key-label" type="text" maxlength="60" aria-label="اسم الحساب الذي جُلب منه المفتاح"
+             placeholder="اسم الحساب (مثلاً: الحساب الرئيسي)">
+      <!-- password + new-password: كي لا يعرض المتصفّح القيمة على الشاشة ولا
+           يحفظها في مدير كلمات المرور ولا يقترحها في حقلٍ آخر لاحقاً. -->
+      <input id="key-value" type="password" autocomplete="new-password" spellcheck="false"
+             aria-label="قيمة المفتاح" placeholder="المفتاح — يُخزَّن في recorder/chain_keys.json">
+      <button type="submit" class="keybtn go">إضافة</button>
+      <span class="keymsg" id="key-msg" role="status" aria-live="polite"></span>
+    </form>
     <div class="body flush" id="provider-keys"></div>
   </div>
 
@@ -1166,22 +1215,69 @@ function renderErrors(rows) {
   host.innerHTML = html;
 }
 
-/* مفاتيح المزوّدين: **أعدادٌ ومؤشّرات فقط** (FR-013). الخادم لا يرسل قيمة
-   مفتاح ولا كسراً منها أصلاً — فلا يوجد ما يُشطب هنا. والغرض سؤالان لا يجيبهما
-   سجلٌّ نصّيّ: «هل هناك بديل إن رُفض مفتاح؟» و«هل واحدٌ منها مرفوض الآن؟» */
+/* مفاتيح المزوّدين: نقطةٌ لكلّ مفتاح، واسمُ الحساب الذي جُلب منه، وآخرُ 4 أحرف.
+   **لا قيمة**: الخادم لا يرسلها أصلاً، فلا شيء يُشطب هنا. واللونُ يجمع ثلاثة
+   مصادر: الملفّ (مفعّل؟) وحالةُ العمّال (مبرَّد الآن؟) والفحصُ الحيّ (اختبر
+   الآن) — أخضرُ بحالةِ عمّالٍ وحدها يعني «لم يُرفض بعد» لا «مُجرَّب». */
+function keyStateText(r) {
+  if (!r.enabled) return "موقوف مؤقّتاً — في الملفّ ولا يُنادى به";
+  if (r.env) return "مضبوط من البيئة — تحرير الملفّ لا يؤثّر";
+  if (r.provider_disabled) return "مزوّدٌ معطَّل لبقيّة عمر العمليّة (نفاد رصيد)";
+  if (r.cooled_by.length) return `مبرَّد الآن في ${r.cooled_by.join(" و")} — رُفض قبل قليل`;
+  if (r.probe) return `فحص: ${r.probe.detail}`;
+  if (r.in_use) return "مستعمل الآن ولم يُرفض";
+  return "مفعَّل — لم يُختبر بعد";
+}
+
 function renderProviderKeys(data) {
   const host = document.getElementById("provider-keys");
-  const rows = data.pools || [];
-  if (!rows.length) {
-    host.innerHTML = `<div class="errline"><span class="badge warn">؟ لا تقرير</span>
-      <span style="margin-inline-start:8px;color:var(--muted)">لم تختم أي عمليّة حالة أحواضها بعد —
-      تظهر بعد أوّل دورة من <span class="mono">FomoChain</span> و<span class="mono">FomoEVMReplay</span>.</span></div>`;
-    return;
-  }
+  const keys = data.keys || [];
+  const providers = data.providers || [];
+  fillKeyProviders(providers);
+  const pools = data.pools || [];
   const min = data.min_keys || 2;
-  host.innerHTML = rows.map(r => {
+
+  let html = "";
+  if (!keys.length) {
+    html += `<div class="errline"><span class="badge warn">؟ لا مفاتيح</span>
+      <span style="margin-inline-start:8px;color:var(--muted)">لا مفتاح في
+      <span class="mono">recorder/chain_keys.json</span> — أضِف واحداً بالأعلى.</span></div>`;
+  }
+  // تجميعٌ بالمزوّد: ترويسةٌ تقول العدد ومَن يستعمله، ثمّ أسطرُه.
+  for (const p of providers) {
+    const mine = keys.filter(k => k.provider === p.provider);
+    if (!mine.length) continue;
+    const owners = p.owners.length ? p.owners.join(" · ") : "لا عمليّة ختمت حالتها بعد";
+    const few = p.enabled < min;
+    html += `<div class="keyhead">${esc(p.title)} — ${p.enabled} مفعّل من ${p.keys}
+      ${few ? `<span style="color:var(--warn)">· أقلّ من ${min}: لا بديل عند الرفض</span>` : ""}
+      <span class="mono" style="margin-inline-start:6px">${esc(owners)}</span>
+      ${p.env ? `<span style="color:var(--warn);margin-inline-start:6px">·
+        <span class="mono">${esc(p.env_name)}</span> مضبوط في البيئة ⇒ يتقدّم على الملفّ</span>` : ""}</div>`;
+    html += mine.map(r => {
+      const label = r.label ? esc(r.label) : `<span style="color:var(--muted)">بلا اسم حساب</span>`;
+      const tail = r.tail ? `<span class="mono">…${esc(r.tail)}</span>`
+        : `<span class="mono" title="مفتاحٌ قصير: إظهار ذيله يكشف جزءاً معتبَراً منه">…</span>`;
+      const act = `data-provider="${esc(r.provider)}" data-slot="${r.slot}" data-tail="${esc(r.tail)}"`;
+      return `<div class="keyrow${r.enabled ? "" : " off"}">
+        <span class="keydot ${r.level}" title="${esc(keyStateText(r))}"></span>
+        <span>${label}</span>
+        ${tail}
+        ${r.in_use ? `<span class="badge">مستعمل</span>` : ""}
+        <span class="grow" style="color:var(--muted)">${esc(keyStateText(r))}
+          ${r.probe ? `<span class="mono">(${ago(r.probe.at)})</span>` : ""}</span>
+        <button class="keybtn" data-act="test" ${act}>اختبر الآن</button>
+        <button class="keybtn" data-act="toggle" ${act} data-enable="${r.enabled ? 0 : 1}">
+          ${r.enabled ? "أوقف" : "شغّل"}</button>
+        <button class="keybtn danger" data-act="delete" ${act}>حذف</button>
+      </div>`;
+    }).join("");
+  }
+
+  // حالةُ الأحواض كما ختمتها كلّ عمليّة: تبقى لأنّها تجيب سؤالاً آخر — «هل
+  // العمليّة المالكة حيّة وتدوّر فعلاً؟» لا «هل هذا المفتاح صالح؟».
+  html += pools.map(r => {
     const mark = r.level === "bad" ? "✕" : r.level === "warn" ? "!" : "✓";
-    // سببٌ واحد صريح لا لونٌ وحده: أيّهما أهمّ يسبق.
     const why = r.disabled ? "معطَّل — نفد رصيد كل المفاتيح"
       : !r.keys ? "لا مفاتيح على القرص"
       : !r.available ? `كل المفاتيح مبرَّدة الآن (${r.keys})`
@@ -1196,7 +1292,85 @@ function renderProviderKeys(data) {
         ${r.stale ? "· تقريرٌ متجمّد" : ""} · ${ago(r.at)}</span>
     </div>`;
   }).join("");
+
+  if (!pools.length) {
+    html += `<div class="errline resolved"><span class="badge warn">؟ لا تقرير أحواض</span>
+      <span style="margin-inline-start:8px;color:var(--muted)">لم تختم أي عمليّة حالة أحواضها بعد —
+      تظهر بعد أوّل دورة من <span class="mono">FomoChain</span> و<span class="mono">FomoEVMReplay</span>.</span></div>`;
+  }
+  host.innerHTML = html;
 }
+
+/* ---------- إدارة المفاتيح: النموذج والأزرار ---------- */
+const keyMsg = document.getElementById("key-msg");
+function showKeyMsg(text, level) {
+  keyMsg.textContent = text || "";
+  keyMsg.className = "keymsg" + (level ? " " + level : "");
+}
+
+/** يملأ قائمة المزوّدين مرّة واحدة: إعادةُ بنائها كانت تُلغي اختيار المستخدم. */
+function fillKeyProviders(providers) {
+  const select = document.getElementById("key-provider");
+  if (select.options.length || !providers.length) return;
+  select.innerHTML = providers
+    .map(p => `<option value="${esc(p.provider)}">${esc(p.title)}</option>`).join("");
+}
+
+/** يجلب لوحة المفاتيح وحدَها: أسرعُ من دورةٍ كاملة، والنتيجة تُرى فوراً. */
+async function refreshKeys() {
+  renderProviderKeys(await getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }));
+}
+
+document.getElementById("key-add").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const value = document.getElementById("key-value");
+  const label = document.getElementById("key-label");
+  const provider = document.getElementById("key-provider").value;
+  if (!value.value.trim()) { showKeyMsg("الصق المفتاح أوّلاً", "bad"); return; }
+  showKeyMsg("جارٍ الإضافة…", "");
+  try {
+    const out = await postJSON("/api/provider-keys/add",
+      { provider, key: value.value, label: label.value });
+    // يُفرَغ الحقل فوراً عند النجاح: المفتاح مخزَّنٌ الآن، وبقاؤه على الشاشة
+    // خطرٌ بلا فائدة (لقطةُ شاشة، شخصٌ يمرّ، صفحةٌ منسيّة مفتوحة).
+    value.value = ""; label.value = "";
+    showKeyMsg(`أُضيف …${out.tail} — يدخل الدورة التالية بلا إعادة تشغيل`, "good");
+    await refreshKeys();
+  } catch (err) {
+    showKeyMsg(err.message, "bad");
+  }
+});
+
+// تفويضٌ على الحاوية لا مستمعٌ لكلّ زرّ: اللوحة تُعاد رسمها كل 10ث، فمستمعو
+// الأزرار القديمة يُرمَون مع عقدها.
+document.getElementById("provider-keys").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-act]");
+  if (!button) return;
+  const { act, provider, slot, tail, enable } = button.dataset;
+  const body = { provider, slot: Number(slot), tail };
+  if (act === "delete" && !confirm(`حذف نهائيّ لمفتاح ${provider} (…${tail}). لا تراجع — متأكّد؟`)) return;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "…";
+  try {
+    if (act === "test") {
+      const out = await postJSON("/api/provider-keys/test", body);
+      showKeyMsg(`…${tail}: ${out.detail}`, out.level === "good" ? "good" : out.level);
+    } else if (act === "toggle") {
+      const out = await postJSON("/api/provider-keys/toggle", { ...body, enabled: enable === "1" });
+      showKeyMsg(out.warning || (out.enabled ? "أُعيد تشغيله" : "أُوقف مؤقّتاً — لا يزال في الملفّ"),
+        out.warning ? "warn" : "good");
+    } else if (act === "delete") {
+      const out = await postJSON("/api/provider-keys/delete", body);
+      showKeyMsg(out.warning || `حُذف …${tail}`, out.warning ? "warn" : "good");
+    }
+    await refreshKeys();
+  } catch (err) {
+    showKeyMsg(err.message, "bad");
+    button.disabled = false;
+    button.textContent = original;
+  }
+});
 
 const NETWORK_META = {
   "1399811149": { name: "Solana", source: "Helius + FOMO" },
@@ -1322,7 +1496,7 @@ async function tick() {
       getJSON("/api/control-progress"),
       getOptionalJSON("/api/networks", { networks: [] }),
       // اختياريّ: صفحةٌ محمَّلة قبل تحديث الخادم لا تفقد بقيّة اللوحات لأجل هذه.
-      getOptionalJSON("/api/provider-keys", { pools: [] }),
+      getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }),
     ]);
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 

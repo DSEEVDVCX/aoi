@@ -1,9 +1,12 @@
-"""خادم اللوحة: قراءة فقط من قاعدة بيانات المسجّل.
+"""خادم اللوحة: قراءةٌ من قاعدة المسجّل، وكتابةٌ في ملفّ المفاتيح وحدَه.
 
-- لا كتابة إطلاقاً: `dao` يفتح القاعدة بـmode=ro ولا مسار كتابة في الخادم.
+- **القاعدة للقراءة فقط**: `dao` يفتحها بـmode=ro ولا مسار كتابة إليها. هذا لا
+  يُساوَم عليه — كاتبٌ ثانٍ يزاحم المسجّل على قفلٍ رأينا موتَه ثلاثَ ساعاتٍ مرّة.
+- مسارُ الكتابة الوحيد `/api/provider-keys/{add,toggle,delete}` وهدفُه ملفُّ
+  `recorder/chain_keys.json` عبر `keystore`. وهذا هو أوّلُ مسارٍ يغيّر الحالة في
+  هذا الخادم — والحارس أدناه كان مكتوباً وجاهزاً قبله، فلم يُضَف على عجل.
 - الاستماع على 127.0.0.1 فقط (محلّي).
-- Host guard + CSRF يبقيان: يمنعان DNS rebinding ويؤمّنان أي طلب يغيّر الحالة
-  لو أُضيف لاحقاً — الحارس أرخص من تذكّر إعادته عند أوّل مسار كتابة.
+- Host guard + CSRF: يمنعان DNS rebinding ويحرسان مسارات الكتابة تلك.
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 import config
 import dao
+import keystore
 
 app = FastAPI(title="Fomo Recorder Dashboard", docs_url=None, redoc_url=None)
 _DASHBOARD_TOKEN = secrets.token_hex(32)
@@ -235,18 +239,112 @@ def api_errors() -> dict[str, Any]:
 
 @app.get("/api/provider-keys")
 def api_provider_keys() -> dict[str, Any]:
-    """أحواضُ مفاتيح المزوّدين — **أعدادٌ ومؤشّرات لا قيم** (FR-013).
+    """أحواضُ المزوّدين وأسطرُ مفاتيحهم — حالةٌ وأسماءُ حسابات، **بلا قيمة**.
 
-    ولا سبيل إلى القيمة من هنا: المصدر أسطرُ `meta` التي كتبتها العمليّات، وهي
-    لا تحمل مفتاحاً ولا كسراً منه أصلاً. واللوحة تفتح القاعدة بـ `mode=ro`.
+    مصدران لا مصدرٌ واحد، وهذا مقصود: `pools` أسطرُ `meta` التي كتبتها العمليّات
+    المالكة (أعدادٌ ومؤشّرات فقط، ولا تحمل مفتاحاً أصلاً)، و`keys` قراءةُ الملفّ
+    نفسه — منها اسمُ الحساب وآخرُ أربعة أحرف (`key_file.tail`، خفضٌ مقصودٌ
+    لِـ FR-013 طلبه المستخدم للتمييز). القيمةُ كاملةً لا تخرج من الخادم أبداً.
+
+    ودمجُهما هنا لا في المتصفّح: حالةُ المفتاح = ملفٌّ (مفعّل؟) + حوضٌ (مبرَّد؟)
+    + فحصٌ حيّ، وثلاثتُها لا تُقرأ من مكانٍ واحد.
     """
-    rows = _with_conn(lambda c: dao.provider_keys(
+    pools = _with_conn(lambda c: dao.provider_keys(
         c,
         prefix=config.PROVIDER_KEY_META_PREFIX,
         min_keys=config.PROVIDER_KEY_MIN_KEYS,
         stale_seconds=config.PROVIDER_KEY_STALE_SECONDS,
     ))
-    return {"pools": rows, "min_keys": config.PROVIDER_KEY_MIN_KEYS}
+    return {"pools": pools, "min_keys": config.PROVIDER_KEY_MIN_KEYS, **keystore.rows(pools)}
+
+
+async def _body(request: Request) -> dict[str, Any]:
+    """جسمُ الطلب كقاموس. **لا يُسجَّل ولا يُعاد في رسالة خطأ** — فيه المفتاح."""
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 — أيُّ عطبِ تحليلٍ جوابُه واحد
+        raise keystore.KeyStoreError("جسم الطلب ليس JSON صالحاً") from None
+    if not isinstance(data, dict):
+        raise keystore.KeyStoreError("جسم الطلب يجب أن يكون كائن JSON")
+    return data
+
+
+def _slot(data: dict[str, Any]) -> int:
+    try:
+        return int(data.get("slot"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise keystore.KeyStoreError("موضع المفتاح مفقود أو غير صحيح") from None
+
+
+def _fail(exc: keystore.KeyStoreError) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, status_code=exc.status)
+
+
+@app.post("/api/provider-keys/add")
+async def api_provider_keys_add(request: Request) -> Any:
+    """يضيف مفتاحاً إلى ملفّ المسجّل. لا إعادةَ تشغيلٍ لازمة.
+
+    العملاء يقرأون الملفّ **عند كلّ نداء** (`solana_rpc._post`، `goldrush_rpc._key`،
+    `nodereal_rpc._call` تنادي `refresh(_read_keys())`)، فالمفتاح الجديد يدخل
+    الدورة التالية من نفسه — ولذلك لا تُوقف اللوحة مهمّةً ولا تلمس عمليّةً.
+    """
+    try:
+        data = await _body(request)
+        return keystore.add(
+            str(data.get("provider") or ""),
+            str(data.get("key") or ""),
+            str(data.get("label") or ""),
+        )
+    except keystore.KeyStoreError as exc:
+        return _fail(exc)
+
+
+@app.post("/api/provider-keys/toggle")
+async def api_provider_keys_toggle(request: Request) -> Any:
+    """يوقف مفتاحاً مؤقّتاً أو يعيده. القيمة تبقى في الملفّ، ويخرج من الحوض."""
+    try:
+        data = await _body(request)
+        return keystore.set_enabled(
+            str(data.get("provider") or ""),
+            _slot(data),
+            str(data.get("tail") or ""),
+            bool(data.get("enabled")),
+        )
+    except keystore.KeyStoreError as exc:
+        return _fail(exc)
+
+
+@app.post("/api/provider-keys/delete")
+async def api_provider_keys_delete(request: Request) -> Any:
+    """يحذف مفتاحاً نهائيّاً — لا تراجع، فالقيمة لا تُحفظ في مكانٍ آخر."""
+    try:
+        data = await _body(request)
+        return keystore.remove(
+            str(data.get("provider") or ""),
+            _slot(data),
+            str(data.get("tail") or ""),
+        )
+    except keystore.KeyStoreError as exc:
+        return _fail(exc)
+
+
+@app.post("/api/provider-keys/test")
+async def api_provider_keys_test(request: Request) -> Any:
+    """نداءٌ حقيقيّ واحد بهذا المفتاح: «مقبول» ليست «الخدمة تعمل».
+
+    حالةُ العمّال وحدها لا تكفي: مفتاحٌ أُضيف قبل دقيقة لم يُنادَ به بعد، فيظهر
+    أخضرَ بلا دليل. والزرُّ هو الدليل. وهو POST لا GET رغم أنّه قراءة: يخرج
+    نداءً بمفتاحٍ سرّيّ إلى الخارج، فيمرّ بحارس الرمز مثل بقيّة ما يغيّر شيئاً.
+    """
+    try:
+        data = await _body(request)
+        return keystore.probe(
+            str(data.get("provider") or ""),
+            _slot(data),
+            str(data.get("tail") or ""),
+        )
+    except keystore.KeyStoreError as exc:
+        return _fail(exc)
 
 
 @app.get("/")

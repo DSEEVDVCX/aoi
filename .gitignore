@@ -20,10 +20,14 @@ privy_storage_dump.json
 privy_refresh_call.json
 captured_endpoints.json
 
-# مفاتيح مزوّدي البلوك تشين (Helius): مفتاح واحد في نصّ صريح — يُقرأ من القرص
+# مفاتيح مزوّدي البلوك تشين (Helius/NodeReal/GoldRush): نصٌّ صريح يُقرأ من القرص
 # كل نداء ولا يُطبع ولا يُسجَّل، ولا يُلتزَم إطلاقاً.
 recorder/chain_keys.json
 chain_keys.json
+# واللوحة تكتبه باستبدالٍ ذرّيّ عبر ملفٍّ مؤقّت في نفس المجلّد (key_file.save_entries)؛
+# انقطاعٌ في أثناء الكتابة قد يُبقي واحداً منها وفيه المفاتيح كاملةً.
+.keys-*.tmp
+recorder/.keys-*.tmp
 
 # Runtime artefacts
 evm_replay_run.err
