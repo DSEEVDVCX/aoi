@@ -7,6 +7,10 @@
   هذا الخادم — والحارس أدناه كان مكتوباً وجاهزاً قبله، فلم يُضَف على عجل.
 - الاستماع على 127.0.0.1 فقط (محلّي).
 - Host guard + CSRF: يمنعان DNS rebinding ويحرسان مسارات الكتابة تلك.
+- **والتخزينُ المؤقّت لا يخرق شيئاً من ذلك**: `cache.MEMO` ذاكرةُ هذه العمليّة
+  وحدها — لا جدولَ تخزينٍ في القاعدة ولا ختمَ في `meta` ولا فهرسَ يُبنى. ثلاثةُ
+  مساراتٍ تعدّ التاريخَ كلَّه (`networks`/`counts`/`ticks-summary`) تُحسب مرّةً
+  كلَّ مدّة بدل كلِّ عشر ثوانٍ؛ والسببُ والقياسُ في `cache.py`.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import cache
 import config
 import dao
 import keystore
@@ -74,6 +79,19 @@ def _with_conn(fn):
         return fn(conn)
     finally:
         conn.close()
+
+
+def _cached(key: str, ttl: float, fn) -> tuple[Any, dict[str, Any]]:
+    """قيمةٌ مخزَّنة مؤقّتاً لاستعلامٍ ثقيل، مع وصفِ طزاجتها للعرض.
+
+    الاتصالُ يُفتح **داخل** المُغلَّف لا خارجَه: التجديدُ يجري في خيطٍ خلفيّ بعد
+    أن يكون الطلبُ الذي أشعله قد أغلق اتصالَه، فتمريرُ اتصالٍ من هنا كان يعني
+    استعمالَه بعد الإغلاق. انظر `cache.py` لسبب «تُقدَّم البائتةُ فوراً».
+    """
+    return cache.MEMO.get(
+        key, ttl, lambda: _with_conn(fn),
+        error_backoff=config.CACHE_ERROR_BACKOFF_SECONDS,
+    )
 
 
 @app.get("/api/status")
@@ -142,17 +160,33 @@ def api_watchlist() -> dict[str, Any]:
 
 @app.get("/api/ticks-summary")
 def api_ticks_summary() -> dict[str, Any]:
-    return _with_conn(dao.ticks_summary)
+    summary, meta = _cached(
+        "ticks_summary", config.TICKS_SUMMARY_TTL_SECONDS, dao.ticks_summary,
+    )
+    return {**summary, "cache": meta}
 
 
 @app.get("/api/networks")
 def api_networks() -> dict[str, Any]:
-    return _with_conn(lambda c: {"networks": dao.network_summary(c)})
+    """تغطيةُ الشبكات: أعدادٌ مخزَّنة مؤقّتاً، وطزاجةٌ حيّةٌ فوقها.
+
+    الأعدادُ تلزمها مسحةٌ كاملة (1724 مللي ثانية) فتُخزَّن؛ أمّا «آخرُ لقطة» فهو
+    الحقلُ الذي يُقرأ كنبضٍ ويُلاحظ تأخّرُه فوراً، وله طريقٌ يكلّف 0.4 مللي ثانية
+    ⇒ يُحسب حيّاً في كلّ طلبٍ ويُدمج فوق المخزَّن بلا أن يتراجع.
+    """
+    rows, meta = _cached(
+        "network_summary", config.NETWORK_SUMMARY_TTL_SECONDS, dao.network_summary,
+    )
+    live = _with_conn(dao.latest_tick_per_active_network)
+    return {"networks": dao.with_live_latest_tick(rows, live), "cache": meta}
 
 
 @app.get("/api/counts")
 def api_counts() -> dict[str, Any]:
-    return _with_conn(dao.table_counts)
+    counts, meta = _cached(
+        "table_counts", config.TABLE_COUNTS_TTL_SECONDS, dao.table_counts,
+    )
+    return {**counts, "cache": meta}
 
 
 @app.get("/api/control-progress")

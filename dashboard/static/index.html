@@ -106,6 +106,9 @@ body {
 .page-head p { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }
 .page-kicker { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
 .network-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+/* سطرُ الطزاجة يمتدّ على العرض كلّه: هو وصفٌ للشبكات جميعاً لا بطاقةَ شبكة. */
+.network-note { grid-column: 1 / -1; font-size: 11px; color: var(--muted); padding: 0 2px; }
+.network-note.warn { color: var(--warn); }
 .network-item { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .network-item header { display: flex; align-items: center; justify-content: space-between; padding: 13px 14px; border-bottom: 1px solid var(--line); }
 .network-item header > div { min-width: 0; }
@@ -482,6 +485,11 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 <script>
 "use strict";
 const REFRESH_MS = 10000;
+/* اللوحاتُ الثقيلة تُطلب كلَّ سادس تحديث (دقيقة) لا كلَّ عشر ثوانٍ: أرقامُها
+   تاريخيّة تُعرض مضغوطةً، والخادمُ يخزّنها مؤقّتاً بعُمر 60–120 ثانية أصلاً
+   (`cache.py`) — فسؤالُها ستَّ مرّاتٍ في الدقيقة يُعيد الجوابَ نفسَه ستّاً.
+   وبين الطلبين تُعاد آخرُ حمولةٍ من `heavy` فلا تفرغ لوحةٌ ولا تُرسم فارغة. */
+const HEAVY_EVERY = 6;
 const DASHBOARD_TOKEN = "__DASHBOARD_TOKEN__";
 
 /* ألوان السلاسل تُقرأ من CSS فتتبع السمة تلقائياً. اللون يتبع **نوع الإشارة**
@@ -1386,13 +1394,21 @@ function coveragePct(value, total) {
   return total > 0 ? Math.min(100, value / total * 100) : 0;
 }
 
-function renderNetworks(rows) {
+function renderNetworks(rows, cacheMeta) {
   const host = document.getElementById("network-summary");
   if (!rows.length) {
     host.innerHTML = `<div class="card"><div class="body empty">لا توجد بيانات شبكات بعد.</div></div>`;
     return;
   }
-  host.innerHTML = rows.map(row => {
+  /* الأمانةُ في العرض: أعدادُ التغطية مخزَّنةٌ مؤقّتاً وقد تتأخّر دقيقتين، أمّا
+     «آخر سوق» فيُحسب حيّاً في كلّ طلب. عرضُ الاثنين بلا تمييزٍ يقرأ كأنّ الكلَّ
+     لحظيّ — ورقمٌ يُظنّ لحظيّاً وهو ليس كذلك أسوأُ من رقمٍ يقول عمرَه. */
+  const note = cacheMeta
+    ? `<div class="network-note${cacheMeta.error ? " warn" : ""}">أعدادُ التغطية محسوبةٌ منذ
+         ${ago(cacheMeta.computed_at)} (تُجدَّد كلّ ${num(Math.round(cacheMeta.ttl_seconds))} ثانية) ·
+         «آخر سوق» حيٌّ في كلّ تحديث${cacheMeta.error ? ` · تعذّر التجديد: ${esc(cacheMeta.error)}` : ""}</div>`
+    : "";
+  host.innerHTML = note + rows.map(row => {
     const meta = NETWORK_META[String(row.network_id)] || {
       name: `شبكة ${row.network_id}`,
       source: "مصدر غير مصنّف",
@@ -1461,6 +1477,10 @@ function setActiveView() {
 
 /* ---------- الحلقة ---------- */
 let paused = false, inflight = false;
+/* آخرُ حمولةٍ للّوحات الثقيلة، وعدّادُ الدورات الذي يقرّر متى تُطلب مجدّداً.
+   `null` تعني «لم تُجلب بعد» ⇒ تُطلب في الدورة القادمة أيّاً كان العدّاد. */
+let heavyTick = 0;
+const heavy = { counts: null, networks: null };
 
 /** ينفّذ رسم لوحة واحدة معزولاً؛ الفشل يُبلَّغ في مكانها ولا يوقف البقيّة. */
 function paint(id, fn) {
@@ -1482,22 +1502,31 @@ async function tick() {
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
   try {
+    // اللوحاتُ الثقيلة: تُطلب أوّلَ مرّة ثم كلَّ HEAVY_EVERY، وتُستعاد من `heavy`
+    // بينهما. الشرطُ على وجودِ الحمولة أيضاً لا على العدّاد وحده — فطلبٌ فاشل في
+    // الدورة السادسة كان سيُبقي اللوحةَ فارغةً دقيقةً كاملة قبل المحاولة الثانية.
+    const wantHeavy = (heavyTick % HEAVY_EVERY === 0) || heavy.counts === null;
+    heavyTick += 1;
     const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
       getJSON("/api/watchlist"),
-      getJSON("/api/counts"),
+      wantHeavy ? getJSON("/api/counts") : heavy.counts,
       getJSON("/api/errors"),
       getJSON("/api/storage"),
       getJSON("/api/bars"),
       getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
       getJSON("/api/signal-timeline?hours=24"),
       getJSON("/api/control-progress"),
-      getOptionalJSON("/api/networks", { networks: [] }),
+      wantHeavy
+        ? getOptionalJSON("/api/networks", heavy.networks || { networks: [] })
+        : heavy.networks,
       // اختياريّ: صفحةٌ محمَّلة قبل تحديث الخادم لا تفقد بقيّة اللوحات لأجل هذه.
       getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }),
     ]);
+    heavy.counts = cnt;
+    heavy.networks = networks;
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
     // كل لوحة تُرسم مستقلّة: عطبٌ في واحدة يُفرغ تلك وحدها لا اللوحة كلّها.
@@ -1514,7 +1543,7 @@ async function tick() {
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
     paint("provider-keys", () => renderProviderKeys(keys));
-    paint("network-summary", () => renderNetworks(networks.networks || []));
+    paint("network-summary", () => renderNetworks(networks.networks || [], networks.cache));
     renderStatus(st);
     renderApi(api);
     lastRows.perf = rows; lastRows.tl = tl;

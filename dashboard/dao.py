@@ -833,8 +833,76 @@ def ticks_summary(conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 # --- network coverage ---
+def latest_tick_per_active_network(conn: sqlite3.Connection) -> dict[str, str]:
+    """آخرُ لقطةِ سوقٍ لكلّ شبكةٍ فيها مراقبةٌ نشطة — بقفزاتٍ لا بمسح.
+
+    `network_summary` يحسب هذا الختمَ ضمن تجميعٍ يمسح جدولَ اللقطات كلَّه (قياساً
+    1780 مللي ثانية على ثلاثة ملايين سطر) لأنّه يجمع بـ`network_id` ولا فهرسَ
+    يبدأ به. أمّا هنا فنعكس الاتّجاه: نمرّ على العملات النشطة (184) ونسأل عن آخر
+    ختمٍ لكلٍّ منها، فيُطابق `(token_address, network_id)` بدايةَ المفتاح الأساسيّ
+    ⇒ قفزةٌ واحدة إلى طرف مداها. القياس: **0.4 مللي ثانية**، بفهرسٍ موجودٍ أصلاً
+    ولا يُبنى شيءٌ جديد.
+
+    والفرقُ الوحيد أنّه يعمى عن شبكةٍ بلا مراقبةٍ نشطة — ولذلك لا يُستعمل بديلاً
+    عن الملخّص بل طبقةً فوقه (`with_live_latest_tick`): المخزَّن يحمل كلَّ الشبكات
+    والحيُّ يُحدّث طزاجةَ العاملة منها.
+    """
+    if not (_table_exists(conn, "watchlist") and _table_exists(conn, "market_ticks")):
+        return {}
+    rows = conn.execute(
+        """SELECT w.network_id AS network_id,
+                  MAX((SELECT MAX(m.recorded_at) FROM market_ticks m
+                        WHERE m.token_address = w.token_address
+                          AND m.network_id = w.network_id)) AS latest_tick
+             FROM (SELECT DISTINCT token_address, network_id
+                     FROM watchlist
+                    WHERE active = 1
+                      AND network_id IS NOT NULL AND network_id != '') w
+            GROUP BY w.network_id""",
+    ).fetchall()
+    return {
+        str(row["network_id"]): row["latest_tick"]
+        for row in rows
+        if row["latest_tick"]
+    }
+
+
+def with_live_latest_tick(
+    rows: list[dict[str, Any]], live: dict[str, str],
+) -> list[dict[str, Any]]:
+    """ينسخ صفوفَ الملخّص ويرفع `latest_tick` إلى الأحدث بين المخزَّن والحيّ.
+
+    **ينسخ ولا يعدّل**: الصفوف الواردة قد تكون في ذاكرةٍ مؤقّتة يتشاركها طلباتٌ
+    متوازية، فتعديلها في مكانها كان سيُفسدها لمن يقرؤها في اللحظة نفسها.
+
+    و`max` لا استبدال: الحيُّ أعمى عن عملةٍ توقّفت مراقبتُها بعد آخر لقطةٍ لها،
+    فلو حملت هي أحدثَ ختمٍ في شبكتها لكان الاستبدالُ **تراجعاً** في الطزاجة —
+    ورقمٌ يتراجع في اللوحة يقرأ كأنّ البيانات تعود إلى الوراء. الأختامُ ISO بنفس
+    الإزاحة (‎+00:00) من كاتبٍ واحد، فترتيبُها المعجميّ هو ترتيبُها الزمنيّ.
+    """
+    merged: list[dict[str, Any]] = []
+    for row in rows:
+        copy = dict(row)
+        fresh = live.get(str(copy.get("network_id")))
+        if fresh:
+            stored = copy.get("latest_tick")
+            copy["latest_tick"] = max(stored, fresh) if stored else fresh
+        merged.append(copy)
+    return merged
+
+
 def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """ملخّص تغطية كل شبكة من البيانات الحية والقياسات على السلسلة."""
+    """ملخّص تغطية كل شبكة من البيانات الحية والقياسات على السلسلة.
+
+    استعلامٌ ثقيل بحكم بنيته: عقدةُ `ticks` تجمع بـ`network_id` ولا فهرسَ يبدأ
+    به، فتمسح الجدولَ كلَّه (1724 من 1880 مللي ثانية مقيسة). ولا يُصلَح بلا فهرسٍ
+    جديد — وذلك مسٌّ للقاعدة — فيُخزَّن ناتجُه مؤقّتاً في `cache.MEMO` بعُمرٍ
+    محدّد، وتُرفع طزاجتُه فوقه من `latest_tick_per_active_network`.
+
+    ولا تُستبدل عقدةُ `ticks` بالبديل الرخيص: هي أيضاً تُسهم في **قائمة الشبكات**
+    نفسها (`networks = active UNION ticks`)، فشبكةٌ لها لقطاتٌ بلا مراقبةٍ نشطة
+    تظهر بفضلها وحدها — واستبدالُها كان سيُخفيها من اللوحة بلا أن يقول أحدٌ شيئاً.
+    """
     if not _table_exists(conn, "watchlist"):
         return []
 

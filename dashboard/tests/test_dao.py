@@ -459,6 +459,124 @@ def test_network_summary_excludes_null_network_ticks(db_path):
     assert rows == []
 
 
+# --- طزاجةُ الشبكات: القفزةُ الحيّة وطبقتُها فوق المخزَّن ---
+def test_latest_tick_per_active_network_matches_full_scan(db_path):
+    """القفزةُ الرخيصة تعطي نفسَ ختمِ المسحِ الكامل للشبكات العاملة.
+
+    هذا هو الاختبارُ الذي يحرس التبديلَ نفسه: لو انحرفت القفزةُ عن التجميع
+    الكامل لصار سطرُ «آخر سوق» يكذب بلا أن يُلاحظ — والفرقُ ثوانٍ لا ساعات.
+    """
+    c = sqlite3.connect(db_path)
+    c.executemany(
+        "INSERT INTO watchlist VALUES(?,?,?,?,?,?,?,?)",
+        [
+            ("sol", "1399811149", "t", "large_buy", "t2", "s", 1, 0),
+            ("bsc", "56", "t", "large_buy", "t2", "s", 1, 0),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO market_ticks(token_address, network_id, recorded_at) VALUES(?,?,?)",
+        [
+            ("sol", "1399811149", "2026-08-18T10:00:00+00:00"),
+            ("sol", "1399811149", "2026-08-18T11:00:00+00:00"),
+            ("bsc", "56", "2026-08-18T09:00:00+00:00"),
+        ],
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    live = dao.latest_tick_per_active_network(conn)
+    full = {r["network_id"]: r["latest_tick"] for r in dao.network_summary(conn)}
+    conn.close()
+
+    assert live == {
+        "1399811149": "2026-08-18T11:00:00+00:00",
+        "56": "2026-08-18T09:00:00+00:00",
+    }
+    assert live == {k: v for k, v in full.items() if k in live}
+
+
+def test_latest_tick_per_active_network_ignores_inactive_and_blank(db_path):
+    """يعمى عمداً عن المراقبةِ المنتهية وعن شبكةٍ فارغةِ المعرِّف."""
+    c = sqlite3.connect(db_path)
+    c.executemany(
+        "INSERT INTO watchlist VALUES(?,?,?,?,?,?,?,?)",
+        [
+            ("old", "56", "t", "large_buy", "t2", "s", 0, 0),
+            ("blank", "", "t", "large_buy", "t2", "s", 1, 0),
+            ("none", None, "t", "large_buy", "t2", "s", 1, 0),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO market_ticks(token_address, network_id, recorded_at) VALUES(?,?,?)",
+        [
+            ("old", "56", "2026-08-18T10:00:00+00:00"),
+            ("blank", "", "2026-08-18T10:00:00+00:00"),
+            ("none", None, "2026-08-18T10:00:00+00:00"),
+        ],
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    assert dao.latest_tick_per_active_network(conn) == {}
+    conn.close()
+
+
+def test_latest_tick_per_active_network_tolerates_pre_chain_schema(tmp_path):
+    """قاعدةٌ بلا `market_ticks` تعيد قاموساً فارغاً لا تنهار."""
+    p = str(tmp_path / "no-ticks.db")
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE watchlist (token_address TEXT, network_id TEXT, active INTEGER)")
+    c.execute("INSERT INTO watchlist VALUES('token','56',1)")
+    c.commit()
+    c.close()
+
+    conn = _conn(p)
+    assert dao.latest_tick_per_active_network(conn) == {}
+    conn.close()
+
+
+def test_with_live_latest_tick_lifts_stale_stamp():
+    rows = [{"network_id": "56", "latest_tick": "2026-08-18T09:00:00+00:00", "tick_rows": 7}]
+    merged = dao.with_live_latest_tick(rows, {"56": "2026-08-18T11:00:00+00:00"})
+    assert merged[0]["latest_tick"] == "2026-08-18T11:00:00+00:00"
+    assert merged[0]["tick_rows"] == 7          # بقيّةُ الحقول تمرّ كما هي
+
+
+def test_with_live_latest_tick_never_regresses():
+    """المخزَّنُ الأحدثُ يبقى: الحيُّ أعمى عن عملةٍ توقّفت بعد آخر لقطةٍ لها."""
+    rows = [{"network_id": "56", "latest_tick": "2026-08-18T12:00:00+00:00"}]
+    merged = dao.with_live_latest_tick(rows, {"56": "2026-08-18T09:00:00+00:00"})
+    assert merged[0]["latest_tick"] == "2026-08-18T12:00:00+00:00"
+
+
+def test_with_live_latest_tick_fills_missing_stamp():
+    rows = [{"network_id": "56", "latest_tick": None}]
+    merged = dao.with_live_latest_tick(rows, {"56": "2026-08-18T09:00:00+00:00"})
+    assert merged[0]["latest_tick"] == "2026-08-18T09:00:00+00:00"
+
+
+def test_with_live_latest_tick_keeps_networks_without_live_stamp():
+    """شبكةٌ بلا مراقبةٍ نشطة تبقى في القائمة بختمها المخزَّن — لا تُحذف."""
+    rows = [
+        {"network_id": "143", "latest_tick": "2026-08-15T00:00:00+00:00"},
+        {"network_id": "56", "latest_tick": "2026-08-18T09:00:00+00:00"},
+    ]
+    merged = dao.with_live_latest_tick(rows, {"56": "2026-08-18T11:00:00+00:00"})
+    assert [r["network_id"] for r in merged] == ["143", "56"]
+    assert merged[0]["latest_tick"] == "2026-08-15T00:00:00+00:00"
+
+
+def test_with_live_latest_tick_does_not_mutate_source_rows():
+    """الصفوفُ الواردة قد تكون في ذاكرةٍ مؤقّتة يتشاركها طلباتٌ متوازية."""
+    rows = [{"network_id": "56", "latest_tick": "2026-08-18T09:00:00+00:00"}]
+    merged = dao.with_live_latest_tick(rows, {"56": "2026-08-18T11:00:00+00:00"})
+    assert rows[0]["latest_tick"] == "2026-08-18T09:00:00+00:00"
+    assert merged[0] is not rows[0]
+
+
 def test_recorder_errors_active_when_newer_than_boundary(db_path):
     # خطأ أحدث من آخر دورة ناجحة ومن started_at → حالي (غير قديم).
     _seed_meta(
