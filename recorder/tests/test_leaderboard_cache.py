@@ -5,7 +5,6 @@ rank)، والمغلّف الخام الكامل يُحتفَظ به في `last_
 snapshots كل ساعة — بلا ذلك يضيع مسار كل متصدّر إلى الأبد. الفشل يبقي
 الخريطة والخام القديمين (لا يمسحهما).
 """
-import pytest
 
 import recorder
 from leaderboard_cache import LeaderboardCache

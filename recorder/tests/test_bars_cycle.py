@@ -5,7 +5,7 @@
 سلسلة سعرية تُوسَم no_data لتُستبعد لاحقاً.
 """
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import pytest
 

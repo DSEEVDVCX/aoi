@@ -602,7 +602,8 @@ def test_recent_signals_order_and_fields(db_path):
         "INSERT INTO signal_events(id, token_address, recorded_at, signal_type, ticker) "
         "VALUES('b','tokB','2026-07-25T01:00:00Z','multi_user_buy','BBB')"
     )
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     rows = dao.recent_signals(conn, 50)
     assert [r["id"] for r in rows] == ["b", "a"]   # الأحدث أولاً
@@ -633,7 +634,8 @@ def test_active_watchlist_counts_ticks(db_path):
             "INSERT INTO market_ticks(token_address, recorded_at, source) VALUES('tokA',?, 'trending')",
             (f"2026-07-25T00:0{i}:00Z",),
         )
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     wl = dao.active_watchlist(conn)
     assert len(wl) == 1                            # النشط فقط
@@ -656,7 +658,8 @@ def test_active_watchlist_first_ever_from_watch_windows(db_path):
     )
     for ts in ("2026-08-02T22:42:13Z", "2026-08-05T10:00:00Z", "2026-08-08T23:17:00Z"):
         c.execute("INSERT INTO watch_windows VALUES('tokA','56',?,3)", (ts,))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     row = dao.active_watchlist(conn)[0]
     assert row["first_ever_at"] == "2026-08-02T22:42:13Z"   # أوّل نافذة
@@ -675,7 +678,8 @@ def test_active_watchlist_first_ever_ignores_other_token(db_path):
     c.execute("INSERT INTO watch_windows VALUES('tokB','56','2026-07-01T00:00:00Z',3)")
     c.execute("INSERT INTO watch_windows VALUES('tokA','99','2026-07-02T00:00:00Z',3)")
     c.execute("INSERT INTO watch_windows VALUES('tokA','56','2026-08-08T00:00:00Z',3)")
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     row = dao.active_watchlist(conn)[0]
     assert row["first_ever_at"] == "2026-08-08T00:00:00Z"
@@ -690,7 +694,8 @@ def test_active_watchlist_first_ever_falls_back_without_window(db_path):
         " watch_until, active) VALUES('tokA','56','feed',"
         "'2026-08-08T00:00:00Z','2026-08-10T00:00:00Z',1)"
     )
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     row = dao.active_watchlist(conn)[0]
     assert row["first_ever_at"] is None       # MIN على لا شيء
@@ -707,7 +712,8 @@ def test_ticks_summary_latest_per_token(db_path):
     )
     c.execute("INSERT INTO market_ticks(token_address, recorded_at, price_usd, volume_24h) VALUES('tokA','2026-07-25T00:00:00Z',1.0,100.0)")
     c.execute("INSERT INTO market_ticks(token_address, recorded_at, price_usd, volume_24h) VALUES('tokA','2026-07-25T00:05:00Z',2.0,200.0)")
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     summ = dao.ticks_summary(conn)
     assert summ["total"] == 2
@@ -721,7 +727,8 @@ def test_table_counts(db_path):
     c = sqlite3.connect(db_path)
     c.execute("INSERT INTO signal_events(id, token_address) VALUES('a','x')")
     c.execute("INSERT INTO token_static(token_address) VALUES('x')")
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     counts = dao.table_counts(conn)
     assert counts["signal_events"] == 1
@@ -745,7 +752,8 @@ def test_storage_stats_reports_size_and_growth_rate(db_path):
         "VALUES('2026-07-22T00:00:00+00:00','trending', ?)",
         ("y" * 50_000,),
     )
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     st = dao.storage_stats(db_path, conn)
     assert st["bytes"] > 100_000
@@ -824,7 +832,8 @@ def test_bars_coverage_counts_watched_tokens_with_series(db_path):
     c.execute("INSERT INTO token_bars VALUES('a','56','5',100,1,2,0.5,1.5,9,'t')")
     c.execute("INSERT INTO token_bars VALUES('a','56','5',400,1,2,0.5,1.5,9,'t')")
     c.execute("INSERT INTO bars_fetch_state VALUES('b','56','t','no_data',0,3)")
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
     conn = _conn(db_path)
     cov = dao.bars_coverage(conn, 0)    # live=0: عدّ كل الشموع (اختبار آلية التغطية لا الحِقبة)
@@ -848,7 +857,8 @@ def test_bars_coverage_candles_excludes_pre_live_retro(db_path):
     c.execute("INSERT INTO token_bars VALUES('a','56','5',?,1,2,0.5,1.5,9,'t')", (live - 3600,))
     c.execute("INSERT INTO token_bars VALUES('a','56','5',?,1,2,0.5,1.5,9,'t')", (live - 60,))
     c.execute("INSERT INTO token_bars VALUES('a','56','5',?,1,2,0.5,1.5,9,'t')", (live + 60,))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
     conn = _conn(db_path)
     cov = dao.bars_coverage(conn, live)
@@ -887,7 +897,8 @@ def _perf_fixture(db_path):
                   (tok, entry + 300, peak, peak, peak, peak))
         c.execute("INSERT INTO token_bars VALUES(?, '56','5',?,?,?,?,?,1,'t')",
                   (tok, entry + 600, last, last, last, last))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 def test_watch_performance_computes_entry_peak_and_change(db_path):
@@ -933,7 +944,8 @@ def test_sorting_keeps_missing_values_last_in_both_directions(db_path):
     c = sqlite3.connect(db_path)
     c.execute("UPDATE token_static SET symbol=NULL")     # لا رموز أصلاً
     c.execute("INSERT INTO token_static(token_address, symbol) VALUES('big','ZZZ')")
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(db_path)
     for desc in (True, False):
         syms = [r["symbol"] for r in dao.watch_performance(conn, 10, "symbol", desc)]
@@ -1036,7 +1048,8 @@ def _mixed_fixture(db_path):
         for ts, px in ((entry, e), (entry + 300, peak), (entry + 600, last)):
             c.execute("INSERT INTO token_bars VALUES(?, '56','5',?,?,?,?,?,1,'t')",
                       (tok, ts, px, px, px, px))
-    c.commit(); c.close()
+    c.commit()
+    c.close()
 
 
 def test_performance_table_excludes_control_coins(db_path):
@@ -1098,7 +1111,8 @@ def test_dao_tolerates_a_database_without_the_is_control_column(tmp_path):
         INSERT INTO token_bars VALUES('t','56','5',1785000000,1,1,1,1,1,'t');
         INSERT INTO token_bars VALUES('t','56','5',1785000600,2,2,2,2,1,'t');
     """)
-    c.commit(); c.close()
+    c.commit()
+    c.close()
     conn = _conn(p)
     rows = dao.watch_performance(conn, limit=5)
     assert len(rows) == 1 and rows[0]["is_control"] is False

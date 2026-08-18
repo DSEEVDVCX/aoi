@@ -19,6 +19,7 @@ import csv
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import time
 
@@ -26,8 +27,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
-
-import sqlite3
 
 DEFAULT_OUT = r"C:\Users\rr\Desktop\data"
 BAR_RESOLUTION = "5"          # الدقّة الوحيدة المكتملة؛ 1D عبر 48س شمعتان لا تنفعان

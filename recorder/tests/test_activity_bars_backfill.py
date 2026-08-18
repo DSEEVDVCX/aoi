@@ -9,7 +9,6 @@ import os
 import pytest
 
 import backfill_activity_bars as bab
-import config
 import labeler
 from db import RecorderDB
 
