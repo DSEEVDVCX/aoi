@@ -4,11 +4,11 @@
 يسبق الإشارة، القمم من الشموع التالية حصراً، والتقسيم بالعملة لا بالصفّ.
 """
 import os
-
-import pytest
+from datetime import UTC
 
 import config
 import labeler
+import pytest
 from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
@@ -61,7 +61,7 @@ def test_labels_from_a_known_series():
 
 def test_entry_bar_never_precedes_the_signal():
     """تسرّب معكوس: شمعة قبل الإشارة لا تصلح دخولاً ولا تُحسب قممها."""
-    bars = [_bar(ENTRY - 300, h=99.0, c=0.1)] + _series()
+    bars = [_bar(ENTRY - 300, h=99.0, c=0.1), *_series()]
     out = labeler.compute_labels(bars, ENTRY)
     assert out["entry_px"] == 1.0                        # لا 0.1 السابقة
     assert out["max_gain_48h"] == pytest.approx(2.0)     # لا 99 السابقة
@@ -171,9 +171,9 @@ def _seed_bars(db, token, entry, *, final=2.0):
 
 
 def _iso(epoch):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+    return datetime.fromtimestamp(epoch, UTC).isoformat()
 
 
 def test_only_mature_windows_are_labeled(db):

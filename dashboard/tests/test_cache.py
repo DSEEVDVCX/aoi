@@ -6,9 +6,8 @@
 """
 import threading
 
-import pytest
-
 import cache
+import pytest
 
 
 class Clock:

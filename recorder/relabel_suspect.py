@@ -72,10 +72,10 @@ def main() -> None:
         # نسخة نصّية للصفوف قبل حذفها: الليبل مشتقّ حتميّاً من الشموع فالحذف
         # قابل للاسترجاع، لكن الاحتفاظ بالقيم القديمة يسمح بمقارنة قبل/بعد.
         snap = os.path.join(HERE, "relabel_suspect_before.json")
+        pairs = ", ".join(["(?, ?)"] * len(bad))
         full = [
             dict(r) for r in db._conn.execute(
-                "SELECT * FROM outcomes WHERE (kind, key) IN (%s)"
-                % ", ".join(["(?, ?)"] * len(bad)),
+                f"SELECT * FROM outcomes WHERE (kind, key) IN ({pairs})",
                 [v for r in bad for v in (r["kind"], r["key"])],
             ).fetchall()
         ]

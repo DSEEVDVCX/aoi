@@ -6,10 +6,9 @@ keccak مكتوب بأيدينا (لا `pycryptodome` ولا `eth-hash` في ا�
 """
 import os
 
-import pytest
-
 import config
 import evm_contract
+import pytest
 from db import RecorderDB, decode_raw
 from evm_rpc import EVMRateLimit
 

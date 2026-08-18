@@ -113,7 +113,7 @@ class LeaderboardCache:
         """يحمّل مدّة واحدة. الفشل موضعيّ: يبقي خريطة هذه المدّة وخامها."""
         try:
             data = await self._client._get(self._path(period), {"limit": self._size})
-        except Exception:
+        except Exception:  # noqa: BLE001 — فشلٌ موضعيّ: الحلقةُ الأعلى تسجّله وتكمل
             return False  # الحلقة الأعلى تسجّل الفشل في meta وتكمل
         traders = leaderboard_items(data)
         if not traders:

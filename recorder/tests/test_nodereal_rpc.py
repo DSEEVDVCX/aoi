@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import httpx
-import pytest
-
 import nodereal_rpc
+import pytest
 
 
 @pytest.mark.asyncio

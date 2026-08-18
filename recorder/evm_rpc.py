@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """عميل قراءة لعقد EVM الرسميّة — بلا مفتاح، بلا مزوّد، بلا تسجيل.
 
 **قراءة فقط** (FR-012): `eth_blockNumber`، `eth_getLogs`، `eth_call`،
@@ -25,11 +24,11 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, Sequence
-
-import httpx
+from collections.abc import Sequence
+from typing import Any
 
 import config
+import httpx
 
 # توقيع حدث `Transfer(address,address,uint256)` — keccak-256 لنصّ التوقيع.
 # هذا **الطريق الوحيد** إلى قائمة حائزين على EVM: معيار ERC-20 لا يخزّن القائمة

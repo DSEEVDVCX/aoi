@@ -2,7 +2,6 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from backup_db import backup_database, validate_destination
 
 

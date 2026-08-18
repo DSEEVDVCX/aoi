@@ -45,7 +45,7 @@ class _Entry:
 
 
 class _State:
-    __slots__ = ("lock", "entry", "refreshing")
+    __slots__ = ("entry", "lock", "refreshing")
 
     def __init__(self) -> None:
         self.lock = threading.Lock()      # يُسلسل الحسابَ الباردَ وحدَه

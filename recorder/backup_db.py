@@ -30,7 +30,7 @@ def default_backup_dir() -> Path:
     configured = os.environ.get("AOI_BACKUP_DIR")
     if configured:
         return Path(configured).expanduser()
-    onedrive = os.environ.get("OneDrive")
+    onedrive = os.environ.get("OneDrive")  # noqa: SIM112 — اسمُه في ويندوز بهذا الرسم لا بالكبير
     if onedrive:
         return Path(onedrive) / "aoi-backups"
     raise RuntimeError(
@@ -183,7 +183,7 @@ def main() -> int:
         _log(f"backup ok path={backup} bytes={backup.stat().st_size} pruned={len(removed)}")
         print(backup)
         return 0
-    except Exception as exc:  # scheduled pythonw process needs a durable failure record
+    except Exception as exc:  # noqa: BLE001 — scheduled pythonw process needs a durable failure record
         _log(f"backup failed: {type(exc).__name__}: {exc}")
         print(f"backup failed: {exc}", file=sys.stderr)
         return 1

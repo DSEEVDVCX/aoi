@@ -6,6 +6,7 @@
 """
 import asyncio
 import sqlite3
+from typing import ClassVar
 
 import pytest
 
@@ -15,7 +16,7 @@ import recorder
 class _FakeClient:
     """عميل وهمي يسجّل التوكن الذي بُني به وما إذا أُغلق."""
 
-    instances: list["_FakeClient"] = []
+    instances: ClassVar[list["_FakeClient"]] = []
 
     def __init__(self, token: str) -> None:
         self.token = token

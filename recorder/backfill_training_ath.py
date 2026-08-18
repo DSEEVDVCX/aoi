@@ -158,7 +158,7 @@ def main() -> None:
         try:
             batch_size = max(1, int(sys.argv[sys.argv.index("--batch-size") + 1]))
         except (IndexError, ValueError):
-            raise SystemExit("--batch-size يحتاج عدداً صحيحاً")
+            raise SystemExit("--batch-size يحتاج عدداً صحيحاً") from None
     force = "--force" in sys.argv
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:

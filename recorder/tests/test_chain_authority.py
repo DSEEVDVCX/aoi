@@ -8,11 +8,10 @@
 """
 import os
 
-import pytest
-
 import chain_layer
 import config
 import extract
+import pytest
 import solana_rpc
 from db import RecorderDB, decode_raw
 

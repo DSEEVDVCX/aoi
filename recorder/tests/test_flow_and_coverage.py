@@ -6,13 +6,13 @@ import json
 import os
 from datetime import datetime
 
-import pytest
-
 import config
 import extract
 import features
-import recorder
+import pytest
 from db import RecorderDB, decode_raw
+
+import recorder
 
 SCHEMA = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql"

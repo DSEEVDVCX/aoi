@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """عميل قراءة NodeReal لقياسات حائزي BSC.
 
 NodeReal يعيد عدد الحائزين الدقيق وأعلى الأرصدة مرتبة، وهما ما لا يقدمه
@@ -10,9 +9,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import httpx
-
 import config
+import httpx
 from provider_keys import KeyPool, read_keys
 
 

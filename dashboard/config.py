@@ -52,8 +52,8 @@ CONTROL_DESIGN_VERSION = 3
 # التخزين والنسخ الاحتياطي. يطابق الافتراضي recorder/backup_db.py: وجهة
 # متزامنة خارج المستودع، مع إنذار إن مرّ أكثر من يوم ونصف بلا نسخة سليمة.
 BACKUP_DIR = os.environ.get("AOI_BACKUP_DIR") or (
-    os.path.join(os.environ["OneDrive"], "aoi-backups")
-    if os.environ.get("OneDrive")
+    os.path.join(os.environ["OneDrive"], "aoi-backups")  # noqa: SIM112 — اسمُه في ويندوز بهذا الرسم لا بالكبير
+    if os.environ.get("OneDrive")  # noqa: SIM112 — اسمُه في ويندوز بهذا الرسم لا بالكبير
     else None
 )
 BACKUP_MAX_AGE_HOURS = 36.0

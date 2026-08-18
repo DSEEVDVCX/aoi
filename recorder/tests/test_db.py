@@ -8,7 +8,6 @@ import os
 import sqlite3
 
 import pytest
-
 from db import RecorderDB, decode_raw, encode_raw
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
@@ -290,10 +289,9 @@ def test_batch_commits_once_and_rolls_back_on_error(db):
         db.insert_tick(_tick(ts="2026-07-25T00:11:00Z"))
     assert db._conn.execute("SELECT COUNT(*) c FROM market_ticks").fetchone()["c"] == 2
 
-    with pytest.raises(RuntimeError):
-        with db.batch():
-            db.insert_tick(_tick(ts="2026-07-25T00:12:00Z"))
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), db.batch():
+        db.insert_tick(_tick(ts="2026-07-25T00:12:00Z"))
+        raise RuntimeError("boom")
     # الدفعة الفاشلة تُرجَع كاملة
     assert db._conn.execute("SELECT COUNT(*) c FROM market_ticks").fetchone()["c"] == 2
 
@@ -315,10 +313,9 @@ def test_failed_batch_inside_an_existing_transaction_keeps_prior_work(db):
         "INSERT INTO meta(key, value) VALUES('before-batch', 'pending')"
     )
 
-    with pytest.raises(RuntimeError):
-        with db.batch():
-            db.set_meta("inside-batch", "discarded")
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), db.batch():
+        db.set_meta("inside-batch", "discarded")
+        raise RuntimeError("boom")
 
     assert db.get_meta("before-batch") == "pending"
     assert db.get_meta("inside-batch") is None
@@ -327,10 +324,9 @@ def test_failed_batch_inside_an_existing_transaction_keeps_prior_work(db):
 def test_nested_batch_rolls_back_inner_savepoint_when_error_is_caught(db):
     with db.batch():
         db.set_meta("outer", "kept")
-        with pytest.raises(RuntimeError):
-            with db.batch():
-                db.set_meta("inner", "discarded")
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError), db.batch():
+            db.set_meta("inner", "discarded")
+            raise RuntimeError("boom")
         db.set_meta("after-inner", "kept")
 
     assert db.get_meta("outer") == "kept"

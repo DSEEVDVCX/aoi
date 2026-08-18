@@ -62,7 +62,7 @@ def _recorder_is_running() -> bool:
              "Where-Object { $_.CommandLine -like '*run_recorder.py*' }).ProcessId"],
             capture_output=True, text=True, timeout=30,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — تعذّر الفحص — القرار للمشغّل
         return False  # لا نستطيع الفحص — نترك القرار للمشغّل
     return bool(out.stdout.strip())
 
@@ -115,7 +115,7 @@ def main() -> None:
         for r in rows:
             try:
                 event = decode_raw(r["raw_json"])
-            except Exception:
+            except Exception:  # noqa: BLE001 — صفّ خام تالف يُتخطّى ولا يُسقط الترحيل
                 continue  # صفّ خام تالف — يُتخطّى، لا يُسقط الترحيل
             # نعيد الاستخراج بالدالة نفسها التي يستعملها المسجّل: مصدر واحد
             # للحقيقة، فلا ينحرف المُرحَّل عن المُسجَّل حديثاً.

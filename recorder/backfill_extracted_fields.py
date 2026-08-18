@@ -130,7 +130,7 @@ def _backfill(
             vals = tuple(row.get(f) for f in fields)
             if all(v is None for v in vals):
                 continue  # المصدر صامت فعلاً — لا كتابة ولا فبركة
-            if all(_same(v, r[f]) for v, f in zip(vals, fields)):
+            if all(_same(v, r[f]) for v, f in zip(vals, fields, strict=True)):
                 continue  # مطابق للمخزَّن — كتابة بلا أثر
             pending.append(vals + tuple(r[c] for c in key_cols))
 

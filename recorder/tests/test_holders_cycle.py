@@ -1,12 +1,12 @@
 """اختبارات دورة الحائزين ومستخرجيها (بلا شبكة)."""
 import os
 
-import pytest
-
 import config
 import extract
-import recorder
+import pytest
 from db import RecorderDB, decode_raw
+
+import recorder
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 NOW = "2026-08-09T12:00:00+00:00"

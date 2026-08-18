@@ -14,13 +14,12 @@
 """
 import sqlite3
 
-import pytest
-from fastapi.testclient import TestClient
-
 import app as dashboard_app
 import cache
 import config
 import dao
+import pytest
+from fastapi.testclient import TestClient
 
 HOST = {"Host": "127.0.0.1:8090"}
 

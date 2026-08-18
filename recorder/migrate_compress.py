@@ -66,21 +66,21 @@ def _recorder_is_running() -> bool:
              "Where-Object { $_.CommandLine -like '*run_recorder.py*' }).ProcessId"],
             capture_output=True, text=True, timeout=30,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — تعذّر الفحص — القرار للمشغّل
         return False  # لا نستطيع الفحص — نترك القرار للمشغّل
     return bool(out.stdout.strip())
 
 
 def _pending_count(conn: sqlite3.Connection, table: str) -> int:
     return conn.execute(
-        f"SELECT COUNT(*) FROM {table} WHERE typeof(raw_json)='text'"  # noqa: S608
+        f"SELECT COUNT(*) FROM {table} WHERE typeof(raw_json)='text'"
     ).fetchone()[0]
 
 
 def estimate_table(conn: sqlite3.Connection, table: str, pending: int) -> tuple[int, int]:
     """معاينة: يقيس عيّنة ويستقرئ على كامل الجدول. يعيد (بايت قبل، بايت بعد)."""
     sample = conn.execute(
-        f"SELECT raw_json FROM {table} WHERE typeof(raw_json)='text' "  # noqa: S608
+        f"SELECT raw_json FROM {table} WHERE typeof(raw_json)='text' "
         f"LIMIT {_SAMPLE}"
     ).fetchall()
     if not sample:
@@ -96,7 +96,7 @@ def migrate_table(conn: sqlite3.Connection, table: str, key: str) -> tuple[int, 
     rows_done = before = after = 0
     while True:
         rows = conn.execute(
-            f"SELECT {key} AS k, raw_json FROM {table} "  # noqa: S608
+            f"SELECT {key} AS k, raw_json FROM {table} "
             f"WHERE typeof(raw_json)='text' LIMIT {_BATCH}"
         ).fetchall()
         if not rows:
@@ -112,7 +112,7 @@ def migrate_table(conn: sqlite3.Connection, table: str, key: str) -> tuple[int, 
             before += len(text.encode("utf-8"))
             after += len(blob)
             updates.append((blob, k))
-        conn.executemany(f"UPDATE {table} SET raw_json=? WHERE {key}=?", updates)  # noqa: S608
+        conn.executemany(f"UPDATE {table} SET raw_json=? WHERE {key}=?", updates)
         conn.commit()
         rows_done += len(updates)
         print(f"  {table}: {rows_done} صفّاً ({before/1e6:.0f} -> {after/1e6:.0f} MB)", flush=True)

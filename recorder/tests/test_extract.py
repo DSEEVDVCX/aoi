@@ -9,7 +9,6 @@ import json
 import config
 import extract
 
-
 # --- أشكال خام مؤكّدة ---
 FEED_EVENT = {
     "id": "evt_123",

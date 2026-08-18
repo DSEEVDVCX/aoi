@@ -20,7 +20,7 @@ def _boot_log(msg: str) -> None:
     try:
         with open(config.BOOT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
-    except Exception:
+    except Exception:  # noqa: BLE001 — سجلّ الإقلاع لا يُسقط الإقلاع
         pass
 
 

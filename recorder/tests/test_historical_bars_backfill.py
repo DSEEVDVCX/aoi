@@ -1,10 +1,9 @@
 import os
 
-import pytest
-
 import backfill_bars as bb
 import backfill_training_ath as bta
 import features
+import pytest
 from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")

@@ -6,10 +6,9 @@
 """
 import os
 
-import pytest
-
 import backfill_activity as ba
 import extract
+import pytest
 from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
@@ -154,7 +153,7 @@ async def test_walk_inserts_pages_and_checkpoints(db):
 
 async def test_walk_is_idempotent_on_rerun(db):
     pages = [_envelope([SWAP_BUY], has_next=True)]
-    client = _PagerClient(pages + [_envelope([SWAP_BUY], has_next=True)])
+    client = _PagerClient([*pages, _envelope([SWAP_BUY], has_next=True)])
     await ba.walk(client, db, max_pages=2, sleep=_noop)
     assert db.activity_count() == 1
     # إعادة من نقطة الاستئناف: الصفحة التالية تعيد الحدث نفسه — OR IGNORE يبتلعه

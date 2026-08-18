@@ -21,15 +21,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-
 import cache
 import config
 import dao
+import httpx
 import keystore
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Fomo Recorder Dashboard", docs_url=None, redoc_url=None)
 _DASHBOARD_TOKEN = secrets.token_hex(32)
@@ -116,7 +115,7 @@ def api_health() -> dict[str, Any]:
         body: Any
         try:
             body = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001 — جوابٌ ليس JSON يُعرض خاماً
             body = {"raw": resp.text[:200]}
         status_str = body.get("status") if isinstance(body, dict) else None
         # 200 + status=ok → متصل سليم. 503/degraded → متصل لكن معطوب.

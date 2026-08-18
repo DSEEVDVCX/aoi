@@ -707,7 +707,7 @@ async def run_filter_tokens_cycle(
                 if a:
                     by_addr[a.lower()] = item
             with db.batch():
-                for addr, net in batch:
+                for addr, _net in batch:
                     item = by_addr.get(addr.lower())
                     if item is None:
                         continue  # حُذف بصمت (عملة مشطوبة) — لا يكسر الدفعة
@@ -1127,7 +1127,7 @@ def _log(msg: str) -> None:
     try:
         with open(config.LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line)
-    except Exception:
+    except Exception:  # noqa: BLE001 — الكتابةُ في السجلّ لا تُسقط ما تُسجّله
         pass
 
 

@@ -9,7 +9,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import config
 
@@ -573,9 +574,9 @@ def classify_asset(
     """
     sym = (symbol or "").strip().upper()
     lo, hi = config.ASSET_STABLE_PRICE_BAND
-    if price_min is not None and price_max is not None and price_min > 0:
-        if lo <= price_min and price_max <= hi:
-            return "stable", f"price pinned in [{lo}, {hi}]"
+    if (price_min is not None and price_max is not None and price_min > 0
+            and lo <= price_min and price_max <= hi):
+        return "stable", f"price pinned in [{lo}, {hi}]"
     credible_mc = (
         market_cap_max
         if market_cap_max is not None
@@ -647,7 +648,7 @@ def extract_bars(
     # الأعلام على الدفعة كسلسلة: الجار هو المرجع (انظر bar_context_flags).
     # الشمعة الأخيرة بلا جار لاحق بعد، فيُعاد الحساب لاحقاً عبر
     # db.recompute_bar_flags حين تصل تاليتها.
-    for row, (h_bad, l_bad, c_bad) in zip(rows, bar_context_flags(rows)):
+    for row, (h_bad, l_bad, c_bad) in zip(rows, bar_context_flags(rows), strict=True):
         row["h_suspect"], row["l_suspect"], row["c_suspect"] = h_bad, l_bad, c_bad
     return rows
 
@@ -1271,7 +1272,7 @@ def extract_chain_concentration(
         "top_accounts": len(amounts),
         "raw_json": _dumps(raw_envelope),
     }
-    for n, col in _CHAIN_TIERS:
+    for _n, col in _CHAIN_TIERS:
         row[col] = None
     if supply_base and amounts:              # صفر أو None ⇒ لا نسبة
         for n, col in _CHAIN_TIERS:

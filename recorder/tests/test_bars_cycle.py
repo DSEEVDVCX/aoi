@@ -7,11 +7,11 @@
 import os
 from datetime import datetime, timedelta
 
-import pytest
-
 import config
-import recorder
+import pytest
 from db import RecorderDB
+
+import recorder
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 NOW = "2026-07-26T12:00:00+00:00"

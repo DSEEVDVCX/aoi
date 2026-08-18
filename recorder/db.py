@@ -85,7 +85,7 @@ class RecorderDB:
         except BaseException:
             self._conn.rollback()
             raise
-        with open(schema_path, "r", encoding="utf-8") as fh:
+        with open(schema_path, encoding="utf-8") as fh:
             script = fh.read()
         # سبعُ عمليّات تفتح القاعدة الآن، وإقلاعها قد يتزامن (إعادة تشغيل مهمّة،
         # أو دخول Windows). المخطّط يحوي `DROP VIEW IF EXISTS v; CREATE VIEW v`
@@ -431,7 +431,7 @@ class RecorderDB:
         changes = [
             (h, low, c, token_address, network_id, resolution, b["ts"])
             for b, (h, low, c) in zip(
-                series, bar_context_flags(series, max_ratio=ratio)
+                series, bar_context_flags(series, max_ratio=ratio), strict=True
             )
             if (h, low, c) != (b["h_suspect"], b["l_suspect"], b["c_suspect"])
         ]

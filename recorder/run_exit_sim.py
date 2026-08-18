@@ -18,7 +18,13 @@ if HERE not in sys.path:
 
 import config  # noqa: E402
 from db import RecorderDB  # noqa: E402
-from exit_sim import DEFAULT_RULES, ExitRule, breakeven_cost, load_trades, simulate_all  # noqa: E402
+from exit_sim import (  # noqa: E402
+    DEFAULT_RULES,
+    ExitRule,
+    breakeven_cost,
+    load_trades,
+    simulate_all,
+)
 
 for _s in (sys.stdout, sys.stderr):
     try:

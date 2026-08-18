@@ -3,15 +3,15 @@
 تثبت الخصائص التي تجعل المقارنة صالحة علمياً: الاختيار عشوائيّ لا ترتيبيّ،
 لا يلمس ما أُشير إليه، لا يُخفّض عملة مُشار إليها، ويُقسَّط على الزمن.
 """
+import math
 import os
 import random
-import math
-
-import pytest
 
 import config
-import recorder
+import pytest
 from db import RecorderDB
+
+import recorder
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 NOW = "2026-07-27T00:00:00+00:00"

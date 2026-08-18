@@ -2,7 +2,6 @@ import os
 from datetime import datetime
 
 import pytest
-
 import repair_evm_ledger
 from db import RecorderDB
 

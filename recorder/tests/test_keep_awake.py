@@ -2,9 +2,8 @@
 import ctypes
 import sys
 
-import pytest
-
 import keep_awake
+import pytest
 
 
 def _stub(monkeypatch, ret=1, exc=None):

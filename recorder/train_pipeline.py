@@ -18,8 +18,8 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 # بعد الكتمِ عن قصد: استيرادُ db/config يجرّ تحذيراتِ حِزمٍ لا شأنَ لنا بها.
-from db import RecorderDB  # noqa: E402
 import config  # noqa: E402
+from db import RecorderDB  # noqa: E402
 
 FORBIDDEN = {
     "key", "token_address", "network_id", "entry_ts", "asset_class", "split",

@@ -6,10 +6,9 @@ no_entry أبديّ قبل وصول الشموع)، كتابة outcomes بـkind
 """
 import os
 
-import pytest
-
 import backfill_activity_bars as bab
 import labeler
+import pytest
 from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")

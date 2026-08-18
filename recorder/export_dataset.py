@@ -214,7 +214,7 @@ always match the CSVs beside it.
 
 
 def _writer(path: str):
-    fh = open(path, "w", encoding="utf-8", newline="")
+    fh = open(path, "w", encoding="utf-8", newline="")  # noqa: SIM115 — مصنعٌ يُرجع المقبضَ والمنادي يغلقه
     # lineterminator صريح: بلاه يكتب \r\n على ويندوز فيتضخّم الملفّ ويربك قارئات
     # بعض الأدوات. None يُكتب حقلاً فارغاً تلقائياً — وهذا المطلوب: الغائب ليس صفراً.
     return fh, csv.writer(fh, lineterminator="\n")

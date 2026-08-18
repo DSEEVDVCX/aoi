@@ -93,7 +93,7 @@ def main() -> None:
             (x for x in rows if x["asset_class"] != "meme"),
             key=lambda x: -(x["price_max"] or 0),
         ):
-            print(f"  {r['asset_class']:<7} {str(r['symbol'] or '?'):<8} "
+            print(f"  {r['asset_class']:<7} {r['symbol'] or '?'!s:<8} "
                   f"px_max={r['price_max']} mc_max={r['market_cap_max']} "
                   f"obs={r['observations']} — {r['reason']}")
         if dry:

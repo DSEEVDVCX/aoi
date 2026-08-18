@@ -6,9 +6,8 @@
 """
 import os
 
-import pytest
-
 import features
+import pytest
 from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
@@ -286,7 +285,7 @@ def test_social_features_do_not_cross_networks(db):
 
 
 def test_macro_features_read_hourly_reference(db):
-    label, addr, net = features.config.MACRO_BARS[0]
+    _label, addr, net = features.config.MACRO_BARS[0]
     _bars(db, T0 - 86400 * 2, 48, step=3600, c=100.0, grow=0.01,
           tok=addr, net=net, res=features.config.MACRO_BARS_RESOLUTION)
     f = features.macro_features(db, T0)

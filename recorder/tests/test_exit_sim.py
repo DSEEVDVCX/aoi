@@ -5,7 +5,6 @@
 المشي على الشموع بدل قراءة أعمدة outcomes.
 """
 import pytest
-
 from exit_sim import ExitRule, breakeven_cost, simulate_all, simulate_trade
 
 ENTRY = 1_785_000_000

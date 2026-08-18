@@ -4,15 +4,14 @@ from __future__ import annotations
 import argparse
 import sqlite3
 from collections import Counter
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean, median
-from typing import Callable, Iterable
-
-import numpy as np
-from scipy.stats import fisher_exact, mannwhitneyu
 
 import config
+import numpy as np
+from scipy.stats import fisher_exact, mannwhitneyu
 
 MIN_WORTHWHILE_MEDIAN_DIFF = 0.05
 ALPHA = 0.05

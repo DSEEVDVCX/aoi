@@ -16,7 +16,8 @@ import asyncio
 import os
 import sys
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -26,6 +27,7 @@ import config  # noqa: E402
 import extract  # noqa: E402
 from db import RecorderDB, utcnow_iso  # noqa: E402
 from features import epoch_of  # noqa: E402
+
 from recorder import _fetch_bars_raw  # noqa: E402
 
 RESOLUTION = "1D"
@@ -193,7 +195,7 @@ async def run(
                     break
                 cursor = next_cursor
                 await sleep(PACING_SECONDS)
-            except Exception as exc:  # عملة واحدة لا توقف الكون كله
+            except Exception as exc:  # noqa: BLE001 — عملة واحدة لا توقف الكون كله
                 consecutive_errors += 1
                 _save_state(db, token, network, cursor_to=cursor,
                             oldest_ts=None, status="error", added=0)
@@ -239,7 +241,7 @@ async def main() -> None:
         try:
             max_calls = max(0, int(sys.argv[sys.argv.index("--max-calls") + 1]))
         except (IndexError, ValueError):
-            raise SystemExit("--max-calls يحتاج عدداً صحيحاً")
+            raise SystemExit("--max-calls يحتاج عدداً صحيحاً") from None
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     client = None if dry_run else _load_client()
     try:

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """عميل قراءة لسولانا RPC (Helius) — طبقة السلسلة.
 
 **قراءة فقط** (FR-012): لا يستدعي إلّا توابع استعلام (`getTokenSupply`،
@@ -20,9 +19,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import httpx
-
 import config
+import httpx
 from provider_keys import KeyPool, read_keys
 
 
@@ -217,12 +215,12 @@ class SolanaRPC:
         largest = self._unwrap(by_id["largest"], "getTokenLargestAccounts")
         supply_slot = (supply.get("context") or {}).get("slot") if isinstance(supply, dict) else None
         largest_slot = (largest.get("context") or {}).get("slot") if isinstance(largest, dict) else None
-        if isinstance(supply_slot, int) and isinstance(largest_slot, int):
-            if abs(supply_slot - largest_slot) > config.CHAIN_MAX_SLOT_LAG:
-                raise ChainRPCError(
-                    "لقطتا العرض والحسابات غير متزامنتين: "
-                    f"فارق {abs(supply_slot - largest_slot)} slot"
-                )
+        if (isinstance(supply_slot, int) and isinstance(largest_slot, int)
+                and abs(supply_slot - largest_slot) > config.CHAIN_MAX_SLOT_LAG):
+            raise ChainRPCError(
+                "لقطتا العرض والحسابات غير متزامنتين: "
+                f"فارق {abs(supply_slot - largest_slot)} slot"
+            )
         return {
             "supply": supply,
             "largest": largest,

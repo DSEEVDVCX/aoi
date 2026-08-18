@@ -127,13 +127,13 @@ def inspect(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
     else:
         result["replay_pending"] = 0
     result["training_missing"] = int(db._conn.execute(
-        """SELECT COUNT(*) FROM outcomes o
+        f"""SELECT COUNT(*) FROM outcomes o
              WHERE o.network_id IN ({marks}) AND o.status IN ('ok','no_bars')
                AND NOT EXISTS (
                    SELECT 1 FROM training_rows r
                     WHERE r.kind=o.kind AND r.key=o.key
                       AND r.feature_version=?
-               )""".format(marks=marks),
+               )""",
         (*nets, __import__("features").FEATURE_VERSION),
     ).fetchone()[0])
     return result

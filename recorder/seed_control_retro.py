@@ -65,7 +65,7 @@ def _recorder_is_running() -> bool:
              "Where-Object { $_.CommandLine -like '*run_recorder.py*' }).ProcessId"],
             capture_output=True, text=True, timeout=30,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 — تعذّر الفحص — القرار للمشغّل
         return False
     return bool(out.stdout.strip())
 
@@ -80,7 +80,7 @@ def build_appearance_map(db: RecorderDB) -> dict[tuple[str, str], list[str]]:
     for row in rows:
         try:
             items = extract.unwrap_token_list(decode_raw(row["raw_json"]))
-        except Exception:
+        except Exception:  # noqa: BLE001 — لقطة تالفة تُتخطّى ولا تُسقط البناء
             continue  # لقطة تالفة تُتخطّى ولا تُسقط البناء
         for it in items:
             addr = extract._token_address(it)

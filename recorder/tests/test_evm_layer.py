@@ -7,12 +7,11 @@
 import os
 import sqlite3
 
-import httpx
-import pytest
-
 import config
 import evm_layer
 import evm_rpc
+import httpx
+import pytest
 from db import RecorderDB, decode_raw
 
 SCHEMA = os.path.join(
@@ -331,7 +330,7 @@ async def test_paging_ignores_a_deadline_that_never_comes():
 
     rpc = _PagingRPC(limit_above=100, per_block={150: [_log(A, B, 5, 150)]})
 
-    logs, calls, complete, resume = await rpc.get_logs_paged(
+    logs, _calls, complete, resume = await rpc.get_logs_paged(
         NET, [TOK], 0, 400, max_calls=50, sleep=_noop,
         deadline=time.monotonic() + 300,
     )
@@ -366,7 +365,7 @@ class _ScriptedHTTP:
         self._fn = fn
         self.ranges = []
 
-    async def post(self, url, json=None):                       # noqa: A002
+    async def post(self, url, json=None):
         params = ((json or {}).get("params") or [{}])[0]
         params = params if isinstance(params, dict) else {}
         lo = int(str(params.get("fromBlock", "0x0")), 16)
@@ -422,7 +421,7 @@ async def test_rate_limit_waits_and_repeats_the_same_range():
         return _ok([_log(A, B, 5, lo)])
 
     rpc = _fake_rpc(fn)
-    logs, calls, complete, resume = await rpc.get_logs_paged(
+    logs, _calls, complete, _resume = await rpc.get_logs_paged(
         NET, [TOK], 0, 100, max_calls=5, sleep=_noop,
     )
 
@@ -439,7 +438,7 @@ async def test_rate_limit_inside_a_200_body_is_also_classified():
         return _ok([])
 
     rpc = _fake_rpc(fn)
-    logs, calls, complete, _ = await rpc.get_logs_paged(
+    _logs, _calls, complete, _ = await rpc.get_logs_paged(
         NET, [TOK], 0, 10, max_calls=5, sleep=_noop,
     )
 

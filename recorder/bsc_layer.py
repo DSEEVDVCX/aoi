@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """طبقة قياس BSC اللحظي عبر NodeReal.
 
 تطلب NodeReal أعلى 20 رصيداً مرتبة، وعدد الحائزين، بينما يُقرأ totalSupply
@@ -10,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Sequence
 from datetime import datetime, timedelta
-from typing import Any, Sequence
+from typing import Any
 
 import config
 import evm_rpc

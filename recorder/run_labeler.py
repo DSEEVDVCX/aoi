@@ -25,7 +25,7 @@ def _log_boot(msg: str) -> None:
     try:
         with open(_BOOT_LOG, "a", encoding="utf-8") as fh:
             fh.write(msg + "\n")
-    except Exception:
+    except Exception:  # noqa: BLE001 — سجلّ الإقلاع لا يُسقط الإقلاع
         pass
 
 
@@ -46,7 +46,7 @@ def _log(msg: str) -> None:
     try:
         with open(config.LABEL_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line)
-    except Exception:
+    except Exception:  # noqa: BLE001 — الكتابةُ في السجلّ لا تُسقط ما تُسجّله
         pass
 
 
@@ -86,7 +86,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:  # noqa: BLE001 — أخطاء الإقلاع قبل بدء الحلقة
+    except Exception:
         import traceback
 
         _log_boot("BOOT FAILURE:\n" + traceback.format_exc())

@@ -6,8 +6,9 @@ snapshots كل ساعة — بلا ذلك يضيع مسار كل متصدّر إ
 الخريطة والخام القديمين (لا يمسحهما).
 """
 
-import recorder
 from leaderboard_cache import LeaderboardCache
+
+import recorder
 
 RAW = {
     "success": True,

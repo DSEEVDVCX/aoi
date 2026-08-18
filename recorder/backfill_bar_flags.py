@@ -55,7 +55,7 @@ def scan(db: RecorderDB) -> list[tuple[int, int, int, str, str, str, int]]:
         ratio = (config.DAILY_BAR_WICK_MAX_RATIO if k["resolution"] == "1D"
                  else config.BAR_WICK_MAX_RATIO)
         for b, (h_bad, l_bad, c_bad) in zip(
-            series, bar_context_flags(series, max_ratio=ratio)
+            series, bar_context_flags(series, max_ratio=ratio), strict=True
         ):
             if (h_bad, l_bad, c_bad) != (b["h_suspect"], b["l_suspect"], b["c_suspect"]):
                 out.append((h_bad, l_bad, c_bad, k["token_address"],

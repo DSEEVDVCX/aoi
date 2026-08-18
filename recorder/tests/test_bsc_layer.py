@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 import bsc_layer
+import pytest
 from db import RecorderDB, decode_raw
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")

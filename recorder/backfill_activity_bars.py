@@ -34,6 +34,7 @@ if HERE not in sys.path:
 import config  # noqa: E402
 import extract  # noqa: E402
 from db import RecorderDB, utcnow_iso  # noqa: E402
+
 from recorder import _fetch_bars_raw  # noqa: E402  (نفس جسم الطلب المؤكَّد حيّاً)
 
 for _stream in (sys.stdout, sys.stderr):

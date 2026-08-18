@@ -14,8 +14,8 @@
 """
 from __future__ import annotations
 
-import importlib.util
 import hmac
+import importlib.util
 import os
 import re
 import secrets
@@ -23,9 +23,8 @@ import threading
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
-
 import config
+import httpx
 
 
 def _load_key_file():

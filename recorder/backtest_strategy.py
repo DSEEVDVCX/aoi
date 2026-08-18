@@ -26,10 +26,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import config  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-
-import config  # noqa: E402
 from db import RecorderDB  # noqa: E402
 from exit_sim import ExitRule, simulate_trade  # noqa: E402
 
