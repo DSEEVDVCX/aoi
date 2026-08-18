@@ -1,7 +1,19 @@
 -r requirements.txt
 
-pytest>=8.2,<9
-pytest-asyncio>=0.23,<2
-respx>=0.21,<1
-ruff>=0.5,<1
-mypy>=1.10,<2
+# Exact pins, not ranges -- and this comment is ASCII on purpose (pip decodes a
+# requirements file with the system codepage when it finds no BOM, and cp1252
+# has no mapping for some UTF-8 continuation bytes).
+#
+# The reason for pinning: a checker's OUTPUT is the contract. With an open upper
+# bound the runner installs the newest release while your machine keeps whatever
+# it already had, so the same commit is green locally and red in CI. That is
+# what happened on 2026-08-18: CI resolved pytest 8.4.2 + ruff 0.16.3 while this
+# machine had 8.3.4 + 0.15.22. Two suites died on a warning class that pytest
+# 8.4 had removed, and 211 lint findings appeared out of ruff 0.16's new default
+# rule set -- none of it caused by a line of our code. Raising a version is now
+# a decision taken on a line in this file, not an event that happens by itself.
+pytest==8.4.2
+pytest-asyncio==1.4.0
+respx==0.23.1
+ruff==0.16.3
+mypy==1.20.2

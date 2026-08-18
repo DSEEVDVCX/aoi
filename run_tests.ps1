@@ -31,8 +31,13 @@ if ($pythonLocation -and (Test-Path -LiteralPath (Join-Path $pythonLocation "pyt
 # كلَّه قبل أن يُشغَّل اختبارٌ واحد. والتعليقُ محصَّنٌ منه لأنّه يُلفظ إلى آخر
 # السطر بلا نظرٍ في الاقتباس. (وضعُ BOM يحلّها أيضاً لكنّه بايتٌ خفيّ يُسقطه أيُّ
 # محرّرٍ فيعود العطبُ صامتاً، ويُفسد سطرَ shebang أعلاه.)
+#
+# والنسخُ مطبوعةٌ معه لأنّ الفارقَ بين جهازك والخادم هو ما أعمى هذا الفحص: نفسُ
+# الالتزامِ أخضرُ هنا وأحمرُ هناك، والرسالةُ لا تقول إنّ الأداةَ اختلفت. وهي
+# مثبَّتةٌ بالضبط في `requirements-dev.txt`، فاختلافُ هذا السطر عن سطر الخادم
+# يعني أنّ بيئتَك قديمةٌ لا أنّ الشيفرةَ عطبت: أعِد التنصيب.
 Write-Output "python: $python"
-& $python -c "import sys, pytest, ruff, mypy; print('deps ok on Python ' + sys.version.split()[0])"
+& $python -c "import sys, pytest, ruff, mypy; from importlib.metadata import version as v; print('deps ok on Python ' + sys.version.split()[0] + ' | pytest ' + v('pytest') + ' | pytest-asyncio ' + v('pytest-asyncio') + ' | ruff ' + v('ruff') + ' | mypy ' + v('mypy'))"
 if ($LASTEXITCODE -ne 0) {
     Write-Output "`nFATAL: pytest/ruff/mypy are not installed for THIS interpreter."
     Write-Output "       Fix: $python -m pip install -r requirements-dev.txt"
