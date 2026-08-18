@@ -9,8 +9,10 @@ CSRF على مسار غير موجود أيضاً — الوسيط يسبق ال
 **كلُّ اختبارٍ يلمس المفاتيح يستعمل `keys_file`**: بلا ذلك تكتب الاختبارات في
 ملفّ الأسرار الحقيقيّ على هذا الجهاز وتحذف مفاتيحَ تعمل.
 """
+import hashlib
 import json
 import re
+import secrets
 
 import pytest
 from fastapi.testclient import TestClient
@@ -62,6 +64,51 @@ def test_index_serves_a_fresh_csrf_token():
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert re.search(r'const DASHBOARD_TOKEN = "([0-9a-f]{64})"', response.text)
+
+
+def test_index_refreshes_a_stale_dashboard_token_before_retrying_mutations():
+    client = TestClient(dashboard_app.app)
+    response = client.get("/", headers=HOST)
+
+    assert response.status_code == 200
+    assert "refreshDashboardToken" in response.text
+    assert "retried" in response.text
+    assert "token_refresh=" in response.text
+
+
+def test_a_restarted_dashboard_hands_an_open_page_a_token_that_works(monkeypatch):
+    """الميزةُ تُقاس بعملها، لا بوجود اسمها في الصفحة.
+
+    الاختبارُ أعلاه يتحقّق أنّ `refreshDashboardToken` و`token_refresh=` مكتوبةٌ
+    في الصفحة — وهو يمرّ حتى لو لم تعمل الميزةُ أصلاً. وهي تتعلّق بعقدين صامتين
+    ينكسران بلا صوت: أنّ نصَّ خطأ الحارس يحتوي «رمز حماية اللوحة» بعينه (فهذا
+    شرطُ إعادة المحاولة في الصفحة، وتغييرُ كلمةٍ في الرسالة يُبطله)، وأنّ الصفحةَ
+    المُعادة تُقرأ بنمطِ الاستخراج نفسه. فنمشي المسارَ كما تمشيه الصفحة.
+
+    والرمزُ يُولَد مرّةً عند الاستيراد، فالحالةُ الوحيدة التي تحتاج التحديثَ هي
+    إقلاعُ اللوحة من جديد — وهي نفسُ حالةِ [`_ID_SALT`] في `keystore`.
+    """
+    client = TestClient(dashboard_app.app)
+    page = client.get("/", headers=HOST)
+    stale = re.search(r'const DASHBOARD_TOKEN = "([0-9a-f]{64})"', page.text).group(1)
+
+    monkeypatch.setattr(dashboard_app, "_DASHBOARD_TOKEN", secrets.token_hex(32))
+
+    refused = client.post("/api/anything", json={}, headers={
+        **HOST, "Origin": "http://127.0.0.1:8090", "X-Dashboard-Token": stale,
+    })
+    assert refused.status_code == 403
+    assert "رمز حماية اللوحة" in refused.json()["error"]
+
+    # المسارُ الذي تجلبه `refreshDashboardToken`، والنمطُ الذي تستخرج به.
+    refreshed = client.get("/?token_refresh=1", headers=HOST)
+    fresh = re.search(r'const DASHBOARD_TOKEN = "([0-9a-f]{64})"', refreshed.text).group(1)
+    assert fresh != stale
+
+    retried = client.post("/api/anything", json={}, headers={
+        **HOST, "Origin": "http://127.0.0.1:8090", "X-Dashboard-Token": fresh,
+    })
+    assert retried.status_code == 404      # مرّ الحارسَ: 404 توجيهٍ لا 403 حرس
 
 
 def test_index_exposes_separate_dashboard_views():
@@ -331,6 +378,147 @@ def test_a_jsonrpc_error_under_http_200_is_not_called_healthy(keys_file, signed,
     assert "invalid api key" in result["detail"]
 
 
+def test_goldrush_error_false_under_http_200_is_healthy(keys_file, signed, monkeypatch):
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"error": False, "data": {"items": []}}
+
+    class _Client:
+        def __init__(self, *_a, **_k): pass
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def request(self, *_a, **_k): return _Response()
+
+    monkeypatch.setattr(keystore.httpx, "Client", _Client)
+    signed.post("/api/provider-keys/add", json={
+        "provider": "goldrush", "key": FAKE,
+    })
+
+    result = signed.post("/api/provider-keys/test", json={
+        "provider": "goldrush", "slot": 0, "tail": "wxyz",
+    }).json()
+
+    assert result["level"] == "good"
+    assert result["detail"] == "سليم"
+
+
+def test_probe_results_do_not_cross_keys_with_the_same_tail(keys_file, signed, monkeypatch):
+    first = "AAAAAAAAAAAAwxyz"
+    second = "BBBBBBBBBBBBwxyz"
+
+    class _Response:
+        status_code = 401
+
+        def json(self):
+            return {"error": "rejected"}
+
+    class _Client:
+        def __init__(self, *_a, **_k): pass
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def request(self, *_a, **_k): return _Response()
+
+    monkeypatch.setattr(keystore.httpx, "Client", _Client)
+    signed.post("/api/provider-keys/add", json={"provider": "helius", "key": first})
+    signed.post("/api/provider-keys/add", json={"provider": "helius", "key": second})
+    rows = [row for row in signed.get("/api/provider-keys").json()["keys"]
+            if row["provider"] == "helius"]
+    signed.post("/api/provider-keys/test", json={
+        "provider": "helius", "slot": 0, "tail": "wxyz",
+        "key_id": rows[0]["key_id"],
+    })
+
+    rows = [row for row in signed.get("/api/provider-keys").json()["keys"]
+            if row["provider"] == "helius"]
+    assert rows[0]["probe"]["status"] == 401
+    assert rows[1]["probe"] is None
+
+
+def test_opaque_key_id_disambiguates_mutations_with_the_same_tail(keys_file, signed):
+    first = "AAAAAAAAAAAAwxyz"
+    second = "BBBBBBBBBBBBwxyz"
+    signed.post("/api/provider-keys/add", json={"provider": "helius", "key": first})
+    signed.post("/api/provider-keys/add", json={"provider": "helius", "key": second})
+    rows = [row for row in signed.get("/api/provider-keys").json()["keys"]
+            if row["provider"] == "helius"]
+
+    assert rows[0]["key_id"] != rows[1]["key_id"]
+    assert first not in rows[0]["key_id"] and second not in rows[1]["key_id"]
+    response = signed.post("/api/provider-keys/delete", json={
+        "provider": "helius", "slot": 1, "tail": "wxyz",
+        "key_id": rows[1]["key_id"],
+    })
+
+    assert response.status_code == 200
+    stored = json.loads(keys_file.read_text(encoding="utf-8"))["helius_api_keys"]
+    assert [row["key"] for row in stored] == [first]
+
+
+def test_the_published_key_id_is_not_derived_from_the_key(keys_file, signed):
+    """القاعدة: لا قيمة، ولا شَظيّة، ولا **بصمة**. وهذا الحرسُ يُثبّتها.
+
+    `sha256(key)` تؤدّي وظيفةَ التمييز نفسَها، فالإغراءُ حقيقيّ — وهي تخالف
+    القاعدة: تصلح مِحكّاً يؤكّد به مَن يملك قائمةَ مفاتيحٍ مرشَّحة أيَّها
+    المستعمل هنا، وتصلح رابطاً يُطابق نفسَ المفتاح بين نظامين. والملحُ العشوائيّ
+    يقطع الاثنين، لكنّه سطرٌ يسهل «تبسيطُه» بعد سنة — فنُثبّته باختبار.
+    """
+    signed.post("/api/provider-keys/add", json={"provider": "helius", "key": FAKE})
+    row = next(item for item in signed.get("/api/provider-keys").json()["keys"]
+               if item["provider"] == "helius")
+
+    forbidden = {
+        hashlib.sha256(FAKE.encode()).hexdigest(),
+        hashlib.sha256(FAKE.strip().encode()).hexdigest(),
+        hashlib.md5(FAKE.encode()).hexdigest(),  # noqa: S324 — نمنعه لا نستعمله
+        hashlib.sha1(FAKE.encode()).hexdigest(),  # noqa: S324 — نمنعه لا نستعمله
+    }
+    assert row["key_id"]
+    assert not any(row["key_id"] == digest or row["key_id"] == digest[:32]
+                   for digest in forbidden)
+    # ولا شَظيّة: الذيلُ وحده هو المسموح، والهويّةُ لا تحمل منه شيئاً.
+    assert FAKE[:8] not in row["key_id"]
+
+
+def test_key_ids_die_with_the_process_so_a_stale_page_is_refused(keys_file, signed):
+    """الملحُ في الذاكرة: بعد الإقلاع تبطل الهويّاتُ القديمة بـ409 لا بحذفٍ خطأ."""
+    signed.post("/api/provider-keys/add", json={"provider": "helius", "key": FAKE})
+    row = next(item for item in signed.get("/api/provider-keys").json()["keys"]
+               if item["provider"] == "helius")
+    stale_id = row["key_id"]
+
+    keystore._ID_SALT = secrets.token_bytes(32)      # كما لو أُقلعت اللوحةُ من جديد
+    response = signed.post("/api/provider-keys/delete", json={
+        "provider": "helius", "slot": 0, "tail": "wxyz", "key_id": stale_id,
+    })
+
+    assert response.status_code == 409
+    assert json.loads(keys_file.read_text(encoding="utf-8"))["helius_api_keys"]
+
+
+def test_stale_pool_report_does_not_mark_a_key_as_currently_cooled(keys_file):
+    """اللحظيُّ يسقط بالتقادم، والإعداديُّ يبقى.
+
+    تبريدُ موضعٍ واستعمالُه ينتهيان مع الدورة، فتقريرٌ بائتٌ لا يشهد بهما.
+    أمّا تعطيلُ المزوّد ومَن يملكه فوصفُ إعدادٍ — إسقاطُه كان سيقول «سليم» عن
+    مزوّدٍ مُطفأ، وهو الكذبُ المعاكس.
+    """
+    keys_file.write_text(json.dumps({"helius_api_keys": [FAKE]}), encoding="utf-8")
+    view = keystore.rows([{
+        "provider": "helius", "owner": "chain", "keys": 1,
+        "blocked_index": [0], "index": 0, "disabled": True, "stale": True,
+    }])
+
+    row = next(item for item in view["keys"] if item["provider"] == "helius")
+    assert row["cooled_by"] == []
+    assert row["in_use"] is False
+    assert row["provider_disabled"] is True
+    provider = next(item for item in view["providers"] if item["provider"] == "helius")
+    assert provider["disabled_by"] == ["chain"]
+    assert provider["owners"] == ["chain"]
+
+
 def test_health_view_shows_the_provider_key_panel():
     client = TestClient(dashboard_app.app)
     response = client.get("/", headers=HOST)
@@ -344,4 +532,3 @@ def test_health_view_shows_the_provider_key_panel():
     assert "مفاتيح المزوّدين الخارجيّين" in response.text
     # التصريح معروضٌ للقارئ لا في التعليقات وحدها، ومطابقٌ لما يحدث فعلاً.
     assert "القيمة لا تُعرض ولا تُسجَّل" in response.text
-

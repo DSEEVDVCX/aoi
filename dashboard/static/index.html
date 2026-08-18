@@ -491,6 +491,7 @@ const REFRESH_MS = 10000;
    وبين الطلبين تُعاد آخرُ حمولةٍ من `heavy` فلا تفرغ لوحةٌ ولا تُرسم فارغة. */
 const HEAVY_EVERY = 6;
 const DASHBOARD_TOKEN = "__DASHBOARD_TOKEN__";
+let dashboardToken = DASHBOARD_TOKEN;
 
 /* ألوان السلاسل تُقرأ من CSS فتتبع السمة تلقائياً. اللون يتبع **نوع الإشارة**
    لا ترتيبها — وإلّا أعادت الفلترة طلاء السلاسل الباقية وضلّل القارئ. */
@@ -612,14 +613,32 @@ async function getOptionalJSON(url, fallback) {
   }
 }
 
-async function postJSON(url, payload) {
+async function refreshDashboardToken() {
+  const response = await fetch(`${location.pathname || "/"}?token_refresh=${Date.now()}`, {
+    cache: "no-store",
+    headers: { Accept: "text/html" },
+  });
+  if (!response.ok) throw new Error(`تعذّر تحديث رمز حماية اللوحة (${response.status})`);
+  const html = await response.text();
+  const match = html.match(/(?:const|let) dashboardToken = "([0-9a-f]{64})"/i)
+    || html.match(/const DASHBOARD_TOKEN = "([0-9a-f]{64})"/);
+  if (!match) throw new Error("لم يُعثر على رمز حماية جديد");
+  dashboardToken = match[1];
+}
+
+async function postJSON(url, payload, retried = false) {
   const response = await fetch(url, {
     method: "POST",
     cache: "no-store",
-    headers: { "Content-Type": "application/json", "X-Dashboard-Token": DASHBOARD_TOKEN },
+    headers: { "Content-Type": "application/json", "X-Dashboard-Token": dashboardToken },
     body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
+  if (response.status === 403 && !retried &&
+      String(data.error || "").includes("رمز حماية اللوحة")) {
+    await refreshDashboardToken();
+    return postJSON(url, payload, true);
+  }
   if (!response.ok) throw new Error(data.error || data.detail || `HTTP ${response.status}`);
   return data;
 }
@@ -1266,7 +1285,7 @@ function renderProviderKeys(data) {
       const label = r.label ? esc(r.label) : `<span style="color:var(--muted)">بلا اسم حساب</span>`;
       const tail = r.tail ? `<span class="mono">…${esc(r.tail)}</span>`
         : `<span class="mono" title="مفتاحٌ قصير: إظهار ذيله يكشف جزءاً معتبَراً منه">…</span>`;
-      const act = `data-provider="${esc(r.provider)}" data-slot="${r.slot}" data-tail="${esc(r.tail)}"`;
+      const act = `data-provider="${esc(r.provider)}" data-slot="${r.slot}" data-tail="${esc(r.tail)}" data-key-id="${esc(r.key_id)}"`;
       return `<div class="keyrow${r.enabled ? "" : " off"}">
         <span class="keydot ${r.level}" title="${esc(keyStateText(r))}"></span>
         <span>${label}</span>
@@ -1354,8 +1373,8 @@ document.getElementById("key-add").addEventListener("submit", async (event) => {
 document.getElementById("provider-keys").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
-  const { act, provider, slot, tail, enable } = button.dataset;
-  const body = { provider, slot: Number(slot), tail };
+  const { act, provider, slot, tail, keyId, enable } = button.dataset;
+  const body = { provider, slot: Number(slot), tail, key_id: keyId };
   if (act === "delete" && !confirm(`حذف نهائيّ لمفتاح ${provider} (…${tail}). لا تراجع — متأكّد؟`)) return;
   button.disabled = true;
   const original = button.textContent;

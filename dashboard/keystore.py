@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import importlib.util
+import hmac
 import os
 import re
+import secrets
 import threading
 from datetime import UTC, datetime
 from typing import Any
@@ -118,7 +120,9 @@ def _clean_key(value: str) -> str:
     return text
 
 
-def _locate(provider: str, slot: int, expect_tail: str) -> tuple[list[dict], int]:
+def _locate(
+    provider: str, slot: int, expect_tail: str, expect_id: str = "",
+) -> tuple[list[dict], int]:
     """يجد سطراً بالموضع، ويتحقّق من الذيل قبل تعديله.
 
     الموضعُ وحده لا يكفي: بين رسمِ الصفحة وضغطِ الزرّ قد يكون الملفُّ تغيّر
@@ -131,6 +135,11 @@ def _locate(provider: str, slot: int, expect_tail: str) -> tuple[list[dict], int
         raise KeyStoreError("تغيّر الملفّ — أعد تحميل الصفحة", 409)
     if key_file.tail(rows[slot]["key"]) != str(expect_tail or ""):
         raise KeyStoreError("تغيّر الملفّ — أعد تحميل الصفحة", 409)
+    if expect_id:
+        if _key_id(rows[slot]["key"]) != expect_id:
+            raise KeyStoreError("تغيّر الملفّ — أعد تحميل الصفحة", 409)
+    elif sum(key_file.tail(row["key"]) == str(expect_tail or "") for row in rows) > 1:
+        raise KeyStoreError("آخر أحرف المفتاح غير فريدة — أعد تحميل الصفحة", 409)
     return rows, slot
 
 
@@ -140,6 +149,30 @@ def _redact(text: str, key: str) -> str:
     if key:
         out = out.replace(key, "<محجوب>")
     return re.sub(r"(api-key=|Bearer\s+)[^\s\"'&)>]+", r"\1<محجوب>", out)
+
+
+# ملحٌ عشوائيّ يُولَد مرّةً لكلّ عمليّة ولا يخرج من الذاكرة.
+_ID_SALT = secrets.token_bytes(32)
+
+
+def _key_id(key: str) -> str:
+    """هويّةٌ تميّز مفتاحاً عن آخر: ثابتةٌ داخل العمليّة، بلا معنى خارجها.
+
+    الذيلُ الرباعيّ لا يكفي هويّةً — مفتاحان ينتهيان بـ`wxyz` يجعلان `_locate`
+    يطابق الخطأ فيُحذف السليم، ونتيجةَ فحصٍ لأحدهما تُلوّن الآخر. فاحتجنا معرّفاً
+    فريداً يُرسَل مع الزرّ.
+
+    وهو **ليس** بصمةَ المفتاح: `sha256(key)` كانت ستؤدّي الوظيفةَ نفسها وتخالف
+    القاعدةَ («لا قيمة، ولا شَظيّة، ولا بصمة»)، لأنّها تصلح مِحكّاً — من يملك
+    قائمةَ مفاتيحٍ مرشَّحة يؤكّد بها أيَّها المستعمل هنا — وتصلح رابطاً يُطابق
+    نفسَ المفتاح بين نظامين. أمّا HMAC بملحٍ عشوائيٍّ فناتجُه لافتةٌ عشوائيّة:
+    لا تُشتقّ منها قيمة ولا تُطابق من خارج هذه العمليّة.
+
+    والملحُ يموت بموتِ العمليّة، فالهويّاتُ تبطل عند الإقلاع. وهذا هو الصواب لا
+    عيبٌ فيه: صفحةٌ مفتوحةٌ من قبل الإقلاع تُعاد تحميلاً بدل أن يُصدَّق زرُّها،
+    ولوحُ المفاتيح يُرسَم كلَّ دورةِ تحديثٍ فالنافذةُ ثوانٍ.
+    """
+    return hmac.new(_ID_SALT, key.strip().encode("utf-8"), "sha256").hexdigest()[:32]
 
 
 # --- العرض ---
@@ -158,6 +191,12 @@ def _pool_view(pool_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         state["owners"].append(row["owner"])
         if row.get("disabled"):
             state["disabled_by"].append(row["owner"])
+        # تقريرٌ متقادمٌ وصفٌ للماضي: التبريدُ والاستعمالُ حالتان لحظيّتان تنتهيان
+        # مع الدورة، فتلوينُ مفتاحٍ بعينه بهما من تقريرٍ بائتٍ كذبٌ صريح. أمّا
+        # المالكُ والتعطيلُ فوصفُ إعدادٍ لا لحظة، وكتمانُهما يقول «سليم» عن
+        # مزوّدٍ مُطفأ — وسطرُ الحوض يحمل علامةَ stale فالقارئ يرى المصدر.
+        if row.get("stale"):
+            continue
         for index in row.get("blocked_index") or []:
             state["cooled"].setdefault(int(index), []).append(row["owner"])
         if row.get("keys"):
@@ -193,7 +232,7 @@ def rows(pool_rows: list[dict[str, Any]]) -> dict[str, Any]:
             cooled_by = sorted(state.get("cooled", {}).get(pool_slot, [])) if enabled else []
             in_use = enabled and pool_slot in (state.get("in_use") or set())
             tail = key_file.tail(row["key"])
-            probe = _PROBES.get((provider, tail)) if tail else None
+            probe = _PROBES.get((provider, _key_id(row["key"])))
             out.append({
                 "provider": provider,
                 "title": meta["title"],
@@ -201,6 +240,7 @@ def rows(pool_rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "pool_slot": pool_slot if enabled else None,
                 "label": row["label"],
                 "tail": tail,
+                "key_id": _key_id(row["key"]),
                 "enabled": enabled,
                 "env": env,
                 "cooled_by": cooled_by,
@@ -236,26 +276,28 @@ def add(provider: str, key: str, label: str) -> dict[str, Any]:
     return {"ok": True, "tail": key_file.tail(value), "keys": len(rows_now)}
 
 
-def set_enabled(provider: str, slot: int, expect_tail: str, enabled: bool) -> dict[str, Any]:
+def set_enabled(
+    provider: str, slot: int, expect_tail: str, enabled: bool, expect_id: str = "",
+) -> dict[str, Any]:
     with _LOCK:
         if _env_override(provider):
             raise KeyStoreError(
                 f"مضبوطٌ من البيئة ({_meta(provider)['env']}) — الملفّ مُهمَل هناك", 409,
             )
-        rows_now, index = _locate(provider, slot, expect_tail)
+        rows_now, index = _locate(provider, slot, expect_tail, expect_id)
         rows_now[index]["enabled"] = bool(enabled)
         _write(provider, rows_now)
         left = sum(1 for row in rows_now if row["enabled"])
     return {"ok": True, "enabled": bool(enabled), "warning": _shortfall(provider, left)}
 
 
-def remove(provider: str, slot: int, expect_tail: str) -> dict[str, Any]:
+def remove(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> dict[str, Any]:
     with _LOCK:
         if _env_override(provider):
             raise KeyStoreError(
                 f"مضبوطٌ من البيئة ({_meta(provider)['env']}) — الملفّ مُهمَل هناك", 409,
             )
-        rows_now, index = _locate(provider, slot, expect_tail)
+        rows_now, index = _locate(provider, slot, expect_tail, expect_id)
         rows_now.pop(index)
         _write(provider, rows_now)
         left = sum(1 for row in rows_now if row["enabled"])
@@ -293,10 +335,10 @@ def _classify(status: int) -> tuple[str, str]:
     return "warn", f"HTTP {status}"
 
 
-def probe(provider: str, slot: int, expect_tail: str) -> dict[str, Any]:
+def probe(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> dict[str, Any]:
     """نداءٌ حقيقيّ واحد بهذا المفتاح بعينه، إلى العنوان الذي يستعمله العميل."""
     meta = _meta(provider)
-    rows_now, index = _locate(provider, slot, expect_tail)
+    rows_now, index = _locate(provider, slot, expect_tail, expect_id)
     value = rows_now[index]["key"]
     spec = meta["probe"]
     url = spec["url"].format(key=value)
@@ -314,7 +356,7 @@ def probe(provider: str, slot: int, expect_tail: str) -> dict[str, Any]:
                 body = response.json()
             except ValueError:
                 body = None
-            if isinstance(body, dict) and body.get("error") is not None:
+            if isinstance(body, dict) and body.get("error") not in (None, False):
                 level, detail = "bad", _redact(str(body["error"])[:120], value)
         status: int | None = response.status_code
     except httpx.TimeoutException:
@@ -328,7 +370,5 @@ def probe(provider: str, slot: int, expect_tail: str) -> dict[str, Any]:
         "status": status,
         "at": datetime.now(UTC).isoformat(),
     }
-    tail = key_file.tail(value)
-    if tail:
-        _PROBES[(provider, tail)] = result
+    _PROBES[(provider, _key_id(value))] = result
     return result

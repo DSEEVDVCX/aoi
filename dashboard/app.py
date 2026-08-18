@@ -343,6 +343,7 @@ async def api_provider_keys_toggle(request: Request) -> Any:
             _slot(data),
             str(data.get("tail") or ""),
             bool(data.get("enabled")),
+            str(data.get("key_id") or ""),
         )
     except keystore.KeyStoreError as exc:
         return _fail(exc)
@@ -357,6 +358,7 @@ async def api_provider_keys_delete(request: Request) -> Any:
             str(data.get("provider") or ""),
             _slot(data),
             str(data.get("tail") or ""),
+            str(data.get("key_id") or ""),
         )
     except keystore.KeyStoreError as exc:
         return _fail(exc)
@@ -376,6 +378,7 @@ async def api_provider_keys_test(request: Request) -> Any:
             str(data.get("provider") or ""),
             _slot(data),
             str(data.get("tail") or ""),
+            str(data.get("key_id") or ""),
         )
     except keystore.KeyStoreError as exc:
         return _fail(exc)
