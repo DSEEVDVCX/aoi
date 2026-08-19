@@ -86,15 +86,23 @@ async def main() -> None:
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     targets = db._conn.execute(
-        "SELECT token_address, network_id FROM watchlist WHERE active=1 "
-        "ORDER BY is_control, first_seen_at"
+        "SELECT token_address, network_id FROM watchlist "
+        "GROUP BY token_address, network_id ORDER BY MIN(first_seen_at)"
     ).fetchall()
-    print(f"عملات مراقَبة نشطة: {len(targets)} · حدّ الصفحات لكل عملة: {max_pages}")
+    print(f"أزواج عملات مراقَبة: {len(targets)} · حدّ الصفحات لكل عملة: {max_pages}")
+
+    if dry_run:
+        print("[معاينة] لا اتصال بالشبكة ولا كتابة.")
+        db.close()
+        return
 
     from fomo_api.auth.credential_store import CredentialStore
     from fomo_api.clients.fomo_client import FomoClient
 
-    token = CredentialStore(config.credential_state_path()).load().access_token
+    credentials = CredentialStore(config.credential_state_path()).load()
+    if credentials is None or not credentials.access_token:
+        raise RuntimeError("لا يوجد اعتماد صالح — شغّل خدمة الـ api أولاً.")
+    token = credentials.access_token
     client = FomoClient(session_token=token)
 
     total_rows = total_added = failed = 0

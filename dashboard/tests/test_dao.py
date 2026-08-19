@@ -394,10 +394,12 @@ def test_network_summary_reports_chain_coverage(db_path):
     conn.close()
 
     assert result["56"]["active_watches"] == 1
+    assert result["56"]["historical_watches"] == 1
     assert result["56"]["concentration_rows"] == 1
     assert result["56"]["holder_count_rows"] == 1
     assert result["56"]["details_holder_rows"] == 1
     assert result["1399811149"]["top20_rows"] == 1
+    assert result["1399811149"]["historical_watches"] == 0
     assert result["1399811149"]["details_holder_rows"] == 1
 
 
@@ -415,7 +417,10 @@ def test_network_summary_tolerates_pre_chain_schema(tmp_path):
 
     assert result == [{
         "network_id": "56", "active_watches": 1, "concentration_rows": 0,
+        "historical_watches": 0,
         "top1_rows": 0, "top5_rows": 0, "top10_rows": 0, "top20_rows": 0,
+        "historical_concentration_rows": 0, "historical_top1_rows": 0,
+        "historical_top5_rows": 0, "historical_top10_rows": 0, "historical_top20_rows": 0,
         "holder_count_rows": 0, "details_holder_rows": 0,
         "details_top10_rows": 0, "tick_rows": 0,
         "latest_concentration": None, "latest_details": None, "latest_tick": None,

@@ -540,9 +540,18 @@ async def replay_token(
     anchor_ceiling = base_calls + max(4, int(config.EVM_REPLAY_ANCHOR_MAX_CALLS))
     log_budget = max(1, int(config.EVM_REPLAY_MAX_CALLS))
     to_block = max(0, int(head) - int(config.EVM_CONFIRMATIONS))
+    if (
+        _epoch(now_iso) - end_ts > int(config.EVM_REPLAY_HEAD_GRACE_SECONDS)
+        and clock.calls < anchor_ceiling
+    ):
+        window_block = await clock.block_at_time(
+            rpc, end_ts, to_block, now_iso, sleep,
+            max_calls=anchor_ceiling,
+        )
+        to_block = min(to_block, window_block)
 
     checkpoint: dict[str, Any] | None = None
-    if (watch.get("replay_status") or "") in ("partial", "error"):
+    if (watch.get("replay_status") or "") in ("partial", "budget", "error"):
         raw_checkpoint = watch.get("replay_checkpoint_json")
         if raw_checkpoint is not None:
             try:
@@ -558,19 +567,33 @@ async def replay_token(
         # نبدأ من genesis ونستأنف عبر checkpoint؛ أبطأ لكنه الدليل الوحيد الكامل.
         from_block = 0
     checkpoint_balances = (checkpoint or {}).get("balances", {})
+    resettable_status = (watch.get("replay_status") or "") in (
+        "negative", "no_time", "empty", "skip",
+    )
+    origin_calls = 0
     if (
-        net in config.EVM_CREATION_BLOCK_NETWORKS
+        net in (*config.EVM_CREATION_BLOCK_NETWORKS, *config.EVM_MINT_SCAN_NETWORKS)
         and not checkpoint_balances
-        and int(watch.get("replay_transfers") or 0) == 0
+        and (int(watch.get("replay_transfers") or 0) == 0 or resettable_status)
     ):
-        creation = await rpc.contract_creation_block(net, token, to_block)
-        if creation is not None:
-            from_block = max(from_block, creation)
+        # طريقان لسؤال «متى نشأت؟» بحسب ما تحفظه العقدة، والشبكة في أحدهما لا
+        # كليهما: الأرشيف يسمح ببحث ثنائيّ على `eth_getCode`، وحيث لا أرشيف
+        # (روبن‑هود ~128 كتلة) يجيب مرشّح السكّ في نداء واحد. والوفر هنا أكبر من
+        # الطبقة الحيّة: الإعادة تمشي كل عملة من نشأتها في كل دورة استئناف.
+        origin_calls = 1
+        if net in config.EVM_MINT_SCAN_NETWORKS:
+            minted = await rpc.first_mint_block(net, token, to_block)
+            if minted is not None:
+                from_block = max(from_block, minted)
+        else:
+            creation = await rpc.contract_creation_block(net, token, to_block)
+            if creation is not None:
+                from_block = max(from_block, creation)
 
     rows: list[dict[str, Any]] = []
     meta: dict[str, int] = {"events": 0, "skipped": 0, "empty": 0,
                             "negatives": 0, "applied": 0}
-    calls_used = 0
+    calls_used = origin_calls
     unknown = 0
     complete = False
     covered_to = to_block
@@ -579,6 +602,10 @@ async def replay_token(
         str(holder): int(value)
         for holder, value in (checkpoint or {}).get("balances", {}).items()
     }
+    checkpoint_negative = any(
+        value < 0 and holder not in _BURN
+        for holder, value in initial_balances.items()
+    )
     next_grid = int((checkpoint or {}).get("next_grid") or grid_points(start_ts, start_ts, step)[0])
     final_balances = dict(initial_balances)
     for _attempt in (0,):
@@ -628,9 +655,15 @@ async def replay_token(
     # ثلاثة أسباب لعدم الكتابة، ولكلٍّ حالته: أرصدة سالبة (أرقام كاذبة)، وسجلّ
     # بلا وقت (لا نعرف في أيّ لقطة يدخل فيخمَّن)، ولا تحويل أصلاً (عملة لم
     # تتحرّك — غياب لا صفر، FR-007).
-    if meta["negatives"]:
+    prior_transfers = int(watch.get("replay_transfers") or 0) if checkpoint else 0
+    prior_calls = int(watch.get("replay_calls") or 0) if checkpoint else 0
+    has_negative = bool(meta["negatives"] or checkpoint_negative)
+    if has_negative and not window_complete:
+        status, check = "partial", "ok"
+        out["note"] = "السجل الجزئي يحتوي أرصدة سالبة؛ سيُعاد التحقق بعد اكتماله"
+    elif has_negative:
         status, check = "negative", "negative"
-        out["note"] = f"{meta['negatives']} عنواناً سالباً ⇒ لا صفّ"
+        out["note"] = "أرصدة سالبة بعد اكتمال السجل ⇒ لا صفّ"
     elif unknown:
         status, check = "no_time", "ok"
         out["note"] = f"{unknown} كتلة بلا وقت ⇒ لا صفّ"
@@ -643,6 +676,21 @@ async def replay_token(
         out["note"] = "لا تحويل في المدى"
     else:
         status, check = "done", "ok"
+
+    # سقفٌ **لكل عملة**، وهو ما لا يفعله `EVM_REPLAY_MAX_CALLS` (سقف الدورة):
+    # عملة تعود `partial` كل دورة تستأنف إلى الأبد وتأكل الميزانيّة من العملات
+    # التي تُنجَز. مقيس على Base: عملتان أنفقتا 15,270 و11,665 نداءً بصفر صفّ،
+    # مقابل ~4,960 نداءً لأثقل مشيٍ مشروع. فالتجاوز ليس بطأً بل عطبٌ صامت.
+    # ويُسجَّل باسمه: `budget` نهائيّة فلا تُعاد، لكنّ الـcheckpoint يبقى محفوظاً
+    # فيُستأنف من حيث توقّف يوم يُرفع السقف أو يُطلَب `--redo`.
+    if status == "partial" and prior_calls + calls_used >= int(
+        config.EVM_REPLAY_TOKEN_CALL_CAP
+    ):
+        status, check = "budget", "ok"
+        out["note"] = (
+            f"{prior_calls + calls_used} نداءً بلغ سقف العملة "
+            f"({config.EVM_REPLAY_TOKEN_CALL_CAP}) ⇒ توقّف مع نقطة استئناف"
+        )
 
     written = 0
     if write:
@@ -671,8 +719,6 @@ async def replay_token(
             prior_snapshots = int(watch.get("replay_snapshots") or 0) if checkpoint else 0
             if status in ("negative", "no_time"):
                 prior_snapshots = 0
-            prior_transfers = int(watch.get("replay_transfers") or 0) if checkpoint else 0
-            prior_calls = int(watch.get("replay_calls") or 0) if checkpoint else 0
             # في الحالة المكتملة يبقى `from_block` تاريخياً: بداية المدى الذي
             # فُحص. أما `partial` فيحمل نقطة الاستئناف الفعلية.
             state_from_block = (
@@ -683,7 +729,7 @@ async def replay_token(
             saved_checkpoint = (
                 {"balances": {h: str(v) for h, v in final_balances.items()},
                  "next_grid": next_point}
-                if status == "partial" else None
+                if status in ("partial", "budget") else None
             )
             # **لا `set_chain_state`**: ذاك جدول إيقاع الطبقة الحيّة، وكتابته هنا
             # تُخبر الحيّة أنّ العملة قيست الآن فتؤجّل لقطتها الحقيقيّة.
@@ -699,10 +745,14 @@ async def replay_token(
     return out
 
 
-# حالات نهائيّة لا تُعاد إلّا بـ`--redo`: أُنجزت، أو تبيّن أنّها لا تُنجَز.
-# و`partial`/`error` **ليست** نهائيّة: الأولى نفد سقف نداءاتها والثانية عطبٌ قد
-# يكون عابراً (كتم، مهلة) — ودمجُهما مع النهائيّة يعني هجر عملة بسبب ثانية سيّئة.
-_FINAL_STATUSES = ("done", "negative", "empty", "no_time", "skip")
+# حالات نهائيّة لا تُعاد إلّا بـ`--redo`: أُنجزت، أو تبيّن أنّها لا تُنجَز، أو
+# أنفقت سقف نداءاتها (`budget`). و`partial`/`error` **ليست** نهائيّة: الأولى نفد
+# سقف *الدورة* والثانية عطبٌ قد يكون عابراً (كتم، مهلة) — ودمجُهما مع النهائيّة
+# يعني هجر عملة بسبب ثانية سيّئة.
+# والقائمة **واحدة** لأنّها كانت ثلاثاً: هنا وفي `repair_evm_ledger` وفي
+# `run_evm_replay`. ونسخةٌ تنسى حالةً جديدة تعني عدّاً معلّقاً لا ينزل أبداً في
+# تقرير، أو عملةً «مستحقّة» في تقرير وغير مستحقّة في التنفيذ.
+FINAL_STATUSES = ("done", "negative", "empty", "no_time", "skip", "budget")
 
 
 async def run_replay(
@@ -724,7 +774,8 @@ async def run_replay(
     stats: dict[str, Any] = {
         "networks": len(nets), "tokens": 0, "rows": 0, "written": 0,
         "calls": 0, "anchor_calls": 0, "done": 0, "partial": 0,
-        "negative": 0, "empty": 0, "no_time": 0, "skip": 0, "errors": 0,
+        "negative": 0, "empty": 0, "no_time": 0, "skip": 0, "budget": 0,
+        "errors": 0,
         "refused_networks": [n for n in asked if n not in allowed],
     }
     remaining = None if limit is None else int(limit)
@@ -736,7 +787,7 @@ async def run_replay(
     for net in nets:
         targets = [
             w for w in db.evm_replay_targets([net])
-            if redo or (w.get("replay_status") or None) not in _FINAL_STATUSES
+            if redo or (w.get("replay_status") or None) not in FINAL_STATUSES
         ]
         if not redo:
             targets.sort(key=lambda w: (
@@ -832,7 +883,7 @@ def _check(db: RecorderDB) -> int:
             by_status[key] = by_status.get(key, 0) + 1
         due = [
             w for w in targets
-            if (w.get("replay_status") or None) not in _FINAL_STATUSES
+            if (w.get("replay_status") or None) not in FINAL_STATUSES
         ]
         active = sum(1 for w in targets if int(w.get("active") or 0))
         # 48 ساعة ÷ 5 دقائق = 576 لقطة للنافذة الكاملة، والمنتهية نافذتها كاملة.
@@ -867,7 +918,9 @@ def main() -> int:
             db.close()
 
     async def _go() -> dict[str, Any]:
-        rpc = evm_rpc.EVMRPC()
+        from goldrush_rpc import GoldRushReplayRPC
+
+        rpc = GoldRushReplayRPC()
         try:
             return await run_replay(
                 rpc, db, networks=args.networks, limit=args.limit,

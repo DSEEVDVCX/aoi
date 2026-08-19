@@ -127,7 +127,7 @@ def test_network_view_distinguishes_no_active_watches_from_bad_data():
 
     assert response.status_code == 200
     assert 'total === 0' in response.text
-    assert '"لا مراقبات نشطة"' in response.text
+    assert '"لا مراقبات"' in response.text
 
 
 def test_state_changing_request_without_token_is_refused():

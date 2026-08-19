@@ -975,12 +975,19 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                  SELECT DISTINCT token_address, network_id
                    FROM watchlist
                   WHERE active=1 AND network_id IS NOT NULL AND network_id != ''
-             ), active AS (
-                 SELECT network_id, COUNT(*) AS active_watches
-                   FROM active_tokens GROUP BY network_id
-             ), latest_concentration AS (
-                 {concentration_cte}
-             ), conc AS (
+              ), active AS (
+                  SELECT network_id, COUNT(*) AS active_watches
+                    FROM active_tokens GROUP BY network_id
+              ), historical_tokens AS (
+                  SELECT DISTINCT token_address, network_id
+                    FROM watchlist
+                   WHERE active=0 AND network_id IS NOT NULL AND network_id != ''
+              ), historical AS (
+                  SELECT network_id, COUNT(*) AS historical_watches
+                    FROM historical_tokens GROUP BY network_id
+              ), latest_concentration AS (
+                  {concentration_cte}
+              ), conc AS (
                  SELECT a.network_id,
                         COUNT(lc.token_address) AS concentration_rows,
                         COUNT(lc.top1_pct) AS top1_rows,
@@ -993,8 +1000,20 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                    LEFT JOIN latest_concentration lc
                      ON lc.token_address = a.token_address
                     AND lc.network_id = a.network_id
-                  GROUP BY a.network_id
-             ), latest_details AS (
+                   GROUP BY a.network_id
+              ), historical_conc AS (
+                  SELECT h.network_id,
+                         COUNT(lc.token_address) AS historical_concentration_rows,
+                         COUNT(lc.top1_pct) AS historical_top1_rows,
+                         COUNT(lc.top5_pct) AS historical_top5_rows,
+                         COUNT(lc.top10_pct) AS historical_top10_rows,
+                         COUNT(lc.top20_pct) AS historical_top20_rows
+                    FROM historical_tokens h
+                    LEFT JOIN latest_concentration lc
+                      ON lc.token_address = h.token_address
+                     AND lc.network_id = h.network_id
+                   GROUP BY h.network_id
+              ), latest_details AS (
                  {details_cte}
              ), details AS (
                  SELECT a.network_id,
@@ -1008,17 +1027,25 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                   GROUP BY a.network_id
              ), ticks AS (
                  {ticks_cte}
-             ), networks AS (
-                 SELECT network_id FROM active
-                 UNION SELECT network_id FROM ticks
-             )
-             SELECT networks.network_id,
-                    COALESCE(active.active_watches, 0) AS active_watches,
-                    COALESCE(conc.concentration_rows, 0) AS concentration_rows,
+              ), networks AS (
+                  SELECT network_id FROM active
+                  UNION SELECT network_id FROM historical
+                  UNION SELECT network_id FROM ticks
+              )
+              SELECT networks.network_id,
+                     COALESCE(active.active_watches, 0) AS active_watches,
+                     COALESCE(historical.historical_watches, 0) AS historical_watches,
+                     COALESCE(conc.concentration_rows, 0) AS concentration_rows,
                     COALESCE(conc.top1_rows, 0) AS top1_rows,
                     COALESCE(conc.top5_rows, 0) AS top5_rows,
                     COALESCE(conc.top10_rows, 0) AS top10_rows,
-                    COALESCE(conc.top20_rows, 0) AS top20_rows,
+                     COALESCE(conc.top20_rows, 0) AS top20_rows,
+                     COALESCE(historical_conc.historical_concentration_rows, 0)
+                         AS historical_concentration_rows,
+                     COALESCE(historical_conc.historical_top1_rows, 0) AS historical_top1_rows,
+                     COALESCE(historical_conc.historical_top5_rows, 0) AS historical_top5_rows,
+                     COALESCE(historical_conc.historical_top10_rows, 0) AS historical_top10_rows,
+                     COALESCE(historical_conc.historical_top20_rows, 0) AS historical_top20_rows,
                     COALESCE(conc.holder_count_rows, 0) AS holder_count_rows,
                     COALESCE(details.details_holder_rows, 0) AS details_holder_rows,
                     COALESCE(details.details_top10_rows, 0) AS details_top10_rows,
@@ -1026,8 +1053,10 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                     conc.latest_concentration, details.latest_details,
                     ticks.latest_tick
                FROM networks
-               LEFT JOIN active ON active.network_id = networks.network_id
-               LEFT JOIN conc ON conc.network_id = networks.network_id
+                LEFT JOIN active ON active.network_id = networks.network_id
+                LEFT JOIN historical ON historical.network_id = networks.network_id
+                LEFT JOIN conc ON conc.network_id = networks.network_id
+                LEFT JOIN historical_conc ON historical_conc.network_id = networks.network_id
                LEFT JOIN details ON details.network_id = networks.network_id
                LEFT JOIN ticks ON ticks.network_id = networks.network_id
               ORDER BY active_watches DESC, networks.network_id"""

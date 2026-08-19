@@ -4,6 +4,7 @@
 قاعدة مؤقّتة. ما يُتحقَّق منه هو ما يُفسده الصمت: رصيد ناقص، مدًى يُطبَّق مرّتين،
 لقطة تُبنى على دفتر نصف معبَّأ.
 """
+import json
 import os
 import sqlite3
 
@@ -339,6 +340,258 @@ async def test_paging_ignores_a_deadline_that_never_comes():
 
 
 # ---------------------------------------------------------------------------
+# الدفعة: عدّة نداءات في طلب HTTP واحد
+#
+# السقف حدٌّ للنداء الواحد لا للطلب، فالدفعة تضاعف المدى المقروء بنفس عدد
+# الطلبات — وهي في المعيار نفسه (JSON-RPC 2.0 §6) لا تحايلاً عليه. وثمنها أنّ
+# النجاح والفشل يختلطان في ردٍّ واحد، وهو ما تفحصه هذه الاختبارات.
+# ---------------------------------------------------------------------------
+class _BatchRPC(_PagingRPC):
+    """يضيف الدفعة إلى عميل القسمة: `batches` هو ما حُزم في طلبٍ واحد."""
+
+    def __init__(self, *args, too_large_once=False, gag_oldest_once=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batches = []
+        self._too_large_once = too_large_once
+        self._gag_oldest_once = gag_oldest_once
+
+    async def get_logs_multi(self, network_id, addresses, ranges, topics=None):
+        self.batches.append(list(ranges))
+        if self._too_large_once:
+            self._too_large_once = False
+            return [
+                evm_rpc.EVMBatchLimit("backend response too large") for _ in ranges
+            ]
+        out = []
+        for index, (lo, hi) in enumerate(ranges):
+            if index == 0 and self._gag_oldest_once:
+                self._gag_oldest_once = False
+                out.append(evm_rpc.EVMRateLimit("HTTP 429"))
+                continue
+            try:
+                out.append(
+                    await self.get_logs(network_id, addresses, lo, hi, topics)
+                )
+            except evm_rpc.EVMRPCError as exc:
+                out.append(exc)
+        return out
+
+
+def test_split_range_uses_the_hint_only_when_it_actually_shrinks():
+    """مدًى طوله = التلميح بالضبط لا يُقسَم بالتلميح، وإلّا أعاد نفسه إلى الأبد.
+
+    هذا شرط بقاء لا تحسين: `range(lo, hi+1, hint)` على مدًى بطول التلميح يعيد
+    مدًى واحداً هو نفسه، فيُدفَع إلى المكدّس ليُرفَض ثانيةً — حلقةٌ تأكل سقف
+    النداءات كلّه بصفر تقدّم، وتظهر في السجلّ كعملة «تعمل» بلا صفوف.
+    """
+    assert evm_rpc._split_range(0, 400, 100) == [
+        (0, 99), (100, 199), (200, 299), (300, 399), (400, 400),
+    ]
+    assert evm_rpc._split_range(0, 99, 100) == [(0, 49), (50, 99)]
+    assert evm_rpc._split_range(0, 400, 0) == [(0, 200), (201, 400)]
+
+
+async def test_batch_carries_one_sub_call_per_range_and_maps_replies_by_id():
+    """الردّ يُقرأ بالـ`id` لا بالترتيب: المعيار لا يضمن ترتيب مصفوفة الردّ."""
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        # مقلوبٌ عمداً: القراءة بالترتيب تنسب سجلّات مدًى إلى مدًى آخر.
+        return httpx.Response(200, json=[
+            {"jsonrpc": "2.0", "id": 2, "result": [_log(A, B, 5, 250)]},
+            {"jsonrpc": "2.0", "id": 0, "result": []},
+            {"jsonrpc": "2.0", "id": 1, "result": [_log(A, B, 7, 150)]},
+        ])
+
+    rpc = _mock_rpc(handler)
+    try:
+        out = await rpc.get_logs_multi(
+            NET, [TOK], [(0, 99), (100, 199), (200, 299)],
+        )
+    finally:
+        await rpc.aclose()
+
+    assert [item["method"] for item in seen["body"]] == ["eth_getLogs"] * 3
+    assert [item["id"] for item in seen["body"]] == [0, 1, 2]
+    assert [
+        (item["params"][0]["fromBlock"], item["params"][0]["toBlock"])
+        for item in seen["body"]
+    ] == [("0x0", "0x63"), ("0x64", "0xc7"), ("0xc8", "0x12b")]
+    assert [len(result) for result in out] == [0, 1, 1]
+    assert out[1][0]["blockNumber"] == hex(150)
+    assert out[2][0]["blockNumber"] == hex(250)
+
+
+async def test_batch_marks_only_the_truncated_sub_call_as_a_range_limit(monkeypatch):
+    """نداءٌ قُصَّ في دفعة لا يُسقط أخاه: لكلٍّ نتيجته وعلاجه.
+
+    وهذا هو الفرق العمليّ بين الدفعة والنداء: الرفع عند أوّل فشل يرمي نتائج
+    ناجحة دُفع ثمن طلبها، والقصّ (10,000 سجلّ) شائعٌ في مدًى واحد من عشرة.
+    """
+    monkeypatch.setattr(config, "EVM_LOG_LIMIT", 2)
+
+    def handler(_request):
+        return httpx.Response(200, json=[
+            {"jsonrpc": "2.0", "id": 0, "result": [_log(A, B, 1, 10)]},
+            {"jsonrpc": "2.0", "id": 1,
+             "result": [_log(A, B, 1, 110), _log(A, B, 2, 111)]},
+            {"jsonrpc": "2.0", "id": 2,
+             "error": {"code": -32020, "message": "backend response too large"}},
+        ])
+
+    rpc = _mock_rpc(handler)
+    try:
+        out = await rpc.get_logs_multi(
+            NET, [TOK], [(0, 99), (100, 199), (200, 299)],
+        )
+    finally:
+        await rpc.aclose()
+
+    assert isinstance(out[0], list) and len(out[0]) == 1
+    assert isinstance(out[1], evm_rpc.EVMLogLimit)      # بلغ السقف ⇒ قسّم المدى
+    assert isinstance(out[2], evm_rpc.EVMBatchLimit)    # ثقل ردّ ⇒ قلّص العدد
+
+
+async def test_batching_covers_the_same_range_in_fewer_requests(monkeypatch):
+    """نفس التغطية بالضبط، وثلث الطلبات — وهذه هي الغلّة كلّها."""
+    monkeypatch.setitem(config.EVM_LOG_RANGE_HINT, NET, 100)
+    monkeypatch.setitem(config.EVM_BATCH_SIZE, NET, 4)
+    rpc = _BatchRPC(limit_above=100, per_block={150: [_log(A, B, 5, 150)]})
+
+    logs, calls, complete, resume = await rpc.get_logs_paged(
+        NET, [TOK], 0, 400, max_calls=10, sleep=_noop,
+    )
+
+    assert (complete, resume, len(logs)) == (True, 400, 1)
+    # نداءات العقدة كما هي (ستّة) — والطلبات ثلاثة: رفضٌ، فدفعةُ أربعة، فمفرد.
+    assert rpc.ranges == [
+        (0, 400), (0, 99), (100, 199), (200, 299), (300, 399), (400, 400),
+    ]
+    assert calls == 3
+    assert rpc.batches == [[(0, 99), (100, 199), (200, 299), (300, 399)]]
+
+
+async def test_a_too_large_response_shrinks_the_batch_without_splitting_ranges(
+    monkeypatch,
+):
+    """`-32020` حدُّ حجمٍ لا حدُّ مدًى: يُنصَّف العدد وتبقى المدود كما هي.
+
+    وقسمة المدى هنا خطأٌ مكلف: المدود كلّها مقبولة أصلاً، فتقسيمها يهدر السقف
+    المتاح ويضاعف النداءات بلا سبب. وأكبر دفعة مقبولة صفةُ عملةٍ لا صفةُ شبكة
+    (قِيست 10 و5 و3 و2 و1 لخمس عملات Base) فالتعلّم داخل النداء لا في الملفّ.
+    """
+    monkeypatch.setitem(config.EVM_LOG_RANGE_HINT, NET, 100)
+    monkeypatch.setitem(config.EVM_BATCH_SIZE, NET, 4)
+    rpc = _BatchRPC(limit_above=100, too_large_once=True)
+
+    _logs, calls, complete, resume = await rpc.get_logs_paged(
+        NET, [TOK], 0, 400, max_calls=10, sleep=_noop,
+    )
+
+    assert (complete, resume) == (True, 400)
+    assert [len(batch) for batch in rpc.batches] == [4, 2, 2]
+    assert rpc.batches[0] == [(0, 99), (100, 199), (200, 299), (300, 399)]
+    # ولا يعود الحجم إلى الأعلى: العودة تعني رفضاً جديداً كل بضعة طلبات.
+    assert calls == 5
+
+
+async def test_logs_above_an_older_failed_range_are_discarded_and_reread(monkeypatch):
+    """أخطر ما تفعله الدفعة: يفشل أقدم مدًى وينجح ما بعده في نفس الردّ.
+
+    الاحتفاظ بسجلّات المدى الأحدث يعني إمّا قراءتها ثانيةً في الدورة القادمة
+    (مضاعفة رصيد) أو تقديم نقطة الاستئناف فوق مدًى لم يُقرأ (ثغرة دائمة). فالعقد
+    أنّ كل سجلّ مُعاد كتلته أدنى من نقطة الاستئناف — ولو كلّف طلباً زائداً.
+    """
+    monkeypatch.setitem(config.EVM_LOG_RANGE_HINT, NET, 100)
+    monkeypatch.setitem(config.EVM_BATCH_SIZE, NET, 4)
+    monkeypatch.setattr(config, "EVM_RATE_LIMIT_BACKOFF_SECONDS", 0)
+    rpc = _BatchRPC(
+        limit_above=100, gag_oldest_once=True,
+        per_block={150: [_log(A, B, 5, 150)], 250: [_log(B, C, 3, 250)]},
+    )
+
+    logs, _calls, complete, resume = await rpc.get_logs_paged(
+        NET, [TOK], 0, 400, max_calls=20, sleep=_noop,
+    )
+
+    assert (complete, resume) == (True, 400)
+    # سجلٌّ واحد لكلّ تحويل ولو قُرئ مرّتين، ومرتّبٌ تصاعديّاً.
+    assert [int(log["blockNumber"], 16) for log in logs] == [150, 250]
+    # والدليل أنّه قُرئ مرّتين فعلاً: المدى الناجح أُعيد طلبه بعد كتم أقدم منه.
+    assert rpc.ranges.count((100, 199)) == 2
+    assert rpc.ranges.count((200, 299)) == 2
+
+
+async def test_first_mint_block_finds_the_creation_block_in_one_call():
+    """مرشّح بموضوعين ⇒ المِنح وحدها، وأدناها كتلةُ النشأة عمليّاً.
+
+    القياس على السلسلة الحيّة: ثلاث من أربع عملات روبن‑هود سُكَّت فوق 67% من طول
+    السلسلة، فالمشي من الصفر يقرأ 27–37 مليون كتلة فارغة. والنداء 0.17 ثانية.
+    """
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": 1,
+            "result": [_log(ZERO, A, 5, 900), _log(ZERO, B, 7, 700)],
+        })
+
+    rpc = _mock_rpc(handler)
+    try:
+        block = await rpc.first_mint_block(NET, TOK, 1_000)
+    finally:
+        await rpc.aclose()
+
+    assert block == 700
+    params = seen["body"]["params"][0]
+    assert params["topics"] == [evm_rpc.TRANSFER_TOPIC, evm_rpc.ZERO_TOPIC]
+    assert (params["fromBlock"], params["toBlock"]) == ("0x0", "0x3e8")
+
+
+async def test_first_mint_block_returns_none_when_nothing_was_minted():
+    rpc = _mock_rpc(lambda _r: httpx.Response(
+        200, json={"jsonrpc": "2.0", "id": 1, "result": []},
+    ))
+    try:
+        assert await rpc.first_mint_block(NET, TOK, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_truncated_mint_scan_answers_unknown_not_a_higher_floor(monkeypatch):
+    """ردٌّ مقصوص لا يُقرأ أدناه: حدٌّ أدنى كاذب يعني عملةً تُرفض كلّها.
+
+    عملة تسكّ باستمرار تبلغ سقف الـ10,000، فأدنى ما رأيناه أعلى من الحقيقة —
+    وحائزٌ استلم قبل الحدّ يظهر رصيده سالباً. فـ`None` هي الإجابة الصادقة.
+    """
+    monkeypatch.setattr(config, "EVM_LOG_LIMIT", 2)
+    rpc = _mock_rpc(lambda _r: httpx.Response(200, json={
+        "jsonrpc": "2.0", "id": 1,
+        "result": [_log(ZERO, A, 5, 900), _log(ZERO, B, 7, 700)],
+    }))
+    try:
+        assert await rpc.first_mint_block(NET, TOK, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_gagged_mint_scan_raises_instead_of_answering_unknown():
+    """«لم أستطع السؤال» ليس «لا سكّ قبل هذه الكتلة».
+
+    ابتلاعُ الكتم يحوّل ثانيةً سيّئة إلى مشيٍ من genesis لكل عملة في كل دورة —
+    وهو بالضبط ما يجعل السقف ينفد قبل أوّل لقطة.
+    """
+    rpc = _mock_rpc(lambda _r: httpx.Response(429, text="rate limited"))
+    try:
+        with pytest.raises(evm_rpc.EVMRateLimit):
+            await rpc.first_mint_block(NET, TOK, 1_000)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
 # تصنيف ردّ العقدة: مهلة تُقسَم، كتم يُنتظَر
 #
 # كلا الحالتين مقيسة على أوّل دورة حيّة (2026-08-13): روبن‑هود ردّ على تعبئة من
@@ -590,12 +843,24 @@ def test_concentration_row_none_when_ledger_empty():
 class _CycleRPC:
     """عميل EVM مزيّف: سجلّات ثابتة تُرشَّح بالمدى والعنوان كما تفعل العقدة."""
 
-    def __init__(self, head=1_000, logs=(), fail=()):
+    def __init__(self, head=1_000, logs=(), fail=(), mint=None):
         self.head = head
         self._logs = list(logs)
         self._fail = set(fail)
+        self._mint = mint
         self.ranges = []
         self.heads = []
+        self.mint_scans = []
+
+    async def first_mint_block(self, network_id, address, head):
+        """`None` هو الافتراض هنا: «لم أعرف» ⇒ مشيٌ من genesis.
+
+        وهو ما يجب أن تبقى عليه بقيّة الاختبارات لأنّ بياناتها تصف سلسلةً صغيرة
+        تبدأ من الصفر، وبعضها يضع تحويلاً **قبل** السكّ كتبسيط. والمسح نفسه
+        يُختبَر بتمرير `mint=` صريحاً حيث يكون هو موضوع الاختبار.
+        """
+        self.mint_scans.append((str(network_id), address.lower(), int(head)))
+        return self._mint
 
     async def block_number(self, network_id):
         self.heads.append(str(network_id))
@@ -699,6 +964,45 @@ async def test_base_backfill_starts_at_contract_creation_block(db, monkeypatch):
     assert stats["evm_backfilled"] == 1
     assert rpc.ranges[0][2:] == (creation, 988)
     assert db.evm_top_balances(net, TOK, 10) == [(A, 700)]
+
+
+async def test_backfill_starts_at_the_first_mint_where_there_is_no_archive(db):
+    """روبن‑هود لا تحفظ حالةً قديمة، فبديل البحث الثنائيّ نداءٌ بمرشّح السكّ.
+
+    والوفر مقيس على السلسلة الحيّة 2026-08-19: ثلاث من أربع عملات مراقَبة سُكَّت
+    فوق 67% من طول السلسلة (67.7% و88.6% و93.6%)، أي 27–37 **مليون** كتلة لا
+    تحمل تحويلاً واحداً كانت تُمشى قبل أوّل سجلّ. والنداء يجيب في 0.17 ثانية.
+    """
+    mint = 700
+    _watch(db)
+    db.set_evm_cursor(NET, 988, NOW, "ok")
+    rpc = _CycleRPC(head=1_000, mint=mint, logs=[_log(ZERO, A, 700, mint)])
+
+    stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert stats["evm_backfilled"] == 1
+    # الحدّ الأعلى للمسح هو المؤشّر نفسه: ما فوقه ملكُ التطبيق الحيّ.
+    assert rpc.mint_scans == [(NET, TOK, 988)]
+    assert rpc.ranges[0][2:] == (mint, 988)
+    assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
+
+
+async def test_unknown_mint_block_walks_from_genesis_instead_of_guessing(db):
+    """`None` تعني «لم أعرف» لا «لا سكّ قبل هذه الكتلة» — والفرق دفترٌ صحيح.
+
+    عملة تسكّ باستمرار قد تقصّ ردّ المسح عند السقف، فيصير أدنى ما رأيناه أعلى من
+    الحقيقة. وحدٌّ أدنى أعلى من النشأة يعني حائزاً استلم قبله فيظهر رصيده سالباً،
+    وعملةٌ برصيد سالب تُرفض كلّها. فالمشي الطويل ثمنٌ مقبول، والحدّ الكاذب ليس.
+    """
+    _watch(db)
+    db.set_evm_cursor(NET, 988, NOW, "ok")
+    rpc = _CycleRPC(head=1_000, mint=None, logs=[_log(ZERO, A, 700, 40)])
+
+    await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert rpc.mint_scans == [(NET, TOK, 988)]
+    assert rpc.ranges[0][2:] == (config.EVM_BACKFILL_FROM_BLOCK, 988)
+    assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
 
 
 async def test_empty_partial_backfill_rechecks_contract_creation(db, monkeypatch):

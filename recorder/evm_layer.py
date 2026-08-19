@@ -256,14 +256,28 @@ async def _backfill_token(
         # هذه الدورة لا حتى هدف قديم ينمو الرأس بنفس سرعته ويبقيها `partial` أبداً.
         to_block = max(to_block, int(watch.get("to_block") or to_block))
     creation_due = state is None or watch.get("from_block") is None
+    # لسؤال «متى نشأت هذه العملة؟» طريقان بحسب ما تحفظه العقدة، والشبكة في أحدهما
+    # لا كليهما: الأرشيف يسمح ببحث ثنائيّ على `eth_getCode`، وحيث لا أرشيف
+    # (روبن‑هود تحفظ ~128 كتلة) يجيب مرشّح السكّ في نداء واحد.
+    origin_networks = (
+        *config.EVM_CREATION_BLOCK_NETWORKS, *config.EVM_MINT_SCAN_NETWORKS,
+    )
     if (
         not creation_due
-        and net in config.EVM_CREATION_BLOCK_NETWORKS
+        and net in origin_networks
         and int(watch.get("backfill_transfers") or 0) == 0
     ):
         ledger = db.evm_ledger_stats(net, token, exclude=evm_rpc.BURN_ADDRESSES)
         creation_due = int(ledger.get("holder_count") or 0) == 0
-    if creation_due and net in config.EVM_CREATION_BLOCK_NETWORKS:
+    if creation_due and net in config.EVM_MINT_SCAN_NETWORKS:
+        # القياس: ثلاث من أربع عملات روبن‑هود سُكَّت فوق 67% من السلسلة، أي 27–37
+        # **مليون** كتلة فارغة كانت تُمشى قبل أوّل تحويل. و`None` تعني «لم يُعرَف»
+        # فنبقى على `EVM_BACKFILL_FROM_BLOCK`: حدٌّ أدنى خاطئ أسوأ من مشيٍ طويل،
+        # لأنّ حائزاً استلم قبله يظهر رصيده سالباً ⇒ العملة كلّها تُرفض.
+        minted = await rpc.first_mint_block(net, token, to_block)
+        if minted is not None:
+            from_block = max(from_block, minted)
+    elif creation_due and net in config.EVM_CREATION_BLOCK_NETWORKS:
         creation = await rpc.contract_creation_block(net, token, to_block)
         if creation is not None:
             from_block = max(from_block, creation)
@@ -516,7 +530,7 @@ async def run_evm_backfill_assist(
     ]
     pending.sort(key=_assist_priority)
     stats["evm_backfill_due"] = len(pending)
-    deadline = time.monotonic() + config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE
+    deadline = time.monotonic() + config.EVM_BACKFILL_ASSIST_BUDGET_SECONDS
     for index, watch in enumerate(pending[:config.EVM_BACKFILL_TOKENS_PER_CYCLE]):
         if index and time.monotonic() >= deadline:
             stats["evm_backfill_skipped"] += 1

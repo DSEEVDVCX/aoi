@@ -81,7 +81,7 @@ class _FakeRPC:
     """عقدة مزيّفة: سجلّات جاهزة، وطوابع كتل من خطّ زمنيّ معلوم."""
 
     def __init__(self, logs=(), head=1000, rate=0.1, base_ts=1_000_000,
-                 complete=True, resume=None, fail_ts=False):
+                 complete=True, resume=None, fail_ts=False, mint=None):
         self.logs = list(logs)
         self.head = head
         self.rate = rate
@@ -89,8 +89,19 @@ class _FakeRPC:
         self.complete = complete
         self.resume = resume
         self.fail_ts = fail_ts
+        self.mint = mint
         self.ranges = []
         self.blocks_asked = []
+        self.mint_scans = []
+
+    async def first_mint_block(self, _net, address, head):
+        """`None` افتراضاً = «لم أعرف» ⇒ مشيٌ من genesis كما تصفه بقيّة الاختبارات.
+
+        وهو ليس تبسيطاً بل حالةٌ يجب أن تبقى مغطّاة: العملة الصاخبة تقصّ ردّ
+        المسح فلا يُعتمَد أدناه. والمسح الناجح يُختبَر بتمرير `mint=` صريحاً.
+        """
+        self.mint_scans.append((address.lower(), int(head)))
+        return self.mint
 
     async def block_number(self, _net):
         return self.head
@@ -443,7 +454,7 @@ async def test_dry_run_writes_neither_rows_nor_state(db):
 
 
 async def test_replay_rows_roll_back_when_state_write_fails(db, monkeypatch):
-    rpc = _rpc(_story())
+    rpc = _rpc([_log(ZERO, A, 1000, _blk(5000))])
     clock = evm_replay.BlockClock(db, NET)
 
     def _fail(*_args, **_kwargs):
@@ -631,6 +642,30 @@ async def test_negative_balance_retries_from_genesis_once(db):
     assert db.evm_replay_state(TOK, NET)["balance_check"] == "negative"
 
 
+async def test_negative_prefix_stays_partial_until_the_range_is_complete(db):
+    """السالب في جزء أول لا يصبح حكماً نهائياً قبل قراءة بقية المدى."""
+    _seed_watch(db, TOK, 3600, 1)
+    first_rpc = _rpc(
+        [_log(A, B, 200, _blk(1500))], complete=False, resume=_blk(1800),
+    )
+
+    first = await evm_replay.run_replay(
+        first_rpc, db, networks=[NET], sleep=_noop,
+    )
+
+    assert first["partial"] == 1
+    state = db.evm_replay_state(TOK, NET)
+    assert state["status"] == "partial"
+    assert decode_raw(state["checkpoint_json"])["balances"][A] == "-200"
+
+    second = await evm_replay.run_replay(
+        _rpc([], complete=True), db, networks=[NET], sleep=_noop,
+    )
+
+    assert second["negative"] == 1
+    assert db.evm_replay_state(TOK, NET)["status"] == "negative"
+
+
 # ---------------------------------------------------------------------------
 # المهمّة كاملة
 # ---------------------------------------------------------------------------
@@ -725,7 +760,21 @@ async def test_active_window_stays_partial_until_head_reaches_end(db):
         sleep=_noop,
     )
     assert res["status"] == "partial"
-    assert db.evm_replay_state(TOK, NET)["status"] == "partial"
+
+
+async def test_finished_window_caps_replay_at_window_end(db, monkeypatch):
+    """النافذة المنتهية لا تجلب كتل الشبكة التي جاءت بعدها."""
+    watch = _watch(_iso_dt(T0 - 7200), _iso_dt(T0 - 3600))
+    monkeypatch.setattr(config, "EVM_REPLAY_HEAD_GRACE_SECONDS", 0)
+    rpc = _rpc([_log(ZERO, A, 1000, _blk(5000))])
+
+    result = await evm_replay.replay_token(
+        rpc, db, watch, evm_replay.BlockClock(db, NET), HEAD, NOW,
+        sleep=_noop,
+    )
+
+    assert result["status"] == "done"
+    assert rpc.ranges[0][1] < HEAD - 1000
 
 
 async def test_partial_is_retried_because_a_gag_is_not_a_verdict(db):
@@ -761,6 +810,96 @@ async def test_partial_replay_resumes_from_saved_block(db):
     assert second["done"] == 1
 
 
+async def test_replay_starts_at_the_first_mint_where_there_is_no_archive(db):
+    """الإعادة أشدّ حاجةً للمسح من الطبقة الحيّة: تمشي كل عملة من نشأتها.
+
+    والمقيس على السلسلة الحيّة أنّ ثلاثاً من أربع عملات روبن‑هود سُكَّت فوق 67%
+    من طولها، فـ`from_block = 0` يقرأ 27–37 مليون كتلة لا تحمل تحويلاً واحداً —
+    وهي بالضبط النداءات التي كانت تنفد قبل أوّل لقطة.
+    """
+    _seed_watch(db, TOK, 3600, 1)
+    mint = _blk(4000)
+    rpc = _rpc(_story(), mint=mint)
+
+    result = await evm_replay.run_replay(
+        rpc, db, networks=[NET], sleep=_noop,
+    )
+
+    assert result["tokens"] == 1
+    assert rpc.mint_scans and rpc.mint_scans[0][0] == TOK
+    assert rpc.ranges[0][0] == mint
+
+
+async def test_an_unknown_mint_block_replays_from_genesis_instead_of_guessing(db):
+    """`None` = «لم أعرف» ⇒ المشي الكامل. حدٌّ أدنى كاذب يُسقط العملة كلّها."""
+    _seed_watch(db, TOK, 3600, 1)
+    rpc = _rpc(_story(), mint=None)
+
+    await evm_replay.run_replay(rpc, db, networks=[NET], sleep=_noop)
+
+    assert rpc.mint_scans and rpc.ranges[0][0] == 0
+
+
+async def test_a_token_that_spends_its_call_cap_stops_final_with_a_checkpoint(
+    db, monkeypatch,
+):
+    """سقفٌ لكل عملة: `partial` أبديّة تأكل ميزانيّة العملات التي تُنجَز.
+
+    `EVM_REPLAY_MAX_CALLS` سقف **الدورة** لا العملة، فعملة تعود `partial` كل
+    دورة تستأنف إلى الأبد. مقيس على Base: عملتان أنفقتا 15,270 و11,665 نداءً
+    بصفر صفّ، مقابل ~4,960 نداءً لأثقل مشيٍ مشروع — فالتجاوز عطبٌ صامت لا بطء.
+    """
+    monkeypatch.setattr(config, "EVM_REPLAY_TOKEN_CALL_CAP", 5)
+    _seed_watch(db, TOK, 3600, 1)
+    next_grid = evm_replay.grid_points(T0 - 4200, T0 - 4200, 300)[0]
+    db.set_evm_replay_state(
+        TOK, NET, "partial", NOW, from_block=100, to_block=99,
+        transfers=3, snapshots=0, calls=5,
+        checkpoint={"balances": {A: "1000"}, "next_grid": next_grid},
+    )
+
+    result = await evm_replay.run_replay(
+        _rpc([], complete=False, resume=200), db, networks=[NET], sleep=_noop,
+    )
+
+    assert result["budget"] == 1
+    state = db.evm_replay_state(TOK, NET)
+    assert state["status"] == "budget"
+    # نقطة الاستئناف والـcheckpoint محفوظان: التوقّف ليس حرقاً للعمل المنجَز،
+    # فرفعُ السقف أو `--redo` يُكمل من هنا لا من الصفر.
+    assert state["from_block"] == 200
+    assert decode_raw(state["checkpoint_json"])["balances"] == {A: "1000"}
+    assert "سقف العملة" in (state["last_error"] or "")
+
+    # ولا تُعاد: `budget` نهائيّة، وإلّا كان السقف عدّاداً بلا أثر.
+    again = await evm_replay.run_replay(
+        _rpc([], complete=False, resume=200), db, networks=[NET], sleep=_noop,
+    )
+    assert again["tokens"] == 0
+    redone = await evm_replay.run_replay(
+        _rpc([], complete=False, resume=200), db, networks=[NET], sleep=_noop,
+        redo=True,
+    )
+    assert redone["tokens"] == 1
+
+
+async def test_the_call_cap_never_overrides_a_verdict_the_data_gives(db, monkeypatch):
+    """السقف يخصّ `partial` وحدها: رصيدٌ سالب حكمٌ على البيانات لا على الميزانيّة.
+
+    خلطُهما يخفي `negative` — أي رقماً كاذباً — خلف «نفد السقف»، فتبدو العملة
+    ناقصةَ عملٍ وهي مرفوضة أصلاً، ويُفتَح لها بابُ إعادةٍ لا تنتهي عند رفع السقف.
+    """
+    monkeypatch.setattr(config, "EVM_REPLAY_TOKEN_CALL_CAP", 1)
+    _seed_watch(db, TOK, 3600, 1)
+    # تحويلٌ من حائز لم يستلم قطّ ⇒ رصيد سالب بعد اكتمال المدى.
+    rpc = _rpc([_log(A, B, 500, _blk(3000), ts=T0 - 3000)])
+
+    result = await evm_replay.run_replay(rpc, db, networks=[NET], sleep=_noop)
+
+    assert result["negative"] == 1 and result["budget"] == 0
+    assert db.evm_replay_state(TOK, NET)["balance_check"] == "negative"
+
+
 async def test_empty_partial_replay_jumps_to_contract_creation(db, monkeypatch):
     """Checkpoint فارغ قد يتجاوز فقط الكتل التي سبقت وجود العقد."""
     _seed_watch(db, TOK, 3600, 1)
@@ -771,6 +910,9 @@ async def test_empty_partial_replay_jumps_to_contract_creation(db, monkeypatch):
         checkpoint={"balances": {}, "next_grid": next_grid},
     )
     monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (NET,))
+    # الشبكة في مجموعةٍ واحدة لا اثنتين: هنا نصفها بأنّها تحفظ أرشيفاً، فيكون
+    # `eth_getCode` هو الجواب. ومسح السكّ بديلٌ عنه حيث لا أرشيف لا زميلٌ له.
+    monkeypatch.setattr(config, "EVM_MINT_SCAN_NETWORKS", ())
     rpc = _rpc([], complete=False, resume=800)
 
     async def creation_block(network_id, address, head):
@@ -781,6 +923,33 @@ async def test_empty_partial_replay_jumps_to_contract_creation(db, monkeypatch):
 
     result = await evm_replay.run_replay(
         rpc, db, networks=[NET], sleep=_noop,
+    )
+
+    assert result["partial"] == 1
+    assert rpc.ranges[0][0] == 700
+
+
+async def test_redo_negative_replay_ignores_old_counters_for_creation_jump(db, monkeypatch):
+    """محاولة مرفوضة سابقة لا تُجبر إعادةً جديدة على المسح من genesis."""
+    _seed_watch(db, TOK, 3600, 1)
+    db.set_evm_replay_state(
+        TOK, NET, "negative", NOW, from_block=700, to_block=900,
+        transfers=123, snapshots=0, calls=45, balance_check="negative",
+    )
+    monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (NET,))
+    # الشبكة في مجموعةٍ واحدة لا اثنتين: هنا نصفها بأنّها تحفظ أرشيفاً، فيكون
+    # `eth_getCode` هو الجواب. ومسح السكّ بديلٌ عنه حيث لا أرشيف لا زميلٌ له.
+    monkeypatch.setattr(config, "EVM_MINT_SCAN_NETWORKS", ())
+    rpc = _rpc([], complete=False, resume=800)
+
+    async def creation_block(network_id, address, head):
+        assert (network_id, address) == (NET, TOK)
+        return 700
+
+    rpc.contract_creation_block = creation_block
+
+    result = await evm_replay.run_replay(
+        rpc, db, networks=[NET], sleep=_noop, redo=True,
     )
 
     assert result["partial"] == 1

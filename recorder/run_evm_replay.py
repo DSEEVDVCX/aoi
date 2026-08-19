@@ -78,18 +78,9 @@ async def run_cycle(rpc, db) -> dict:
         rpc, db, networks=config.EVM_BACKFILL_ASSIST_NETWORKS,
         recorded_at=__import__("db").utcnow_iso(),
     )
-    if assist["evm_backfill_due"]:
-        now = __import__("db").utcnow_iso()
-        _stamp(db, {
-            "evm_replay_last_run_at": now,
-            "evm_replay_last_stats": str({**assist, "network": "live"}),
-            **({} if assist.get("evm_backfill_errors") else {"evm_replay_last_ok_at": now}),
-        })
-        return {**assist, "network": "live"}
-
     networks = tuple(str(network) for network in config.EVM_REPLAY_NETWORKS)
     if not networks:
-        return {"tokens": 0, "written": 0, "errors": 0, "network": None}
+        return {**assist, "tokens": 0, "written": 0, "errors": 0, "network": None}
 
     network, following = _next_network(db, networks)
     stats = await evm_replay.run_replay(
@@ -101,13 +92,18 @@ async def run_cycle(rpc, db) -> dict:
         budget_seconds=config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE,
     )
     now = __import__("db").utcnow_iso()
+    combined = {**stats, "network": network}
+    if assist["evm_backfill_due"] or _worked(assist):
+        combined.update(assist)
+    now = __import__("db").utcnow_iso()
     _stamp(db, {
         "evm_replay_next_network": following,
         "evm_replay_last_run_at": now,
-        "evm_replay_last_stats": str({**stats, "network": network}),
-        **({} if stats.get("errors") else {"evm_replay_last_ok_at": now}),
+        "evm_replay_last_stats": str(combined),
+        **({} if assist.get("evm_backfill_errors") or stats.get("errors")
+           else {"evm_replay_last_ok_at": now}),
     })
-    return {**stats, "network": network}
+    return combined
 
 
 def _check_config() -> int:
@@ -122,7 +118,8 @@ def _check_config() -> int:
         "GOLDRUSH_REPLAY_CHAINS",
         "GOLDRUSH_BLOCK_CHUNK", "GOLDRUSH_RETRIES",
         "GOLDRUSH_MIN_RANGE", "EVM_CREATION_BLOCK_NETWORKS",
-        "EVM_BACKFILL_ASSIST_NETWORKS",
+        "EVM_BACKFILL_ASSIST_NETWORKS", "EVM_BACKFILL_ASSIST_BUDGET_SECONDS",
+        "EVM_REPLAY_HEAD_GRACE_SECONDS",
     ):
         if not hasattr(config, name):
             print(f"config.{name} مفقود", file=sys.stderr)
@@ -146,7 +143,7 @@ def _check_config() -> int:
         pending = sum(
             1 for row in db.evm_replay_targets(config.EVM_REPLAY_NETWORKS)
             if (row.get("replay_status") or "") not in
-            ("done", "negative", "empty", "no_time", "skip")
+            evm_replay.FINAL_STATUSES
         )
     finally:
         db.close()

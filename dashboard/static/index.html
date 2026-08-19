@@ -1432,33 +1432,52 @@ function renderNetworks(rows, cacheMeta) {
       name: `شبكة ${row.network_id}`,
       source: "مصدر غير مصنّف",
     };
-    const total = row.active_watches || 0;
-    const directAvailable = row.concentration_rows > 0;
-    const detailsAvailable = row.details_top10_rows > 0 || row.details_holder_rows > 0;
-    const coverage = [
-      { label: "Top 1 · سلسلة", value: row.top1_rows, available: directAvailable },
-      { label: "Top 5 · سلسلة", value: row.top5_rows, available: directAvailable },
-      { label: "Top 10 · سلسلة", value: row.top10_rows, available: directAvailable },
-      { label: "Top 20 · سلسلة", value: row.top20_rows, available: directAvailable },
+     const activeTotal = row.active_watches || 0;
+     const historicalTotal = row.historical_watches || 0;
+     const historicalMode = activeTotal === 0 && historicalTotal > 0;
+     const total = historicalMode ? historicalTotal : activeTotal;
+     const directAvailable = historicalMode
+       ? row.historical_concentration_rows > 0
+       : row.concentration_rows > 0;
+     const detailsAvailable = row.details_top10_rows > 0 || row.details_holder_rows > 0;
+     const values = historicalMode ? {
+       top1: row.historical_top1_rows,
+       top5: row.historical_top5_rows,
+       top10: row.historical_top10_rows,
+       top20: row.historical_top20_rows,
+     } : {
+       top1: row.top1_rows,
+       top5: row.top5_rows,
+       top10: row.top10_rows,
+       top20: row.top20_rows,
+     };
+     const concentrationTotal = historicalMode
+       ? row.historical_concentration_rows
+       : row.concentration_rows;
+     const coverage = [
+       { label: "Top 1 · سلسلة", value: values.top1, available: directAvailable },
+       { label: "Top 5 · سلسلة", value: values.top5, available: directAvailable },
+       { label: "Top 10 · سلسلة", value: values.top10, available: directAvailable },
+       { label: "Top 20 · سلسلة", value: values.top20, available: directAvailable },
       { label: "Top 10 · FOMO", value: row.details_top10_rows, available: detailsAvailable },
       { label: "عدد الحائزين", value: row.details_holder_rows, available: detailsAvailable },
     ];
-    const noActive = total === 0;
-    const stateLabel = noActive ? "لا مراقبات نشطة" : directAvailable ? "تركيز كامل" : detailsAvailable ? "Top 10 + حائزون" : "بيانات سوق";
-    return `<article class="network-item">
+     const noCoverage = total === 0;
+     const stateLabel = noCoverage ? "لا مراقبات" : directAvailable ? (historicalMode ? "تركيز تاريخي" : "تركيز كامل") : detailsAvailable ? "Top 10 + حائزون" : "بيانات سوق";
+     return `<article class="network-item">
       <header><div><h3>${esc(meta.name)}</h3><span class="meta">${esc(meta.source)} · ID ${esc(row.network_id)}</span></div>
-        <span class="badge ${noActive ? "" : directAvailable ? "good" : detailsAvailable ? "warn" : "bad"}">${stateLabel}</span></header>
+         <span class="badge ${noCoverage ? "" : directAvailable ? "good" : detailsAvailable ? "warn" : "bad"}">${stateLabel}</span></header>
       <div class="network-metrics">
-        <div class="network-metric"><span>مراقبة نشطة</span><strong>${num(row.active_watches)}</strong></div>
-        <div class="network-metric"><span>لقطات سوق</span><strong>${compact(row.tick_rows)}</strong></div>
-        <div class="network-metric"><span>لقطات تركّز</span><strong>${compact(row.concentration_rows)}</strong></div>
+         <div class="network-metric"><span>مراقبة نشطة</span><strong>${num(row.active_watches)}</strong></div>
+         <div class="network-metric"><span>لقطات سوق</span><strong>${compact(row.tick_rows)}</strong></div>
+         <div class="network-metric"><span>لقطات تركّز</span><strong>${compact(concentrationTotal)}</strong></div>
       </div>
       <div class="coverage-list">${coverage.map(metric => {
         const p = metric.available ? coveragePct(metric.value || 0, total) : 0;
-        const value = metric.available ? `${num(metric.value)} / ${num(total)}` : "غير متاح";
+         const value = metric.available ? `${num(metric.value)} من ${num(total)}` : "غير متاح";
         return `<div class="coverage-row"><span>${esc(metric.label)}</span><div class="meter"><i style="width:${p}%;background:${p >= 95 ? "var(--good)" : p ? "var(--s1)" : "var(--muted)"}"></i></div><span class="value">${value}</span></div>`;
       }).join("")}
-      <div class="meta">آخر سوق: ${ago(row.latest_tick)} · FOMO: ${ago(row.latest_details)} · تركّز كامل: ${ago(row.latest_concentration)}</div></div>
+       <div class="meta">مراقبات تاريخية: ${num(historicalTotal)} · آخر سوق: ${ago(row.latest_tick)} · FOMO: ${ago(row.latest_details)} · تركّز كامل: ${ago(row.latest_concentration)}</div></div>
     </article>`;
   }).join("");
 }

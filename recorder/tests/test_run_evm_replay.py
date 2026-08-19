@@ -71,7 +71,7 @@ async def test_cycle_recovers_when_saved_network_is_no_longer_configured(monkeyp
     assert db.get_meta("evm_replay_next_network") == "143"
 
 
-async def test_cycle_prioritizes_live_backfill_before_historical_replay(monkeypatch):
+async def test_cycle_runs_live_backfill_before_historical_replay(monkeypatch):
     db = _DB("8453")
     replay_calls = []
 
@@ -89,22 +89,33 @@ async def test_cycle_prioritizes_live_backfill_before_historical_replay(monkeypa
 
     async def fake_replay(*args, **kwargs):
         replay_calls.append((args, kwargs))
-        return {}
+        return {"tokens": 1, "written": 2, "errors": 0}
 
     monkeypatch.setattr(run_evm_replay.evm_layer, "run_evm_backfill_assist", fake_assist)
     monkeypatch.setattr(run_evm_replay.evm_replay, "run_replay", fake_replay)
 
     stats = await run_evm_replay.run_cycle(object(), db)
 
-    assert replay_calls == []
+    assert replay_calls and replay_calls[0][1]["networks"] == ["8453"]
     assert stats["evm_backfilled"] == 1
-    assert stats["network"] == "live"
+    assert stats["tokens"] == 1
+    assert stats["network"] == "8453"
 
 
-def test_base_and_monad_are_enabled_for_live_and_historical_collection():
+def test_monad_is_collected_live_but_not_replayed():
+    """مونادْ تُجمَع حيّاً ولا تُعاد تاريخيّاً — وهذا فرقٌ مقصود لا سهو.
+
+    الإعادة التاريخيّة تمشي دفتر كل عملة من نشأتها، وسجلّ المراقبة يحمل صفر عملة
+    مونادْ نشطة (مقابل 49 روبن‑هود و23 Base و35 BSC) وثلاثاً خاملة. ومع ذلك أخذت
+    مونادْ ثلث دورات الإعادة و2,950 نداءً مقابل **صفر** لقطة، تسجّل
+    `كتل 38963051→38963050` أي مدًى مقلوباً = لا تقدّم. فالحياة تبقى: عملة جديدة
+    قد تظهر غداً وتُجمَع من لحظتها. والإعادة تنتظر أن توجد عملة تستحقّها، ورجوعها
+    سطرٌ في `config`.
+    """
     assert {"4663", "8453", "143"} <= set(config.EVM_NETWORKS)
-    assert {"4663", "8453", "143"} <= set(config.EVM_REPLAY_NETWORKS)
     assert config.EVM_RPC_URLS["143"].startswith("https://")
+    assert {"4663", "8453"} <= set(config.EVM_REPLAY_NETWORKS)
+    assert "143" not in config.EVM_REPLAY_NETWORKS
 
 
 def test_live_assist_prioritizes_unstarted_then_nearest_completion():
@@ -177,4 +188,3 @@ async def test_cycle_survives_a_locked_database_at_stamp_time(monkeypatch):
     stats = await run_evm_replay.run_cycle(object(), _LockedDB("8453"))
 
     assert stats == {"tokens": 1, "written": 2, "errors": 0, "network": "8453"}
-

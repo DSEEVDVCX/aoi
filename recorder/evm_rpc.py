@@ -35,6 +35,11 @@ import httpx
 # فلا نداء عقدة يعيدها، والرصيد لا يُعرف إلّا بإعادة تشغيل كل تحويل.
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
+# موضوع بعرض 32 بايت لعنوان الصفر. `topics=[Transfer, ZERO_TOPIC]` يعني «التحويلات
+# **من** عنوان الصفر» أي السكّ وحده — وأدنى كتلة فيها هي كتلة إنشاء العملة عمليّاً:
+# لا رصيد يُوجَد إلّا بسكّ، ومعيار ERC-20 يُطلق `Transfer(0x0, …)` عند كل `_mint`.
+ZERO_TOPIC = "0x" + "0" * 64
+
 # عناوين لا تُحسب حائزاً: الصفر (سكّ وحرق) والحرق الصريح.
 BURN_ADDRESSES = (
     "0x0000000000000000000000000000000000000000",
@@ -55,6 +60,20 @@ class EVMLogLimit(EVMRPCError):
     ويشمل **مهلة الاستعلام** لا القصّ وحده: روبن‑هود ردّ على تعبئة من الكتلة صفر
     بـ`-32000 log query timed out` (مقيس 2026-08-13) — وهي نفس المعلومة بصياغة
     أخرى: «المدى أوسع من طاقتي». من دون ذلك تموت تعبئة العملة كلّها بدل أن تُقسَم.
+    """
+
+
+class EVMBatchLimit(EVMRPCError):
+    """الردّ المجموع لدفعةٍ أكبر من طاقة العقدة ⇒ يُقلَّص **عدد** النداءات لا المدى.
+
+    منفصل عن `EVMLogLimit` لأنّ العلاج مختلف: هناك المدى واسع، وهنا المدى مقبول
+    ولكنّ حزم عشرة ردود مقبولة في ردٍّ واحد يتجاوز حدّ الحجم. مقيس على Base
+    2026-08-19: `-32020 backend response too large` يسقط الدفعة **كلّها ذرّيّاً**،
+    وأكبر دفعة مقبولة صفةُ عملةٍ لا صفةُ شبكة — قِيست 10 و5 و3 و2 و1 لخمس عملات
+    مراقَبة. فقسمة المدى هنا تصحيحٌ في المكان الخطأ: تضاعف عدد النداءات لتحلّ
+    مشكلة حجم، وتهدر سقف المدى المتاح.
+
+    وحين تكون الدفعة **واحداً** أصلاً فلا عدد يُقلَّص ⇒ يُعامَل قصّاً في المدى.
     """
 
 
@@ -102,6 +121,64 @@ def _uint256(value: Any) -> int | None:
     if not isinstance(value, str) or re.fullmatch(r"0x[0-9a-fA-F]{1,64}", value) is None:
         return None
     return int(value, 16)
+
+
+def _classify(label: str, code: Any, message: str) -> EVMRPCError:
+    """رمز الخطأ ونصّه ⇒ الاستثناء الذي يحمل **العلاج** لا الوصف.
+
+    ثلاثة علاجات لا يجوز خلطها: الكتم يُنتظَر، والمدى الواسع يُقسَم، والدفعة
+    الثقيلة يُقلَّص عددها. والترتيب مقصود: «too many requests» كتمٌ لا سعةَ مدًى
+    وإن شاركت كلمةً واحدة مع «too many logs».
+    """
+    low = message.lower()
+    if (
+        code in (429, -32011) or "too many requests" in low
+        or "rate limit" in low or "no backend" in low or "try again" in low
+    ):
+        return EVMRateLimit(f"{label}: {message[:150]}")
+    # حدّ **حجم الردّ** لا حدّ المدى: Base يردّ `-32020 backend response too large`
+    # على دفعةٍ مدودها كلّها مقبولة (مقيس 2026-08-19) ⇒ يُقلَّص العدد. وحين يكون
+    # العدد واحداً أصلاً يصعّده `get_logs_paged` إلى قسمةٍ في المدى.
+    if code == -32020 or "response too large" in low:
+        return EVMBatchLimit(f"{label}: {message[:150]}")
+    # العقد تصوغ «المدى أوسع من طاقتي» بعبارات مختلفة (`exceeds limit of 10000`،
+    # `query returned more than`، `limit exceeded`، `limited to a 10,000 range`،
+    # و**مهلة الاستعلام**) وكلّها تعني شيئاً واحداً: قسّم المدى.
+    if (
+        code == -32614
+        or "exceed" in low or "more than" in low or "too many" in low
+        or "timed out" in low or "timeout" in low or "limited to a" in low
+    ):
+        return EVMLogLimit(f"{label}: {message[:150]}")
+    return EVMRPCError(f"{label}: JSON-RPC {code}: {message[:150]}")
+
+
+def _split_range(lo: int, hi: int, hint: int) -> list[tuple[int, int]]:
+    """مدًى مرفوض ⇒ مدود أصغر مرتّبة **تصاعديّاً**، بلا فجوة ولا تراكب.
+
+    التلميح يُستخدم **فقط إن قلّص المدى فعلاً**، وهذا شرط بقاء لا تحسين: مدًى
+    طوله 10,000 بالضبط على Base يعيد `range(lo, hi+1, 10_000)` مدًى واحداً هو
+    نفسه، فيُدفَع إلى المكدّس ليُرفَض ثانيةً — حلقةٌ تأكل سقف النداءات كلّه بصفر
+    تقدّم. والتنصيف هو المخرج الوحيد المضمون التقلّص.
+    """
+    if hint > 0 and (hi - lo + 1) > hint:
+        return [(start, min(hi, start + hint - 1)) for start in range(lo, hi + 1, hint)]
+    mid = lo + (hi - lo) // 2
+    return [(lo, mid), (mid + 1, hi)]
+
+
+def _in_block_order(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ترتيب زمنيّ صارم للسجلّات المعادة.
+
+    الدفعة تُرجع مدودها في ردٍّ واحد وقد يُعاد أحدها دون أخيه، فترتيب القراءة لم
+    يبقَ هو ترتيب الكتل. والمستهلكون يرتّبون أو يجمّعون بأنفسهم، لكنّ العقد هنا
+    أن يكون المُعاد مرتّباً: ترتيبٌ مرّةً هنا أرخص من ثقةٍ ضائعة في كل موضع.
+    """
+    return sorted(logs, key=lambda log: (
+        _num(log.get("blockNumber")) or 0,
+        _num(log.get("transactionIndex")) or 0,
+        _num(log.get("logIndex")) or 0,
+    ))
 
 
 class EVMRPC:
@@ -175,24 +252,7 @@ class EVMRPC:
         if err is not None:
             code = err.get("code") if isinstance(err, dict) else None
             msg = str(err.get("message") if isinstance(err, dict) else err)
-            low = msg.lower()
-            if (
-                code in (429, -32011) or "too many requests" in low
-                or "rate limit" in low or "no backend" in low
-                or "try again" in low
-            ):
-                raise EVMRateLimit(f"{method} [{network_id}]: {msg[:150]}")
-            # العقد تصوغ «المدى أوسع من طاقتي» بعبارات مختلفة (`exceeds limit of
-            # 10000`، `query returned more than`، `limit exceeded`، `limited to a
-            # 10,000 range`، و**مهلة الاستعلام**) وكلّها تعني شيئاً واحداً:
-            # قسّم المدى.
-            if (
-                code == -32614
-                or "exceed" in low or "more than" in low or "too many" in low
-                or "timed out" in low or "timeout" in low or "limited to a" in low
-            ):
-                raise EVMLogLimit(f"{method} [{network_id}]: {msg[:150]}")
-            raise EVMRPCError(f"{method} [{network_id}]: JSON-RPC {code}: {msg[:150]}")
+            raise _classify(f"{method} [{network_id}]", code, msg)
         if "result" not in body:
             raise EVMRPCError(f"{method} [{network_id}]: لا result ولا error")
         return body["result"]
@@ -326,6 +386,126 @@ class EVMRPC:
             )
         return [r for r in result if isinstance(r, dict)]
 
+    async def get_logs_multi(
+        self,
+        network_id: str,
+        addresses: Sequence[str],
+        ranges: Sequence[tuple[int, int]],
+        topics: Sequence[Any] | None = None,
+    ) -> list[list[dict[str, Any]] | EVMRPCError]:
+        """عدّة `eth_getLogs` في **طلب HTTP واحد** (دفعة JSON-RPC 2.0).
+
+        هذا هو المخرج من سقوف المدى بلا تحايل: السقف حدّ للنداء الواحد لا للطلب،
+        فحزم عشرة نداءات مقبولة في طلب واحد شرعيٌّ في المعيار نفسه ويضاعف الغلّة.
+        مقيس 2026-08-19: Base 5×10,000 كتلة في 1.16ث (مقابل 0.88ث لنداء واحد)،
+        وMonad 100×100 كتلة = 10,000 كتلة في طلب واحد بينما سقف نداءه 100.
+
+        ويعيد قائمةً **مصفوفةً على `ranges`**: لكل مدًى إمّا سجلّاته أو استثناؤه.
+        الرفع عند أوّل مدًى فاشل يرمي تسع نتائج ناجحة دُفع ثمن طلبها — والدفعة
+        تخلط النجاح والفشل في ردٍّ واحد بطبيعتها. أمّا فشل **الطلب** نفسه (كتم أو
+        حدّ حجم) فيُرفَع: لا نتيجة فيه تُنقَذ.
+        """
+        url = self.url_for(network_id)
+        label = f"eth_getLogs×{len(ranges)} [{network_id}]"
+        topic_filter = list(topics) if topics is not None else [TRANSFER_TOPIC]
+        addrs = [a.lower() for a in addresses]
+        payload = [
+            {
+                "jsonrpc": "2.0", "id": index, "method": "eth_getLogs",
+                "params": [{
+                    "fromBlock": hex(int(lo)), "toBlock": hex(int(hi)),
+                    "address": addrs, "topics": topic_filter,
+                }],
+            }
+            for index, (lo, hi) in enumerate(ranges)
+        ]
+        try:
+            resp = await self._client.post(url, json=payload)
+            status = resp.status_code
+            if status == 429:
+                raise EVMRateLimit(f"{label} HTTP 429")
+            if status >= 500:
+                raise EVMRateLimit(f"{label} HTTP {status}")
+            if status >= 400:
+                # 413 على دفعة مبهم: أهو مدًى واسع أم ردٌّ ثقيل؟ يُقرأ **دفعةً
+                # ثقيلة** لأنّ تقليص العدد تقدّمٌ مضمون في الحالتين، وعند العدد
+                # واحداً يصعّده المستدعي إلى قسمةِ مدًى. والعكس ليس صحيحاً:
+                # قسمة المدى لحلّ مشكلة حجمٍ تهدر السقف المتاح كلّه.
+                raise EVMBatchLimit(f"{label} HTTP {status}: {resp.text[:150]}")
+            body = resp.json()
+        except EVMRPCError:
+            raise
+        except httpx.TransportError as exc:
+            raise EVMRateLimit(f"{label} {type(exc).__name__}") from None
+        except Exception as exc:  # noqa: BLE001
+            raise EVMRPCError(f"{label} {type(exc).__name__}: {exc}") from None
+        if isinstance(body, dict):
+            # ردّ مفرد على طلب مصفوف: خطأٌ يخصّ الطلب كلّه لا مدًى فيه.
+            err = body.get("error")
+            code = err.get("code") if isinstance(err, dict) else None
+            msg = str(err.get("message") if isinstance(err, dict) else err)
+            raise _classify(label, code, msg)
+        if not isinstance(body, list):
+            raise EVMRPCError(f"{label}: ردّ ليس مصفوفاً ({type(body).__name__})")
+        by_id: dict[int, dict[str, Any]] = {}
+        for item in body:
+            if isinstance(item, dict) and isinstance(item.get("id"), int):
+                by_id[item["id"]] = item
+        out: list[list[dict[str, Any]] | EVMRPCError] = []
+        for index in range(len(ranges)):
+            item = by_id.get(index)
+            if item is None:
+                out.append(EVMRPCError(f"{label}: لا ردّ للنداء {index}"))
+                continue
+            err = item.get("error")
+            if err is not None:
+                code = err.get("code") if isinstance(err, dict) else None
+                msg = str(err.get("message") if isinstance(err, dict) else err)
+                out.append(_classify(label, code, msg))
+                continue
+            result = item.get("result")
+            if not isinstance(result, list):
+                out.append(EVMRPCError(f"{label}: نداء {index} بلا نتيجة"))
+                continue
+            if len(result) >= config.EVM_LOG_LIMIT:
+                out.append(EVMLogLimit(f"{label}: {len(result)} سجلّاً ⇒ السقف بلغ"))
+                continue
+            out.append([row for row in result if isinstance(row, dict)])
+        return out
+
+    async def first_mint_block(
+        self, network_id: str, address: str, head: int,
+    ) -> int | None:
+        """أوّل كتلة سُكَّ فيها هذا العقد — **نداء واحد** على المدى `0→head`.
+
+        بديلُ `contract_creation_block` حيث لا أرشيف: عقدة روبن‑هود تحفظ الحالة
+        ~128 كتلة فقط فالبحث الثنائي على `eth_getCode` مستحيل هناك، وكان البديل
+        الوحيد المشيَ من الكتلة صفر. والفرق مقيس 2026-08-19: أربع عملات مراقَبة
+        سُكَّت عند 0.2% و67.7% و88.6% و93.6% من السلسلة، أي 27–37 **مليون** كتلة
+        فارغة تُمشى قبل أوّل تحويل — والمسح يجيب في 0.17 ثانية.
+
+        والحيلة أنّ المرشّح بموضوعين يقصّ الردّ إلى المِنح وحدها (مِنحة واحدة في
+        العملات الأربع) فلا يبلغ سقف الـ10,000 وإن كانت العملة صاخبة.
+
+        يعيد `None` حين لا يُعرَف الجواب، وحينها **يجب** أن يبدأ المستدعي من
+        الصفر لا أن يخمّن: عملة تسكّ باستمرار قد تقصّ الردّ (`EVMLogLimit`) فيصير
+        أدنى ما رأيناه أعلى من الحقيقة، وأدنى خاطئ يعني حائزاً استلم قبله فيظهر
+        رصيده سالباً — أي عملة تُرفض كلّها. والكتم يُرفَع لا يُبتلَع: «لم أستطع
+        السؤال» ليس «لا سكّ قبل هذه الكتلة».
+        """
+        try:
+            logs = await self.get_logs(
+                network_id, [address], 0, int(head),
+                topics=[TRANSFER_TOPIC, ZERO_TOPIC],
+            )
+        except EVMLogLimit:
+            return None
+        blocks = [
+            block for block in (_num(log.get("blockNumber")) for log in logs)
+            if block is not None
+        ]
+        return min(blocks) if blocks else None
+
     async def get_logs_paged(
         self,
         network_id: str,
@@ -337,12 +517,20 @@ class EVMRPC:
         sleep=asyncio.sleep,
         deadline: float | None = None,
     ) -> tuple[list[dict[str, Any]], int, bool, int]:
-        """نفس النداء مع تقسيم المدى نصفين عند القصّ.
+        """نفس النداء مع تقسيم المدى عند القصّ وحزم المدود المقبولة في دفعة.
 
-        يعيد (السجلّات، عدد النداءات، أُكمِل المدى كلّه؟، أوّل كتلة غير مقروءة).
-        الرابع هو نقطة الاستئناف: عند الإكمال يساوي `to_block`، وعند بلوغ سقف
-        النداءات يساوي أدنى كتلة بقيت في المكدّس — فيُستأنف من حيث توقّف بدل أن
-        يُعاد المدى كلّه أو يُعلَن مكتملاً كذباً.
+        يعيد (السجلّات، عدد **الطلبات**، أُكمِل المدى كلّه؟، أوّل كتلة غير مقروءة).
+        الرابع هو نقطة الاستئناف: عند الإكمال يساوي `to_block`، وعند بلوغ السقف
+        يساوي أدنى كتلة بقيت في المكدّس — فيُستأنف من حيث توقّف بدل أن يُعاد المدى
+        كلّه أو يُعلَن مكتملاً كذباً. والعدد صار عدد **طلبات HTTP** لا نداءات:
+        الحصّة المقيسة على العقد العامّة حصّةُ طلبات (تسعة في ~15ث على Base)،
+        فالدفعة تشتري عشرة أضعاف المدى بنفس الثمن.
+
+        و**العقد الذي لا يُخَرق**: كل سجلّ مُعاد كتلته أدنى من نقطة الاستئناف. من
+        دونه يُطبَّق سجلٌّ ثمّ يُقرأ مرّة أخرى في الدورة القادمة ⇒ مضاعفة رصيد،
+        أو يتقدّم المؤشّر فوق مدًى لم يُقرأ ⇒ ثغرة دائمة. والدفعة تهدّده مباشرة:
+        عشرة مدود في طلب واحد قد يفشل أقدمها وينجح أحدثها، فالأحدث يُعاد إلى
+        المكدّس **وتُهمَل سجلّاته** ولو دُفع ثمنها — طلبٌ زائد أرخص من ثغرة.
 
         القسمة تكيّفيّة لا خطوة ثابتة: العملة الهادئة مقيسة بنداء واحد لـ1.71
         مليون كتلة، والصاخبة تقصّ عند 10,000 — وخطوة ثابتة تعني إمّا مئات
@@ -354,14 +542,22 @@ class EVMRPC:
         تكون ثانيتين أو ثماني دقائق — والعدد لا يفرّق. مقيس على الدورة الحيّة
         الثانية: 72 نداءً في 118 ثانية بينما الفترة 60. والتوقّف هنا **ليس
         خسارة**: الخروج ناقصاً مع نقطة استئناف هو نفس مسار السقف، فتُكمِل الدورة
-        القادمة من حيث توقّفنا. ويُسمح دائماً بنداء واحد ولو انتهت الميزانية،
+        القادمة من حيث توقّفنا. ويُسمح دائماً بطلب واحد ولو انتهت الميزانية،
         كي لا تدور العملة بلا تقدّم أبداً.
         """
         cap = config.EVM_BACKFILL_MAX_CALLS if max_calls is None else max_calls
+        net = str(network_id)
+        hint = int(config.EVM_LOG_RANGE_HINT.get(net, 0))
+        # حجم الدفعة يبدأ من السقف المقيس للشبكة ثمّ **يتقلّص ولا يعود**: أكبر
+        # دفعة مقبولة صفةُ عملةٍ لا صفةُ شبكة (قِيست 10 و5 و3 و2 و1 لخمس عملات
+        # Base)، فالتعلّم داخل النداء الواحد أصدق من ثابت في الملفّ. والعودة إلى
+        # الأعلى تعني رفضاً جديداً كل بضعة طلبات، أي ثمناً بلا مقابل.
+        batch = max(1, int(config.EVM_BATCH_SIZE.get(net, 1)))
         out: list[dict[str, Any]] = []
         calls = 0
         # مكدّس مدى‑واحد بدل استدعاء ذاتيّ: العمق قد يبلغ 20 مستوًى على مدى
-        # مليون كتلة، والمكدّس يجعل احترام `cap` سطراً واحداً.
+        # مليون كتلة، والمكدّس يجعل احترام `cap` سطراً واحداً. وثابتُه أنّ قراءته
+        # من القمّة إلى القاع **تصاعديّة**، وهو ما يجعل قمّته نقطةَ الاستئناف.
         pending: list[tuple[int, int]] = [(int(from_block), int(to_block))]
         while pending:
             spent = (
@@ -369,48 +565,86 @@ class EVMRPC:
             )
             if calls >= cap or spent:
                 # ما بقي في المكدّس غير مقروء ⇒ المدى غير مكتمل.
-                return out, calls, False, min(lo for lo, _ in pending)
-            lo, hi = pending.pop()
-            if lo > hi:
+                return (
+                    _in_block_order(out), calls, False,
+                    min(lo for lo, _ in pending),
+                )
+            taken: list[tuple[int, int]] = []
+            while pending and len(taken) < batch:
+                lo, hi = pending.pop()
+                if lo <= hi:
+                    taken.append((lo, hi))
+            if not taken:
                 continue
             if calls:
-                await sleep(config.EVM_PACING_SECONDS)
+                await sleep(
+                    config.EVM_BATCH_PACING_SECONDS if len(taken) > 1
+                    else config.EVM_PACING_SECONDS
+                )
             calls += 1
-            try:
-                out.extend(await self.get_logs(network_id, addresses, lo, hi, topics))
-            except EVMRateLimit:
-                # الكتم يُنتظَر ولا يُقسَم: القسمة تضاعف النداءات فتزيد الكتم.
-                # والمدى يُعاد إلى المكدّس كما هو — تسليمُه هنا يعني ثغرةً في
-                # الدفتر لا تأخيراً. والسقف `cap` هو ما يمنع الحلقة من الدوران.
-                pending.append((lo, hi))
-                await sleep(config.EVM_RATE_LIMIT_BACKOFF_SECONDS)
-                continue
-            except EVMLogLimit:
-                if lo >= hi:
-                    # كتلة واحدة تفوق السقف — لا قسمة ممكنة. يُرفع الاستثناء بدل
-                    # أن تُعلَق الطبقة إلى الأبد على كتلة واحدة.
-                    raise
-                # بعض العقد تفرض سقف مدى ثابتاً (Base: 10,000 كتلة، Monad:
-                # 100 كتلة). التنصيف وحده يهدر 20+ نداءً قبل بلوغ السقف على
-                # مدى genesis؛ بعد أول رفض نتعلم السقف الأعلى المقبول لهذه
-                # الشبكة ونقسم مباشرةً إلى شرائح أقدم-أولاً.
-                hint = int(config.EVM_LOG_RANGE_HINT.get(str(network_id), 0))
-                if hint > 0:
-                    # بعد أول رفض لا نعيد تجربة بقايا المدى الكبير مراراً؛ نحوّله
-                    # دفعةً واحدة إلى شرائح معلومة القبول، مع دفع الأحدث أولاً
-                    # كي يسحب المكدّس الأقدم أولاً.
-                    chunks = [
-                        (start, min(hi, start + hint - 1))
-                        for start in range(lo, hi + 1, hint)
+            if len(taken) == 1:
+                lo, hi = taken[0]
+                try:
+                    results: list[Any] = [
+                        await self.get_logs(net, addresses, lo, hi, topics)
                     ]
-                    pending.extend(reversed(chunks))
+                except EVMRPCError as exc:
+                    results = [exc]
+            else:
+                try:
+                    results = list(
+                        await self.get_logs_multi(net, addresses, taken, topics)
+                    )
+                except EVMRPCError as exc:
+                    results = [exc] * len(taken)
+
+            fresh: list[tuple[int, int, list[dict[str, Any]]]] = []
+            requeue: list[tuple[int, int]] = []
+            waited = False
+            shrink = False
+            # `strict`: ردٌّ واحد لكل مدى بحكم البناء، واختلافُ الطول يعني
+            # ازدواج ردٍّ على مدى غير مداه — دفترٌ كاذب لا استثناءٌ صاخب.
+            for (lo, hi), result in zip(taken, results, strict=True):
+                if isinstance(result, list):
+                    fresh.append((lo, hi, result))
                     continue
-                mid = lo + (hi - lo) // 2
-                # الأقدم يُقرأ أوّلاً (آخر ما يُدفَع أوّل ما يُسحَب): الترتيب
-                # الزمنيّ شرط صحّة الرصيد حين يُثبَّت عند صفر.
-                pending.append((mid + 1, hi))
-                pending.append((lo, mid))
-        return out, calls, True, int(to_block)
+                if isinstance(result, EVMRateLimit):
+                    # الكتم يُنتظَر ولا يُقسَم: القسمة تضاعف النداءات فتزيد الكتم.
+                    # والمدى يُعاد إلى المكدّس كما هو — تسليمُه هنا يعني ثغرةً في
+                    # الدفتر لا تأخيراً. والسقف `cap` هو ما يمنع الحلقة من الدوران.
+                    requeue.append((lo, hi))
+                    waited = True
+                    continue
+                if isinstance(result, EVMBatchLimit) and len(taken) > 1:
+                    requeue.append((lo, hi))
+                    shrink = True
+                    continue
+                if isinstance(result, (EVMLogLimit, EVMBatchLimit)):
+                    if lo >= hi:
+                        # كتلة واحدة تفوق السقف — لا قسمة ممكنة. يُرفع الاستثناء
+                        # بدل أن تُعلَق الطبقة إلى الأبد على كتلة واحدة.
+                        raise result
+                    requeue.extend(_split_range(lo, hi, hint))
+                    continue
+                raise result
+
+            floor = min((lo for lo, _ in requeue), default=None)
+            for lo, hi, logs in fresh:
+                if floor is not None and lo > floor:
+                    # نجح هذا المدى لكنّ مدًى **أقدم منه** في نفس الدفعة لم ينجح.
+                    # الاحتفاظ بسجلّاته يعني إمّا إعادة قراءتها لاحقاً (مضاعفة
+                    # رصيد) أو تقديم الاستئناف فوق المدى الفاشل (ثغرة دائمة).
+                    # فتُهمَل ويُعاد المدى: طلبٌ زائد أرخص من دفترٍ كاذب.
+                    requeue.append((lo, hi))
+                else:
+                    out.extend(logs)
+            if shrink:
+                batch = max(1, batch // 2)
+            requeue.sort()
+            pending.extend(reversed(requeue))
+            if waited:
+                await sleep(config.EVM_RATE_LIMIT_BACKOFF_SECONDS)
+        return _in_block_order(out), calls, True, int(to_block)
 
 
 def decode_transfer(log: dict[str, Any]) -> dict[str, Any] | None:

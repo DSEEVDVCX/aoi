@@ -19,21 +19,22 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import config  # noqa: E402
+import evm_replay  # noqa: E402 — قائمةُ الحالات النهائيّة واحدة لا نسخة
 from db import RecorderDB, decode_raw  # noqa: E402
 
 
-def _allowed_networks() -> set[str]:
+def allowed_networks() -> set[str]:
     return {
         *(str(network) for network in config.EVM_NETWORKS),
         *(str(network) for network in config.EVM_REPLAY_NETWORKS),
     }
 
 
-def _validated_networks(
+def validated_networks(
     networks: Sequence[str], *, require_all: bool = False,
 ) -> tuple[str, ...]:
     nets = tuple(dict.fromkeys(str(network) for network in networks))
-    allowed = _allowed_networks()
+    allowed = allowed_networks()
     refused = sorted(set(nets) - allowed)
     if refused:
         raise ValueError(f"شبكات EVM غير مسموح بها: {', '.join(refused)}")
@@ -56,7 +57,7 @@ def _epoch(value: str) -> int:
 def _replay_pending(db: RecorderDB, networks: Sequence[str]) -> int:
     now = int(datetime.now(UTC).timestamp())
     step = max(1, int(config.EVM_REPLAY_STEP_SECONDS))
-    final = {"done", "negative", "empty", "no_time", "skip"}
+    final = set(evm_replay.FINAL_STATUSES)
     pending = 0
     for target in db.evm_replay_targets(networks):
         mature = [
@@ -82,7 +83,7 @@ def _replay_pending(db: RecorderDB, networks: Sequence[str]) -> int:
 
 
 def inspect(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
-    nets = _validated_networks(networks)
+    nets = validated_networks(networks)
     if not nets:
         return {"balances": 0, "live_snapshots": 0, "replay_snapshots": 0,
                 "backfills": 0, "cursors": 0, "training_rows": 0,
@@ -140,7 +141,7 @@ def inspect(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
 
 
 def reset(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
-    nets = _validated_networks(networks, require_all=True)
+    nets = validated_networks(networks, require_all=True)
     if not nets:
         return inspect(db, nets)
     marks = _marks(nets)
@@ -183,7 +184,7 @@ def reset(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
 
 
 def finalize_training(db: RecorderDB, networks: Sequence[str]) -> int:
-    nets = _validated_networks(networks, require_all=True)
+    nets = validated_networks(networks, require_all=True)
     generation = db.evm_ledger_generation()
     state = inspect(db, nets)
     if state["active_pending"]:
