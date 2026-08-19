@@ -751,3 +751,47 @@ def test_note_error_swallows_any_write_failure_not_only_locks(db, monkeypatch):
     monkeypatch.setattr(db, "set_meta", _closed)
     assert db.note_error("last_error_x", "boom") is False
 
+def test_a_wedged_open_transaction_is_rolled_back_so_writes_resume(db):
+    """المعاملة المعلّقة أشيع سبب لاتّصالٍ عَلِق: تُترك مفتوحة فتُقفل على نفسها.
+
+    الدرع في `recorder.main_loop` كان يسجّل الانهيار ويُكمل، فاتّصالٌ خرج من دورةٍ
+    بمعاملةٍ لم تُغلق يبقى كذلك إلى إعادة التشغيل — وهو ما كلّف 22 دقيقة و40 ثانية
+    من الجمع في 2026-08-19.
+    """
+    db._conn.execute("BEGIN IMMEDIATE")
+    assert db._conn.in_transaction
+
+    said = db.recover_connection()
+
+    assert "rollback" in said
+    assert not db._conn.in_transaction
+    db.set_meta("after", "1")                     # والكتابة عادت فعلاً
+    assert db.get_meta("after") == "1"
+
+
+def test_a_dead_connection_is_replaced_so_writes_resume(db):
+    """الدرجة الأخيرة: ما لا يُشفى بتراجعٍ يُشفى باتّصالٍ جديد.
+
+    ولا `_apply_schema` في الطريق: الترحيل والمخطّط عملُ إقلاعٍ ثقيل، وإعادتُه
+    عند كلّ انهيارٍ تشتري لنفسها ميزانية الدورة. القاعدة بمخطّطها قائمة.
+    """
+    db.set_meta("before", "1")
+    db._conn.close()                              # اتصالٌ ميّت: كلّ نداءٍ يرفع
+
+    said = db.recover_connection()
+
+    assert "reconnected" in said
+    assert db.get_meta("before") == "1"            # القاعدة نفسها، لا واحدةٌ جديدة
+    db.set_meta("after", "2")
+    assert db.get_meta("after") == "2"
+
+
+def test_recovery_returns_a_line_instead_of_raising_when_nothing_helps(db, tmp_path):
+    """يدُ الإنقاذ تُنادى من مسار انهيار، فرفعُها يُسقط الحلقة التي جاءت تُنجيها."""
+    db._conn.close()
+    db._db_path = str(tmp_path / "no_such_dir" / "x.db")   # الفتح نفسه يتعذّر
+
+    said = db.recover_connection()
+
+    assert isinstance(said, str) and said                  # خبرٌ للسجلّ لا استثناء
+    assert "failed" in said

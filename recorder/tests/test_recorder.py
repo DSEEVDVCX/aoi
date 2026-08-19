@@ -41,6 +41,7 @@ class _FakeDB:
     def __init__(self):
         self.meta: dict[str, str] = {}
         self.closed = False
+        self.recoveries = 0
 
     def set_meta(self, k, v):
         self.meta[k] = v
@@ -55,6 +56,10 @@ class _FakeDB:
 
     def bump_counter(self, k, n=1):
         pass
+
+    def recover_connection(self):
+        self.recoveries += 1
+        return "ok"
 
     def close(self):
         self.closed = True
@@ -214,3 +219,7 @@ def test_locked_database_does_not_end_the_cycle_loop(patched, monkeypatch):
 
     assert len(ran) == 3              # الثلاث تمّت: الدرع نجا من قفل عدّاده
     assert db.closed is True          # وخرجت الحلقة بنظافة لا بانفجار
+    # والتسجيلُ وحده لم يكن يكفي: اتّصالٌ عَلِق يُنهي كلّ دورةٍ تالية كما أنهى
+    # هذه. 2026-08-19: ثلاثة عشر دورةً متطابقةَ الانهيار، و22 دقيقة و40 ثانية
+    # بلا صفٍّ واحد، حتى إعادةِ تشغيلٍ يدويّة.
+    assert db.recoveries == 3         # إنقاذٌ لكلّ انهيار، لا واحدٌ للحلقة

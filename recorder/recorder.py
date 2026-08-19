@@ -1094,6 +1094,14 @@ async def main_loop(cycles: int | None = None) -> None:
                 _log(f"cycle {n}: {stats}")
             except Exception:  # noqa: BLE001 — درع أخير حول الدورة كلها
                 _log("cycle crashed:\n" + traceback.format_exc())
+                # اتصالٌ واحد عمره عمر العملية: إن عَلِق بمعاملةٍ مفتوحة أو
+                # بلقطة قراءةٍ سُبقت، بقيت كلّ دورةٍ تالية تنهار كما انهارت هذه
+                # — 22 دقيقة و40 ثانية صامتة في 2026-08-19 حتى إعادةٍ يدويّة.
+                # فالإنقاذ هنا: بعد الانهيار، وقبل عدّاده وقبل الدورة القادمة.
+                try:
+                    _log(f"connection recovery: {db.recover_connection()}")
+                except Exception as rec_exc:  # noqa: BLE001
+                    _log(f"connection recovery failed: {type(rec_exc).__name__}")
                 # والدرع لا يجوز أن يموت بيده: هذا السطر بعينه أخرج العمليّة
                 # بالرمز 1 عند 2026-08-17T16:27 لأنّ القاعدة كانت مقفلة.
                 try:

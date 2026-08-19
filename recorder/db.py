@@ -68,6 +68,7 @@ class RecorderDB:
         # timeout=30: عمليتان تكتبان الآن (المسجّل + الموسِّم FomoLabeler)؛
         # WAL يسلسل الكتابات لكنّ مهلة بايثون الافتراضية (5ث) قد تضيق وقت
         # الازدحام فترمي "database is locked" بلا داعٍ.
+        self._db_path = db_path
         self._conn = sqlite3.connect(db_path, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._batching = False
@@ -219,6 +220,56 @@ class RecorderDB:
 
     def close(self) -> None:
         self._conn.close()
+
+    def recover_connection(self) -> str:
+        """ينقذ اتّصالاً عَلِق فصار يرفض كلّ كتابة بـ`database is locked`.
+
+        الاتصال واحد وعمره عمر العملية (`__init__` تفتح واحداً)، فعطبٌ في حالته
+        يدوم إلى إعادة التشغيل. وأخطر ما يَعلق لقطةُ قراءة في WAL: إن سبق
+        الكاتبون لقطةَ اتّصالنا ردّ SQLite كلّ كتابةٍ منه بـ`SQLITE_BUSY_SNAPSHOT`
+        — ورسالته في بايثون `database is locked` نفسها، **والمهلة لا تنفع**: لا
+        يُنادى معالج الانتظار لهذه الحالة، فالثلاثون ثانية تنتهي كما بدأت ويبقى
+        الاتصال عاجزاً أبداً بلا سبب ظاهر.
+
+        حدث فعلاً: 2026-08-19، انقطع الجمع 22 دقيقة و40 ثانية (14:10:11 ←
+        14:32:51 UTC)، كل دورة تنهار عند `set_meta`، بينما أخذ اتّصالٌ جديد قفلَ
+        الكتابة في 0.09 ثانية — فالقفل حرّ والعالق اتّصالنا. بدأ ذلك 42 ثانية قبل
+        `VACUUM INTO` التي تجريها `FomoBackup` على 16.7 GB. ودرعُ الدورة كان
+        يسجّل ويُكمل، فلم يفرج عنه إلا إعادةُ تشغيلٍ يدويّة.
+
+        ثلاث درجات تتوقّف عند أوّل ما يكفي: `rollback` إن كانت معاملةٌ مفتوحة،
+        ثمّ مسبار `BEGIN IMMEDIATE`/`ROLLBACK` يقطع بأنّ الكتابة عادت، وإلّا
+        اتّصالٌ جديد. وبلا `_apply_schema`: الترحيل والمخطّط عملُ إقلاعٍ ثقيل
+        وليس هذا موضعه — القاعدة بمخطّطها قائمة أصلاً.
+
+        يعيد وصفاً قصيراً للسجلّ، ولا يرفع شيئاً بحال: يُنادى من مسار انهيار،
+        فيدُ الإنقاذ لا يجوز أن تُسقط الحلقة التي جاءت تُنجيها.
+        """
+        steps: list[str] = []
+        try:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+                steps.append("rollback")
+        except Exception as exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+            steps.append(f"rollback failed: {type(exc).__name__}")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute("ROLLBACK")
+            return "+".join(steps) or "ok"
+        except Exception as exc:  # noqa: BLE001
+            steps.append(f"probe failed: {type(exc).__name__}")
+        try:
+            self._conn.close()
+        except Exception:  # noqa: BLE001 — قد يكون ميّتاً أصلاً
+            pass
+        try:
+            self._conn = sqlite3.connect(self._db_path, timeout=30)
+            self._conn.row_factory = sqlite3.Row
+            self._batching = False
+            steps.append("reconnected")
+        except Exception as exc:  # noqa: BLE001
+            steps.append(f"reconnect failed: {type(exc).__name__}")
+        return "+".join(steps)
 
     # --- meta ---
     def set_meta(self, key: str, value: str) -> None:
