@@ -95,13 +95,13 @@ def test_save_entries_leaves_other_providers_untouched(tmp_path):
     path = tmp_path / "keys.json"
     key_file.save_entries(str(path), "helius_api_keys", "helius_api_key",
                           [{"key": "helius-key-1234"}])
-    key_file.save_entries(str(path), "goldrush_api_keys", "goldrush_api_key",
-                          [{"key": "goldrush-key-12"}])
+    key_file.save_entries(str(path), "nodereal_api_keys", "nodereal_api_key",
+                          [{"key": "nodereal-key-12"}])
 
     assert [r["key"] for r in key_file.load_entries(
         str(path), "helius_api_keys", "helius_api_key")] == ["helius-key-1234"]
     assert [r["key"] for r in key_file.load_entries(
-        str(path), "goldrush_api_keys", "goldrush_api_key")] == ["goldrush-key-12"]
+        str(path), "nodereal_api_keys", "nodereal_api_key")] == ["nodereal-key-12"]
 
 
 def test_save_entries_replaces_atomically_and_leaves_no_temp_file(tmp_path):
@@ -136,8 +136,6 @@ def test_probe_endpoints_match_the_clients_that_use_the_keys():
     assert "helius-rpc.com" in config.SOLANA_RPC_URL
     assert "nodereal.io" in key_file.PROVIDERS["nodereal"]["probe"]["url"]
     assert "nodereal.io" in _source("nodereal_rpc.py")
-    assert "covalenthq.com" in key_file.PROVIDERS["goldrush"]["probe"]["url"]
-    assert "covalenthq.com" in _source("goldrush_rpc.py")
 
 
 def test_provider_field_names_match_what_read_keys_is_actually_called_with():
@@ -152,7 +150,7 @@ def test_provider_field_names_match_what_read_keys_is_actually_called_with():
     known = {(meta["plural"], meta["singular"]) for meta in key_file.PROVIDERS.values()}
     pattern = re.compile(r"""read_keys\(\s*["'](\w+)["'],\s*["'](\w+)["']""")
     found = set()
-    for name in ("solana_rpc.py", "nodereal_rpc.py", "goldrush_rpc.py",
+    for name in ("solana_rpc.py", "nodereal_rpc.py",
                  "run_chain.py", "run_evm_replay.py"):
         found |= {tuple(match) for match in pattern.findall(_source(name))}
 

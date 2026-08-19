@@ -34,7 +34,7 @@ def keys_file(tmp_path, monkeypatch):
     path = tmp_path / "chain_keys.json"
     monkeypatch.setattr(config, "CHAIN_KEYS_PATH", str(path))
     monkeypatch.setattr(keystore.config, "CHAIN_KEYS_PATH", str(path))
-    for name in ("HELIUS_API_KEY", "NODEREAL_API_KEY", "GOLDRUSH_API_KEY"):
+    for name in ("HELIUS_API_KEY", "NODEREAL_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     keystore._PROBES.clear()
     return path
@@ -378,12 +378,18 @@ def test_a_jsonrpc_error_under_http_200_is_not_called_healthy(keys_file, signed,
     assert "invalid api key" in result["detail"]
 
 
-def test_goldrush_error_false_under_http_200_is_healthy(keys_file, signed, monkeypatch):
+def test_error_false_under_http_200_is_healthy(keys_file, signed, monkeypatch):
+    """`error: false` ليست خطأً: الفحص يرفض ما ليس `None` ولا `False`.
+
+    جاءت القاعدة من Covalent/GoldRush الذي كان يردّ `error: false` عند النجاح،
+    وبقيت بعد حذفه لأنّها ليست خاصّةً بمزوّد: أيُّ JSON-RPC قد يردّ الحقلَ كاذباً،
+    و«سليمٌ» يُقرأ خطأً هنا يُلام على مفتاحٍ يعمل.
+    """
     class _Response:
         status_code = 200
 
         def json(self):
-            return {"error": False, "data": {"items": []}}
+            return {"error": False, "result": "0x1"}
 
     class _Client:
         def __init__(self, *_a, **_k): pass
@@ -393,11 +399,11 @@ def test_goldrush_error_false_under_http_200_is_healthy(keys_file, signed, monke
 
     monkeypatch.setattr(keystore.httpx, "Client", _Client)
     signed.post("/api/provider-keys/add", json={
-        "provider": "goldrush", "key": FAKE,
+        "provider": "nodereal", "key": FAKE,
     })
 
     result = signed.post("/api/provider-keys/test", json={
-        "provider": "goldrush", "slot": 0, "tail": "wxyz",
+        "provider": "nodereal", "slot": 0, "tail": "wxyz",
     }).json()
 
     assert result["level"] == "good"

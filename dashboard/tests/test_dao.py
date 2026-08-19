@@ -321,9 +321,9 @@ def test_provider_keys_flags_a_pool_whose_keys_are_all_cooling_down(db_path):
 
 
 def test_provider_keys_flags_a_provider_disabled_for_the_process_lifetime(db_path):
-    """نفادُ رصيد GoldRush (402) يُسكِته لبقيّة العمر: أحواضٌ سليمة ومزوّدٌ ميت."""
-    _seed_pool(db_path, "replay", {
-        "goldrush": {"keys": 2, "blocked": 0, "available": 2, "disabled": True},
+    """نفادُ رصيدِ مزوّدٍ (402) يُسكِته لبقيّة العمر: أحواضٌ سليمة ومزوّدٌ ميت."""
+    _seed_pool(db_path, "chain", {
+        "nodereal": {"keys": 2, "blocked": 0, "available": 2, "disabled": True},
     })
     conn = _conn(db_path)
     rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 1, tzinfo=UTC))
@@ -331,10 +331,10 @@ def test_provider_keys_flags_a_provider_disabled_for_the_process_lifetime(db_pat
     conn.close()
 
 
-def test_provider_keys_keeps_the_two_goldrush_pools_apart(db_path):
+def test_provider_keys_keeps_two_pools_of_one_provider_apart(db_path):
     """حوضان لنفس المزوّد في عمليّتين: دمجُهما يخفي عطبَ إحداهما تحت الأخرى."""
-    _seed_pool(db_path, "chain", {"goldrush": {"keys": 2, "available": 2}})
-    _seed_pool(db_path, "replay", {"goldrush": {"keys": 2, "available": 0}})
+    _seed_pool(db_path, "chain", {"helius": {"keys": 2, "available": 2}})
+    _seed_pool(db_path, "replay", {"helius": {"keys": 2, "available": 0}})
     conn = _conn(db_path)
     rows = dao.provider_keys(conn, now=datetime(2026, 8, 17, 20, 1, tzinfo=UTC))
     assert [(r["owner"], r["level"]) for r in rows] == [("chain", "good"), ("replay", "bad")]

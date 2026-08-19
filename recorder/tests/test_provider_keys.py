@@ -9,12 +9,12 @@ def test_read_keys_supports_plural_and_legacy_file_keys(monkeypatch, tmp_path):
     path = tmp_path / "keys.json"
     path.write_text(json.dumps({
         "helius_api_keys": [" h1 ", "h2", "h1"],
-        "goldrush_api_key": "g1",
+        "nodereal_api_key": "n1",
     }))
     monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(path))
 
     assert provider_keys.read_keys("helius_api_keys", "helius_api_key") == ["h1", "h2"]
-    assert provider_keys.read_keys("goldrush_api_keys", "goldrush_api_key") == ["g1"]
+    assert provider_keys.read_keys("nodereal_api_keys", "nodereal_api_key") == ["n1"]
 
 
 def test_read_keys_supports_comma_separated_environment(monkeypatch, tmp_path):
@@ -141,9 +141,13 @@ def test_stats_never_leaks_a_key_value_or_a_fragment_of_one():
 
 
 def test_pool_report_names_its_owner_so_two_processes_do_not_overwrite():
-    """حوض GoldRush يوجد في عمليّتين بحالتين مختلفتين؛ صفٌّ واحد لهما كذبة."""
+    """مزوّدٌ واحد في عمليّتين بحالتين مختلفتين؛ صفٌّ واحد لهما كذبة.
+
+    لا مزوّدَ مشتركاً اليوم — مسارُ الإعادة بلا مفتاح بعد حذف GoldRush — لكنّ
+    حقلَ المالك هو ما يمنع الأحدثَ من مسح صفِّ الأخرى يومَ يُضاف مزوّدٌ للطرفين.
+    """
     report = json.loads(provider_keys.pool_report(
-        {"goldrush": {"keys": 1}}, at="2026-08-17T00:00:00+00:00", owner="replay",
+        {"nodereal": {"keys": 1}}, at="2026-08-17T00:00:00+00:00", owner="replay",
     ))
 
     assert report["owner"] == "replay"

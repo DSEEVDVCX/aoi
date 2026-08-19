@@ -166,14 +166,14 @@ async def main_loop(cycles: int | None = None) -> None:
     import config
     from chain_layer import run_chain_auth_cycle, run_chain_cycle
     from db import RecorderDB, utcnow_iso
-    from goldrush_rpc import GoldRushReplayRPC
+    import evm_rpc
     from nodereal_rpc import NodeRealRPC
     from provider_keys import write_pool_report
     from solana_rpc import ChainKeyMissing, SolanaRPC
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     rpc = SolanaRPC()
-    evm = GoldRushReplayRPC()
+    evm = evm_rpc.EVMRPC()
     # عميل NodeReal يعيش عمر الحلقة كبقيّة العملاء: كان يُبنى ويُغلق كل دقيقة،
     # فيدفع مصافحة TLS جديدة لكل دورة — والأهمّ أنّ عدّاد تدوير مفاتيحه كان
     # يُصفَّر معها، فلا يظهر في التقرير إلّا تدويرُ الدقيقة الأخيرة.
@@ -213,10 +213,10 @@ async def main_loop(cycles: int | None = None) -> None:
             # تقرير الأحواض **خارج** حرس السلسلة: حالة المفاتيح أهمّ ما يُقرأ حين
             # تتعثّر الدورة، فلا يصحّ أن يسقط مع الفرع الذي تعثّر.
             try:
+                # وطبقةُ EVM ليست في التقرير: عقدٌ رسميّة بلا مفتاح، فلا حوض.
                 write_pool_report(db, "chain", {
                     "helius": rpc.key_stats(),
                     "nodereal": nodereal.key_stats(),
-                    "goldrush": evm.key_stats(),
                 }, utcnow_iso())
             except Exception:  # noqa: BLE001 — تقريرٌ لا قياس
                 pass
@@ -262,8 +262,6 @@ def _check_config() -> int:
         "BSC_NODEREAL_NETWORK", "BSC_NODEREAL_REFRESH_SECONDS",
         "BSC_NODEREAL_ERROR_RETRY_SECONDS", "BSC_NODEREAL_PER_CYCLE",
         "BSC_NODEREAL_PACING_SECONDS", "BSC_NODEREAL_CALL_PACING_SECONDS",
-        "GOLDRUSH_REPLAY_CHAINS", "GOLDRUSH_BLOCK_CHUNK",
-        "GOLDRUSH_RETRIES", "GOLDRUSH_MIN_RANGE",
         "EVM_CREATION_BLOCK_NETWORKS",
     ):
         if not hasattr(config, name):
@@ -285,7 +283,6 @@ def _check_config() -> int:
     # المزوّدان الآخران يُعدّان أيضاً: «تحقّقٌ قبل الجدولة» يفحص مفتاح Helius
     # وحده كان يمرّ بنجاح وطبقةُ BSC تفشل كل دقيقة لغياب مفتاح NodeReal.
     nodereal_keys = read_keys("nodereal_api_keys", "nodereal_api_key", "NODEREAL_API_KEY")
-    goldrush_keys = read_keys("goldrush_api_keys", "goldrush_api_key", "GOLDRUSH_API_KEY")
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
@@ -352,7 +349,6 @@ def _check_config() -> int:
     print(
         f"مفاتيح: helius {_count(helius_keys, required=True)}"
         f" · nodereal {_count(nodereal_keys, required=bool(config.BSC_NODEREAL_NETWORK))}"
-        f" · goldrush {_count(goldrush_keys, required=False)}"
         f" · الملف: {key_path}"
     )
     return 0 if key_ok else 1

@@ -317,8 +317,8 @@ def _fail(exc: keystore.KeyStoreError) -> JSONResponse:
 async def api_provider_keys_add(request: Request) -> Any:
     """يضيف مفتاحاً إلى ملفّ المسجّل. لا إعادةَ تشغيلٍ لازمة.
 
-    العملاء يقرأون الملفّ **عند كلّ نداء** (`solana_rpc._post`، `goldrush_rpc._key`،
-    `nodereal_rpc._call` تنادي `refresh(_read_keys())`)، فالمفتاح الجديد يدخل
+    العملاء يقرأون الملفّ **عند كلّ نداء** (`solana_rpc._post` و`nodereal_rpc._call`
+    تناديان `refresh(_read_keys())`)، فالمفتاح الجديد يدخل
     الدورة التالية من نفسه — ولذلك لا تُوقف اللوحة مهمّةً ولا تلمس عمليّةً.
     """
     try:

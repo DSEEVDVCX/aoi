@@ -109,15 +109,12 @@ async def run_cycle(rpc, db) -> dict:
 def _check_config() -> int:
     import config
     from db import RecorderDB
-    from provider_keys import read_keys
 
     for name in (
         "EVM_REPLAY_NETWORKS", "EVM_REPLAY_INTERVAL_SECONDS",
         "EVM_REPLAY_TOKENS_PER_CYCLE", "EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE",
         "EVM_REPLAY_RUN_LOG_PATH", "EVM_REPLAY_HEARTBEAT_SECONDS",
-        "GOLDRUSH_REPLAY_CHAINS",
-        "GOLDRUSH_BLOCK_CHUNK", "GOLDRUSH_RETRIES",
-        "GOLDRUSH_MIN_RANGE", "EVM_CREATION_BLOCK_NETWORKS",
+        "EVM_CREATION_BLOCK_NETWORKS",
         "EVM_BACKFILL_ASSIST_NETWORKS", "EVM_BACKFILL_ASSIST_BUDGET_SECONDS",
         "EVM_REPLAY_HEAD_GRACE_SECONDS",
     ):
@@ -127,14 +124,6 @@ def _check_config() -> int:
     if not config.EVM_REPLAY_NETWORKS:
         print("لا توجد شبكات إعادة EVM مفعَّلة", file=sys.stderr)
         return 1
-    goldrush_keys: list[str] = []
-    if config.GOLDRUSH_REPLAY_CHAINS:
-        goldrush_keys = read_keys(
-            "goldrush_api_keys", "goldrush_api_key", "GOLDRUSH_API_KEY",
-        )
-        if not goldrush_keys:
-            print("مفتاح GoldRush مفقود للإعادة التاريخية", file=sys.stderr)
-            return 1
     if not os.path.exists(config.DB_PATH):
         print(f"قاعدة البيانات غير موجودة: {config.DB_PATH}", file=sys.stderr)
         return 1
@@ -147,18 +136,13 @@ def _check_config() -> int:
         )
     finally:
         db.close()
-    # **عدد المفاتيح لا قيمتها** (FR-013). ونفادُ رصيد مفتاحٍ واحد يُسكِت
-    # GoldRush لبقيّة عمر العمليّة، فقلّةُ العدد تُقال قبل الجدولة لا بعدها.
-    keys_note = (
-        "—" if not config.GOLDRUSH_REPLAY_CHAINS
-        else f"{len(goldrush_keys)}"
-        + (" (بلا بديل عند نفاد الرصيد)" if len(goldrush_keys) == 1 else "")
-    )
+    # لا سطرَ مفاتيح هنا: المسارُ كلّه على العقد الرسميّة بلا مفتاح (انظر
+    # `GOLDRUSH_REPLAY_CHAINS` المحذوف في config والمصيدة #29). فإن أُضيف
+    # مزوّدٌ بمفتاح يوماً فليُضَف عدُّه هنا — **عدداً لا قيمة** (FR-013).
     print(
         f"ok · شبكات: {','.join(map(str, config.EVM_REPLAY_NETWORKS))}"
         f" · عملة/دورة: {config.EVM_REPLAY_TOKENS_PER_CYCLE}"
         f" · معلّق: {pending}"
-        f" · مفاتيح goldrush: {keys_note}"
         f" · نبضة السجلّ: {config.EVM_REPLAY_HEARTBEAT_SECONDS}ث"
     )
     return 0
@@ -166,12 +150,11 @@ def _check_config() -> int:
 
 async def _main(cycles: int | None = None) -> None:
     import config
+    import evm_rpc
     from db import RecorderDB, utcnow_iso
-    from goldrush_rpc import GoldRushReplayRPC
-    from provider_keys import write_pool_report
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
-    rpc = GoldRushReplayRPC()
+    rpc = evm_rpc.EVMRPC()
     count = 0
     # `None` لا `monotonic()`: أوّل دورة تسجّل دائماً مهما كانت خاملة، فسطرُ
     # الإقلاع هو الدليل الوحيد على أنّ العامل نهض بعد إعادة التشغيل.
@@ -203,15 +186,9 @@ async def _main(cycles: int | None = None) -> None:
                 )
                 # التعثّر سطرٌ أيضاً ⇒ يؤجّل النبضة: أثرُ الانهيار أبلغ منها.
                 last_logged = started
-            # تقرير الحوض خارج الحرس: حالةُ المفاتيح أهمّ ما يُقرأ حين تتعثّر
-            # الدورة. وحوض GoldRush هنا **غير** حوضِه في `FomoChain` (عمليّتان،
-            # ذاكرتان) فلكلٍّ صفُّه: `provider_keys_replay` مقابل `_chain`.
-            try:
-                write_pool_report(
-                    db, "replay", {"goldrush": rpc.key_stats()}, utcnow_iso(),
-                )
-            except Exception:  # noqa: BLE001 — تقريرٌ لا قياس
-                pass
+            # ولا تقريرَ أحواضٍ لهذا المالك: لا مفتاح على مسار الإعادة، وصفٌّ
+            # فارغ في اللوحة أسوأ من غيابه. (كان `provider_keys_replay` يحمل
+            # حوض GoldRush وحده، فحُذف الصفُّ مع المزوّد.)
             count += 1
             if cycles is not None and count >= cycles:
                 break

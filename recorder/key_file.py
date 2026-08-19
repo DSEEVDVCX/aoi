@@ -31,7 +31,7 @@ from typing import Any
 # اللوحة، ويجب أن تقول اللوحة ذلك صراحةً بدل أن تكتب في فراغ.
 #
 # `probe` نداءُ التحقّق الأرخص لكلّ مزوّد، وعنوانُه يطابق ما يستعمله العميل فعلاً
-# (`config.SOLANA_RPC_URL`, `nodereal_rpc._call`, `goldrush_rpc._chunk`) — فحصٌ
+# (`config.SOLANA_RPC_URL`, `nodereal_rpc._call`) — فحصٌ
 # لعنوانٍ آخر كان سيقول «سليم» عن مفتاحٍ لا يعمل حيث يُستعمل. يحرسه
 # `tests/test_key_file.py::test_probe_endpoints_match_the_clients`.
 PROVIDERS: dict[str, dict[str, Any]] = {
@@ -55,20 +55,6 @@ PROVIDERS: dict[str, dict[str, Any]] = {
             "method": "POST",
             "url": "https://bsc-mainnet.nodereal.io/v1/{key}",
             "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
-        },
-    },
-    "goldrush": {
-        "plural": "goldrush_api_keys",
-        "singular": "goldrush_api_key",
-        "env": "GOLDRUSH_API_KEY",
-        "title": "GoldRush · إعادة EVM",
-        "probe": {
-            "method": "GET",
-            "url": "https://api.covalenthq.com/v1/eth-mainnet/events/",
-            "headers": {"authorization": "Bearer {key}"},
-            # أضيقُ نافذةٍ ممكنة: التحقّق من المفتاح لا جلبُ بيانات. و402 هنا
-            # هي بذاتها الجواب المطلوب («المفتاح صحيح والرصيد نفد»).
-            "params": {"starting-block": 1, "ending-block": 2, "page-size": 1},
         },
     },
 }

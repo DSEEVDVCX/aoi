@@ -918,9 +918,9 @@ def main() -> int:
             db.close()
 
     async def _go() -> dict[str, Any]:
-        from goldrush_rpc import GoldRushReplayRPC
+        import evm_rpc
 
-        rpc = GoldRushReplayRPC()
+        rpc = evm_rpc.EVMRPC()
         try:
             return await run_replay(
                 rpc, db, networks=args.networks, limit=args.limit,
