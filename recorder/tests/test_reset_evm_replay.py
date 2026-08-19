@@ -50,6 +50,16 @@ def _seed(db, token, net, status, *, calls=0, replay_rows=0, live_rows=0):
         })
 
 
+def _seed_orphan(db, token, net, rows):
+    """صفوفُ إعادةٍ بلا `evm_replay_state` — هذا ما يخلّفه مسارٌ حُذف بعد الكتابة."""
+    db.upsert_watch(token, net, "trending", "sig", 48, NOW)
+    for index in range(rows):
+        assert db.insert_chain_concentration({
+            **_row(token, net, replay=True),
+            "recorded_at": f"2026-08-13T09:{index:02d}:00+00:00",
+        })
+
+
 def _count(db, net, replay):
     return db._conn.execute(
         """SELECT COUNT(*) FROM chain_concentration
@@ -169,3 +179,64 @@ def test_apply_resets_only_the_first_max_tokens(db, tmp_path, monkeypatch, capsy
     assert "أُرجعت 1 عملة" in capsys.readouterr().out
     assert db.evm_replay_state(TOK, NET) is None            # الأثقل نداءً أوّلاً
     assert db.evm_replay_state(TOK2, NET)["status"] == "error"
+
+
+def test_an_orphan_is_invisible_to_candidates_which_is_why_orphans_exists(db):
+    """السببُ الذي من أجله وُجدت `orphans`: `--status` لا يمسك ما لا حالةَ له."""
+    _seed_orphan(db, TOK, NET, 4)
+
+    assert reset_evm_replay.candidates(db, (NET,), ("error", "partial", "")) == []
+    found = reset_evm_replay.orphans(db, (NET,))
+    assert [(r["token_address"], r["rows_written"]) for r in found] == [(TOK, 4)]
+
+
+def test_orphans_ignores_live_rows_and_other_networks(db):
+    """اللقطةُ الحيّة ليست يتيمة: هي مقيسةٌ لحظتها ولا حالةَ إعادةٍ تُنتظَر لها."""
+    _seed_orphan(db, TOK, NET, 2)
+    _seed(db, TOK2, NET, "partial", replay_rows=3, live_rows=5)   # له حالة ⇒ ليس يتيماً
+    _seed_orphan(db, TOK, OTHER, 7)
+
+    found = reset_evm_replay.orphans(db, (NET,))
+
+    assert [r["token_address"] for r in found] == [TOK]
+    assert found[0]["rows_written"] == 2
+
+
+def test_orphans_carry_the_same_shape_so_reset_deletes_them_unchanged(db):
+    """شكلٌ واحد لا فرعٌ ثانٍ: `reset` تمحو اليتيم بلا أن تعرف أنّه يتيم."""
+    _seed_orphan(db, TOK, NET, 3)
+
+    done = reset_evm_replay.reset(db, reset_evm_replay.orphans(db, (NET,)))
+
+    assert done == {"tokens": 1, "rows_deleted": 3, "calls_freed": 0}
+    assert _count(db, NET, replay=True) == 0
+
+
+def test_an_orphan_is_reported_even_when_not_requested(db, tmp_path, monkeypatch, capsys):
+    """الإظهارُ إفادةٌ لا يكلّف شيئاً: يتيمٌ صامتٌ يبقى في الدفتر إلى الأبد."""
+    _seed_orphan(db, TOK, NET, 6)
+    db._conn.commit()
+    monkeypatch.setattr(reset_evm_replay.config, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(reset_evm_replay.sys, "argv", [
+        "reset_evm_replay.py", "--networks", NET,
+    ])
+
+    assert reset_evm_replay.main() == 0
+
+    out = capsys.readouterr().out
+    assert "يتامى (غير مشمولين): 1 عملة · 6 صفّاً" in out
+    assert _count(db, NET, replay=True) == 6         # عرضٌ لا حذف
+
+
+def test_orphans_are_deleted_only_when_asked_for_explicitly(db, tmp_path, monkeypatch, capsys):
+    _seed_orphan(db, TOK, NET, 6)
+    db._conn.commit()
+    monkeypatch.setattr(reset_evm_replay.config, "DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(reset_evm_replay.sys, "argv", [
+        "reset_evm_replay.py", "--networks", NET, "--orphans", "--apply",
+    ])
+
+    assert reset_evm_replay.main() == 0
+
+    assert "حُذف 6 صفّ" in capsys.readouterr().out
+    assert _count(db, NET, replay=True) == 0

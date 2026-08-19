@@ -9,6 +9,10 @@
 الحذف هو الإرجاع: `evm_replay_state` مشتقّةٌ بالكامل من سجلّات السلسلة، فمحوُ
 صفّها يعيد العملة إلى الطابور من نشأتها. والافتراض عرضٌ فقط، ولا يُكتب شيء إلّا
 بـ`--apply`.
+
+وحالةٌ ثالثة أخفى من الاثنتين: **يتيمٌ** — صفوفُ تركّزٍ من إعادةٍ بلا صفِّ حالةٍ
+أصلاً. لا حالةَ تُطابِق فلا `--status` يمسكه، فيبقى في الدفتر يُقرأ كأنّه مقيس.
+يُعرَض في كلّ تشغيل، ويُحذف بـ`--orphans`.
 """
 from __future__ import annotations
 
@@ -53,6 +57,44 @@ def candidates(
               FROM evm_replay_state s
              WHERE {' AND '.join(where)}
              ORDER BY COALESCE(s.calls, 0) DESC""",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def orphans(
+    db: RecorderDB, networks: tuple[str, ...], tokens: tuple[str, ...] = (),
+) -> list[dict]:
+    """صفوفُ إعادةٍ لا حالةَ لها — كتبها مسارٌ لم يُخلِّف سجلّاً يُنتقى به.
+
+    `candidates` تنتقي من `evm_replay_state`، فعملةٌ كُتبت صفوفُها ثمّ اختفى صفُّ
+    حالتها تصير غيرَ مرئيّةٍ لهذه الأداة كلّها: لا حالةَ تُطابَق فلا حذف. وهي
+    أخطرُ الحالتين لا أهونهما — صفوفُها في الدفتر تُقرأ كأنّها مقيسة، ولا شيءَ
+    يقول أيُّ مسارٍ كتبها ولا إلى أيّ كتلةٍ بلغ. ولذلك تُعرَض **دائماً**، ولا
+    تُحذف إلّا بطلبٍ صريح (`--orphans`): إظهارُها إفادة، وحذفُها قرار.
+
+    الشكلُ نفسُ شكل `candidates` كي يعمل `reset` و`_describe` بلا فرعٍ ثانٍ.
+    """
+    where = [
+        f"c.network_id IN ({', '.join('?' for _ in networks)})",
+        "c.is_replay = 1",
+        "s.token_address IS NULL",
+    ]
+    params: list[str] = list(networks)
+    if tokens:
+        where.append(f"c.token_address IN ({', '.join('?' for _ in tokens)})")
+        params.extend(token.lower() for token in tokens)
+    rows = db._conn.execute(
+        f"""SELECT c.token_address, c.network_id, NULL AS status, NULL AS calls,
+                   NULL AS snapshots, NULL AS transfers, NULL AS from_block,
+                   NULL AS last_error, COUNT(*) AS rows_written
+              FROM chain_concentration c
+              LEFT JOIN evm_replay_state s
+                     ON s.token_address = c.token_address
+                    AND s.network_id = c.network_id
+             WHERE {' AND '.join(where)}
+             GROUP BY c.token_address, c.network_id
+             ORDER BY COUNT(*) DESC""",
         params,
     ).fetchall()
     return [dict(row) for row in rows]
@@ -107,6 +149,10 @@ def main() -> int:
         "--max", type=int, default=0,
         help="سقفُ عملاتٍ تُرجَع في هذه العمليّة (0 = بلا سقف)",
     )
+    parser.add_argument(
+        "--orphans", action="store_true",
+        help="أضِف صفوف الإعادة التي لا حالةَ لها (تُعرَض دائماً)",
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 
@@ -127,11 +173,22 @@ def main() -> int:
     db = RecorderDB(config.DB_PATH, os.path.join(HERE, "schema.sql"))
     try:
         rows = candidates(db, networks, statuses, tuple(args.token))
+        stray = orphans(db, networks, tuple(args.token))
+        if stray and not args.orphans:
+            # تُعرَض ولو لم تُطلَب: يتيمٌ صامتٌ يبقى في الدفتر إلى الأبد لأنّ
+            # لا حالةَ له تُطابِق أيَّ `--status` يكتبه المشغّل.
+            print(
+                f"يتامى (غير مشمولين): {len(stray)} عملة · "
+                f"{sum(int(r['rows_written'] or 0) for r in stray)} صفّاً — "
+                "أضف --orphans لشملهم"
+            )
+        if args.orphans:
+            rows = [*rows, *stray]
         if args.max > 0:
             rows = rows[: args.max]
         print(
-            f"شبكات: {', '.join(networks)} · حالات: {', '.join(statuses)} · "
-            f"مطابق: {len(rows)}"
+            f"شبكات: {', '.join(networks)} · حالات: {', '.join(statuses)}"
+            f"{' + يتامى' if args.orphans else ''} · مطابق: {len(rows)}"
         )
         if rows:
             print(_describe(rows))
