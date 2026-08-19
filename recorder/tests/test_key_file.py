@@ -136,6 +136,11 @@ def test_probe_endpoints_match_the_clients_that_use_the_keys():
     assert "helius-rpc.com" in config.SOLANA_RPC_URL
     assert "nodereal.io" in key_file.PROVIDERS["nodereal"]["probe"]["url"]
     assert "nodereal.io" in _source("nodereal_rpc.py")
+    audit = _source("audit_evm_ledger.py")
+    assert "g.alchemy.com" in key_file.PROVIDERS["alchemy"]["probe"]["url"]
+    assert "g.alchemy.com" in audit
+    assert "lb.drpc.org" in key_file.PROVIDERS["drpc"]["probe"]["url"]
+    assert "lb.drpc.org" in audit
 
 
 def test_provider_field_names_match_what_read_keys_is_actually_called_with():
@@ -150,9 +155,40 @@ def test_provider_field_names_match_what_read_keys_is_actually_called_with():
     known = {(meta["plural"], meta["singular"]) for meta in key_file.PROVIDERS.values()}
     pattern = re.compile(r"""read_keys\(\s*["'](\w+)["'],\s*["'](\w+)["']""")
     found = set()
-    for name in ("solana_rpc.py", "nodereal_rpc.py",
-                 "run_chain.py", "run_evm_replay.py"):
+    for name in ("solana_rpc.py", "nodereal_rpc.py", "run_chain.py",
+                 "run_evm_replay.py", "audit_evm_ledger.py"):
         found |= {tuple(match) for match in pattern.findall(_source(name))}
 
     assert found, "لم يُعثر على أيّ نداء read_keys — تغيّر شكل النداء فالفحص أعمى"
     assert found <= known, f"حقولٌ لا تعرفها اللوحة: {found - known}"
+
+
+def test_the_audit_tools_field_triplets_are_the_same_ones_the_dashboard_writes():
+    """المدقّق ينادي `read_keys` بمتغيّراتٍ من جدولٍ خاصّ، فالفحصُ النصّيّ أعمى عنه.
+
+    فحصُ النداءات فوق يقرأ حروفاً بين قوسين، و`audit_evm_ledger` يمرّر أسماءَ
+    حقولٍ من `PROVIDER_FIELDS` — لا يراها ذاك النمط. فيُطابَق الجدولان مباشرةً:
+    حرفٌ واحد يفترق هنا يعني لوحةً تكتب مفتاحاً في حقلٍ لا يقرؤه المدقّق، فيبدو
+    المفتاحُ مُضافاً وهو غيرُ موجود.
+    """
+    import audit_evm_ledger
+
+    for name, (plural, singular, env) in audit_evm_ledger.PROVIDER_FIELDS.items():
+        assert name in key_file.PROVIDERS, name
+        meta = key_file.PROVIDERS[name]
+        assert (meta["plural"], meta["singular"], meta["env"]) == (
+            plural, singular, env,
+        ), name
+    # وكلُّ شبكةٍ في المدقّق مسارُها مزوّدٌ مُسجَّل — لا اسمٌ مخترَعٌ عند التشغيل.
+    for network, routes in audit_evm_ledger.ARCHIVE_ROUTES.items():
+        for provider, _ in routes:
+            assert provider in key_file.PROVIDERS, (network, provider)
+
+
+def test_every_provider_has_the_five_fields_the_dashboard_reads():
+    """اللوحة تقرأ الخمسةَ بلا حماية، فمزوّدٌ ناقصُ حقلٍ يُسقطها بـKeyError."""
+    for name, meta in key_file.PROVIDERS.items():
+        assert set(meta) == {"plural", "singular", "env", "title", "probe"}, name
+        assert meta["probe"]["method"] == "POST", name
+        assert "{key}" in meta["probe"]["url"], name
+        assert meta["probe"]["json"]["method"], name

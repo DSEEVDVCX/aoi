@@ -57,6 +57,33 @@ PROVIDERS: dict[str, dict[str, Any]] = {
             "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
         },
     },
+    # المزوّدان التاليان لا يبنيان بياناً: يدقّقان دفترَ EVM بحالةٍ أرشيفيّة
+    # (`audit_evm_ledger.py`) لأنّ عقدَنا العامّة بلا أرشيف — عقدةُ روبن‑هود
+    # عمقُها ~128 كتلة. والطبقةُ الحيّة تبقى بلا مفتاح (FR-012).
+    "alchemy": {
+        "plural": "alchemy_api_keys",
+        "singular": "alchemy_api_key",
+        "env": "ALCHEMY_API_KEY",
+        "title": "Alchemy · أرشيف EVM",
+        "probe": {
+            "method": "POST",
+            # الفحصُ على Base لا على روبن‑هود: كلاهما يخدمه هذا المفتاح، وBase
+            # شريحةٌ عامّةٌ مستقرّة — فسقوطُ الفحص يعني المفتاحَ لا الشبكة.
+            "url": "https://base-mainnet.g.alchemy.com/v2/{key}",
+            "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
+        },
+    },
+    "drpc": {
+        "plural": "drpc_api_keys",
+        "singular": "drpc_api_key",
+        "env": "DRPC_API_KEY",
+        "title": "dRPC · أرشيف Base",
+        "probe": {
+            "method": "POST",
+            "url": "https://lb.drpc.org/ogrpc?network=base&dkey={key}",
+            "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
+        },
+    },
 }
 
 # أقصرُ مفتاحٍ يجوز إظهارُ ذيله. مفتاحٌ قصير (≤11) ذيلُه الرباعيّ جزءٌ معتبَرٌ من
