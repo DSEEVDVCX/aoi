@@ -244,6 +244,33 @@ def test_a_new_window_stales_the_verdict_and_keeps_the_walk(db):
         )
 
 
+def test_a_budget_retired_token_is_not_re_woken_by_a_new_window(db):
+    """`budget` قرارُ وقفِ إنفاق، لا حكمٌ على التغطية — فلا تُبطله نافذة.
+
+    لو أُبطلت: تعود العملةُ إلى الطابور، تُنتقى، تمشي شوطاً، ثمّ يعيدها السقفُ
+    إلى `budget` — انتقاءٌ كامل لكلّ نافذة. وصاحبةُ السقف هي العملةُ الحارّة
+    ذاتُ مئات النوافذ، فذاك يُبطل السقفَ ثانيةً بالتقسيط.
+    """
+    token, network = "0xcafe000000000000000000000000000000000004", "8453"
+    now = "2026-07-25T00:00:00+00:00"
+    db.upsert_watch(token, network, "trending", "s1", 48, now)
+    db.set_evm_replay_state(
+        token, network, "budget", now, from_block=5_000, to_block=9_999,
+        transfers=11, snapshots=0, calls=8_040, balance_check="ok",
+        checkpoint={"balances": {"0x1": "7"}},
+    )
+    before = db.evm_replay_state(token, network)
+
+    assert db.add_signal_comparison_window(
+        token, network, "large_buy", "s2", 48, "2026-07-25T02:00:00+00:00", 1.5, 1,
+    )
+
+    after = db.evm_replay_state(token, network)
+    assert after["status"] == "budget", "السقفُ أُبطل بنافذة — يعود الإنفاق بالتقسيط"
+    assert after["revision"] == before["revision"], "مراجعةٌ زائدة تُسقط تشغيلاً بلا سبب"
+    assert after["calls"] == 8_040
+
+
 def test_the_per_token_call_cap_is_not_reset_by_a_new_window(db):
     """الحارسُ الذي كان الحذفُ يُبطله: السقفُ يُجمَع من `calls` في الصفّ.
 
