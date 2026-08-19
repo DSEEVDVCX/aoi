@@ -8,7 +8,7 @@ import os
 import sqlite3
 
 import pytest
-from db import RecorderDB, decode_raw, encode_raw
+from db import RecorderDB, StaleEVMState, decode_raw, encode_raw
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 
@@ -203,6 +203,78 @@ def test_evm_readmission_invalidates_stale_ledger_and_replay_state(db):
     assert db.evm_backfill_state(network, token) is None
     assert db.evm_replay_state(token, network) is None
     assert db.evm_ledger_stats(network, token) == {"holder_count": 0, "supply": 0}
+
+
+def test_a_new_window_stales_the_verdict_and_keeps_the_walk(db):
+    """النافذةُ الجديدة تُبطل الحكمَ لا المشي — وكان هذا حذفاً للصفّ كلِّه.
+
+    العملةُ الساخنة تُشار إليها كلَّ دقائق (واحدةٌ على Base لها 522 نافذة)، فصفُّ
+    حالتها كان يُحذف أسرعَ من أن يُكتب: تُقرأ «لم تُحاوَل قطّ» فتُمشى من النشأة،
+    فلا تبلغ أوّلَ لقطةٍ أبداً. ذلك سببُ أنّ 51 عملةً على Base كانت `partial`
+    بمراجعةٍ = 1 ومدًى = ‎−1‎ — محاولةٌ واحدةٌ بلا تقدّم بعد كلّ حذف.
+    """
+    token, network = "0xaaaa000000000000000000000000000000000009", "8453"
+    now = "2026-07-25T00:00:00+00:00"
+    db.upsert_watch(token, network, "large_buy", "s1", 48, now)
+    db.set_evm_replay_state(
+        token, network, "partial", now, from_block=1_000, to_block=9_999,
+        transfers=4_242, snapshots=17, calls=6_000, balance_check="ok",
+        checkpoint={"balances": {"0x1": "5"}},
+    )
+    before = db.evm_replay_state(token, network)
+
+    assert db.add_signal_comparison_window(
+        token, network, "large_buy", "s2", 48,
+        "2026-07-25T02:00:00+00:00", 1.5, 1,
+    )
+    after = db.evm_replay_state(token, network)
+
+    assert after is not None, "الصفّ حُذف — عادت العملةُ إلى المشي من النشأة"
+    assert after["status"] == "window"
+    for field in ("from_block", "to_block", "transfers", "snapshots", "calls"):
+        assert after[field] == before[field], field
+    assert decode_raw(after["checkpoint_json"]) == {"balances": {"0x1": "5"}}
+    # المراجعةُ تُزاد: تشغيلٌ جارٍ يحمل لقطةً أقدم يسقط في StaleEVMState بدل أن
+    # يكتب فوق نافذةٍ لم يرها.
+    assert after["revision"] == before["revision"] + 1
+    with pytest.raises(StaleEVMState):
+        db.assert_evm_replay_state(
+            token, network, before["status"], before["from_block"],
+            before["checkpoint_json"], before["revision"],
+        )
+
+
+def test_the_per_token_call_cap_is_not_reset_by_a_new_window(db):
+    """الحارسُ الذي كان الحذفُ يُبطله: السقفُ يُجمَع من `calls` في الصفّ.
+
+    `EVM_REPLAY_TOKEN_CALL_CAP` يوقف عملةً لا تكتمل أبداً عند 8,000 نداء. ومحوُ
+    الصفّ كان يصفّر العدّاد، فعملةٌ تُشار إليها كلَّ دقائق لا تبلغ سقفَها أبداً
+    وتأكل ميزانيّةَ الدورة من العملات التي تُنجَز.
+    """
+    token, network = "0xaaaa00000000000000000000000000000000000a", "8453"
+    now = "2026-07-25T00:00:00+00:00"
+    db.upsert_watch(token, network, "large_buy", "s1", 48, now)
+    db.set_evm_replay_state(token, network, "partial", now, calls=7_900)
+
+    for index in range(3):
+        db.add_signal_comparison_window(
+            token, network, "large_buy", f"s{index}", 48,
+            f"2026-07-25T0{index + 1}:00:00+00:00", 1.0, 1,
+        )
+
+    assert db.evm_replay_state(token, network)["calls"] == 7_900
+
+
+def test_a_new_window_on_a_token_with_no_replay_state_writes_none(db):
+    """التحديثُ لا يخلق صفّاً: صفٌّ بلا مشيٍ يدّعي تغطيةً لا يملكها."""
+    token, network = "0xaaaa00000000000000000000000000000000000b", "8453"
+    db.upsert_watch(token, network, "large_buy", "s1", 48, "2026-07-25T00:00:00+00:00")
+
+    db.add_signal_comparison_window(
+        token, network, "large_buy", "s2", 48, "2026-07-25T03:00:00+00:00", 1.0, 1,
+    )
+
+    assert db.evm_replay_state(token, network) is None
 
 
 def test_watchlist_watch_until_is_48h(db):

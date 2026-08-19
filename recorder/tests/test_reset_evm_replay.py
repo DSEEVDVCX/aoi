@@ -202,14 +202,16 @@ def test_orphans_ignores_live_rows_and_other_networks(db):
     assert found[0]["rows_written"] == 2
 
 
-def test_orphans_carry_the_same_shape_so_reset_deletes_them_unchanged(db):
-    """شكلٌ واحد لا فرعٌ ثانٍ: `reset` تمحو اليتيم بلا أن تعرف أنّه يتيم."""
+def test_orphans_carry_the_candidate_shape_so_one_printer_serves_both(db):
+    """`_describe` تقرأ الحقولَ بلا حراسة، فحقلٌ ناقصٌ هنا يُسقط تشغيلاً كاملاً."""
     _seed_orphan(db, TOK, NET, 3)
+    _seed(db, TOK2, NET, "error", replay_rows=2)
 
-    done = reset_evm_replay.reset(db, reset_evm_replay.orphans(db, (NET,)))
+    stray = reset_evm_replay.orphans(db, (NET,))
+    picked = reset_evm_replay.candidates(db, (NET,), ("error",))
 
-    assert done == {"tokens": 1, "rows_deleted": 3, "calls_freed": 0}
-    assert _count(db, NET, replay=True) == 0
+    assert set(stray[0]) == set(picked[0])
+    assert reset_evm_replay._describe(stray)          # لا KeyError ولا None في حساب
 
 
 def test_an_orphan_is_reported_even_when_not_requested(db, tmp_path, monkeypatch, capsys):
@@ -224,19 +226,34 @@ def test_an_orphan_is_reported_even_when_not_requested(db, tmp_path, monkeypatch
     assert reset_evm_replay.main() == 0
 
     out = capsys.readouterr().out
-    assert "يتامى (غير مشمولين): 1 عملة · 6 صفّاً" in out
-    assert _count(db, NET, replay=True) == 6         # عرضٌ لا حذف
+    assert "يتامى (خبرٌ فقط، لا تُحذف): 1 عملة · 6 صفّاً" in out
+    assert "audit_evm_ledger.py" in out              # الطريقُ إلى الحكم
+    assert _count(db, NET, replay=True) == 6         # خبرٌ لا حذف
 
 
-def test_orphans_are_deleted_only_when_asked_for_explicitly(db, tmp_path, monkeypatch, capsys):
+def test_no_flag_deletes_an_orphan_because_its_rows_are_the_measured_part(db,
+        tmp_path, monkeypatch, capsys):
+    """اليُتمُ فقدُ حالةٍ لا فسادُ صفوف؛ ومصدرُه مسارٌ مقصود (`db.admit`).
+
+    كان هناك `--orphans` يشملها في الحذف، وكان ذلك خطأً: `audit_evm_ledger.py`
+    قرأ 77 لقطةً على 4663 و8453 فجاءت تغطيتُها 100.000000% — فالحذفُ كان
+    سيُتلف بياناتِ تدريبٍ مقيسةً صحيحة ويُلزم مشياً جديداً. وما ينقصها صفُّ
+    حالةٍ يكتبه المشيُ التالي من نفسه.
+    """
     _seed_orphan(db, TOK, NET, 6)
     db._conn.commit()
     monkeypatch.setattr(reset_evm_replay.config, "DB_PATH", str(tmp_path / "t.db"))
     monkeypatch.setattr(reset_evm_replay.sys, "argv", [
-        "reset_evm_replay.py", "--networks", NET, "--orphans", "--apply",
+        "reset_evm_replay.py", "--networks", NET, "--status", "error", "--apply",
     ])
 
     assert reset_evm_replay.main() == 0
+    assert _count(db, NET, replay=True) == 6
 
-    assert "حُذف 6 صفّ" in capsys.readouterr().out
-    assert _count(db, NET, replay=True) == 0
+    # والحجّةُ نفسُها مُزالة: لا بابَ خلفيّ يعيدها بلا مراجعة
+    monkeypatch.setattr(reset_evm_replay.sys, "argv", [
+        "reset_evm_replay.py", "--networks", NET, "--orphans", "--apply",
+    ])
+    with pytest.raises(SystemExit):
+        reset_evm_replay.main()
+    assert _count(db, NET, replay=True) == 6

@@ -551,7 +551,10 @@ async def replay_token(
         to_block = min(to_block, window_block)
 
     checkpoint: dict[str, Any] | None = None
-    if (watch.get("replay_status") or "") in ("partial", "budget", "error"):
+    # `window` معها: حكمُها أُبطل بنافذةٍ جديدة (`db.stale_evm_replay_verdict`)
+    # ومشيُها قائم. إخراجُها من هنا يجعل الصفَّ يُقرأ ثمّ يُهمَل مشيُه فتبدأ من
+    # النشأة — وهو العطبُ الذي أُبقي الصفُّ لأجله.
+    if (watch.get("replay_status") or "") in ("partial", "budget", "error", "window"):
         raw_checkpoint = watch.get("replay_checkpoint_json")
         if raw_checkpoint is not None:
             try:

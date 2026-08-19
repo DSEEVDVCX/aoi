@@ -840,6 +840,36 @@ async def test_an_unknown_mint_block_replays_from_genesis_instead_of_guessing(db
     assert rpc.mint_scans and rpc.ranges[0][0] == 0
 
 
+async def test_a_window_staled_token_resumes_from_its_checkpoint_not_genesis(db):
+    """`window` حكمٌ أُبطل ومشيٌ قائم — فتُقرأ من نقطة الاستئناف لا من النشأة.
+
+    كانت النافذةُ الجديدة تحذف صفَّ الحالة كلَّه، فتُقرأ العملةُ «لم تُحاوَل قطّ»
+    وتُمشى من الكتلة صفر. صارت `db.stale_evm_replay_verdict` تُبقي المشي وتُبطل
+    الحكم وحدَه — ولا ينفع ذلك شيئاً إن لم تكن `window` في مجموعةِ استئناف
+    الـcheckpoint هنا: يُقرأ الصفُّ ثمّ يُهمَل مشيُه فيعود العطبُ كما كان.
+    """
+    _seed_watch(db, TOK, 3600, 1)
+    next_grid = evm_replay.grid_points(T0 - 4200, T0 - 4200, 300)[0]
+    db.set_evm_replay_state(
+        TOK, NET, "partial", NOW, from_block=100, to_block=99,
+        transfers=3, snapshots=0, calls=40,
+        checkpoint={"balances": {A: "1000"}, "next_grid": next_grid},
+    )
+    db.stale_evm_replay_verdict(TOK, NET)
+    db._conn.commit()
+    assert db.evm_replay_state(TOK, NET)["status"] == "window"
+
+    rpc = _rpc([], complete=False, resume=200)
+    await evm_replay.run_replay(rpc, db, networks=[NET], sleep=_noop)
+
+    assert rpc.ranges, "لم تُنتقَ العملة — `window` صارت نهائيّةً بالخطأ"
+    assert rpc.ranges[0][0] == 100, "مشيٌ من النشأة: الـcheckpoint أُهمل"
+    # والرصيدُ المستأنف حاضر: مجموعُ الاستئناف لا يُعاد بناؤه من لا شيء.
+    state = db.evm_replay_state(TOK, NET)
+    assert decode_raw(state["checkpoint_json"])["balances"] == {A: "1000"}
+    assert state["calls"] >= 40, "عدّادُ السقف تصفّر عند إبطال الحكم"
+
+
 async def test_a_token_that_spends_its_call_cap_stops_final_with_a_checkpoint(
     db, monkeypatch,
 ):

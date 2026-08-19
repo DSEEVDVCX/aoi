@@ -1407,6 +1407,41 @@ class RecorderDB:
         )
         self._commit()
 
+    def stale_evm_replay_verdict(self, token_address: str, network_id: str) -> None:
+        """نافذةٌ جديدة تُبطل الحكمَ وحدَه — والمشيُ يبقى.
+
+        كان هذا حذفاً للصفّ كلِّه، والفرقُ بين الحذف وهذا هو الفرقُ بين حقيقتين
+        خُلطتا في عمودٍ واحد: `status` جوابُ «هل غطّيتُ كلَّ نوافذ العملة؟» وهو
+        يبطل فعلاً بنافذةٍ جديدة، أمّا `from_block`/`to_block`/`checkpoint_json`
+        فجوابُ «إلى أين بلغ مشيي في السلسلة؟» وهو عن الكتل لا عن النوافذ، فلا
+        تُبطله نافذةٌ أُضيفت. والحذفُ كان يرمي الثاني مع الأوّل.
+
+        وثمنُ ذلك مقيسٌ لا متوقّع: العملةُ الساخنة تُشار إليها كلَّ دقائق، فصفُّ
+        حالتها يُحذف أسرعَ من أن يُكتب — واحدةٌ على Base لها 522 نافذة، وواحدةٌ
+        1440 — فتبدأ الإعادةُ من النشأة كلَّ مرّة ولا تبلغ أوّل لقطةٍ أبداً. ذلك
+        سببُ أنّ 51 عملةً على Base كانت `partial` بمراجعةٍ = 1 ومدًى = ‎−1‎:
+        محاولةٌ واحدةٌ بعد كلّ حذف، بلا تقدّم، إلى الأبد.
+
+        والأسوأُ أنّ الحذفَ كان يُبطل الحارسَ الموضوع لهذا بعينه: سقفُ
+        `EVM_REPLAY_TOKEN_CALL_CAP` يُجمَع من `calls` في الصفّ، فمحوُ الصفّ يصفّر
+        العدّاد — فعملةٌ لا تكتمل أبداً لا تبلغ سقفَها أبداً. وبإبقاء الصفّ يتراكم
+        العدّادُ فتُحال إلى `budget` وتخرج من الطريق.
+
+        و`window` ليست في `FINAL_STATUSES` فالجدولةُ لا تتغيّر: تُنتقى كما كانت
+        تُنتقى وهي بلا صفّ. وهي في مجموعةِ استئناف الـcheckpoint في
+        `evm_replay._replay_token` — وبغير ذلك يُقرأ الصفُّ ويُهمَل مشيُه.
+
+        والمراجعةُ تُزاد: تشغيلٌ جارٍ يحمل لقطةً أقدم يسقط في `StaleEVMState`
+        فيُترك للدورة التالية، بدل أن يكتب فوق نافذةٍ لم يرها. ولا `_commit` هنا:
+        النداءُ من داخل معاملة الإدخال، والالتزامُ لها.
+        """
+        self._conn.execute(
+            """UPDATE evm_replay_state
+                  SET status = 'window', revision = revision + 1
+                WHERE token_address = ? AND network_id = ?""",
+            (token_address.lower(), str(network_id)),
+        )
+
     def reset_evm_replay_token(self, token_address: str, network_id: str) -> None:
         """يمحو صفوف وحالة replay لعملة واحدة كي يكون `--redo` إعادة حقيقية."""
         token, net = token_address.lower(), str(network_id)
@@ -1763,12 +1798,9 @@ class RecorderDB:
         )
         if cur.rowcount > 0:
             # حالة replay تخص اتحاد نوافذ العملة. إضافة نافذة تجعل أي حكم نهائي
-            # سابق قديماً؛ الصفوف السابقة تبقى صحيحة، والحالة وحدها تُعاد كي
+            # سابق قديماً؛ الصفوف السابقة تبقى صحيحة، والحكم وحده يُبطَل كي
             # يضيف التشغيل التالي نقاط النافذة الجديدة بلا فجوة ولا حذف تاريخ.
-            self._conn.execute(
-                "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
-                (token_address.lower(), str(network_id)),
-            )
+            self.stale_evm_replay_verdict(token_address, network_id)
 
     def known_tokens(self) -> set[tuple[str, str]]:
         """كل عملة سبق أن دخلت (مُشار إليها أو ضابطة، نشطة أو منتهية).
