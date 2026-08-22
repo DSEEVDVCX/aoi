@@ -10,6 +10,8 @@ import os
 import sys
 import time
 
+import bsc_layer
+import evm_contract
 import evm_replay
 import evm_layer
 
@@ -71,16 +73,21 @@ def _worked(stats: dict) -> bool:
     return False
 
 
-async def run_cycle(rpc, db) -> dict:
+async def run_cycle(rpc, db, nodereal=None) -> dict:
     import config
 
-    assist = await evm_layer.run_evm_backfill_assist(
-        rpc, db, networks=config.EVM_BACKFILL_ASSIST_NETWORKS,
-        recorded_at=__import__("db").utcnow_iso(),
-    )
+    from db import utcnow_iso
+
+    # This is the sole EVM writer. Keeping live application, backfill,
+    # snapshots, contract checks, and historical replay in one connection
+    # prevents concurrent SQLite writers from holding incompatible batches.
+    live = await evm_layer.run_evm_cycle(rpc, db, utcnow_iso())
+    if nodereal is not None:
+        live.update(await bsc_layer.run_bsc_cycle(nodereal, db, utcnow_iso()))
+    live.update(await evm_contract.run_evm_contract_cycle(rpc, db, utcnow_iso()))
     networks = tuple(str(network) for network in config.EVM_REPLAY_NETWORKS)
     if not networks:
-        return {**assist, "tokens": 0, "written": 0, "errors": 0, "network": None}
+        return {**live, "tokens": 0, "written": 0, "errors": 0, "network": None}
 
     network, following = _next_network(db, networks)
     stats = await evm_replay.run_replay(
@@ -91,17 +98,23 @@ async def run_cycle(rpc, db) -> dict:
         log=_log,
         budget_seconds=config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE,
     )
-    now = __import__("db").utcnow_iso()
-    combined = {**stats, "network": network}
-    if assist["evm_backfill_due"] or _worked(assist):
-        combined.update(assist)
-    now = __import__("db").utcnow_iso()
+    now = utcnow_iso()
+    combined = {**live, **stats, "network": network}
+    live_ok = not int(live.get("evm_errors") or 0) and not int(
+        live.get("evm_backfill_errors") or 0
+    )
+    contract_ok = not int(live.get("evm_contract_errors") or 0)
+    bsc_ok = "bsc_errors" in live and not int(live.get("bsc_errors") or 0)
     _stamp(db, {
+        "evm_last_run_at": now,
+        "evm_last_stats": str(live),
         "evm_replay_next_network": following,
         "evm_replay_last_run_at": now,
         "evm_replay_last_stats": str(combined),
-        **({} if assist.get("evm_backfill_errors") or stats.get("errors")
-           else {"evm_replay_last_ok_at": now}),
+        **({"evm_last_ok_at": now} if live_ok else {}),
+        **({"evm_contract_last_ok_at": now} if contract_ok else {}),
+        **({"bsc_nodereal_last_ok_at": now} if bsc_ok else {}),
+        **({"evm_replay_last_ok_at": now} if not stats.get("errors") else {}),
     })
     return combined
 
@@ -151,10 +164,12 @@ def _check_config() -> int:
 async def _main(cycles: int | None = None) -> None:
     import config
     import evm_rpc
+    from nodereal_rpc import NodeRealRPC
     from db import RecorderDB, utcnow_iso
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     rpc = evm_rpc.EVMRPC()
+    nodereal = NodeRealRPC()
     count = 0
     # `None` لا `monotonic()`: أوّل دورة تسجّل دائماً مهما كانت خاملة، فسطرُ
     # الإقلاع هو الدليل الوحيد على أنّ العامل نهض بعد إعادة التشغيل.
@@ -163,7 +178,7 @@ async def _main(cycles: int | None = None) -> None:
         while cycles is None or count < cycles:
             started = time.monotonic()
             try:
-                stats = await run_cycle(rpc, db)
+                stats = await run_cycle(rpc, db, nodereal)
                 if _worked(stats):
                     _log(f"cycle: {stats}")
                     last_logged = started
@@ -197,6 +212,7 @@ async def _main(cycles: int | None = None) -> None:
                 await asyncio.sleep(remaining)
     finally:
         await rpc.aclose()
+        await nodereal.aclose()
         db.close()
 
 

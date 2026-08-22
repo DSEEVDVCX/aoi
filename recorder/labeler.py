@@ -59,9 +59,10 @@ def compute_labels(
 
     دالة خالصة: لا قاعدة ولا شبكة ولا ساعة نظام — قابلة للاختبار حتمياً.
     تعيد دائماً قاموساً فيه `status`:
-      ok       — دخول وشموع بعده؛ كل الحقول محسوبة.
-      no_entry — لا شمعة دخول خلال المهلة (فجوة سحب لحظة الإشارة).
-      no_bars  — شمعة دخول بلا أي شمعة بعدها (العملة ماتت فوراً).
+      ok         — دخول وشموع بعده؛ كل الحقول المطلوبة محسوبة.
+      no_entry   — لا شمعة دخول خلال المهلة (فجوة سحب لحظة الإشارة).
+      no_bars    — شمعة دخول بلا أي شمعة بعدها (العملة ماتت فوراً).
+      incomplete — توجد شموع، لكن مقياس مطلوب لا يمكن اشتقاقه منها.
     """
     window_h = window_h or config.LABEL_WINDOW_HOURS
     window_end = entry_ts + window_h * 3600
@@ -131,7 +132,10 @@ def compute_labels(
         out["is_rug"] = 1 if out["final_return_48h"] <= config.LABEL_RUG_THRESHOLD else 0
     out["last_bar_lag_h"] = (window_end - last_bar["ts"]) / 3600
     out["bars_truncated"] = 1 if out["last_bar_lag_h"] > 1.0 else 0
-    out["status"] = "ok"
+    required = ("final_return_48h", "max_gain_24h", "is_rug")
+    out["status"] = (
+        "ok" if all(out[field] is not None for field in required) else "incomplete"
+    )
     return out
 
 
@@ -153,7 +157,7 @@ def label_pending(
         now_epoch - config.LABEL_WINDOW_HOURS * 3600 - config.LABEL_MARGIN_SECONDS
     )
     stats = {"signals": 0, "watches": 0, "activities": 0,
-             "ok": 0, "no_entry": 0, "no_bars": 0}
+             "ok": 0, "no_entry": 0, "no_bars": 0, "incomplete": 0}
     labeled_at = utcnow_iso()
 
     for s in db.signals_pending_label(mature_before, batch):
@@ -192,6 +196,7 @@ def label_pending(
         labels = compute_labels(
             bars, entry, admission_price_usd=w.get("admission_price_usd")
         )
+        analysis_eligible = w["design_version"] >= 3 and labels["status"] != "incomplete"
         db.insert_outcome({
             "kind": "watch", "key": w["key"],
             "token_address": w["token_address"],
@@ -201,9 +206,12 @@ def label_pending(
             "entry_ts": entry,
             "split": assign_split(w["token_address"]),
             "labeled_at": labeled_at, "design_version": w["design_version"],
-            "analysis_eligible": 1 if w["design_version"] >= 3 else 0,
+            "analysis_eligible": 1 if analysis_eligible else 0,
             "exclusion_reason": (
-                None if w["design_version"] >= 3 else "superseded_comparison_design"
+                None if analysis_eligible else (
+                    "incomplete_metrics" if labels["status"] == "incomplete"
+                    else "superseded_comparison_design"
+                )
             ),
             **labels,
         })

@@ -187,15 +187,22 @@ def _analyze_rows(rows: list[dict]) -> dict:
     groups = {group: [row for row in rows if row["is_control"] == group] for group in (0, 1)}
     ok = {group: [row for row in group_rows if row["status"] == "ok"]
           for group, group_rows in groups.items()}
+    required_metrics = ("final_return_48h", "max_gain_24h", "is_rug")
+    incomplete = [
+        row.get("key", "<unknown>")
+        for group_rows in ok.values()
+        for row in group_rows
+        if any(row.get(field) is None for field in required_metrics)
+    ]
+    if incomplete:
+        raise RuntimeError(
+            "phase 1 has ok outcomes with incomplete metrics: "
+            + ", ".join(map(str, incomplete[:3]))
+        )
     if not ok[0] or not ok[1]:
         raise RuntimeError(
             "phase 1 requires mature design-v2 signal and control outcomes"
         )
-    if any(row["status"] == "no_bars" for group_rows in groups.values() for row in group_rows):
-        raise RuntimeError(
-            "phase 1 has no_bars outcomes; define their return treatment before analysis"
-        )
-
     returns = {group: [row["final_return_48h"] for row in group_rows]
                for group, group_rows in ok.items()}
     peaks = {group: [row["max_gain_24h"] for row in group_rows]
@@ -213,11 +220,14 @@ def _analyze_rows(rows: list[dict]) -> dict:
             "ok": counts["ok"],
             "no_entry": counts["no_entry"],
             "no_bars": counts["no_bars"],
-            "no_entry_rate": counts["no_entry"] / total,
+            "missing": counts["no_entry"] + counts["no_bars"],
+            "missing_rate": (
+                (counts["no_entry"] + counts["no_bars"]) / total if total else 0.0
+            ),
         }
     missingness = fisher_exact(
-        [[statuses[0]["no_entry"], statuses[0]["ok"]],
-         [statuses[1]["no_entry"], statuses[1]["ok"]]],
+        [[statuses[0]["missing"], statuses[0]["ok"]],
+         [statuses[1]["missing"], statuses[1]["ok"]]],
         alternative="two-sided",
     )
 
@@ -232,7 +242,7 @@ def _analyze_rows(rows: list[dict]) -> dict:
         summaries[group]["peak_24h_median"] = median(peaks[group])
         summaries[group]["rug_rate"] = sum(row["is_rug"] for row in ok[group]) / len(ok[group])
         summaries[group]["truncated_rate"] = (
-            sum(bool(row["bars_truncated"]) for row in ok[group]) / len(ok[group])
+            sum(bool(row.get("bars_truncated")) for row in ok[group]) / len(ok[group])
         )
 
     networks = {
@@ -343,13 +353,15 @@ def render_markdown(primary: dict, sensitivity: dict, *, db_path: str) -> str:
 - مسافة الاختلال الكلية بين نسب الشبكات: {primary['network_total_variation']:.3f}
   (أكبر من 0.10 ⇒ اختلال جوهري وفق حرس التحليل).
 
-| المجموعة | كل النوافذ | `ok` | `no_entry` | `no_bars` | نسبة `no_entry` |
+| المجموعة | كل النوافذ | `ok` | `no_entry` | `no_bars` | نسبة الفقد الكلية |
 |---|---:|---:|---:|---:|---:|
-| الإشارة | {signal_status['total']} | {signal_status['ok']} | {signal_status['no_entry']} | {signal_status['no_bars']} | {signal_status['no_entry_rate'] * 100:.1f}% |
-| الضابطة | {control_status['total']} | {control_status['ok']} | {control_status['no_entry']} | {control_status['no_bars']} | {control_status['no_entry_rate'] * 100:.1f}% |
+| الإشارة | {signal_status['total']} | {signal_status['ok']} | {signal_status['no_entry']} | {signal_status['no_bars']} | {signal_status['missing_rate'] * 100:.1f}% |
+| الضابطة | {control_status['total']} | {control_status['ok']} | {control_status['no_entry']} | {control_status['no_bars']} | {control_status['missing_rate'] * 100:.1f}% |
 
-فحص فقد شمعة الدخول: `Fisher exact p={_p(primary['missingness']['p_two_sided'])}`؛
+فحص فقد النتيجة (`no_entry` + `no_bars`): `Fisher exact p={_p(primary['missingness']['p_two_sided'])}`؛
 الفرق {'دال، ولذلك التصفية على `ok` انتقائية ولا تسمح بحكم سببي نهائي' if missingness_significant else 'غير دال في العينة الحالية'}.
+لا تُسند عوائد مفبركة لصفوف `no_bars`؛ تبقى ضمن تحليل الفقدان فقط وتُستبعد من
+مقاييس العائد التي لا يمكن اشتقاقها.
 `bars_truncated` لم يُستبعد لأنه قد يعني موت الأصل لا نقصاً: نسبته
 {signal['truncated_rate'] * 100:.1f}% للإشارة و{control['truncated_rate'] * 100:.1f}% للضابطة.
 
@@ -394,7 +406,7 @@ n الضابطة={sensitivity['summaries'][1]['n']}، فرق الوسيط
   متطابقين، وتوزيع الشبكات غير متوازن.
 - الضابطة التي تتلقى إشارة قبل توسيم نافذتها قد تُرقّى في `watchlist` ويضيع صفها
   الضابط؛ هذا حذف انتقائي لا يمكن إصلاحه رجعياً من الجدول الحالي.
-- فرق `no_entry` يعني أن تحليل `status='ok'` يقارن جزأين مختلفين في قابلية
+- فرق الفقدان (`no_entry` أو `no_bars`) يعني أن تحليل `status='ok'` يقارن جزأين مختلفين في قابلية
   التسعير. Fisher يشخّص المشكلة ولا يعالج انحيازها.
 - تصنيف `token_class` مشتق من كل المشاهدات المتاحة وقد يتغير لاحقاً. لذلك هذا
   التقرير لقطة قابلة للتدقيق، لا عينة مسجلة مسبقاً وغير قابلة للتغير.
@@ -408,8 +420,12 @@ def main() -> None:
     parser.add_argument("--db", default=config.DB_PATH)
     parser.add_argument("--output")
     args = parser.parse_args()
-    primary = analyze(args.db, include_retro_controls=False)
-    sensitivity = analyze(args.db, include_retro_controls=True)
+    try:
+        primary = analyze(args.db, include_retro_controls=False)
+        sensitivity = analyze(args.db, include_retro_controls=True)
+    except RuntimeError as exc:
+        print(f"phase1 blocked: {exc}")
+        raise SystemExit(2) from exc
     report = render_markdown(primary, sensitivity, db_path=args.db)
     output = Path(args.output) if args.output else Path(config.ROOT) / "docs" / (
         f"phase1-{datetime.now(UTC).date().isoformat()}.md"

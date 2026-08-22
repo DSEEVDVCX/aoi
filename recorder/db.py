@@ -79,7 +79,18 @@ class RecorderDB:
         # الترحيل **قبل** المخطّط: schema.sql ينشئ فهرساً على is_control، وهو
         # يفشل على جدول قديم لا يملك العمود بعد. على قاعدة جديدة الترحيل بلا أثر
         # (لا جداول بعد)، فالترتيب آمن في الحالتين.
-        self._conn.execute("BEGIN IMMEDIATE")
+        # تبدأ عدة مهام معاً بعد تسجيل الدخول؛ أحدها قد يملك قفل الكتابة أثناء
+        # تهيئة المخطّط. نعيد المحاولة للقفل المؤقت فقط، ولا نخفي أخطاء المخطط.
+        delay = 0.25
+        for attempt in range(8):
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 7:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 2.0)
         try:
             self._migrate()
             self._conn.commit()
@@ -106,7 +117,18 @@ class RecorderDB:
                 time.sleep(0.4 * (attempt + 1))
         self._backfill_watch_windows()
         self._quarantine_legacy_outcomes()
+        self._set_current_feature_version()
         self._conn.commit()
+
+    def _set_current_feature_version(self) -> None:
+        """Keep the model view aligned with the feature builder's current release."""
+        from features import FEATURE_VERSION
+
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES('current_feature_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(FEATURE_VERSION),),
+        )
 
     def _quarantine_legacy_outcomes(self) -> None:
         """يعزل كل نتيجة watch أقدم من تصميم المقارنة الحالي."""
@@ -849,6 +871,30 @@ class RecorderDB:
         self._commit()
         return cur.rowcount > 0
 
+    def set_static_created_at(
+        self, token_address: str, network_id: str, created_at: str
+    ) -> bool:
+        """يملأ `token_created_at` **حين يكون فارغاً فقط**.
+
+        حالة نادرة لكنها قائمة: المنبع أعاد العملة في قائمةٍ عامّة بلا تاريخ
+        إنشاء (3 من 406 مقيسة)، فصفّ الثوابت موجودٌ والعمر مفقود — و
+        `upsert_static` هو INSERT OR IGNORE فلا يصلحه. filterTokens يُسأل عن
+        هذه العملة كلَّ دورة، فأوّل إجابةٍ تحمل التاريخ تسدّ الثقب.
+
+        شرط الفراغ يمنع الكتابة فوق تاريخٍ مسجَّل: قيمة المنبع نفسها **تتبدّل**
+        (53 من 216 تخالف المخزَّن بأكثر من ساعة، وواحدة بفرق سنة)، فنُثبّت
+        أوّل ما رأيناه بدل أن نتبع تبدُّله — وإلا تبدّل حكمُ بوّابة العمر تحت
+        عملةٍ مقبولةٍ أصلاً.
+        """
+        cur = self._conn.execute(
+            """UPDATE token_static SET token_created_at=?
+                WHERE token_address=? AND network_id=?
+                  AND (token_created_at IS NULL OR token_created_at='')""",
+            (created_at, token_address, network_id),
+        )
+        self._commit()
+        return cur.rowcount > 0
+
     def holders_fetch_due(
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
     ) -> list[dict[str, Any]]:
@@ -1253,7 +1299,10 @@ class RecorderDB:
         )
         self._commit()
 
-    def evm_watched(self, networks: Sequence[str]) -> list[dict[str, Any]]:
+    def evm_watched(
+        self, networks: Sequence[str],
+        extra_tokens: Sequence[tuple[str, str]] = (),
+    ) -> list[dict[str, Any]]:
         """كل المراقَبات النشطة على شبكات EVM المفعَّلة، مع حالة تعبئتها.
 
         صفٌّ واحد يجمع المراقبة والتعبئة: الطبقة تحتاج الاثنين في كل دورة (من
@@ -1264,6 +1313,26 @@ class RecorderDB:
         if not nets:
             return []
         marks = ", ".join("?" for _ in nets)
+        extra = [(str(network), str(token).lower()) for network, token in extra_tokens]
+        raw_cohort = self.get_meta("evm_repair_cohort")
+        if raw_cohort:
+            try:
+                cohort = json.loads(raw_cohort)
+                extra.extend(
+                    (str(item["network_id"]), str(item["token_address"]).lower())
+                    for item in cohort.get("active_backfills", [])
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+        extra = list(dict.fromkeys(extra))
+        extra_sql = " OR ".join(
+            "(w.network_id=? AND lower(w.token_address)=?)" for _ in extra
+        )
+        active_clause = "w.active=1"
+        params: list[Any] = list(nets)
+        if extra_sql:
+            active_clause += f" OR {extra_sql}"
+            params.extend(value for pair in extra for value in pair)
         rows = self._conn.execute(
             f"""SELECT w.token_address, w.network_id, w.first_seen_at,
                        w.entry_signal_id, w.is_control,
@@ -1273,10 +1342,11 @@ class RecorderDB:
                        b.last_try_at AS backfill_last_try_at
                   FROM watchlist w
                   LEFT JOIN evm_backfill_state b
-                    ON b.token_address=w.token_address AND b.network_id=w.network_id
-                 WHERE w.active=1 AND w.network_id IN ({marks})
-                 ORDER BY w.is_control, w.first_seen_at DESC""",
-            nets,
+                    ON lower(b.token_address)=lower(w.token_address)
+                   AND b.network_id=w.network_id
+                  WHERE w.network_id IN ({marks}) AND ({active_clause})
+                  ORDER BY w.is_control, w.first_seen_at DESC""",
+            params,
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1936,6 +2006,12 @@ class RecorderDB:
             f"VALUES({', '.join(f':{c}' for c in cols)})"
         )
         values = {c: row.get(c) for c in cols}
+        if values["status"] == "ok":
+            required = ("final_return_48h", "max_gain_24h", "is_rug")
+            if any(values[field] is None for field in required):
+                values["status"] = "incomplete"
+                values["analysis_eligible"] = 0
+                values["exclusion_reason"] = "incomplete_metrics"
         if values["design_version"] is None:
             values["design_version"] = 1
         if values["analysis_eligible"] is None:

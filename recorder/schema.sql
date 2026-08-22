@@ -458,7 +458,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
                                                 --   غالباً موت العملة — إشارة لا نقص!
     is_rug           INTEGER,                   -- 1 = العائد النهائي ≤ -90%
     split            TEXT,                      -- train/val/test (تجزئة ثابتة بالعملة)
-    status           TEXT NOT NULL,             -- ok | no_entry | no_bars
+    status           TEXT NOT NULL,             -- ok | no_entry | no_bars | incomplete
     labeled_at       TEXT NOT NULL,
     design_version   INTEGER NOT NULL DEFAULT 1,
     analysis_eligible INTEGER NOT NULL DEFAULT 0,
@@ -740,7 +740,9 @@ SELECT * FROM training_rows
    AND asset_class = 'meme'
    AND status = 'ok'
    AND is_independent = 1
-   AND feature_version >= 2
+   AND feature_version = CAST(COALESCE(
+       (SELECT value FROM meta WHERE key = 'current_feature_version'), '0'
+   ) AS INTEGER)
    AND NOT EXISTS (
        SELECT 1
          FROM signal_events current_event
@@ -762,7 +764,9 @@ SELECT * FROM training_rows
           AND t2.asset_class = 'meme'
           AND t2.status = 'ok'
           AND t2.is_independent = 1
-          AND t2.feature_version >= 2
+          AND t2.feature_version = CAST(COALESCE(
+              (SELECT value FROM meta WHERE key = 'current_feature_version'), '0'
+          ) AS INTEGER)
           AND t2.token_address = training_rows.token_address
           AND COALESCE(t2.network_id, '') =
               COALESCE(training_rows.network_id, '')

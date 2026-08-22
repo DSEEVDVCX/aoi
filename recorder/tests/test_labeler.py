@@ -24,8 +24,8 @@ def db(tmp_path):
     d.close()
 
 
-def _bar(ts, o=1.0, h=1.0, low=1.0, c=1.0):
-    return {"ts": ts, "o": o, "h": h, "l": low, "c": c}
+def _bar(ts, o=1.0, h=1.0, low=1.0, c=1.0, **flags):
+    return {"ts": ts, "o": o, "h": h, "l": low, "c": c, **flags}
 
 
 def _series(*, entry_px=1.0):
@@ -106,6 +106,20 @@ def test_truncated_series_is_flagged_not_dropped():
     assert out["bars_truncated"] == 1
     assert out["last_bar_lag_h"] == pytest.approx(46.0)
     assert out["is_rug"] == 1                            # -92% ≤ عتبة -90%
+
+
+def test_series_without_a_valid_peak_is_incomplete_not_ok():
+    bars = [
+        _bar(ENTRY, c=1.0),
+        _bar(ENTRY + H, h=1.1, c=1.0, h_suspect=1),
+    ]
+
+    out = labeler.compute_labels(bars, ENTRY)
+
+    assert out["status"] == "incomplete"
+    assert out["max_gain_24h"] is None
+    assert out["final_return_48h"] == pytest.approx(0.0)
+    assert out["is_rug"] == 0
 
 
 def test_zero_entry_price_is_rejected_not_divided_by():
@@ -245,6 +259,25 @@ def test_watch_entries_including_control_get_labeled(db):
     assert rows["tokC"]["design_version"] == 2
     assert rows["tokC"]["analysis_eligible"] == 0
     assert rows["tokC"]["exclusion_reason"] == "superseded_comparison_design"
+
+
+def test_incomplete_watch_outcome_is_not_phase1_eligible(db):
+    db.admit_control("tokC", "56", 48, _iso(ENTRY), admission_price_usd=1.0)
+    db.insert_bars([
+        {"token_address": "tokC", "network_id": "56", "resolution": "5",
+         "ts": ENTRY + H, "o": 1.0, "h": 1.1, "l": 1.0, "c": 1.0,
+         "h_suspect": 1, "fetched_at": "t"},
+    ])
+    db.set_bars_state("tokC", "56", "ok", 1, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT status, analysis_eligible, exclusion_reason FROM outcomes"
+    ).fetchone()
+    assert row["status"] == "incomplete"
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "incomplete_metrics"
 
 
 def test_mature_watch_waits_until_bars_fetch_is_finalized(db):

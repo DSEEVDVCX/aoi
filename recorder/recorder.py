@@ -10,12 +10,15 @@ leaderboard). لا نداء يكتب حالة حساب أو تداول.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import random
+import re
 import time
 import traceback
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -23,6 +26,82 @@ import config
 import extract
 from db import RecorderDB, utcnow_iso
 from leaderboard_cache import LeaderboardCache
+
+_evm_admission_paused_runtime = False
+
+
+def _fail_closed_evm_admission(networks: frozenset[str]) -> EVMAdmissionPolicy:
+    global _evm_admission_paused_runtime
+
+    _evm_admission_paused_runtime = True
+    return EVMAdmissionPolicy(networks, -1, 0, 1, True)
+
+
+@dataclass(frozen=True)
+class EVMAdmissionPolicy:
+    """قرار قبول حتميّ للعملات الجديدة؛ شبكات غير EVM لا تتأثر."""
+
+    networks: frozenset[str]
+    backlog: int
+    numerator: int
+    denominator: int
+    paused: bool
+
+    @property
+    def percent(self) -> int:
+        return 100 * self.numerator // self.denominator
+
+    def allows(self, kind: str, token: str, network: str, key: str) -> bool:
+        if str(network) not in self.networks:
+            return True
+        if self.numerator <= 0:
+            return False
+        if self.numerator >= self.denominator:
+            return True
+        # All admission paths must make the same decision for one token. The
+        # unused kind/key parameters remain part of the call contract only.
+        digest = hashlib.sha256(f"{network!s}:{token.lower()}".encode()).digest()
+        return int.from_bytes(digest[:8], "big") % self.denominator < self.numerator
+
+    def score(self, kind: str, token: str, network: str) -> int:
+        digest = hashlib.sha256(f"{network!s}:{token.lower()}".encode()).digest()
+        return int.from_bytes(digest[:8], "big")
+
+
+def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
+    global _evm_admission_paused_runtime
+
+    networks = frozenset(str(network) for network in config.EVM_NETWORKS)
+    if not networks:
+        return EVMAdmissionPolicy(networks, 0, 1, 1, False)
+    marks = ", ".join("?" for _ in networks)
+    backlog = int(db._conn.execute(
+        "SELECT COUNT(*) FROM watchlist w LEFT JOIN evm_backfill_state b "
+        "ON b.network_id=w.network_id AND lower(b.token_address)=lower(w.token_address) "
+        f"WHERE w.active=1 AND w.network_id IN ({marks}) "
+        "AND COALESCE(b.status, '') <> 'done'",
+        tuple(sorted(networks)),
+    ).fetchone()[0])
+    paused = _evm_admission_paused_runtime or db.get_meta("evm_admission_paused") == "1"
+    if paused and backlog < config.EVM_ADMISSION_RESUME_BELOW:
+        paused = False
+        _evm_admission_paused_runtime = False
+        db.set_meta("evm_admission_paused", "0")
+    elif not paused and backlog >= config.EVM_ADMISSION_PAUSE_AT:
+        paused = True
+        _evm_admission_paused_runtime = True
+        db.set_meta("evm_admission_paused", "1")
+    elif paused:
+        _evm_admission_paused_runtime = True
+    if paused:
+        fraction = (0, 1)
+    elif backlog < config.EVM_ADMISSION_FULL_BELOW:
+        fraction = (1, 1)
+    elif backlog < config.EVM_ADMISSION_REDUCED_BELOW:
+        fraction = (3, 4)
+    else:
+        fraction = (1, 2)
+    return EVMAdmissionPolicy(networks, backlog, *fraction, paused)
 
 
 def _load_access_token() -> str:
@@ -55,6 +134,67 @@ def _load_client() -> Any:
     لا يطبع قيمة التوكن إطلاقاً (FR-013). يرفع خطأً واضحاً إن غاب الاعتماد.
     """
     return _build_client(_load_access_token())
+
+
+def _exc_note(exc: Exception) -> str:
+    """اسمُ الخطأ ورسالتُه **ورمزُ حالته** — فالرسالة وحدها تكذب أحياناً.
+
+    قِيس 2026-08-19T14:54Z: حجبت المنصّة الحساب بـ403 على كلّ مسارٍ من اثني
+    عشر، فكتب المسجّل «UpstreamUnavailableError: fomo.family is currently
+    unreachable» — وهي رسالةُ الصنف الافتراضيّة نفسها التي يكتبها الانقطاعُ
+    الشبكيّ الحقيقيّ. فذهب التشخيصُ إلى DNS وping وTLS والمصدرُ يردّ في 20ms،
+    والرمزُ 403 كان في `ApiError.details` طوال الوقت ولم يُطبَع لأنّ التنسيق
+    يأخذ `str(exc)` وحدها. وطبقةُ EVM تُدرج الرمزَ أصلاً — يشهد عليها اختبارٌ
+    يطلب `"503" in last_error_evm` — فهذا توحيدُ عُرفٍ قائم لا اختراعُ آخر.
+
+    والقصُّ مقصود: `details["reason"]` تحمل نصَّ استثناءِ النقل كاملاً، وهذه
+    الملاحظةُ تسكن صفّاً في `meta` يُقرأ في اللوحة لا سجلَّ تنقيبٍ مفتوحَ الطول.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    details = getattr(exc, "details", None)
+    if not isinstance(details, dict) or not details:
+        return text
+    pairs = ", ".join(f"{k}={str(v)[:120]}" for k, v in sorted(details.items()))
+    return f"{text} ({pairs})"
+
+
+def _note_shutout(
+    db: RecorderDB, block: str, recorded_at: str, asked: int, produced: int
+) -> int:
+    """يرفع صوتَ الحصار: كتلةٌ تسأل ولا تُنتج شيئاً، دورةً بعد دورة.
+
+    الدرسُ من 2026-08-19: مات `/v2/users/{id}` فردَّ 404 لكلّ معرّف، و404 و«حسابٌ
+    محذوف» مسارٌ واحد — فكُتب `empty` لكلّ متداول، و`traders_rows: 0` في كلّ سطر
+    سجلّ، و`errors: 0` كذلك. 21 ساعةً ولا كلمةَ خطأ واحدة، لأنّ «لا بيانات لهذا
+    العنصر» جوابٌ **مشروع** لعنصرٍ واحد. الصفرُ الفرديُّ عاديّ؛ الصفرُ الجماعيُّ
+    المتكرّرُ لا يكون إلّا عطلاً.
+
+    فالعدّادُ في `meta` لا في الذاكرة: لو أُعيد تشغيلُ المسجّل كلَّ ساعة (وقد
+    حدث) لبدأت الذاكرةُ من الصفر فبقي الحصارُ صامتاً كما كان. ويُصفَّر عند أوّل
+    صفٍّ ينزل — فالتشخيصُ عن «الآن» لا عن الأمس.
+
+    يُنادى فقط حيث يكون صفرُ الكتلة **مستحيلاً** لا نادراً: 50 متداولاً كلُّهم
+    محذوفون ليس حدثاً (قِيس: 7 غيابات حقيقيّة من 500). أمّا الشموعُ فتغيب
+    مشروعةً، والإشاراتُ تخلو في دقيقةٍ هادئة — فلا تُوصَل هذه بها.
+
+    يعيد طولَ السلسلة بعد التحديث.
+    """
+    key = f"shutout_{block}"
+    if produced > 0 or asked <= 0:
+        if db.get_meta(key) not in (None, "0"):
+            db.note_error(key, "0")
+        return 0
+    previous = db.get_meta(key)
+    streak = (int(previous) if previous and previous.isdigit() else 0) + 1
+    db.note_error(key, str(streak))
+    if streak >= config.SHUTOUT_STREAK_ALERT:
+        db.note_error(
+            f"last_error_{block}",
+            f"{recorded_at}: ShutoutSuspected: سُئل {asked} ولم ينزل صفٌّ واحد "
+            f"في {streak} دورةً متتالية — الأرجحُ أنّ المسار نفسه تعطّل، "
+            f"لا أنّ كلَّ العناصر خالية",
+        )
+    return streak
 
 
 async def _fetch_feed_raw(client: Any) -> Any:
@@ -101,15 +241,30 @@ async def _fetch_filter_tokens_raw(client: Any, symbols: list[str]) -> Any:
     return await client._post(settings.upstream_filter_tokens_path, symbols)
 
 
-async def _fetch_trader_raw(client: Any, trader_id: str) -> Any:
-    """خام GET /v2/users/{id} — ملفّ المتداول.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
-    نتجاوز `get_trader` لأنّها تُعيّن وتُسقط حقولاً؛ نريد المغلّف كاملاً
-    للأرشيف. مقيس حيّاً: 26 مفتاحاً في `responseObject`.
+
+async def _fetch_traders_raw(client: Any, trader_ids: list[str]) -> Any:
+    """خام GET /v2/users?userIds=…&userIds=… — رزمةُ ملفّات متداولين.
+
+    نتجاوز `get_trader_profiles` لأنّها تُعيّن وتُسقط حقولاً؛ نريد المغلّف
+    كاملاً للأرشيف. مقيس حيّاً: 26 مفتاحاً لكلّ مستخدم.
+
+    والرزمةُ ليست تحسيناً اختياريّاً: `/v2/users/{id}` يردّ 404 «User not found»
+    لكلّ معرّفٍ صحيحِ الشكل منذ 2026-08-19T14:53Z — ومعرّفاتٌ خرجت لحظتَها من
+    200 على `/v2/leaderboard` تردّ 404 هي أيضاً، فلا هي معرّفاتُنا ولا حسابُنا.
+    وهذه أوّلُ مرّةٍ يُجلَب فيها متداولٌ منذ ذلك الوقت (3,775 صفّاً آخرُها
+    14:53:51Z، ثمّ 21 ساعةً من `empty` صامت).
+
+    والحدُّ 100 لكلّ نداء يُصرّح به المصدرُ نفسه في خطأ التحقّق.
     """
     from fomo_api.config import settings
 
-    return await client._get(settings.upstream_trader_path.format(trader_id=trader_id))
+    return await client._get(
+        settings.upstream_traders_batch_path, {"userIds": trader_ids}
+    )
 
 
 async def _fetch_bars_raw(
@@ -182,7 +337,7 @@ async def run_bars_cycle(
                 db.set_bars_state(addr, net, "error", 0, recorded_at)
             except Exception:  # noqa: BLE001 — جدولةُ إعادة لا قياس؛ ولو رمت هي
                 pass                        # لَما بُلِغ الختمُ أدناه أصلاً
-            db.note_error("last_error_bars", f"{recorded_at}: {type(exc).__name__}: {exc}")
+            db.note_error("last_error_bars", f"{recorded_at}: {_exc_note(exc)}")
         if i + 1 < len(due):
             await sleep(config.BARS_PACING_SECONDS)
     return stats
@@ -197,6 +352,7 @@ def admit_control_sample(
     ],
     recorded_at: str,
     rng: random.Random | None = None,
+    policy: EVMAdmissionPolicy | None = None,
 ) -> int:
     """يُدخل عملات ضابطة مختارة **عشوائياً** من نفس كون العملات. يعيد كم أُدخلت.
 
@@ -245,6 +401,10 @@ def admit_control_sample(
     pool = sorted(
         key for key in normalized
         if key not in known and key[0] not in signalled
+        and (
+            policy is None
+            or policy.allows("control", key[0], str(key[1] or ""), recorded_at)
+        )
     )
     if not pool:
         return 0
@@ -323,12 +483,23 @@ def admit_control_sample(
                     weights[item],
                 ),
             )
-            pick = rng.choice(eligible_by_network[network])
+            choices = eligible_by_network[network]
+            pick = (
+                min(choices, key=lambda item: policy.score(
+                    "control", item[0], str(item[1] or "")
+                ))
+                if policy is not None else rng.choice(choices)
+            )
             eligible_by_network[network].remove(pick)
             picks.append(pick)
             existing[network] = existing.get(network, 0) + 1
     else:
-        picks = rng.sample(pool, pick_count)
+        picks = (
+            sorted(pool, key=lambda item: policy.score(
+                "control", item[0], str(item[1] or "")
+            ))[:pick_count]
+            if policy is not None else rng.sample(pool, pick_count)
+        )
     added = 0
     for addr, net in picks:
         if db.admit_control(
@@ -345,6 +516,8 @@ def admit_signal_comparison_windows(
     db: RecorderDB,
     candidates: Sequence[tuple[str, str, float | None, str]],
     recorded_at: str,
+    policy: EVMAdmissionPolicy | None = None,
+    admitted_signals: set[str] | None = None,
 ) -> int:
     """يدخل إشارات v3 فقط عندما تظهر في نفس قائمة المرشحين المستخدمة للضابطة."""
     candidate_prices: dict[tuple[str, str], tuple[float, str]] = {}
@@ -369,6 +542,17 @@ def admit_signal_comparison_windows(
         admission = candidate_prices.get(key)
         if admission is None:
             continue
+        if policy is not None:
+            existing = db._conn.execute(
+                "SELECT active FROM watchlist WHERE token_address=? AND network_id=?",
+                key,
+            ).fetchone()
+            if admitted_signals is not None and existing is None and str(row["id"]) not in admitted_signals:
+                continue
+            if existing is None and not policy.allows(
+                "signal", key[0], key[1], str(row["id"]),
+            ):
+                continue
         price, admission_source = admission
         if db.add_signal_comparison_window(
             key[0], key[1], row["signal_type"], row["id"],
@@ -377,6 +561,215 @@ def admit_signal_comparison_windows(
         ):
             added += 1
     return added
+
+
+AGE_OK = "ok"
+AGE_TOO_YOUNG = "too_young"
+AGE_UNKNOWN = "unknown"
+
+
+def token_age_days(created_at: Any, now_iso: str) -> float | None:
+    """عمرُ العملة بالأيّام لحظةَ `now_iso`، أو None إن تعذّر.
+
+    `token_created_at` **ثوانٍ منذ المبدأ مخزَّنةً نصّاً** لا تاريخاً مقروءاً،
+    فـ`julianday()` عليه يعيد NULL بصمت — ولهذا يُحسب هنا في بايثون لا في SQL.
+
+    العمرُ السالب (تاريخُ إنشاءٍ في المستقبل) ليس عمراً: يعود None فيُعامَل
+    معاملةَ المجهول لا معاملةَ القديم، وإلّا لصار انحرافُ ساعةٍ بوّابةً مفتوحة.
+    """
+    if created_at in (None, ""):
+        return None
+    try:
+        created = int(float(created_at))
+    except (TypeError, ValueError):
+        return None
+    if created <= 0:
+        return None
+    age = (int(datetime.fromisoformat(now_iso).timestamp()) - created) / 86400.0
+    return age if age >= 0 else None
+
+
+def age_verdict(created_at: Any, now_iso: str) -> str:
+    """حكمُ بوّابة العمر على تاريخِ إنشاءٍ واحد. `MIN_TOKEN_AGE_DAYS=0` يُلغيها."""
+    if not config.MIN_TOKEN_AGE_DAYS:
+        return AGE_OK
+    age = token_age_days(created_at, now_iso)
+    if age is None:
+        return AGE_UNKNOWN
+    return AGE_OK if age >= config.MIN_TOKEN_AGE_DAYS else AGE_TOO_YOUNG
+
+
+def stored_created_at(db: RecorderDB, addr: str, net: str) -> str | None:
+    row = db._conn.execute(
+        """SELECT token_created_at FROM token_static
+            WHERE token_address=? AND network_id=?""",
+        (addr, net),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["token_created_at"] or None
+
+
+async def resolve_ages(
+    client: Any,
+    db: RecorderDB,
+    keys: Sequence[tuple[str, str]],
+    recorded_at: str,
+    stats: dict[str, int],
+) -> None:
+    """يجلب تاريخَ إنشاءِ المرشّحين المجهولين ويثبّته في `token_static`.
+
+    الإشارةُ نفسها **لا تحمل عمرَ العملة**: حدثُ الـfeed فيه `tokenAddress` و
+    `networkId` و`createdAt` الخاصّ بالمنشور وحده — لا كائنَ عملةٍ فيه إطلاقاً.
+    فبوّابةُ العمر تحتاج مصدراً، و`filterTokens` يسأل عن عنوانٍ بالاسم بلا شرط
+    شعبيّة ويحمل `token.createdAt`.
+
+    الكلفةُ نداءٌ واحد في الدورة على الأكثر: المرشّحون الجدد **1.11 عملة في
+    الدورة** (أقصى ما رُصد 4) والدفعة تحمل 150 — مقابل تسعة نداءات شموع تُجرى
+    في الدورة نفسها. والنتيجةُ تُخزَّن فلا يُسأل عن العملة نفسها ثانيةً: إشارةٌ
+    لاحقة على عملةٍ رُفضت تُحكَم من التاريخ المخزَّن بلا شبكة.
+
+    الفشلُ يُميَّز عن الجهل: `age_lookup_failed` عدّادٌ وختمُ خطأ وسلسلةٌ في
+    `meta`، لأنّ 502 من المنبع يجعل كلّ مرشّح «مجهولاً» فتتوقّف المراقبة كلّها —
+    وهذا انقطاعٌ يجب أن يُسمع لا أن يُقرأ ترشيحاً عادياً.
+    """
+    if not keys:
+        return
+    symbols = [f"{addr}:{net}" for addr, net in keys]
+    try:
+        raw = await _fetch_filter_tokens_raw(client, symbols)
+    except Exception as exc:  # noqa: BLE001 — الإشارة محفوظة أصلاً
+        stats["age_lookup_failed"] += len(keys)
+        db.note_error("last_error_age_lookup", f"{recorded_at}: {_exc_note(exc)}")
+        db.bump_counter("age_lookup_failed_streak")
+        db.bump_counter("age_lookup_failed_total", len(keys))
+        return
+    by_addr: dict[str, Any] = {}
+    for item in extract.unwrap_token_list(raw):
+        a = extract.token_list_address(item)
+        if a:
+            by_addr[a.lower()] = item
+    with db.batch():
+        for addr, net in keys:
+            item = by_addr.get(addr.lower())
+            if item is None:
+                continue          # حُذف بصمت (عنوان ميّت) — يبقى مجهولاً
+            if _write_filter_static(db, item, addr, net, recorded_at):
+                stats["age_resolved"] += 1
+    db.set_meta("age_lookup_last_ok_at", recorded_at)
+    db.set_meta("age_lookup_failed_streak", "0")
+
+
+def _opens_window(existing: Any) -> bool:
+    """هل ستفتح `upsert_watch` نافذةً جديدة لهذا الصفّ؟
+
+    شرطُ التحديث فيه `WHERE watchlist.active=0 OR watchlist.is_control=1`، فثلاثُ
+    حالات تفتح نافذة: لا صفَّ أصلاً، صفٌّ منتهي، صفٌّ ضابط يُحوَّل إلى مُشار
+    إليه. والنشطُ غيرُ الضابط وحده لا تُفتَح له نافذة — نافذتُه تجري بالفعل.
+    """
+    if existing is None:
+        return True
+    return not existing["active"] or bool(existing["is_control"])
+
+
+async def record_feed(
+    db: RecorderDB,
+    raw_feed: Any,
+    recorded_at: str,
+    rank_lookup,
+    rank_lookups,
+    policy: EVMAdmissionPolicy,
+    stats: dict[str, int],
+    client: Any = None,
+) -> set[str]:
+    """يحفظ الإشارات أولاً، ثم يحاول المراقبة بلا أن يربط مصير الاثنين."""
+    events = extract.unwrap_feed(raw_feed)
+    rows = []
+    inserted: set[str] = set()
+    with db.batch():
+        db.insert_snapshot("feed", raw_feed, recorded_at)
+        newest = max(
+            (str(event.get("createdAt")) for event in events if event.get("createdAt")),
+            default=None,
+        )
+        if newest:
+            db.set_meta("last_feed_event_at", newest)
+        for event in events:
+            row = extract.extract_signal_event(
+                event, recorded_at, rank_lookup, rank_lookups,
+            )
+            if row is None:
+                continue
+            rows.append(row)
+            if db.insert_signal(row):
+                inserted.add(str(row["id"]))
+                stats["signals"] += 1
+
+    triggers = [r for r in rows if r["signal_type"] in config.TRIGGER_SIGNAL_TYPES]
+    # حالةُ القائمة لكلّ مُشغّل مرّةً واحدة: يقرأها فرزُ المرشّحين وحلقةُ القبول.
+    watch_state: dict[tuple[str, str], Any] = {}
+    for row in triggers:
+        key = (str(row["token_address"]), str(row["network_id"] or ""))
+        if key not in watch_state:
+            watch_state[key] = db._conn.execute(
+                """SELECT active, is_control FROM watchlist
+                    WHERE token_address=? AND network_id=?""",
+                key,
+            ).fetchone()
+
+    # عمرُ المرشّحين الذين ستُفتَح لهم نافذة، قبل الحكم. المخزَّن يكفي غالباً
+    # فلا نداءَ له؛ المجهول وحده يخرج للشبكة، ونداءٌ واحدٌ يحمل 150.
+    if client is not None and config.MIN_TOKEN_AGE_DAYS:
+        unknown = [
+            key for key, existing in watch_state.items()
+            if _opens_window(existing) and stored_created_at(db, *key) is None
+        ]
+        await resolve_ages(client, db, unknown, recorded_at, stats)
+
+    admitted: set[str] = set()
+    for row in triggers:
+        token = str(row["token_address"])
+        network = str(row["network_id"] or "")
+        existing = watch_state[(token, network)]
+        # البوّابةُ تحكم كلَّ نافذةٍ تُفتَح — الجديدةَ **وإعادةَ التنشيط**:
+        # `upsert_watch` يُحيي صفّاً منتهياً (active=0) أو ضابطاً بنافذةٍ جديدة،
+        # فلو حُصِرت في الجديد لدخلت الصغيرةُ من باب الإحياء.
+        if _opens_window(existing):
+            verdict = age_verdict(stored_created_at(db, token, network), recorded_at)
+            if verdict != AGE_OK:
+                stats["age_rejected"] += 1
+                if verdict == AGE_UNKNOWN:
+                    stats["age_unknown"] += 1
+                continue
+        if existing is None:
+            if db.active_watch_count(is_control=0) >= config.WATCHLIST_CAP:
+                continue
+            if not policy.allows("signal", token, network, str(row["id"])):
+                if network in policy.networks and str(row["id"]) in inserted:
+                    stats["evm_admission_deferred"] += 1
+                continue
+        try:
+            added = db.upsert_watch(
+                token_address=token,
+                network_id=network,
+                source=row["signal_type"],
+                entry_signal_id=row["id"],
+                watch_hours=config.WATCH_HOURS,
+                now_iso=recorded_at,
+                admission_price_usd=row.get("price_usd"),
+            )
+            admitted.add(str(row["id"]))
+            if added:
+                stats["watch_added"] += 1
+                watch_state[(token, network)] = {"active": 1, "is_control": 0}
+        except Exception as exc:  # noqa: BLE001 - signal is already durable
+            stats["errors"] += 1
+            db.note_error("last_error_watch_admission", f"{recorded_at}: {_exc_note(exc)}")
+    if stats["evm_admission_deferred"]:
+        db.bump_counter("evm_admission_deferred_total", stats["evm_admission_deferred"])
+    if stats["age_rejected"]:
+        db.bump_counter("age_rejected_total", stats["age_rejected"])
+    return admitted
 
 
 async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) -> Any:
@@ -490,7 +883,7 @@ async def run_macro_bars_cycle(
                 db.recompute_bar_flags(addr, net, config.MACRO_BARS_RESOLUTION)
         except Exception as exc:  # noqa: BLE001 — أصل واحد لا يُسقط البقيّة
             stats["macro_errors"] += 1
-            db.note_error("last_error_macro", f"{recorded_at}: {label}: {type(exc).__name__}: {exc}")
+            db.note_error("last_error_macro", f"{recorded_at}: {label}: {_exc_note(exc)}")
         if i + 1 < len(config.MACRO_BARS):
             await sleep(config.BARS_PACING_SECONDS)
     # الختم بصفوف مكتوبة فعلاً فقط: فشل كامل (انقطاع fomo) أو فراغ كامل
@@ -546,7 +939,7 @@ async def run_social_cycle(
                 db.set_social_state(addr, net, "error", 0, recorded_at)
             except Exception:  # noqa: BLE001 — كما في bars: لا تحجب الختمَ أدناه
                 pass
-            db.note_error("last_error_social", f"{recorded_at}: {type(exc).__name__}: {exc}")
+            db.note_error("last_error_social", f"{recorded_at}: {_exc_note(exc)}")
         if i + 1 < len(due):
             await sleep(config.SOCIAL_PACING_SECONDS)
     return stats
@@ -632,7 +1025,7 @@ async def run_holders_cycle(
                 stats["holders_errors"] += 1
                 db.note_error(
                     "last_error_holders",
-                    f"{recorded_at}: {source}: {type(exc).__name__}: {exc}",
+                    f"{recorded_at}: {source}: {_exc_note(exc)}",
                 )
             # التدفّق من **نفس** الردّ: مستخرِج ثانٍ على مغلّف بين أيدينا، بلا
             # نداء إضافي. `try` مستقلّ حتى لا يُسقط أحد الجدولين الآخر، و**خارج**
@@ -650,7 +1043,7 @@ async def run_holders_cycle(
                     stats["holders_errors"] += 1
                     db.note_error(
                         "last_error_holders",
-                        f"{recorded_at}: flow: {type(exc).__name__}: {exc}",
+                        f"{recorded_at}: flow: {_exc_note(exc)}",
                     )
             # فاصل **بين** النداءات لا بعد آخرها.
             if i + 1 < len(due) or j + 1 < len(_HOLDERS_SOURCES):
@@ -660,6 +1053,39 @@ async def run_holders_cycle(
             stats["holders_tokens"] += 1
         db.set_holders_state(addr, net, "ok" if got else "error", top10, recorded_at)
     return stats
+
+
+def _write_filter_static(
+    db: RecorderDB, item: Any, addr: str, net: str, recorded_at: str
+) -> bool:
+    """يسدّ ثقب العمر من عنصر filterTokens. يعيد True إن كتب شيئاً.
+
+    كان تاريخ الإنشاء يأتي من القوائم العامّة وحدها، والقائمة العامّة شرطها
+    **الشعبيّة لا العمر**: 406 عملةً ظهرت في trending/verified/most_held فلها
+    صفّ ثوابت، و177 لم تظهر ولا مرّة فلا صفَّ لها إطلاقاً — فصلٌ تامّ 100%
+    مقيس. أي أنّ «العمر المجهول» لم يكن فئة عملاتٍ حديثةٍ بل فئة عملاتٍ غير
+    رائجة (39.8% منها كانت < يومين لحظة أوّل استرجاع، مقابل 42.4% في
+    معروفات العمر — بلا فرق).
+
+    والحلّ لا يكلّف نداءً واحداً: filterTokens يُسأل عن **مراقَباتنا بالذات**
+    كلَّ دورة، وشكل عنصره **مطابقٌ** لشكل عنصر trending (المفاتيح العليا
+    والمفاتيح داخل `token` متطابقة) فيحمل `token.createdAt` — تغطية مقيسة
+    215 من 216 مراقَبة نشطة، وصفر لم يُعَد. كان العنصر بين أيدينا في هذه
+    الحلقة نفسها ونحن نطرحه.
+    """
+    net = str(net or "")
+    if not db.static_exists(addr, net):
+        st = extract.extract_token_static(item, recorded_at)
+        if st is None:
+            return False
+        db.upsert_static(st)
+        return True
+    # الصفّ قائم والعمر مفقود (المنبع أغفله): أوّل إجابةٍ تحمله تسدّه.
+    tok = item.get("token") if isinstance(item.get("token"), Mapping) else {}
+    created = tok.get("createdAt") or item.get("createdAt")
+    if created in (None, ""):
+        return False
+    return db.set_static_created_at(addr, net, str(created))
 
 
 async def run_filter_tokens_cycle(
@@ -687,7 +1113,8 @@ async def run_filter_tokens_cycle(
       (FR-007)، ودمج المصادر في `features.market_features` هو ما يمنع هذا
       النقص من طمس قياس أغنى جاء من trending.
     """
-    stats = {"filter_requested": 0, "filter_ticks": 0, "filter_errors": 0}
+    stats = {"filter_requested": 0, "filter_ticks": 0, "filter_errors": 0,
+             "filter_static": 0}
     missing = sorted(watched - captured)
     if not missing:
         return stats
@@ -722,11 +1149,16 @@ async def run_filter_tokens_cycle(
                     if proto:
                         db.set_static_protocol(tick["token_address"],
                                                str(tick["network_id"] or ""), proto)
+                    if _write_filter_static(
+                        db, item, tick["token_address"],
+                        str(tick["network_id"] or ""), recorded_at,
+                    ):
+                        stats["filter_static"] += 1
         except Exception as exc:  # noqa: BLE001 — دفعة واحدة لا تُسقط الباقي
             stats["filter_errors"] += 1
             db.note_error(
                 "last_error_filter",
-                f"{recorded_at}: {type(exc).__name__}: {exc}",
+                f"{recorded_at}: {_exc_note(exc)}",
             )
         # فاصل **بين** الدفعات لا بعد آخرها. وفي الحالة الغالبة (≈53 عنواناً ⇒
         # دفعة واحدة) كان هذا النوم كلّه ضائعاً بلا نداء بعده.
@@ -748,7 +1180,10 @@ async def run_traders_cycle(
     ثم الأكثر أحداثاً. `INSERT OR REPLACE` عمداً (بخلاف كل الجداول الأخرى):
     الملفّ **يتغيّر** — المتابعون ومدّة الحمل ليست ثوابت.
     """
-    stats = {"traders_fetched": 0, "traders_rows": 0, "traders_errors": 0}
+    stats = {
+        "traders_fetched": 0, "traders_rows": 0, "traders_errors": 0,
+        "traders_missing": 0, "traders_malformed": 0,
+    }
     now_dt = datetime.fromisoformat(recorded_at)
     stale_before = (
         now_dt - timedelta(seconds=config.TRADERS_REFRESH_SECONDS)
@@ -763,33 +1198,68 @@ async def run_traders_cycle(
         min_events=config.TRADERS_MIN_EVENTS,
     )
 
-    for i, w in enumerate(due):
-        tid = w["trader_id"]
-        status = "error"
-        try:
-            raw = await _fetch_trader_raw(client, tid)
-            stats["traders_fetched"] += 1
-            if raw is None:
-                status = "empty"  # 404: حساب محذوف — لا نعيد المحاولة سريعاً
-            else:
-                row = extract.extract_trader(raw, tid, recorded_at)
-                if row is None:
-                    status = "empty"
-                else:
-                    db.upsert_trader(row)
-                    stats["traders_rows"] += 1
-                    status = "ok"
-        except Exception as exc:  # noqa: BLE001 — متداول واحد لا يُسقط الباقي
-            stats["traders_errors"] += 1
-            db.note_error(
-                "last_error_traders",
-                f"{recorded_at}: {type(exc).__name__}: {exc}",
+    def _seal() -> dict[str, int]:
+        """ختمُ آخرِ الدورة: حرسُ الحصار ثمّ ختمُ النجاح. مخرجان يشتركان فيه.
+
+        سُئل عددٌ ولم ينزل صفٌّ: مقبولٌ مرّةً، عطلٌ إن تكرّر — `_note_shutout`.
+        ولا يُحاسب هذا على الأخطاء: الخطأُ يكتب سطرَه بنفسه، والحصارُ صامتٌ بطبعه.
+
+        وختمُ النجاح شرطُه **نزولُ صفٍّ** (أو ألّا يُسأل أحد)، بخلاف قاعدة
+        `chain_last_ok_at` «صفرُ أخطاءٍ ⇒ ختم». لأنّ الحصار هو بالضبط صفرُ أخطاءٍ
+        مع صفرِ صفوف: ختمٌ هنا كان سيُعلن خطأَ الحصار «متعافياً» بعد دقيقة، فيموت
+        الحرسُ بنفس الصحّةِ الكاذبة التي أوجدته. و«لم يُسأل أحد» نجاحٌ حقيقيّ لا
+        خمود — لا شيء استحقّ الجلب فلا شيء فشل — وبلا ختمٍ له يبقى طابورٌ هادئ
+        أحمرَ إلى الأبد على خطأٍ قد شُفي.
+        """
+        if not stats["traders_errors"]:
+            streak = _note_shutout(
+                db, "traders", recorded_at,
+                stats["traders_fetched"], stats["traders_rows"],
             )
-        db.set_trader_state(tid, status, recorded_at)
-        # فاصل **بين** النداءات لا بعد آخرها.
-        if i + 1 < len(due):
+            if streak == 0:
+                db.set_meta("traders_last_ok_at", recorded_at)
+        return stats
+
+    # معرّفٌ فاسدُ الشكل يُسقط الرزمةَ كلَّها (400 على العنصر الفاسد وحده)، فلا
+    # يجوز أن يكلّف معرّفٌ واحدٌ رديء التسعةَ والتسعين الباقين. و`unsupported`
+    # لا `error` لأنّه لن يصلح بإعادة المحاولة: استعلامُ الاستحقاق يستبعده نهائيّاً.
+    wanted, malformed = [], []
+    for w in due:
+        (wanted if _UUID_RE.match(str(w["trader_id"] or "")) else malformed).append(
+            str(w["trader_id"])
+        )
+    for tid in malformed:
+        db.set_trader_state(tid, "unsupported", recorded_at)
+        stats["traders_malformed"] += 1
+    if not wanted:
+        return _seal()
+
+    cap = max(1, config.TRADERS_BATCH_MAX)
+    for start in range(0, len(wanted), cap):
+        chunk = wanted[start : start + cap]
+        try:
+            raw = await _fetch_traders_raw(client, chunk)
+            stats["traders_fetched"] += len(chunk)
+            rows = extract.extract_traders(raw, recorded_at) if raw is not None else {}
+            for tid in chunk:
+                row = rows.get(tid)
+                if row is None:
+                    # غائبٌ عن الردّ = لا مستخدمَ بهذا المعرّف. المصدرُ يحذف
+                    # المجهولَ بصمتٍ ولا يخطئ به، فهذا جوابٌ لا فشل.
+                    db.set_trader_state(tid, "empty", recorded_at)
+                    stats["traders_missing"] += 1
+                    continue
+                db.upsert_trader(row)
+                stats["traders_rows"] += 1
+                db.set_trader_state(tid, "ok", recorded_at)
+        except Exception as exc:  # noqa: BLE001 — رزمةٌ واحدة لا تُسقط الدورة
+            stats["traders_errors"] += 1
+            db.note_error("last_error_traders", f"{recorded_at}: {_exc_note(exc)}")
+            # ولا حالةَ تُكتب لمن سقطت رزمتُه: الحالةُ تعني «سألنا وهذا الجواب»،
+            # وكتابة `error` هنا تدفعه إلى مهلة الانتظار الطويلة على ذنبِ الشبكة.
+        if start + cap < len(wanted):
             await sleep(config.TRADERS_PACING_SECONDS)
-    return stats
+    return _seal()
 
 
 async def run_cycle(
@@ -807,9 +1277,27 @@ async def run_cycle(
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
         "holders_tokens": 0, "holders_details": 0, "holders_top": 0,
         "flow_rows": 0, "filter_requested": 0, "filter_ticks": 0,
+        "filter_static": 0,
         "traders_rows": 0,
+        "evm_admission_backlog": 0, "evm_admission_percent": 100,
+        "evm_admission_paused": 0, "evm_admission_deferred": 0,
+        "age_rejected": 0, "age_unknown": 0, "age_resolved": 0,
+        "age_lookup_failed": 0,
         "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
+
+    try:
+        admission_policy = evm_admission_policy(db)
+        stats["evm_admission_backlog"] = admission_policy.backlog
+        stats["evm_admission_percent"] = admission_policy.percent
+        stats["evm_admission_paused"] = 1 if admission_policy.paused else 0
+    except Exception as exc:  # noqa: BLE001 - admission must fail closed for EVM
+        _fail_policy_networks = frozenset(str(n) for n in config.EVM_NETWORKS)
+        admission_policy = _fail_closed_evm_admission(_fail_policy_networks)
+        stats["evm_admission_backlog"] = -1
+        stats["evm_admission_percent"] = 0
+        stats["evm_admission_paused"] = 1
+        db.note_error("last_error_evm_admission", f"{recorded_at}: {_exc_note(exc)}")
 
     def _fail(where: str, exc: Exception) -> None:
         stats["errors"] += 1
@@ -822,7 +1310,7 @@ async def run_cycle(
             db.bump_counter("errors_total")
         except Exception:  # noqa: BLE001 — عدّادٌ لا قياس
             pass
-        note = f"{recorded_at}: {type(exc).__name__}: {exc}"
+        note = f"{recorded_at}: {_exc_note(exc)}"
         if not db.note_error(f"last_error_{where}", note):
             # لا نصمت تماماً: السجلّ آخرُ ما يبقى حين تُقفل القاعدة، و`_log`
             # نفسها محميّة فلا تُسقط الدورة.
@@ -835,46 +1323,14 @@ async def run_cycle(
         _fail("leaderboard", exc)
 
     # 1) الـ feed الخام → signal_events + watchlist للمُشغّلات.
+    admitted_signals: set[str] = set()
     try:
         raw_feed = await _fetch_feed_raw(client)
         if raw_feed is not None:
-            with db.batch():  # تثبيت واحد للقطة + كل إشارات الدورة
-                db.insert_snapshot("feed", raw_feed, recorded_at)
-                events = extract.unwrap_feed(raw_feed)
-                # ختم أحدث حدث في الـ feed. بدونه لا يمكن تمييز "السوق هادئ"
-                # عن "feed المصدر متجمّد" — وقد شوهد متجمّداً 3 ساعات بينما
-                # المسجّل يعمل بلا خطأ. الفرق حاسم لأي تحليل زمنيّ لاحق.
-                newest = max(
-                    (str(e.get("createdAt")) for e in events if e.get("createdAt")),
-                    default=None,
-                )
-                if newest:
-                    db.set_meta("last_feed_event_at", newest)
-                for ev in events:
-                    row = extract.extract_signal_event(
-                        ev, recorded_at, lb.lookup, lb.lookups
-                    )
-                    if row is None:
-                        continue
-                    if db.insert_signal(row):
-                        stats["signals"] += 1
-                    # المُشغّلات فقط تُدخل المراقبة؛ sell سياق لا يُشغّل.
-                    # السقف يخصّ المُشار إليها وحدها — الضابطة لا تزاحمها عليه.
-                    if (
-                        row["signal_type"] in config.TRIGGER_SIGNAL_TYPES
-                        and db.active_watch_count(is_control=0) < config.WATCHLIST_CAP
-                    ):
-                        added = db.upsert_watch(
-                            token_address=row["token_address"],
-                            network_id=row["network_id"] or "",
-                            source=row["signal_type"],
-                            entry_signal_id=row["id"],
-                            watch_hours=config.WATCH_HOURS,
-                            now_iso=recorded_at,
-                            admission_price_usd=row.get("price_usd"),
-                        )
-                        if added:
-                            stats["watch_added"] += 1
+            admitted_signals = await record_feed(
+                db, raw_feed, recorded_at, lb.lookup, lb.lookups,
+                admission_policy, stats, client,
+            )
     except Exception as exc:  # noqa: BLE001
         _fail("feed", exc)
 
@@ -931,6 +1387,7 @@ async def run_cycle(
         filt = await run_filter_tokens_cycle(client, db, recorded_at, watched, captured)
         stats["filter_requested"] = filt["filter_requested"]
         stats["filter_ticks"] = filt["filter_ticks"]
+        stats["filter_static"] = filt["filter_static"]
         if filt["filter_errors"]:
             stats["errors"] += filt["filter_errors"]
     except Exception as exc:  # noqa: BLE001
@@ -939,7 +1396,8 @@ async def run_cycle(
     # 2.2) نوافذ إشارة من الكون نفسه وسعر السوق نفسه المستخدم للضابطة.
     try:
         stats["comparison_signal_added"] = admit_signal_comparison_windows(
-            db, control_candidates, recorded_at
+            db, control_candidates, recorded_at, policy=admission_policy,
+            admitted_signals=admitted_signals,
         )
     except Exception as exc:  # noqa: BLE001
         _fail("comparison_signal", exc)
@@ -949,7 +1407,7 @@ async def run_cycle(
     if stats["comparison_signal_added"]:
         try:
             stats["control_added"] = admit_control_sample(
-                db, control_candidates, recorded_at
+                db, control_candidates, recorded_at, policy=admission_policy,
             )
         except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
             _fail("control", exc)
@@ -1021,6 +1479,13 @@ async def run_cycle(
         _fail("cleanup", exc)
 
     db.set_meta("last_cycle_at", recorded_at)
+    db.set_meta("evm_admission_last_state", json.dumps({
+        "at": recorded_at,
+        "backlog": stats["evm_admission_backlog"],
+        "percent": stats["evm_admission_percent"],
+        "paused": bool(stats["evm_admission_paused"]),
+        "deferred": stats["evm_admission_deferred"],
+    }, sort_keys=True))
     db.set_meta("last_cycle_stats", str(stats))
     # دورة نجحت كلياً (بلا أي خطأ مصدر) → ختم يُبطل أخطاء meta الأقدم منه في اللوحة.
     if stats["errors"] == 0:
@@ -1063,6 +1528,77 @@ async def _maybe_rotate_client(
     return new_client, disk_token
 
 
+# مفاتيحُ الثمرة: صفوفٌ كُتبت فعلاً. و`filter_requested` ليست منها — هي عدُّ
+# محاولاتٍ يرتفع 108→190 وقتَ الحجب بالضبط (مقيس 2026-08-19T14:55)، فلو حُسبت
+# ثمرةً لأعمَت القاطعَ عن الحجب الذي وُضع له.
+_PRODUCTIVE_KEYS = (
+    "signals", "ticks", "filter_ticks", "bars_rows", "social_items",
+    "holders_details", "holders_top", "flow_rows", "traders_rows", "macro_rows",
+)
+
+
+def _cycle_is_dead(stats: dict[str, int]) -> bool:
+    """دورةٌ أخطأت ولم تكتب صفّاً واحداً — لا «دورةٌ ضعيفة» ولا «دورةٌ بأخطاء».
+
+    الشرطان معاً مقصودان: أخطاءٌ بلا ثمرة تعني أنّ المصدرَ لم يُعطِ شيئاً، أمّا
+    ثمرةٌ مع أخطاء فهي حالةُ 274 دورةٍ من 375 السويّة ولا يجوز أن تُبطئ الجمع.
+    """
+    return stats.get("errors", 0) > 0 and not any(
+        stats.get(key, 0) for key in _PRODUCTIVE_KEYS
+    )
+
+
+def _breaker_wait(dead_streak: int) -> float:
+    """انتظارُ ما بين مِجَسّين: يتضاعف من دورةٍ واحدة إلى السقف.
+
+    مسقوفٌ مرّتين — بالثواني وبالأُسِّ نفسه: `2.0 ** 1024` يرفع OverflowError،
+    وحجبٌ يطول أسبوعاً يبلغ ذلك الأُسّ، فينهار الدرعُ كلَّ دورةٍ إلى الأبد.
+    ومقياسُ الأساس `CYCLE_SECONDS`، فاختبارٌ يصفّره يُلغي الانتظار من نفسه.
+    """
+    return min(
+        float(config.UPSTREAM_BREAKER_MAX_SECONDS),
+        config.CYCLE_SECONDS
+        * 2.0 ** min(dead_streak - config.UPSTREAM_BREAKER_AFTER, 16),
+    )
+
+
+async def _upstream_alive(client: Any, reason: list[str] | None = None) -> bool:
+    """مِجَسٌّ واحد: هل يردّ المصدر أصلاً؟ لا يرفع، ولا يكتب، ولا يُحصى.
+
+    `limit=1` لأنّ المطلوب حالةُ الطريق لا حمولتُه — أمّا `feedTypes` فشرطٌ
+    لازم: قِيس 2026-08-20T00:24Z بحسابٍ سليم أنّ `/feed?limit=1` وحده يردّ
+    **400** «Invalid input: query.feedTypes - Required»، و`_get` يترجم كلَّ
+    ≥400 إلى «غير متاح». فكان المِجَسُّ يقرأ الطريقَ ميتاً وهو حيّ، أي أنّ
+    القاطعَ يُغلق ولا يُفتح أبداً ولو رُفع الحجبُ عن الحساب — وشهد السجلُّ:
+    أحدَ عشرَ إغلاقاً ولا استئنافَ واحداً إلّا بإعادة تشغيل.
+
+    ولذلك حُكمان لا واحد: النداءُ يحمل شرطَه، ثمّ **جوابُ التطبيق بذاته حياة**
+    — فرمزٌ في 4xx غيرُ 403 و401 يعني أنّ الطلبَ وصل وفُحص، وذلك كلُّ ما
+    يسأل عنه القاطع. فلو أضاف المصدرُ شرطاً آخر غداً لم يَقتُل الدرعُ الجمعَ
+    مرّةً ثانية. و403 وحده حجبُ هويّة، و401 توكنٌ باطل، وكلاهما لا يُصلحه
+    تشغيلُ الدورة.
+
+    و`reason` مَخرَجٌ اختياريّ لا قيمةُ رجوع: «محجوب» و«منقطع» يتساويان في قرار
+    الانتظار ويختلفان كلَّ الاختلاف في العلاج — 403 على الهويّة يُحَلّ بحساب،
+    والانقطاع يُحَلّ بالصبر. فمن ردَّ الاستثناءَ نصّاً هنا كتبته الحلقةُ في
+    `meta` فقرأته اللوحة، ومن جعله قيمةَ رجوعٍ كسر `is False` في الاختبار.
+    """
+    from fomo_api.config import settings
+
+    params = {"feedTypes": list(config.FEED_TYPES), "limit": 1}
+    try:
+        await client._get(settings.upstream_feed_path, params)
+        return True
+    except Exception as exc:  # noqa: BLE001 — الفشلُ **هو** الجواب المطلوب
+        details = getattr(exc, "details", None)
+        status = details.get("upstream_status") if isinstance(details, dict) else None
+        if isinstance(status, int) and 400 <= status < 500 and status not in (401, 403):
+            return True                    # جوابُ التطبيق حياةٌ لا موت
+        if reason is not None:
+            reason.append(_exc_note(exc))
+        return False
+
+
 async def main_loop(cycles: int | None = None) -> None:
     """يشغّل الحلقة إلى ما لا نهاية (cycles=None) أو عدداً محدّداً (للتحقّق)."""
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
@@ -1080,6 +1616,7 @@ async def main_loop(cycles: int | None = None) -> None:
     db.set_meta("raw_encoding", "zlib")
     db.set_meta("started_at", utcnow_iso())
     n = 0
+    dead_streak = 0
     try:
         while cycles is None or n < cycles:
             started = time.monotonic()
@@ -1090,7 +1627,37 @@ async def main_loop(cycles: int | None = None) -> None:
                 client, current_token = await _maybe_rotate_client(
                     client, current_token, lb, db
                 )
+                # قاطعُ الحجب — **بعد** التدوير: التوكن يبقى طازجاً وإن لم
+                # نَدُر دورةً واحدة، فحجبٌ طويل لا يورّث 401 عند انتهائه.
+                # مِجَسٌّ واحد بدل دورةٍ كاملة، وانتظارٌ يتضاعف؛ وأوّلُ نجاحٍ
+                # يُعيد كلَّ شيء في الحال فيبقى انقطاعُ الدقيقة دقيقةً واحدة.
+                if dead_streak >= config.UPSTREAM_BREAKER_AFTER:
+                    why: list[str] = []
+                    if await _upstream_alive(client, why):
+                        _log(f"upstream back after {dead_streak} dead cycles")
+                        dead_streak = 0
+                    else:
+                        wait = _breaker_wait(dead_streak)
+                        # سببُ الرفض في السطر نفسه: هذا السطرُ هو ما يُقرأ طولَ
+                        # الحجب، وحجبُ 403 لا يُشبه انقطاعاً في شيءٍ إلا الانتظار.
+                        cause = why[0] if why else "لا جواب"
+                        _log(
+                            f"upstream blocked ({dead_streak} dead cycles) — "
+                            f"{cause} — skipping cycle, next probe in {wait:.0f}s"
+                        )
+                        db.note_error(
+                            "last_error_upstream_blocked",
+                            f"{utcnow_iso()}: مِجَسّ /feed رفض — {cause} — "
+                            f"{dead_streak} دورة ميتة، انتظار {wait:.0f}ث",
+                        )
+                        dead_streak += 1
+                        n += 1
+                        await asyncio.sleep(wait)
+                        continue
                 stats = await run_cycle(client, db, lb, now_mono=started)
+                # الجفافُ يُعَدّ هنا لا في الدرع: دورةٌ انهارت كلّياً يعالجها
+                # الدرع، وهذه دورةٌ **نجحت** في الجريان وفشلت في الجمع.
+                dead_streak = dead_streak + 1 if _cycle_is_dead(stats) else 0
                 _log(f"cycle {n}: {stats}")
             except Exception:  # noqa: BLE001 — درع أخير حول الدورة كلها
                 _log("cycle crashed:\n" + traceback.format_exc())

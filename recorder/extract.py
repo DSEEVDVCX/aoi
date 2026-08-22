@@ -1159,16 +1159,63 @@ def extract_token_flow(
 # **لا ربح ولا نسبة نجاح في هذا الردّ** — الملفّ لا يحملهما (لهما endpoint
 # منفصل)، فلا عمود لهما: العمود الميّت يكلّف ولا يُفيد.
 # ---------------------------------------------------------------------------
+def extract_traders(raw_envelope: Any, recorded_at: str) -> dict[str, dict[str, Any]]:
+    """`/v2/users?userIds=…` خام → {معرّف: صفّ `traders`}.
+
+    الرزمةُ حلّت محلّ النداء الفرديّ لأنّ `/v2/users/{id}` صار يردّ 404 لكلّ
+    معرّف (قِيس 2026-08-20). ومن غاب عن `users` فلا صفَّ له: المصدرُ يحذف
+    المجهولَ بصمتٍ ولا يخطئ به، فالغيابُ جوابٌ لا خطأ.
+
+    و`raw_json` لكلّ صفٍّ هو **كائنُ المستخدم وحده** لا المغلّفُ كلُّه: مئةُ
+    صفٍّ كلٌّ منها يحمل ردَّ المئة كاملاً = مئةُ ضِعفٍ من الحجم في جدولٍ
+    `INSERT OR REPLACE` يُكتب فوقه كلَّ دورة.
+
+    وترتيبُ المفاتيح: ما يردّه المصدرُ في `id` هو المفتاح، لا ما طلبناه به —
+    والمقارنةُ في `run_traders_cycle` هي التي تصل الاثنين.
+    """
+    if not isinstance(raw_envelope, Mapping):
+        return {}
+    ro = raw_envelope.get("responseObject")
+    if not isinstance(ro, Mapping):
+        return {}
+    users = ro.get("users")
+    if not isinstance(users, Sequence) or isinstance(users, (str, bytes)):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for user in users:
+        if not isinstance(user, Mapping):
+            continue
+        tid = _str(user.get("id"))
+        if not tid:
+            continue
+        out[tid] = _trader_row(user, tid, recorded_at)
+    return out
+
+
 def extract_trader(
     raw_envelope: Any, trader_id: str, recorded_at: str
 ) -> dict[str, Any] | None:
-    """`/v2/users/{id}` خام → صفّ `traders`. بلا مغلّف صالح → None."""
+    """`/v2/users/{id}` خام → صفّ `traders`. بلا مغلّف صالح → None.
+
+    والمسارُ الفرديُّ ميتٌ عند المصدر (404 لكلّ معرّف منذ 2026-08-19T14:53Z)،
+    فهذه باقيةٌ للأرشيف الخام المحفوظ وللاختبارات لا للجمع الجاري.
+    """
     if not isinstance(raw_envelope, Mapping):
         return None
     ro = raw_envelope.get("responseObject")
     if not isinstance(ro, Mapping):
         return None
+    return _trader_row(ro, trader_id, recorded_at, envelope=raw_envelope)
 
+
+def _trader_row(
+    ro: Mapping[str, Any],
+    trader_id: str,
+    recorded_at: str,
+    envelope: Any = None,
+) -> dict[str, Any]:
+    """كائنُ مستخدمٍ واحد → صفّ `traders`. واحدةٌ للمسارين: الرزمةِ والفرديّ،
+    فلا ينحرف تعيينُ حقلٍ في أحدهما دون الآخر."""
     # المعرّف من الردّ أوثق من المطلوب، لكنّ غيابه لا يُسقط الصفّ: المفتاح
     # الأساسي هو ما طلبناه به، وهو ما يربط بـ signal_events.buyer_id.
     return {
@@ -1188,7 +1235,7 @@ def extract_trader(
         "evm_address": _str(ro.get("evmAddress")),
         "twitter_url": _str(ro.get("twitter")),
         "created_at": _str(ro.get("createdAt")),
-        "raw_json": _dumps(raw_envelope),
+        "raw_json": _dumps(envelope if envelope is not None else ro),
     }
 
 

@@ -5,21 +5,14 @@
 المسجّل — انظر مقدّمة `chain_layer.py`: الميزانية ممتلئة، والانفصال هو ما يجعل
 إيقاع 5 دقائق ممكناً.
 
-**وطبقة EVM في نفس العملية** (`evm_layer` + `evm_contract`): كلفتها ~8 نداءات في
-الدقيقة (نداء `eth_getLogs` واحد يغطّي كل عملات الشبكة) من دقيقة نصفها فارغ
-أصلاً، فمهمّة مجدولة خامسة لأجلها عمليّةٌ كاملة مقابل ثانيتين — ومهمّة أخرى
-تعني مصدر فشل صامت آخر. لكنّ الطبقتين **مستقلّتان في الأخطاء تماماً**: EVM بلا
-مفتاح، فلو ربطناها بنفس `try` لأوقفها غيابُ مفتاح Helius وهي لا تحتاجه. ولذلك
-EVM أوّلاً وفي حرسها الخاصّ: انتظارُ فرعِ «المفتاح غائب» يجب أن يقع **بعد**
-أن تأخذ EVM دورتها.
-
-كاتبٌ رابع على القاعدة، وهو آمن لنفس أسباب `run_build_rows.py`: WAL نشط،
+كاتبٌ ثالث على القاعدة، وهو آمن لنفس أسباب `run_build_rows.py`: WAL نشط،
 و`RecorderDB` يضبط `timeout=30`، والإدراج `INSERT OR IGNORE` بمفتاح يحمل الوقت
 فالتكرار لا يضرّ.
 
 **المفتاح لا يُطبع ولا يُسجَّل** (FR-013): يُقرأ من `recorder/chain_keys.json`
 عند كل نداء، وكل رسالة خطأ تمرّ عبر شطب داخل `solana_rpc`. و`--check-config`
-يقول «موجود/غائب» ولا يقول قيمته. طبقة EVM بلا سرّ إطلاقاً ⇒ لا شيء يُشطب فيها.
+يقول «موجود/غائب» ولا يقول قيمته. EVM يملكه `run_evm_replay.py` وحده كي لا
+يتنافس كاتبان على SQLite.
 
 الاستخدام:
   python run_chain.py                # حلقة لا نهائية (المهمّة المجدولة)
@@ -51,14 +44,6 @@ def _log(msg: str) -> None:
     import config
 
     _write_log(config.CHAIN_LOG_PATH, msg)
-
-
-def _log_evm(msg: str) -> None:
-    """سجلّ منفصل لطبقة EVM: طبقتان في عمليّة واحدة وسجلٌّ مشترك يعني أنّ ضجيج
-    إحداهما يدفع أثر الأخرى خارج التدوير."""
-    import config
-
-    _write_log(config.EVM_LOG_PATH, msg)
 
 
 def _write_log(path: str, msg: str) -> None:
@@ -114,48 +99,7 @@ def _ok_stamps(stats: dict, at: str) -> dict[str, str]:
         out["chain_last_ok_at"] = at
     if "auth_errors" in stats and _clean("auth_errors"):
         out["chain_auth_last_ok_at"] = at
-    if "evm_errors" in stats and _clean("evm_errors", "evm_backfill_errors"):
-        out["evm_last_ok_at"] = at
-    if "evm_contract_errors" in stats and _clean("evm_contract_errors"):
-        out["evm_contract_last_ok_at"] = at
-    if "bsc_errors" in stats and _clean("bsc_errors"):
-        out["bsc_nodereal_last_ok_at"] = at
     return out
-
-
-async def _evm_tick(evm_rpc_client, nodereal, db, utcnow_iso) -> None:
-    """دورة EVM كاملة في حرسها الخاصّ. لا تُسقط طبقة سولانا ولا تُسقَط بها."""
-    import time
-
-    from evm_contract import run_evm_contract_cycle
-    from evm_layer import run_evm_cycle
-    from bsc_layer import run_bsc_cycle
-
-    started = time.time()
-    try:
-        stats = await run_evm_cycle(evm_rpc_client, db, utcnow_iso())
-        stats.update(await run_bsc_cycle(nodereal, db, utcnow_iso()))
-        # فحص العقد في نفس الدورة: أربع عملات ساعيّاً على Base وحدها ⇒ نداءان
-        # لكل عملة في دقيقة تحمل ثمانية أصلاً.
-        stats.update(await run_evm_contract_cycle(evm_rpc_client, db, utcnow_iso()))
-        stats["seconds"] = round(time.time() - started, 1)
-        now = utcnow_iso()
-        _stamp(db, {
-            "evm_last_run_at": now, "evm_last_stats": str(stats),
-            **_ok_stamps(stats, now),
-        })
-        # نسجّل حين يجري عمل فقط — سطر كل دقيقة إلى الأبد ضجيج.
-        if stats["evm_calls"] or stats["evm_snapshots"] or stats["evm_backfill_due"] \
-                or stats["evm_contract_due"] or stats["evm_errors"] \
-                or stats["bsc_due"] or stats["bsc_rows"] or stats["bsc_errors"] \
-                or stats["bsc_rate_limits"]:
-            _log_evm(f"evm: {stats}")
-    except Exception:  # noqa: BLE001 — درع الطبقة؛ الحلقة لا تموت
-        import traceback
-
-        _log_evm("evm cycle crashed:\n" + traceback.format_exc())
-        # `note_error` لا `set_meta`: القاعدة قد تكون هي سببَ التعثّر نفسه.
-        db.note_error("last_error_evm", f"{utcnow_iso()}: دورة EVM تعثّرت (انظر evm.log)")
 
 
 async def main_loop(cycles: int | None = None) -> None:
@@ -166,25 +110,15 @@ async def main_loop(cycles: int | None = None) -> None:
     import config
     from chain_layer import run_chain_auth_cycle, run_chain_cycle
     from db import RecorderDB, utcnow_iso
-    import evm_rpc
-    from nodereal_rpc import NodeRealRPC
     from provider_keys import write_pool_report
     from solana_rpc import ChainKeyMissing, SolanaRPC
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     rpc = SolanaRPC()
-    evm = evm_rpc.EVMRPC()
-    # عميل NodeReal يعيش عمر الحلقة كبقيّة العملاء: كان يُبنى ويُغلق كل دقيقة،
-    # فيدفع مصافحة TLS جديدة لكل دورة — والأهمّ أنّ عدّاد تدوير مفاتيحه كان
-    # يُصفَّر معها، فلا يظهر في التقرير إلّا تدويرُ الدقيقة الأخيرة.
-    nodereal = NodeRealRPC()
     n = 0
     try:
         while cycles is None or n < cycles:
             started = time.time()
-            # EVM أوّلاً وبلا شرط: بلا مفتاح، فلا يصحّ أن يمنعها فرعُ «مفتاح
-            # سولانا غائب» أدناه (وهو ينام دقيقة كاملة).
-            await _evm_tick(evm, nodereal, db, utcnow_iso)
             try:
                 stats = await run_chain_cycle(rpc, db, utcnow_iso())
                 # الطبقة البطيئة في نفس العملية ونفس الاتّصال: طابورها الساعيّ
@@ -216,7 +150,6 @@ async def main_loop(cycles: int | None = None) -> None:
                 # وطبقةُ EVM ليست في التقرير: عقدٌ رسميّة بلا مفتاح، فلا حوض.
                 write_pool_report(db, "chain", {
                     "helius": rpc.key_stats(),
-                    "nodereal": nodereal.key_stats(),
                 }, utcnow_iso())
             except Exception:  # noqa: BLE001 — تقريرٌ لا قياس
                 pass
@@ -230,8 +163,6 @@ async def main_loop(cycles: int | None = None) -> None:
                 await asyncio.sleep(rest)
     finally:
         await rpc.aclose()
-        await evm.aclose()
-        await nodereal.aclose()
         db.close()
 
 
@@ -249,30 +180,10 @@ def _check_config() -> int:
         "CHAIN_MAX_SLOT_LAG",
         "CHAIN_LOG_PATH", "CHAIN_AUTH_PER_CYCLE", "CHAIN_AUTH_REFRESH_SECONDS",
         "CHAIN_AUTH_ERROR_RETRY_SECONDS",
-        # طبقة EVM في نفس العملية ⇒ نقص أي ثابت منها يُسقط الحلقة، فيُفحَص هنا.
-        "EVM_NETWORKS", "EVM_RPC_URLS", "EVM_ADDRESS_BATCH", "EVM_CONFIRMATIONS",
-        "EVM_HISTORICAL_RPC_URLS", "EVM_LOG_RANGE_HINT",
-        "EVM_LOG_LIMIT", "EVM_BACKFILL_MAX_CALLS", "EVM_BACKFILL_TOKENS_PER_CYCLE",
-         "EVM_BACKFILL_BUDGET_SECONDS", "EVM_BACKFILL_ASSIST_BUDGET_SECONDS",
-        "EVM_BACKFILL_FROM_BLOCK", "EVM_APPLY_MAX_CALLS", "EVM_PACING_SECONDS",
-        "EVM_RATE_LIMIT_BACKOFF_SECONDS", "EVM_HEAD_RETRIES",
-        "EVM_TIMEOUT_SECONDS", "EVM_SNAPSHOT_SECONDS", "EVM_SNAPSHOT_PER_CYCLE",
-        "EVM_LOG_PATH", "EVM_CONTRACT_NETWORKS", "EVM_CONTRACT_PER_CYCLE",
-        "EVM_CONTRACT_REFRESH_SECONDS", "EVM_CONTRACT_ERROR_RETRY_SECONDS",
-        "BSC_NODEREAL_NETWORK", "BSC_NODEREAL_REFRESH_SECONDS",
-        "BSC_NODEREAL_ERROR_RETRY_SECONDS", "BSC_NODEREAL_PER_CYCLE",
-        "BSC_NODEREAL_PACING_SECONDS", "BSC_NODEREAL_CALL_PACING_SECONDS",
-        "EVM_CREATION_BLOCK_NETWORKS",
     ):
         if not hasattr(config, name):
             print(f"config.{name} مفقود", file=sys.stderr)
             return 1
-    # شبكة مفعَّلة بلا عقدة معرّفة تعني خطأً في كل دورة إلى الأبد ⇒ تُكشَف هنا.
-    missing_rpc = [n for n in config.EVM_NETWORKS if not config.EVM_RPC_URLS.get(str(n))]
-    if missing_rpc:
-        print(f"لا عقدة معرّفة لشبكات EVM: {', '.join(map(str, missing_rpc))}",
-              file=sys.stderr)
-        return 1
     if not os.path.exists(config.DB_PATH):
         print(f"قاعدة البيانات غير موجودة: {config.DB_PATH}", file=sys.stderr)
         return 1
@@ -280,10 +191,6 @@ def _check_config() -> int:
     key_path = config.chain_keys_path()
     helius_keys = read_keys("helius_api_keys", "helius_api_key", "HELIUS_API_KEY")
     key_ok = bool(helius_keys)
-    # المزوّدان الآخران يُعدّان أيضاً: «تحقّقٌ قبل الجدولة» يفحص مفتاح Helius
-    # وحده كان يمرّ بنجاح وطبقةُ BSC تفشل كل دقيقة لغياب مفتاح NodeReal.
-    nodereal_keys = read_keys("nodereal_api_keys", "nodereal_api_key", "NODEREAL_API_KEY")
-
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
         row = db._conn.execute(
@@ -292,17 +199,6 @@ def _check_config() -> int:
             tuple(config.CHAIN_NETWORKS),
         ).fetchone()
         active = int(row["n"])
-        evm_active = 0
-        if config.EVM_NETWORKS:
-            row = db._conn.execute(
-                "SELECT COUNT(*) n FROM watchlist WHERE active=1 AND network_id IN "
-                f"({', '.join('?' for _ in config.EVM_NETWORKS)})",
-                tuple(str(n) for n in config.EVM_NETWORKS),
-            ).fetchone()
-            evm_active = int(row["n"])
-        evm_ready = db._conn.execute(
-            "SELECT COUNT(*) n FROM evm_backfill_state WHERE status='done'"
-        ).fetchone()["n"]
     finally:
         db.close()
 
@@ -325,20 +221,6 @@ def _check_config() -> int:
         f" · البطيئة: ×{config.CHAIN_AUTH_PER_CYCLE} -> ~{auth_sweep:.1f}د "
         f"(الهدف {config.CHAIN_AUTH_REFRESH_SECONDS / 60:.0f}د)"
     )
-    evm_sweep = (
-        evm_active / config.EVM_SNAPSHOT_PER_CYCLE
-        * (config.CHAIN_INTERVAL_SECONDS / 60.0)
-        if config.EVM_SNAPSHOT_PER_CYCLE else 0.0
-    )
-    print(
-        f"evm: شبكات {', '.join(str(n) for n in config.EVM_NETWORKS) or '—'} "
-        f"· نشطة عليها: {evm_active} · دفترها مكتمل: {evm_ready} "
-        f"-> لقطة كل ~{evm_sweep:.1f}د (الهدف "
-        f"{config.EVM_SNAPSHOT_SECONDS / 60:.0f}د) · تعبئة ×"
-        f"{config.EVM_BACKFILL_TOKENS_PER_CYCLE} في الدورة "
-        f"· فحص عقد: {', '.join(str(n) for n in config.EVM_CONTRACT_NETWORKS) or '—'} "
-        f"×{config.EVM_CONTRACT_PER_CYCLE} · بلا مفتاح"
-    )
     # **أعداد فقط، بلا أي قيمة** (FR-013). ومفتاحٌ واحد يعني «لا بديل عند الرفض»
     # فيُقال صراحةً: التعدّد موجود في الكود ولا ينفع بحوضٍ من واحد.
     def _count(keys: list[str], *, required: bool) -> str:
@@ -347,9 +229,7 @@ def _check_config() -> int:
         return f"{len(keys)}" + (" — بلا بديل عند الرفض" if len(keys) == 1 else "")
 
     print(
-        f"مفاتيح: helius {_count(helius_keys, required=True)}"
-        f" · nodereal {_count(nodereal_keys, required=bool(config.BSC_NODEREAL_NETWORK))}"
-        f" · الملف: {key_path}"
+        f"مفاتيح: helius {_count(helius_keys, required=True)} · الملف: {key_path}"
     )
     return 0 if key_ok else 1
 

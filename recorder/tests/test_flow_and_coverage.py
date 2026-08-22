@@ -4,6 +4,7 @@
 """
 import json
 import os
+import re
 from datetime import datetime
 
 import config
@@ -196,13 +197,16 @@ async def test_fetch_failure_writes_no_flow_row(db):
 # ---------------------------------------------------------------------------
 # سدّ فجوة القياس (filterTokens)
 # ---------------------------------------------------------------------------
-def _filter_item(addr, *, net="56", price=1.0, protocol=None):
+def _filter_item(addr, *, net="56", price=1.0, protocol=None, created=None):
     item = {
         "token": {"address": addr, "networkId": net, "symbol": "AAA"},
         "priceUSD": price, "liquidity": 5000.0, "volume24": 1000.0,
     }
     if protocol is not None:
         item["pair"] = {"protocol": protocol}
+    if created is not None:
+        item["token"]["createdAt"] = created
+        item["createdAt"] = created
     return item
 
 
@@ -252,7 +256,8 @@ async def test_filter_cycle_no_gap_makes_no_call(db):
     )
 
     assert client.calls == []
-    assert stats == {"filter_requested": 0, "filter_ticks": 0, "filter_errors": 0}
+    assert stats == {"filter_requested": 0, "filter_ticks": 0, "filter_errors": 0,
+                     "filter_static": 0}
 
 
 async def test_filter_cycle_maps_by_address_not_position(db):
@@ -297,6 +302,70 @@ async def test_filter_cycle_fills_dex_protocol(db):
         "SELECT dex_protocol FROM token_static WHERE token_address='tok'"
     ).fetchone()["dex_protocol"]
     assert proto == "PumpAmm"
+
+
+async def test_filter_cycle_fills_missing_static_row(db):
+    """ثقبُ العمر: القائمة العامّة شرطها الشعبيّة لا العمر، فـ177 عملةً لم
+    تظهر فيها ولا مرّة فلا صفَّ ثوابت لها ولا تاريخ إنشاء. وشكلُ عنصر
+    filterTokens مطابقٌ لشكل عنصر trending فيحمل `token.createdAt` —
+    والعنصر بين أيدينا في الحلقة نفسها."""
+    _watch(db, "orphan")
+    client = _FilterClient(items=[_filter_item("orphan", created=1700000000)])
+
+    stats = await recorder.run_filter_tokens_cycle(
+        client, db, NOW, {("orphan", "56")}, set(), sleep=_noop
+    )
+
+    assert stats["filter_static"] == 1
+    row = db._conn.execute(
+        "SELECT token_created_at, symbol FROM token_static WHERE token_address='orphan'"
+    ).fetchone()
+    assert row["token_created_at"] == "1700000000"
+    assert row["symbol"] == "AAA"          # الصفّ كاملٌ لا عموداً واحداً
+
+
+async def test_filter_cycle_fills_empty_age_on_existing_row(db):
+    """الصفّ قائم والعمر مفقود (المنبع أغفله: 3 من 406) — و`upsert_static`
+    هو INSERT OR IGNORE فلا يصلحه، فيلزم مسار تحديث ضيّق."""
+    _watch(db, "tok")
+    db.upsert_static({
+        "token_address": "tok", "network_id": "56", "recorded_at": NOW,
+        "symbol": "OLD", "token_created_at": None, "raw_json": "{}",
+    })
+    client = _FilterClient(items=[_filter_item("tok", created=1700000000)])
+
+    stats = await recorder.run_filter_tokens_cycle(
+        client, db, NOW, {("tok", "56")}, set(), sleep=_noop
+    )
+
+    assert stats["filter_static"] == 1
+    row = db._conn.execute(
+        "SELECT token_created_at, symbol FROM token_static WHERE token_address='tok'"
+    ).fetchone()
+    assert row["token_created_at"] == "1700000000"
+    assert row["symbol"] == "OLD"          # لم يُستبدل الصفّ، مُلئ عمودُه فقط
+
+
+async def test_filter_cycle_never_overwrites_a_recorded_age(db):
+    """قيمة المنبع نفسها **تتبدّل** (53 من 216 تخالف المخزَّن، وواحدة بفرق
+    سنة). فلو تبعنا تبدُّلها لتبدّل حكمُ بوّابة العمر تحت عملةٍ مقبولةٍ
+    أصلاً — نُثبّت أوّل ما رأيناه."""
+    _watch(db, "tok")
+    db.upsert_static({
+        "token_address": "tok", "network_id": "56", "recorded_at": NOW,
+        "token_created_at": "1600000000", "raw_json": "{}",
+    })
+    client = _FilterClient(items=[_filter_item("tok", created=1700000000)])
+
+    stats = await recorder.run_filter_tokens_cycle(
+        client, db, NOW, {("tok", "56")}, set(), sleep=_noop
+    )
+
+    assert stats["filter_static"] == 0
+    age = db._conn.execute(
+        "SELECT token_created_at FROM token_static WHERE token_address='tok'"
+    ).fetchone()["token_created_at"]
+    assert age == "1600000000"
 
 
 async def test_filter_cycle_error_does_not_raise(db):
@@ -348,6 +417,54 @@ def test_trader_extractor_rejects_bad_envelope():
     assert extract.extract_trader(None, "u1", NOW) is None
 
 
+def test_batch_extractor_keys_rows_by_the_id_the_source_returned():
+    """المفتاحُ ما يردّه المصدرُ في `id`، لا ترتيبُ ما طلبناه.
+
+    ولا يجوز أن يفسد المفتاحُ بالترتيب: المصدرُ يحذف المجهولَ من `users`، فردٌّ
+    من ثلاثةٍ لطلبٍ من أربعة يُزيح كلَّ صفٍّ بعد الغائب لو رُبط بالفهرس.
+    """
+    envelope = {"responseObject": {"users": [
+        _trader_envelope("aaa", followers=1)["responseObject"],
+        _trader_envelope("bbb", followers=2)["responseObject"],
+    ]}}
+
+    rows = extract.extract_traders(envelope, NOW)
+
+    assert sorted(rows) == ["aaa", "bbb"]
+    assert rows["bbb"]["followers_count"] == 2
+    assert rows["aaa"]["swap_count"] == 5450
+
+
+def test_batch_extractor_stores_only_the_user_object_as_raw():
+    """`raw_json` كائنُ المستخدم وحده: مئةُ صفٍّ تحمل ردَّ المئة = مئةُ أضعاف."""
+    envelope = {"responseObject": {"users": [
+        _trader_envelope("aaa")["responseObject"],
+        _trader_envelope("bbb")["responseObject"],
+    ]}}
+
+    raw = decode_raw(extract.extract_traders(envelope, NOW)["aaa"]["raw_json"])
+
+    assert raw["id"] == "aaa"
+    assert "users" not in raw and "responseObject" not in raw
+
+
+def test_batch_extractor_rejects_bad_envelopes_without_raising():
+    """ردٌّ مشوَّه = صفرُ صفوف، لا استثناءٌ يُسقط دورةَ التجّار كلَّها."""
+    assert extract.extract_traders(None, NOW) == {}
+    assert extract.extract_traders({"success": True}, NOW) == {}
+    assert extract.extract_traders({"responseObject": {}}, NOW) == {}
+    assert extract.extract_traders({"responseObject": {"users": "nope"}}, NOW) == {}
+    # ومستخدمٌ بلا `id` لا مفتاحَ له فيُطرح، ولا يُطرح جيرانُه معه.
+    rows = extract.extract_traders(
+        {"responseObject": {"users": [
+            {"userHandle": "no-id"},
+            _trader_envelope("aaa")["responseObject"],
+        ]}},
+        NOW,
+    )
+    assert list(rows) == ["aaa"]
+
+
 def _signal(db, sid, buyer, token="tok"):
     db._conn.execute(
         "INSERT INTO signal_events (id, token_address, network_id, ts, "
@@ -358,7 +475,25 @@ def _signal(db, sid, buyer, token="tok"):
     db._conn.commit()
 
 
+def _uuid(tag: str) -> str:
+    """معرّفٌ صحيحُ الشكل من اسمٍ مقروء.
+
+    المصدرُ يشترط uuid: معرّفٌ فاسدُ الشكل يردّ 400 على الرزمة كلِّها، ومعرّفاتُ
+    الإنتاج الـ8,026 كلُّها uuid بلا استثناء (قِيس 2026-08-20). فاختبارٌ بمعرّفاتٍ
+    قصيرة مثل "u1" كان يقيس مساراً لا وجودَ له في الحقيقة.
+    """
+    body = re.sub(r"[^0-9a-f]", "0", tag.lower().ljust(8, "0"))[:8]
+    return f"{body}-0000-5000-8000-000000000000"
+
+
 class _TraderClient:
+    """يحاكي `/v2/users?userIds=…&userIds=…`: رزمةٌ واحدة تردّ `users[]`.
+
+    ومن غاب عن القائمة فلا مستخدمَ بمعرّفه — المصدرُ يحذف المجهولَ بصمتٍ ولا
+    يخطئ به (قِيس: طُلب 6 معرّفات ورجعت 4). `calls` قائمةُ الرزم لا المعرّفات،
+    لأنّ عددَ النداءات هو ما تغيّر: 50 متداولاً في نداءٍ واحد.
+    """
+
     def __init__(self, replies=None, fail=None, missing=None):
         self.calls = []
         self._replies = replies or {}
@@ -366,29 +501,32 @@ class _TraderClient:
         self._missing = missing or set()
 
     async def _get(self, path, params=None):
-        tid = path.rstrip("/").split("/")[-1]
-        self.calls.append(tid)
-        if tid in self._fail:
+        ids = list((params or {}).get("userIds") or [])
+        self.calls.append(ids)
+        if self._fail.intersection(ids):
             raise RuntimeError("upstream boom")
-        if tid in self._missing:
-            return None  # 404
-        return self._replies.get(tid, _trader_envelope(tid))
+        users = [
+            (self._replies.get(tid) or _trader_envelope(tid))["responseObject"]
+            for tid in ids
+            if tid not in self._missing
+        ]
+        return {"responseObject": {"users": users}}
 
 
 async def test_traders_cycle_fetches_only_repeat_buyers(db, monkeypatch):
     """من يظهر مرّة واحدة لا سلوك له نتعلّمه ⇒ لا يُجلب."""
     monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
     for i in range(3):
-        _signal(db, f"s{i}", "repeat")
-    _signal(db, "once", "oneshot")
+        _signal(db, f"s{i}", _uuid("repeat"))
+    _signal(db, "once", _uuid("oneshot"))
     client = _TraderClient()
 
     stats = await recorder.run_traders_cycle(client, db, NOW, sleep=_noop)
 
-    assert client.calls == ["repeat"]
+    assert client.calls == [[_uuid("repeat")]]  # نداءٌ واحد، وبالمتكرّر وحده
     assert stats["traders_rows"] == 1
     row = db._conn.execute("SELECT * FROM traders").fetchone()
-    assert row["trader_id"] == "repeat"
+    assert row["trader_id"] == _uuid("repeat")
     assert row["followers_count"] == 2143
 
 
@@ -396,16 +534,17 @@ async def test_traders_cycle_upserts_changing_profile(db, monkeypatch):
     """الملفّ **يتغيّر** (متابعون، مدّة حمل) ⇒ REPLACE لا IGNORE."""
     monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
     monkeypatch.setattr(config, "TRADERS_REFRESH_SECONDS", 0)
+    tid = _uuid("u1")
     for i in range(3):
-        _signal(db, f"s{i}", "u1")
+        _signal(db, f"s{i}", tid)
 
     await recorder.run_traders_cycle(
-        _TraderClient(replies={"u1": _trader_envelope("u1", followers=100)}),
+        _TraderClient(replies={tid: _trader_envelope(tid, followers=100)}),
         db, NOW, sleep=_noop,
     )
     later = "2026-08-11T12:00:00+00:00"
     await recorder.run_traders_cycle(
-        _TraderClient(replies={"u1": _trader_envelope("u1", followers=999)}),
+        _TraderClient(replies={tid: _trader_envelope(tid, followers=999)}),
         db, later, sleep=_noop,
     )
 
@@ -415,44 +554,104 @@ async def test_traders_cycle_upserts_changing_profile(db, monkeypatch):
     assert rows[0]["recorded_at"] == later
 
 
-async def test_traders_cycle_marks_404_empty_not_error(db, monkeypatch):
+async def test_traders_absent_from_the_batch_is_empty_not_error(db, monkeypatch):
+    """الغيابُ عن `users` جوابٌ لا فشل ⇒ `empty` لا `error`.
+
+    وهذا هو الفرقُ الذي أخفى انقطاعاً 21 ساعة: لمّا مات `/v2/users/{id}` كان
+    404 و«حسابٌ محذوف» مساراً واحداً، فكُتب `empty` لكلّ متداول بلا خطأ واحد.
+    """
     monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    gone = _uuid("gone")
     for i in range(3):
-        _signal(db, f"s{i}", "gone")
-    client = _TraderClient(missing={"gone"})
+        _signal(db, f"s{i}", gone)
+    client = _TraderClient(missing={gone})
 
     stats = await recorder.run_traders_cycle(client, db, NOW, sleep=_noop)
 
     assert stats["traders_errors"] == 0
     assert stats["traders_rows"] == 0
+    assert stats["traders_missing"] == 1
     state = db._conn.execute(
-        "SELECT last_status FROM traders_fetch_state WHERE trader_id='gone'"
+        "SELECT last_status FROM traders_fetch_state WHERE trader_id=?", (gone,)
     ).fetchone()
     assert state["last_status"] == "empty"
 
 
-async def test_traders_cycle_failure_isolated(db, monkeypatch):
+async def test_a_malformed_id_is_dropped_before_it_can_kill_the_batch(db, monkeypatch):
+    """معرّفٌ فاسدُ الشكل يردّ 400 على الرزمة كلِّها، فلا يُرسَل أصلاً.
+
+    و`unsupported` لا `error`: إعادةُ المحاولة لن تُصلح شكلاً فاسداً، واستعلامُ
+    الاستحقاق يستبعد `unsupported` نهائيّاً بينما يعيد المحاولة على `error`.
+    """
     monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    good = _uuid("good")
     for i in range(3):
-        _signal(db, f"a{i}", "bad")
+        _signal(db, f"a{i}", "not-a-uuid")
     for i in range(3):
-        _signal(db, f"b{i}", "good", token="tok2")
-    client = _TraderClient(fail={"bad"})
+        _signal(db, f"b{i}", good, token="tok2")
+    client = _TraderClient()
+
+    stats = await recorder.run_traders_cycle(client, db, NOW, sleep=_noop)
+
+    assert client.calls == [[good]]             # الفاسدُ لم يُرسَل قطّ
+    assert stats["traders_malformed"] == 1
+    assert stats["traders_errors"] == 0
+    assert stats["traders_rows"] == 1
+    assert db._conn.execute(
+        "SELECT last_status FROM traders_fetch_state WHERE trader_id='not-a-uuid'"
+    ).fetchone()["last_status"] == "unsupported"
+
+
+async def test_a_failed_batch_does_not_take_the_next_one_with_it(db, monkeypatch):
+    """الرزمةُ صارت وحدةَ الفشل بدل المتداول، فالعزلُ يُقاس بين رزمتين.
+
+    ولا حالةَ تُكتب لمن سقطت رزمتُه: الحالةُ تعني «سألنا وهذا الجواب»، وكتابةُ
+    `error` تدفعه إلى مهلة ساعةٍ على ذنبِ الشبكة لا على ذنبه.
+    """
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    monkeypatch.setattr(config, "TRADERS_BATCH_MAX", 1)   # رزمةٌ لكلّ متداول
+    bad, good = _uuid("bad"), _uuid("good")
+    for i in range(3):
+        _signal(db, f"a{i}", bad)
+    for i in range(3):
+        _signal(db, f"b{i}", good, token="tok2")
+    client = _TraderClient(fail={bad})
 
     stats = await recorder.run_traders_cycle(client, db, NOW, sleep=_noop)
 
     assert stats["traders_errors"] == 1
-    assert stats["traders_rows"] == 1           # الثاني نجا
+    assert stats["traders_rows"] == 1           # الثانية نجت
     assert db._conn.execute(
         "SELECT trader_id FROM traders"
-    ).fetchone()["trader_id"] == "good"
+    ).fetchone()["trader_id"] == good
+    assert db._conn.execute(
+        "SELECT COUNT(*) n FROM traders_fetch_state WHERE trader_id=?", (bad,)
+    ).fetchone()["n"] == 0
+
+
+async def test_traders_are_chunked_at_the_upstream_batch_cap(db, monkeypatch):
+    """الحدُّ 100 يُصرّح به المصدرُ نفسه، فما فوقه يُقسَّم ولا يُقتطع."""
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    monkeypatch.setattr(config, "TRADERS_BATCH_MAX", 2)
+    for t in range(5):
+        for i in range(3):
+            _signal(db, f"s{t}-{i}", _uuid(f"t{t}"), token=f"tok{t}")
+    client = _TraderClient()
+
+    stats = await recorder.run_traders_cycle(client, db, NOW, sleep=_noop)
+
+    assert [len(c) for c in client.calls] == [2, 2, 1]   # 5 على رزمٍ من 2
+    assert sorted(i for c in client.calls for i in c) == sorted(
+        _uuid(f"t{t}") for t in range(5)
+    )
+    assert stats["traders_rows"] == 5
 
 
 async def test_traders_not_refetched_before_refresh(db, monkeypatch):
     """الملفّ يتغيّر بالأيّام — لا نهدر نداءً كل دقيقة."""
     monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
     for i in range(3):
-        _signal(db, f"s{i}", "u1")
+        _signal(db, f"s{i}", _uuid("u1"))
 
     await recorder.run_traders_cycle(_TraderClient(), db, NOW, sleep=_noop)
     client2 = _TraderClient()
@@ -609,3 +808,112 @@ def test_holders_delta_ignores_future_and_platform_rows(db):
 
     assert before["chain_holders_delta_1h"] == after["chain_holders_delta_1h"] == 100
     assert after["chain_holder_count"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# حرسُ الحصار: صفرٌ جماعيٌّ متكرّر لا يكون إلّا عطلاً
+# ---------------------------------------------------------------------------
+async def test_a_whole_source_shutout_stops_being_silent(db, monkeypatch):
+    """سُئل 3 ولم ينزل صفٌّ، ثلاثَ دوراتٍ ⇒ سطرُ خطأ تراه اللوحة.
+
+    هذا هو الدرسُ من 21 ساعةً بلا كلمة: `traders_rows: 0` و`errors: 0` في كلّ
+    سطرِ سجلّ، لأنّ «لا مستخدمَ بهذا المعرّف» جوابٌ مشروع لعنصرٍ واحد.
+    """
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    monkeypatch.setattr(config, "TRADERS_REFRESH_SECONDS", 0)
+    monkeypatch.setattr(config, "SHUTOUT_STREAK_ALERT", 3)
+    for t in range(3):
+        for i in range(3):
+            _signal(db, f"s{t}-{i}", _uuid(f"t{t}"), token=f"tok{t}")
+    gone = {_uuid(f"t{t}") for t in range(3)}
+
+    for cycle in range(2):
+        at = f"2026-08-11T1{cycle}:00:00+00:00"
+        await recorder.run_traders_cycle(_TraderClient(missing=gone), db, at, sleep=_noop)
+        assert db.get_meta("shutout_traders") == str(cycle + 1)
+        assert db.get_meta("last_error_traders") is None   # مرّةً ومرّتين: صمتٌ
+
+    await recorder.run_traders_cycle(
+        _TraderClient(missing=gone), db, "2026-08-11T12:00:00+00:00", sleep=_noop
+    )
+
+    note = db.get_meta("last_error_traders")
+    assert note is not None and "ShutoutSuspected" in note
+    assert "3" in note
+    # ولا ختمَ نجاح: وإلّا أعلنت اللوحةُ الخطأَ متعافياً بعد دقيقة.
+    assert db.get_meta("traders_last_ok_at") is None
+
+
+async def test_one_row_ends_the_shutout_streak(db, monkeypatch):
+    """الصفرُ الفرديُّ عاديّ: أوّلُ صفٍّ ينزل يُصفّر العدّاد ويختم النجاح."""
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    monkeypatch.setattr(config, "TRADERS_REFRESH_SECONDS", 0)
+    tid = _uuid("t0")
+    for i in range(3):
+        _signal(db, f"s{i}", tid)
+
+    await recorder.run_traders_cycle(
+        _TraderClient(missing={tid}), db, "2026-08-11T10:00:00+00:00", sleep=_noop
+    )
+    assert db.get_meta("shutout_traders") == "1"
+
+    later = "2026-08-11T11:00:00+00:00"
+    await recorder.run_traders_cycle(_TraderClient(), db, later, sleep=_noop)
+
+    assert db.get_meta("shutout_traders") == "0"
+    assert db.get_meta("traders_last_ok_at") == later
+
+
+async def test_the_shutout_streak_survives_a_restart(db, monkeypatch):
+    """العدّادُ في `meta` لا في الذاكرة: إعادةُ التشغيل لا تُعيد الصمت.
+
+    ولو كان في الذاكرة لبدأ من الصفر مع كلّ إقلاع — والمسجّل يُعاد تشغيلُه.
+    """
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    monkeypatch.setattr(config, "TRADERS_REFRESH_SECONDS", 0)
+    monkeypatch.setattr(config, "SHUTOUT_STREAK_ALERT", 2)
+    tid = _uuid("t0")
+    for i in range(3):
+        _signal(db, f"s{i}", tid)
+    db.set_meta("shutout_traders", "1")          # سلسلةٌ ورثناها من عمليّةٍ سابقة
+
+    await recorder.run_traders_cycle(
+        _TraderClient(missing={tid}), db, "2026-08-11T10:00:00+00:00", sleep=_noop
+    )
+
+    assert db.get_meta("shutout_traders") == "2"
+    assert "ShutoutSuspected" in (db.get_meta("last_error_traders") or "")
+
+
+async def test_a_quiet_queue_is_stamped_ok_not_accused(db, monkeypatch):
+    """لم يستحقّ أحدٌ الجلب ⇒ نجاحٌ لا حصار: لا شيء سُئل فلا شيء فشل.
+
+    وبلا ختمٍ هنا يبقى طابورٌ هادئ أحمرَ إلى الأبد على خطأٍ قد شُفي — وهو العيبُ
+    الذي جعل شاراتِ chain حمراءَ يوم 2026-08-17.
+    """
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    at = "2026-08-11T10:00:00+00:00"
+
+    stats = await recorder.run_traders_cycle(_TraderClient(), db, at, sleep=_noop)
+
+    assert stats["traders_fetched"] == 0
+    assert db.get_meta("shutout_traders") in (None, "0")
+    assert db.get_meta("traders_last_ok_at") == at
+
+
+async def test_a_failing_batch_is_not_counted_as_a_shutout(db, monkeypatch):
+    """الخطأُ يكتب سطرَه بنفسه؛ الحرسُ للصمت وحده، فلا يُحاسب على الأخطاء."""
+    monkeypatch.setattr(config, "TRADERS_PER_CYCLE", 10)
+    monkeypatch.setattr(config, "SHUTOUT_STREAK_ALERT", 1)
+    tid = _uuid("bad")
+    for i in range(3):
+        _signal(db, f"s{i}", tid)
+
+    await recorder.run_traders_cycle(
+        _TraderClient(fail={tid}), db, "2026-08-11T10:00:00+00:00", sleep=_noop
+    )
+
+    assert db.get_meta("shutout_traders") is None
+    assert db.get_meta("traders_last_ok_at") is None
+    assert "ShutoutSuspected" not in (db.get_meta("last_error_traders") or "")
+    assert "upstream boom" in (db.get_meta("last_error_traders") or "")

@@ -55,12 +55,44 @@ def test_deduplicate_tokens_keeps_first_window_and_removes_group_overlap():
     }
 
 
-def test_analysis_refuses_to_drop_no_bars_outcomes():
+def test_analysis_keeps_no_bars_in_statuses_but_excludes_it_from_returns():
     rows = [
         {"is_control": 0, "status": "no_bars"},
-        {"is_control": 0, "status": "ok"},
-        {"is_control": 1, "status": "ok"},
+        *[
+            {"is_control": 0, "status": "ok", "final_return_48h": 0.2,
+             "max_gain_24h": 0.3, "is_rug": 0, "network_id": "1"}
+            for _ in range(3)
+        ],
+        *[
+            {"is_control": 1, "status": "ok", "final_return_48h": 0.0,
+             "max_gain_24h": 0.1, "is_rug": 0, "network_id": "1"}
+            for _ in range(3)
+        ],
     ]
 
-    with pytest.raises(RuntimeError, match="no_bars"):
+    result = _analyze_rows(rows)
+
+    assert result["statuses"][0]["no_bars"] == 1
+    assert result["summaries"][0]["n"] == 3
+
+
+def test_analysis_refuses_ok_outcomes_with_incomplete_metrics():
+    rows = [
+        {
+            "is_control": 0,
+            "status": "ok",
+            "final_return_48h": -0.2,
+            "max_gain_24h": None,
+            "is_rug": 0,
+        },
+        {
+            "is_control": 1,
+            "status": "ok",
+            "final_return_48h": 0.1,
+            "max_gain_24h": 0.2,
+            "is_rug": 0,
+        },
+    ]
+
+    with pytest.raises(RuntimeError, match="incomplete metrics"):
         _analyze_rows(rows)

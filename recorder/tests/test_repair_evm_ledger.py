@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import datetime
 
@@ -172,3 +173,76 @@ def test_default_networks_include_live_and_replay(monkeypatch):
         *(str(network) for network in repair_evm_ledger.config.EVM_REPLAY_NETWORKS),
     }
     assert actual == expected
+
+
+def test_capture_cohort_freezes_live_tokens_and_replay_windows(db, monkeypatch):
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", ("8453",))
+    db.upsert_watch(TOK, NET, "large_buy", "sig", 48, NOW)
+    db.upsert_watch(TOK, "8453", "large_buy", "replay", 1, "2026-08-10T12:00:00+00:00")
+
+    cohort = repair_evm_ledger.capture_cohort(db, [NET, "8453"])
+
+    assert cohort["networks"] == ["4663", "8453"]
+    assert cohort["active_backfills"] == [{"network_id": NET, "token_address": TOK}]
+    assert cohort["replay_windows"] == [{
+        "network_id": "8453", "token_address": TOK.lower(),
+        "first_seen_at": "2026-08-10T12:00:00+00:00",
+        "watch_until": "2026-08-10T13:00:00+00:00",
+    }]
+    assert json.loads(db.get_meta(repair_evm_ledger.COHORT_META_KEY)) == cohort
+
+
+def test_capture_cohort_is_idempotent(db, monkeypatch):
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", ())
+    db.upsert_watch(TOK, NET, "large_buy", "sig", 48, NOW)
+
+    first = repair_evm_ledger.capture_cohort(db, [NET])
+    db.upsert_watch("0xbbbb000000000000000000000000000000000002", NET,
+                    "large_buy", "new", 48, NOW)
+
+    assert repair_evm_ledger.capture_cohort(db, [NET]) == first
+
+
+def test_cohort_finalization_ignores_new_coins_after_capture(db, monkeypatch):
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", ())
+    db.upsert_watch(TOK, NET, "large_buy", "sig", 48, NOW)
+    db.set_evm_backfill_state(NET, TOK, "done", NOW)
+    repair_evm_ledger.capture_cohort(db, [NET])
+    db.set_meta("evm_ledger_rebuild_required", "1")
+
+    new_token = "0xbbbb000000000000000000000000000000000002"
+    db.upsert_watch(new_token, NET, "large_buy", "new", 48, NOW)
+
+    assert repair_evm_ledger.inspect(db, [NET])["active_pending"] == 0
+    repair_evm_ledger.finalize_training(db, [NET])
+    assert db.get_meta("evm_training_rebuild_started") == "1"
+
+
+def test_expired_cohort_token_remains_in_worker_queue(db, monkeypatch):
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", ())
+    db.upsert_watch(TOK, NET, "large_buy", "sig", 48, NOW)
+    repair_evm_ledger.capture_cohort(db, [NET])
+    db._conn.execute(
+        "UPDATE watchlist SET active=0 WHERE token_address=? AND network_id=?",
+        (TOK, NET),
+    )
+    db._conn.commit()
+
+    assert [row["token_address"] for row in db.evm_watched([NET])] == [TOK]
+
+
+def test_completed_rebuild_clears_cohort(db, monkeypatch):
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", ())
+    repair_evm_ledger.capture_cohort(db, [NET])
+    db.set_meta("evm_ledger_rebuild_required", "1")
+    db.set_meta("evm_training_rebuild_started", "1")
+
+    repair_evm_ledger.finalize_training(db, [NET])
+
+    assert db.get_meta(repair_evm_ledger.COHORT_META_KEY) is None
+    assert db.get_meta("evm_ledger_rebuild_required") == "0"

@@ -548,15 +548,10 @@ def test_ok_stamps_are_written_per_queue_not_once_for_the_process():
     فموتُ المسجّل جمّد الحدَّ وبقيت الشارات حمراء. الآن لكلٍّ ختمُه من كاتبه."""
     import run_chain
 
-    stats = {
-        "chain_errors": 0, "auth_errors": 0, "evm_errors": 0,
-        "evm_backfill_errors": 0, "evm_contract_errors": 0, "bsc_errors": 0,
-    }
+    stats = {"chain_errors": 0, "auth_errors": 0}
 
     assert run_chain._ok_stamps(stats, NOW) == {
         "chain_last_ok_at": NOW, "chain_auth_last_ok_at": NOW,
-        "evm_last_ok_at": NOW, "evm_contract_last_ok_at": NOW,
-        "bsc_nodereal_last_ok_at": NOW,
     }
 
 
@@ -571,16 +566,7 @@ def test_a_failing_queue_gets_no_stamp_while_its_neighbours_do():
 
     assert "chain_last_ok_at" not in out
     assert out["chain_auth_last_ok_at"] == NOW
-    assert out["evm_last_ok_at"] == NOW
-
-
-def test_evm_stamp_waits_on_backfill_errors_too():
-    """`last_error_evm` يكتبه فرعُ التعبئة أيضاً ⇒ ختمُه يشترط صفاءَ العدّادين."""
-    import run_chain
-
-    assert "evm_last_ok_at" not in run_chain._ok_stamps(
-        {"evm_errors": 0, "evm_backfill_errors": 1}, NOW,
-    )
+    assert "evm_last_ok_at" not in out
 
 
 def test_absent_counter_yields_no_stamp():

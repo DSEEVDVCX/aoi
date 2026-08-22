@@ -336,6 +336,12 @@ def test_meta_counter(db):
     assert db.get_meta("cycles_total") == "2"
 
 
+def test_model_view_tracks_current_feature_version(db):
+    import features
+
+    assert db.get_meta("current_feature_version") == str(features.FEATURE_VERSION)
+
+
 def test_snapshot_insert(db):
     db.insert_snapshot("trending", {"a": 1}, "2026-07-25T00:00:00Z")
     row = db._conn.execute("SELECT id, source, raw_json FROM snapshots").fetchone()
@@ -671,7 +677,7 @@ class _FlakyConn:
         return getattr(self._c, name)
 
     def __setattr__(self, name, value):
-        if name in ("_c", "_message", "_left", "scripts"):
+        if name in ("_c", "_message", "_left", "scripts", "begins"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._c, name, value)
@@ -689,6 +695,68 @@ def _flaky_connect(monkeypatch, message, fail_times):
     monkeypatch.setattr("db.sqlite3.connect", fake)
     monkeypatch.setattr("db.time.sleep", lambda _s: None)
     return made
+
+
+def test_schema_retries_a_temporary_startup_write_lock(tmp_path, monkeypatch):
+    path = str(tmp_path / "startup-lock.db")
+    RecorderDB(path, SCHEMA).close()
+    made = []
+    real = sqlite3.connect
+
+    class StartupLockConn(_FlakyConn):
+        def __init__(self, conn):
+            super().__init__(conn, "", 0)
+            self.begins = 0
+
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                self.begins += 1
+                if self.begins < 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return self._c.execute(sql, *args)
+
+    def fake(*args, **kwargs):
+        conn = StartupLockConn(real(*args, **kwargs))
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr("db.sqlite3.connect", fake)
+    monkeypatch.setattr("db.time.sleep", lambda _seconds: None)
+
+    db = RecorderDB(path, SCHEMA)
+    try:
+        assert made[0].begins == 3
+        assert db.get_meta("current_feature_version") is not None
+    finally:
+        db.close()
+
+
+def test_schema_does_not_retry_a_non_lock_begin_error(tmp_path, monkeypatch):
+    real = sqlite3.connect
+    made = []
+
+    class BrokenBeginConn(_FlakyConn):
+        def __init__(self, conn):
+            super().__init__(conn, "", 0)
+            self.begins = 0
+
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                self.begins += 1
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._c.execute(sql, *args)
+
+    def fake(*args, **kwargs):
+        conn = BrokenBeginConn(real(*args, **kwargs))
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr("db.sqlite3.connect", fake)
+    monkeypatch.setattr("db.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        RecorderDB(str(tmp_path / "broken-begin.db"), SCHEMA)
+    assert made[0].begins == 1
 
 
 def test_schema_retries_when_a_neighbour_created_the_view_first(tmp_path, monkeypatch):
