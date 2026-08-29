@@ -161,6 +161,25 @@ def recorder_status(
     labeler_dt = _parse_iso(meta.get("labeler_last_run_at"))
     labeler_age = (now - labeler_dt).total_seconds() if labeler_dt else None
 
+    admission_networks: dict[str, Any] = {}
+    raw_admission = meta.get("evm_admission_network_state")
+    if raw_admission:
+        try:
+            decoded = json.loads(raw_admission)
+            if isinstance(decoded, dict):
+                admission_networks = decoded
+        except (TypeError, ValueError):
+            admission_networks = {}
+    paused_networks: list[str] = []
+    raw_paused = meta.get("evm_admission_paused_networks")
+    if raw_paused:
+        try:
+            decoded = json.loads(raw_paused)
+            if isinstance(decoded, list):
+                paused_networks = [str(network) for network in decoded]
+        except (TypeError, ValueError):
+            paused_networks = []
+
     return {
         "alive": alive,
         "seconds_since_last_cycle": seconds_since,
@@ -181,6 +200,8 @@ def recorder_status(
         "labeler_age_seconds": labeler_age,
         "labeler_stale": bool(labeler_age is None or labeler_age > labeler_window_seconds),
         "labeler_last_stats": meta.get("labeler_last_stats"),
+        "evm_admission_networks": admission_networks,
+        "evm_admission_paused_networks": paused_networks,
     }
 
 
@@ -217,9 +238,12 @@ def recorder_errors(
         # الختم في القيمة بصيغة "<iso>: <msg>" — نفصله على أول ": ".
         err_dt = _parse_iso(val.split(": ", 1)[0]) if val else None
         own = _boundary(stamps.get(src, ()))
-        boundary = max(
-            (d for d in (own, recorder_boundary) if d is not None), default=None,
-        )
+        # ختمُ المصدر نفسه يحكم إن وُجد، وحدُّ المسجّل بديلٌ عند غيابه لا شريكٌ
+        # له. كان `max(own, recorder_boundary)`، وهو نفسُ عيبِ الحدّ الموحّد
+        # مقلوباً: صحّةُ المسجّل تشفي خطأَ طابورٍ لم ينجح. وقِيس 2026-08-19: حُجب
+        # مسارُ التجّار 21 ساعة والمسجّل يُتمّ دوراتِه بـ`errors: 0` كلَّ دقيقة —
+        # فأيّ خطأٍ يُكتب هناك كان يُعلَن «متعافياً» بعد دقيقةٍ من كتابته.
+        boundary = own if own is not None else recorder_boundary
         stale = bool(val) and boundary is not None and err_dt is not None and err_dt < boundary
         out.append({
             "source": src,

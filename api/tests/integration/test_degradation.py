@@ -5,7 +5,11 @@ import pytest
 from fomo_api.config import settings
 
 LB = settings.upstream_leaderboard_path
-TP = settings.upstream_trader_path.format
+# A trader profile is a batch of one now; ids are uuids and travel as query
+# params, so the mock matches the path and the id has to be well-formed to be
+# sent at all (a malformed one 400s the whole batch upstream).
+TP = settings.upstream_traders_batch_path
+TRADER_ID = "11111111-1111-5111-8111-111111111111"
 
 
 @pytest.mark.asyncio
@@ -38,7 +42,7 @@ async def test_upstream_never_fabricates(authed_client, respx_mock, fomo_json):
 
 @pytest.mark.asyncio
 async def test_expired_session_returns_401(authed_client, respx_mock, fomo_json, trader_payload):
-    respx_mock.get(TP(trader_id="t_1")).mock(return_value=fomo_json(trader_payload, status=401))
-    r = await authed_client.get("/v1/traders/t_1")
+    respx_mock.get(TP).mock(return_value=fomo_json(trader_payload, status=401))
+    r = await authed_client.get(f"/v1/traders/{TRADER_ID}")
     assert r.status_code == 401
     assert r.json()["error"]["code"] == "UNAUTHORIZED"

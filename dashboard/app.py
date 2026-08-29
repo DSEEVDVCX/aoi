@@ -5,6 +5,10 @@
 - مسارُ الكتابة الوحيد `/api/provider-keys/{add,toggle,delete}` وهدفُه ملفُّ
   `recorder/chain_keys.json` عبر `keystore`. وهذا هو أوّلُ مسارٍ يغيّر الحالة في
   هذا الخادم — والحارس أدناه كان مكتوباً وجاهزاً قبله، فلم يُضَف على عجل.
+- ومسارُ الكتابة الثاني `/api/fomo-account/{switch,restore}` وهدفُه ملفُّ
+  `api/.privy_state.json` عبر `account`: تبديلُ حساب fomo حين تُحجب هويّةٌ.
+  ولا ينفّذ أمرَ نظامٍ ولا يوقف مهمّةً مجدولة — كتابةُ ملفٍّ واحدٍ وحسب، لأنّ
+  المسجّلَ يقرأ ذلك الملفَّ كلَّ دورة فيلتقط التبديلَ من نفسه.
 - الاستماع على 127.0.0.1 فقط (محلّي).
 - Host guard + CSRF: يمنعان DNS rebinding ويحرسان مسارات الكتابة تلك.
 - **والتخزينُ المؤقّت لا يخرق شيئاً من ذلك**: `cache.MEMO` ذاكرةُ هذه العمليّة
@@ -14,6 +18,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 import secrets
@@ -21,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import account
 import cache
 import config
 import dao
@@ -39,6 +45,14 @@ def _allowed_origins() -> tuple[str, str]:
     return (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
 
 
+# سقفُ جسم الطلب. الافتراضيّ ضيّقٌ عن قصد — مفتاحُ مزوّدٍ سطرٌ واحد. لكنّ تبديلَ
+# الحساب يستلم مخزنَ متصفّحٍ ملصوقاً، وفيه توكناتٌ تبلغ مئاتَ الأحرف مع مفاتيحَ
+# أخرى لا تخصّنا، فيتجاوز الثمانيةَ آلاف بسهولة — وكان يُرفض بـ«الطلب كبير
+# جداً» فيقرأ المستخدمُ رفضاً لا يفهم سببه.
+_BODY_LIMIT_DEFAULT = 8192
+_BODY_LIMITS = {"/api/fomo-account/switch": 262144}
+
+
 @app.middleware("http")
 async def local_security_guard(request: Request, call_next):
     """يمنع DNS rebinding وCSRF قبل وصول أي طلب يغيّر مخزن الأسرار."""
@@ -51,7 +65,8 @@ async def local_security_guard(request: Request, call_next):
         )
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         length = request.headers.get("content-length")
-        if length and length.isdigit() and int(length) > 8192:
+        cap = _BODY_LIMITS.get(request.url.path, _BODY_LIMIT_DEFAULT)
+        if length and length.isdigit() and int(length) > cap:
             return JSONResponse({"error": "الطلب كبير جداً"}, status_code=413)
         origin = request.headers.get("origin")
         referer = request.headers.get("referer")
@@ -373,7 +388,8 @@ async def api_provider_keys_test(request: Request) -> Any:
     """
     try:
         data = await _body(request)
-        return keystore.probe(
+        return await asyncio.to_thread(
+            keystore.probe,
             str(data.get("provider") or ""),
             _slot(data),
             str(data.get("tail") or ""),
@@ -381,6 +397,69 @@ async def api_provider_keys_test(request: Request) -> Any:
         )
     except keystore.KeyStoreError as exc:
         return _fail(exc)
+
+
+def _fail_account(exc: account.AccountError) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, status_code=exc.status)
+
+
+async def _account_body(request: Request) -> dict[str, Any]:
+    """جسمُ طلبِ الحساب. **لا يُسجَّل ولا يُعاد في رسالة خطأ** — فيه التوكن."""
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 — أيُّ عطبِ تحليلٍ جوابُه واحد
+        raise account.AccountError("جسم الطلب ليس JSON صالحاً") from None
+    if not isinstance(data, dict):
+        raise account.AccountError("جسم الطلب يجب أن يكون كائن JSON")
+    return data
+
+
+@app.get("/api/fomo-account")
+def api_fomo_account() -> dict[str, Any]:
+    """حالةُ حساب fomo الحاليّ — بصمةُ الهويّة ووقتُ الانتهاء، **بلا قيمة**.
+
+    ولا مِجَسَّ حيّاً هنا: هذا المسار يُستدعى مع كلّ تحديثٍ للوحة كلَّ عشر ثوانٍ،
+    ونداءُ المصدر فيه كان سيضرب fomo ستَّ مرّاتٍ في الدقيقة بلا أن يطلبه أحد —
+    وهو بالضبط نوعُ الحِمل الذي أوقع الحجب. الفحصُ بزرٍّ صريح.
+    """
+    return account.status()
+
+
+@app.post("/api/fomo-account/probe")
+async def api_fomo_account_probe() -> Any:
+    """يفحص الحسابَ الحاليّ حيّاً: 200 يعمل، 403 محجوب، 401 توكنٌ منتهٍ.
+
+    في خيطٍ منفصل: `curl_cffi` متزامنٌ وثلاثةُ نداءاتٍ قد تبلغ مهلتَها، وذلك
+    يُجمّد حلقةَ الحوادث فتتوقّف اللوحةُ كلُّها للجميع أثناء الفحص.
+    """
+    try:
+        return await asyncio.to_thread(account.probe)
+    except account.AccountError as exc:
+        return _fail_account(exc)
+
+
+@app.post("/api/fomo-account/switch")
+async def api_fomo_account_switch(request: Request) -> Any:
+    """يبدّل الحسابَ من مخزن متصفّحٍ ملصوق، بعد نسخةٍ احتياطيّة تلقائيّة.
+
+    ولا إعادةَ تشغيلٍ لازمة: المسجّل يقرأ الملفَّ كلَّ دورة (`_reload_token`)،
+    وخادمُ الـapi يتبنّى الهويّةَ الجديدة عند تجديده لأنّ بصمةَ الملفّ تخالف
+    بصمةَ ما يجدّده (`TokenRefresher._adopt_disk_identity`).
+    """
+    try:
+        return account.switch(await _account_body(request))
+    except account.AccountError as exc:
+        return _fail_account(exc)
+
+
+@app.post("/api/fomo-account/restore")
+async def api_fomo_account_restore(request: Request) -> Any:
+    """يرجع إلى نسخةٍ محفوظة — مخرجُ الطوارئ من لصقةٍ خاطئة."""
+    try:
+        data = await _account_body(request)
+        return account.restore(str(data.get("name") or ""))
+    except account.AccountError as exc:
+        return _fail_account(exc)
 
 
 @app.get("/")

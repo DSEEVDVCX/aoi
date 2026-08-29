@@ -94,3 +94,27 @@ async def test_activity_bad_time_range(authed_client, respx_mock, fomo_json):
     )
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_activity_rejects_an_invalid_single_time_bound(authed_client, respx_mock, fomo_json):
+    respx_mock.get(_ap("t_1")).mock(return_value=fomo_json(_activity_payload()))
+    r = await authed_client.get(
+        "/v1/traders/t_1/activity?from=not-a-timestamp"
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_activity_compares_timezones_as_instants(authed_client, respx_mock, fomo_json):
+    respx_mock.get(_ap("t_1")).mock(return_value=fomo_json(_activity_payload()))
+    r = await authed_client.get(
+        "/v1/traders/t_1/activity",
+        params={
+            "from": "2026-07-23T20:00:00+01:00",
+            "to": "2026-07-23T21:00:00+01:00",
+        },
+    )
+    assert r.status_code == 200
+    assert len(r.json()["data"]) == 1

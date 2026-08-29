@@ -336,6 +336,31 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .keyrow .grow { flex: 1 1 auto; min-width: 40px; }
 .keyhead { padding: 8px 18px; border-bottom: 1px solid var(--line);
   background: var(--surface-2); font-size: 12px; color: var(--muted); }
+
+/* --- حسابُ fomo --- */
+/* التبديلُ في `details` مطويّ: أخطرُ ما تكتبه اللوحة، فلا يُفتح حقلُه بالخطأ.
+   ولا حالةَ فتحٍ تُدار بـJS — العنصرُ يحفظها بنفسه، فإعادةُ الرسم كلَّ عشر
+   ثوانٍ لا تُغلقه على مستخدمٍ في منتصف اللصق (ولذلك هو **خارج** الحاوية
+   التي تُعاد كتابتها، مثلَ نموذج إضافة المفتاح تماماً). */
+.acctswitch { border-top: 1px solid var(--line); font-size: 12.5px; }
+.acctswitch > summary { padding: 9px 18px; cursor: pointer; color: var(--ink-2); }
+.acctswitch > summary:hover { color: var(--ink); }
+.acctswitch[open] > summary { color: var(--ink); border-bottom: 1px solid var(--line); }
+.acctbody { padding: 12px 18px 14px; display: flex; flex-direction: column; gap: 10px; }
+.acctnote { margin: 0; color: var(--muted); line-height: 1.7; }
+.acctrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* السطرُ يُقرأ يساراً-يميناً وهو شفرة: `dir=ltr` وإلّا قُرئ مبعثراً فنُسخ خطأً. */
+.acctsnip { direction: ltr; text-align: left; unicode-bidi: isolate; flex: 1 1 260px;
+  min-width: 0; overflow-x: auto; white-space: nowrap; padding: 7px 9px; border-radius: 7px;
+  background: var(--surface-2); border: 1px solid var(--line); font-size: 11.5px; }
+#acct-dump { direction: ltr; text-align: left; font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px; width: 100%; box-sizing: border-box; resize: vertical;
+  padding: 8px 10px; border-radius: 7px; background: var(--surface-2);
+  color: var(--ink); border: 1px solid var(--line); }
+#acct-dump::placeholder { color: var(--muted); }
+#acct-dump:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
+.acctprobe { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); }
+.acctprobe .mono { color: var(--ink-2); }
 .banner { padding: 10px 14px; border-radius: 9px; background: color-mix(in srgb, var(--crit) 14%, transparent); border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent); color: var(--ink); font-size: 12.5px; margin-bottom: 18px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 </style>
@@ -471,6 +496,39 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="body flush" id="provider-keys"></div>
   </div>
 
+  <div class="card" data-view-section="health">
+    <header>
+      <h2>حساب fomo — مصدر البيانات</h2>
+      <span class="note">بصمة الهويّة وآخر 4 أحرف فقط — التوكن لا يُعرض ولا يُسجَّل</span>
+    </header>
+    <div class="body flush" id="fomo-account"></div>
+    <!-- التبديل مطويٌّ عن قصد: هويّةُ الحساب أخطرُ ما تكتبه اللوحة، فلا يُفتح
+         حقلُها إلّا بقصد. و`details` بلا JS ولا حالةٍ تُدار. -->
+    <details class="acctswitch">
+      <summary>تبديل الحساب</summary>
+      <div class="acctbody">
+        <p class="acctnote">
+          سجّل دخولك بالحساب الآخر في <span class="mono">fomo.family</span>، ثمّ افتح
+          طرفيّة المتصفّح (F12 ← Console) والصق هذا السطر — ينسخ مفاتيح Privy وحدَها
+          إلى الحافظة، لا مخزنك كلَّه:
+        </p>
+        <div class="acctrow">
+          <code class="mono acctsnip" id="acct-snippet">copy(JSON.stringify(Object.fromEntries(Object.entries(localStorage).filter(([k])=&gt;k.startsWith('privy:')))))</code>
+          <button class="keybtn" id="acct-copy" type="button">انسخ السطر</button>
+        </div>
+        <form id="acct-form" autocomplete="off">
+          <textarea id="acct-dump" rows="4" spellcheck="false" autocomplete="off"
+                    aria-label="مخزن Privy المنسوخ"
+                    placeholder='الصق هنا: {"privy:token":"…","privy:refresh_token":"…","privy:pat":"…"}'></textarea>
+          <div class="acctrow">
+            <button type="submit" class="keybtn go">بدّل الحساب</button>
+            <span class="keymsg" id="acct-msg" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </div>
+    </details>
+  </div>
+
   <section data-view-section="networks" hidden>
     <div class="network-grid" id="network-summary">
       <div class="card"><div class="body empty">جارٍ تحميل ملخص الشبكات…</div></div>
@@ -568,15 +626,20 @@ function signed(v, digits = 1) {
 }
 const shortAddr = (a) => !a ? "—" : (a.length > 14 ? a.slice(0, 6) + "…" + a.slice(-4) : a);
 
-function ago(iso) {
-  if (!iso) return "—";
-  const t = Date.parse(iso);
-  if (isNaN(t)) return esc(iso);
-  const s = Math.max(0, (Date.now() - t) / 1000);
+/** مدّةٌ بالثواني إلى نصٍّ عربيّ. مفصولةٌ عن `ago` لأنّ بعضَ ما نعرضه يأتي
+    مدّةً محسوبةً في الخادم لا وقتاً مطلقاً، وسلّمُ الوحدات يجب أن يكون واحداً. */
+function dur(s) {
   if (s < 60) return Math.round(s) + " ث";
   if (s < 3600) return Math.round(s / 60) + " د";
   if (s < 86400) return Math.round(s / 3600) + " س";
   return Math.round(s / 86400) + " ي";
+}
+
+function ago(iso) {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (isNaN(t)) return esc(iso);
+  return dur(Math.max(0, (Date.now() - t) / 1000));
 }
 // «أوّل التقاط» ≠ «بداية الدورة». `watchlist.first_seen_at` يُكتب فوقه عند كل
 // إعادة قبول بعد انتهاء النافذة، فعملة مُلتقطة منذ 7 أيام كانت تبدو عمرها 22
@@ -832,6 +895,16 @@ function renderHero(counts, timeline) {
 function renderTiles(st, counts, bars, storage, api) {
   const size = storage.mb == null ? "—"
     : storage.mb >= 1000 ? (storage.mb / 1000).toFixed(1) + " GB" : storage.mb + " MB";
+  const admission = st.evm_admission_networks || {};
+  const paused = st.evm_admission_paused_networks || [];
+  const admissionText = Object.keys(admission).length
+    ? Object.entries(admission).map(([network, state]) =>
+        `${network}: ${state.percent}%${state.paused ? " متوقف" : " متاح"}`
+      ).join(" · ")
+    : "لا توجد حالة per-network بعد";
+  const admissionDetail = paused.length
+    ? `متوقف: ${paused.join(", ")}`
+    : "كل شبكة تقاس بميزانية RPC مستقلة";
   const items = [
     { l: "عملات مراقَبة", v: num(st.active_watch_count), d: "نافذة 48 ساعة" },
     { l: "تغطية الشموع", v: bars.coverage_pct != null ? bars.coverage_pct + "%" : "—",
@@ -844,6 +917,7 @@ function renderTiles(st, counts, bars, storage, api) {
       : storage.mb_per_day != null ? `+${storage.mb_per_day} MB/يوم` : "—" },
     { l: "زمن الـ API", v: api.latency_ms != null ? api.latency_ms + " ms" : "—",
       d: st.cycle_crashes ? `${st.cycle_crashes} انهيار دورة` : "بلا انهيارات" },
+    { l: "قبول EVM حسب الشبكة", v: admissionText, d: admissionDetail },
   ];
   document.getElementById("tiles").innerHTML = items.map(i =>
     `<div class="tile"><div class="l">${esc(i.l)}</div><div class="v">${i.v}</div><div class="d">${esc(i.d)}</div></div>`
@@ -1399,6 +1473,189 @@ document.getElementById("provider-keys").addEventListener("click", async (event)
   }
 });
 
+/* ---------- حسابُ fomo: الحالةُ والفحصُ والتبديل ---------- */
+/* لا قيمةَ توكنٍ تمرّ من هنا في أيّ اتّجاه: الخادمُ يعيد بصمةَ الهويّة وآخرَ
+   أربعة أحرف، وما يُلصق في الحقل يُرسل مرّةً ثمّ يُمحى — لا `console.log` له
+   ولا بقاءٌ على الشاشة بعد النجاح. */
+
+const acctMsg = document.getElementById("acct-msg");
+function showAcctMsg(text, level) {
+  acctMsg.textContent = text || "";
+  acctMsg.className = "keymsg" + (level ? " " + level : "");
+}
+
+/** عمرُ التوكن الباقي — للأمام لا للخلف، فـ`ago` تصفّر كلَّ ما هو مستقبل. */
+function acctLeft(seconds) {
+  if (seconds == null) return "—";
+  const s = Math.abs(seconds);
+  const txt = s < 60 ? Math.round(s) + " ث"
+    : s < 3600 ? Math.round(s / 60) + " د"
+    : Math.round(s / 3600) + " س";
+  return seconds <= 0 ? `انتهى قبل ${txt}` : `يبقى ${txt}`;
+}
+
+/** حكمُ حالة الملفّ نفسه — منفصلٌ عن حكم المِجَسّ: هذا يقول «الملفّ صالح»
+    والمِجَسُّ يقول «المصدر يقبله»، وهما سؤالان لا واحد. */
+function acctState(d) {
+  if (!d.exists) return { level: "bad", text: "لا ملفّ اعتماد — لم يُسجَّل دخولٌ بعد" };
+  // الأحمرُ للنقص المُعطِّل فقط. أمّا ما له بديل (`client_id` من إعداد الخادم،
+  // و`ca_id` لا يُرسَل إن غاب) فيُذكر ولا يُنذر — انظر `_REQUIRED_FIELDS`.
+  const blocking = d.missing_required || d.missing;
+  if (blocking.length) return { level: "bad", text: "ناقص: " + blocking.join("، ") };
+  if (d.did && d.did === d.anon_did) {
+    return { level: "bad", text: "جلسةٌ مجهولة لا حساب — Privy يكتبها قبل الدخول" };
+  }
+  if (!d.did) return { level: "warn", text: "التوكن غيرُ مقروء — ليس JWT" };
+  if (d.expired) {
+    if (!d.refreshable) {
+      return { level: "bad", text: "منتهٍ ولا يمكن تجديده (لا refresh_token أو pat)" };
+    }
+    // منتهٍ و«يمكن تجديده» حالتان متناقضتان يفرّق بينهما عمرُ آخر كتابة، وكان
+    // النصُّ واحداً لهما فأرسل المستخدمَ إلى الجهة الخاطئة يوم 2026-08-20:
+    // الخادمُ كان يعمل ويجدّد كلَّ 60ث ويُرفَض بصمت، واللوحةُ تسأله «هل
+    // خادمُ الـapi يعمل؟». والحدُّ 180ث = ثلاثةُ أضعاف دورةِ التجديد (60ث):
+    // ضعفٌ واحد يجعل تأخّرَ دورةٍ عابرة تشخيصاً كاذباً.
+    const age = d.written_seconds_ago;
+    if (age !== null && age !== undefined && age <= 180) {
+      return {
+        level: "bad",
+        text: "التجديدُ يعمل ويُرفَض — جلسةُ Privy انتهت. سجّل دخولاً جديداً وبدّل الحساب",
+      };
+    }
+    return {
+      level: "warn",
+      text: age === null || age === undefined
+        ? "التوكن منتهٍ ولم يُجدَّد — هل خادمُ الـapi يعمل؟"
+        : `التوكن منتهٍ ولم يُمَسَّ الملفُّ منذ ${dur(age)} — خادمُ الـapi لا يجدّد`,
+    };
+  }
+  const spare = (d.missing || []).filter((f) => !blocking.includes(f));
+  if (spare.length) {
+    return { level: "good", text: `التوكن سارٍ. ${spare.join("، ")} غيرُ مُلتقط وله بديل` };
+  }
+  return { level: "good", text: "ملفٌّ كامل والتوكن سارٍ" };
+}
+
+function renderFomoAccount(data) {
+  const host = document.getElementById("fomo-account");
+  const d = data || { exists: false, missing: [], backups: [] };
+  const state = acctState(d);
+
+  let html = `<div class="keyrow">
+    <span class="keydot ${state.level}" title="${esc(state.text)}"></span>
+    <span class="mono">${d.did ? esc(d.did) : "بلا هويّة"}</span>
+    ${d.token_tail ? `<span class="mono" title="آخر 4 أحرف — للتمييز فقط">…${esc(d.token_tail)}</span>` : ""}
+    <span class="grow" style="color:var(--muted)">${esc(state.text)}
+      ${d.exists && d.expires_at ? `<span class="mono">(${esc(acctLeft(d.seconds_left))})</span>` : ""}</span>
+    <button class="keybtn" data-act="probe">افحص الآن</button>
+  </div>`;
+
+  // نتيجةُ المِجَسّ: الرموزُ الخام معروضةٌ لا مُلخَّصة. حجبُ الهويّة كتبه
+  // المسجّل «المصدرُ غيرُ متاح» فطُوردت الشبكةُ ساعةً وهي سليمة؛ ورقمُ 403
+  // بجانب مساره يقطع ذلك في نظرة.
+  const p = d.last_probe;
+  if (p) {
+    html += `<div class="keyrow">
+      <span class="badge ${p.level === "good" ? "good" : p.level === "bad" ? "bad" : "warn"}">
+        ${p.level === "good" ? "✓" : p.level === "bad" ? "✕" : "!"} ${esc(p.detail)}</span>
+      <span class="grow acctprobe">${(p.rows || []).map(r =>
+        `<span><span class="mono">${esc(r.method)} ${esc(r.path)}</span> →
+          <span class="mono">${r.status == null ? esc(r.note || "لا جواب") : r.status}</span></span>`
+      ).join("")}</span>
+      <span class="mono" style="color:var(--muted)">${ago(p.at)}</span>
+    </div>`;
+  } else if (d.exists) {
+    html += `<div class="keyrow off"><span class="keydot off"></span>
+      <span class="grow" style="color:var(--muted)">لم يُفحص في هذه الجلسة — الفحصُ نداءٌ حقيقيّ
+      إلى المصدر، فلا يجري تلقائياً مع كلّ تحديث.</span></div>`;
+  }
+
+  // النسخُ: مخرجُ الطوارئ من لصقةٍ خاطئة. تُعرض بالبصمة لا بالقيمة.
+  for (const b of d.backups || []) {
+    html += `<div class="keyrow off">
+      <span class="keydot off"></span>
+      <span class="mono">${b.did ? esc(b.did) : "بصمةٌ غيرُ مقروءة"}</span>
+      <span class="grow" style="color:var(--muted)">نسخةٌ محفوظة
+        <span class="mono">${esc(b.name.replace(".privy_state.json.bak-", ""))}</span> · ${ago(b.saved_at)}</span>
+      <button class="keybtn" data-act="restore" data-name="${esc(b.name)}">استعِد</button>
+    </div>`;
+  }
+  host.innerHTML = html;
+}
+
+/** يجلب بطاقةَ الحساب وحدَها — بلا مِجَسّ، فهذا مسارُ قراءةٍ محلّيّ رخيص. */
+async function refreshAccount() {
+  renderFomoAccount(await getOptionalJSON("/api/fomo-account", null));
+}
+
+document.getElementById("acct-copy").addEventListener("click", async (event) => {
+  // النصُّ من `textContent` لا من ثابتٍ في JS: نسخةٌ واحدة لا نسختان تتباعدان.
+  const text = document.getElementById("acct-snippet").textContent.trim();
+  const button = event.currentTarget;
+  try {
+    await navigator.clipboard.writeText(text);
+    button.textContent = "نُسخ ✓";
+  } catch {
+    // 127.0.0.1 سياقٌ آمن فالحافظةُ متاحة، لكنّ المتصفّح قد يرفض بلا تفاعلٍ
+    // موثوق ⇒ نُظلّل السطر ليُنسخ بـCtrl+C بدل رسالة فشلٍ بلا مخرج.
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById("acct-snippet"));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+    button.textContent = "ظُلِّل — Ctrl+C";
+  }
+  setTimeout(() => { button.textContent = "انسخ السطر"; }, 2500);
+});
+
+document.getElementById("acct-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const field = document.getElementById("acct-dump");
+  const raw = field.value.trim();
+  if (!raw) { showAcctMsg("الصق مخزن Privy أوّلاً", "bad"); return; }
+  let dump;
+  try {
+    dump = JSON.parse(raw);
+  } catch {
+    showAcctMsg("ما لُصق ليس JSON — استعمل السطر أعلاه، فهو يُخرجه جاهزاً", "bad");
+    return;
+  }
+  if (!confirm("تبديلُ حساب fomo يغيّر مصدرَ البيانات كلَّه. تُحفظ نسخةٌ قبل الكتابة. متابعة؟")) return;
+  showAcctMsg("جارٍ التبديل…", "");
+  try {
+    const out = await postJSON("/api/fomo-account/switch", dump);
+    // يُفرَغ الحقل فوراً عند النجاح: فيه توكنُ حسابٍ حقيقيّ، وبقاؤه على الشاشة
+    // خطرٌ بلا فائدة — نفسُ حكم حقل المفتاح.
+    field.value = "";
+    showAcctMsg(`تمّ: ${out.did} (…${out.token_tail}). ${out.message}`, "good");
+    await refreshAccount();
+  } catch (err) {
+    showAcctMsg(err.message, "bad");
+  }
+});
+
+document.getElementById("fomo-account").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-act]");
+  if (!button) return;
+  const { act, name } = button.dataset;
+  if (act === "restore" && !confirm(`استعادةُ ${name} تُحلّ محلَّ الحساب الحاليّ. متابعة؟`)) return;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = "…";
+  try {
+    if (act === "probe") {
+      const out = await postJSON("/api/fomo-account/probe", {});
+      showAcctMsg(out.detail, out.level);
+    } else if (act === "restore") {
+      const out = await postJSON("/api/fomo-account/restore", { name });
+      showAcctMsg(out.message + ` (${out.did})`, "good");
+    }
+    await refreshAccount();
+  } catch (err) {
+    showAcctMsg(err.message, "bad");
+    button.disabled = false;
+    button.textContent = original;
+  }
+});
+
 const NETWORK_META = {
   "1399811149": { name: "Solana", source: "Helius + FOMO" },
   "56": { name: "BNB Smart Chain", source: "NodeReal + FOMO" },
@@ -1545,7 +1802,8 @@ async function tick() {
     // الدورة السادسة كان سيُبقي اللوحةَ فارغةً دقيقةً كاملة قبل المحاولة الثانية.
     const wantHeavy = (heavyTick % HEAVY_EVERY === 0) || heavy.counts === null;
     heavyTick += 1;
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys] = await Promise.all([
+    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys,
+           acct] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -1562,6 +1820,7 @@ async function tick() {
         : heavy.networks,
       // اختياريّ: صفحةٌ محمَّلة قبل تحديث الخادم لا تفقد بقيّة اللوحات لأجل هذه.
       getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }),
+      getOptionalJSON("/api/fomo-account", null),
     ]);
     heavy.counts = cnt;
     heavy.networks = networks;
@@ -1581,6 +1840,7 @@ async function tick() {
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
     paint("provider-keys", () => renderProviderKeys(keys));
+    paint("fomo-account", () => renderFomoAccount(acct));
     paint("network-summary", () => renderNetworks(networks.networks || [], networks.cache));
     renderStatus(st);
     renderApi(api);

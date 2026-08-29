@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 
 def _load_creds() -> dict[str, str | None]:
-    d = json.load(open(DUMP, encoding="utf-8"))
+    with open(DUMP, encoding="utf-8") as fh:
+        d = json.load(fh)
     ls = d.get("_full_localStorage", {})
 
     def _clean(v):
@@ -40,7 +41,7 @@ def _load_creds() -> dict[str, str | None]:
             app_id = m[1]
             break
     client_id = None
-    for k, v in ls.items():
+    for _k, v in ls.items():
         if isinstance(v, str) and "client-" in v:
             import re
 

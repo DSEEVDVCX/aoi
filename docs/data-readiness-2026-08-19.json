@@ -1,0 +1,335 @@
+{
+  "database": {
+    "mode": "ro",
+    "path": "C:\\Users\\rr\\Desktop\\aoi\\recorder\\recorder.db",
+    "size_bytes": 16936574976
+  },
+  "generated_at": "2026-08-19T14:08:20.436148+00:00",
+  "integrity_checks": [
+    {
+      "detail": "Extra rows sharing token, network, and decision timestamp.",
+      "key": "model_duplicate_decisions",
+      "status": "pass",
+      "value": 0
+    },
+    {
+      "detail": "Eligible model rows with missing mature outcome labels.",
+      "key": "model_null_labels",
+      "status": "pass",
+      "value": 0
+    },
+    {
+      "detail": "Distinct feature versions exposed by the model view.",
+      "key": "model_feature_versions",
+      "status": "warn",
+      "value": 2
+    },
+    {
+      "detail": "Required eligibility guards absent from the model view definition.",
+      "key": "model_view_contract",
+      "status": "pass",
+      "value": 0
+    },
+    {
+      "detail": "Completed replay rows whose balance check is not ok.",
+      "key": "evm_done_balance_checks",
+      "status": "pass",
+      "value": 0
+    },
+    {
+      "detail": "EVM token ledgers not yet in a terminal live-backfill state.",
+      "key": "evm_pending_backfills",
+      "status": "warn",
+      "value": 73
+    }
+  ],
+  "model": {
+    "by_day": {
+      "2026-07-25": 13,
+      "2026-07-26": 289,
+      "2026-07-27": 343,
+      "2026-07-28": 386,
+      "2026-07-29": 401,
+      "2026-07-30": 513,
+      "2026-07-31": 450,
+      "2026-08-01": 407,
+      "2026-08-02": 286,
+      "2026-08-03": 585,
+      "2026-08-04": 571,
+      "2026-08-05": 555,
+      "2026-08-06": 482,
+      "2026-08-07": 542,
+      "2026-08-08": 591,
+      "2026-08-09": 585,
+      "2026-08-10": 562,
+      "2026-08-11": 348,
+      "2026-08-12": 328,
+      "2026-08-13": 344,
+      "2026-08-14": 294,
+      "2026-08-15": 274,
+      "2026-08-16": 353,
+      "2026-08-17": 188
+    },
+    "by_network": {
+      "1399811149": 4648,
+      "143": 1,
+      "4663": 3164,
+      "56": 1684,
+      "8453": 193
+    },
+    "families": {
+      "density": {
+        "columns": [
+          "prior_signals_token"
+        ],
+        "coverage_pct": 100.0,
+        "rows_present": 9690,
+        "status": "ok"
+      },
+      "event": {
+        "columns": [
+          "size_usd"
+        ],
+        "coverage_pct": 100.0,
+        "rows_present": 9686,
+        "status": "ok"
+      },
+      "evm_contract": {
+        "columns": [
+          "onchain_code_size"
+        ],
+        "coverage_pct": 0.0,
+        "rows_present": 0,
+        "status": "empty"
+      },
+      "flow": {
+        "columns": [
+          "flow_net_volume_5m"
+        ],
+        "coverage_pct": 21.4,
+        "rows_present": 2072,
+        "status": "ok"
+      },
+      "holders": {
+        "columns": [
+          "chain_holder_count"
+        ],
+        "coverage_pct": 30.2,
+        "rows_present": 2931,
+        "status": "ok"
+      },
+      "macro": {
+        "columns": [
+          "sol_ret_24h"
+        ],
+        "coverage_pct": 100.0,
+        "rows_present": 9690,
+        "status": "ok"
+      },
+      "market": {
+        "columns": [
+          "liquidity"
+        ],
+        "coverage_pct": 88.6,
+        "rows_present": 8590,
+        "status": "ok"
+      },
+      "onchain_authority": {
+        "columns": [
+          "onchain_has_mint_authority"
+        ],
+        "coverage_pct": 8.2,
+        "rows_present": 795,
+        "status": "ok"
+      },
+      "onchain_concentration": {
+        "columns": [
+          "onchain_top1_pct"
+        ],
+        "coverage_pct": 11.8,
+        "rows_present": 1147,
+        "status": "ok"
+      },
+      "price_history": {
+        "columns": [
+          "ret_24h_before"
+        ],
+        "coverage_pct": 93.2,
+        "rows_present": 9033,
+        "status": "ok"
+      },
+      "social": {
+        "columns": [
+          "social_thesis_total"
+        ],
+        "coverage_pct": 94.1,
+        "rows_present": 9116,
+        "status": "ok"
+      },
+      "trader": {
+        "columns": [],
+        "coverage_pct": 0.0,
+        "rows_present": 0,
+        "status": "missing"
+      }
+    },
+    "feature_versions": {
+      "12": 8212,
+      "8": 1478
+    },
+    "rows": 9690,
+    "splits": {
+      "test": 1803,
+      "train": 7066,
+      "val": 821
+    },
+    "status": "ok",
+    "tokens": 613
+  },
+  "schema_version": "data-readiness-v1",
+  "sources": {
+    "activity": {
+      "age_seconds": 1903287.125,
+      "latest_at": "2026-07-28T13:26:53.311157+00:00",
+      "rows": 190,
+      "states": {},
+      "status": "ok"
+    },
+    "bars": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 2074801,
+      "states": {
+        "error": 2,
+        "no_data": 32,
+        "ok": 1041
+      },
+      "status": "error"
+    },
+    "chain": {
+      "age_seconds": 11.653,
+      "latest_at": "2026-08-19T14:08:08.783155+00:00",
+      "rows": 292114,
+      "states": {
+        "error": 2,
+        "ok": 396,
+        "unsupported": 1
+      },
+      "status": "error"
+    },
+    "chain_authority": {
+      "age_seconds": 84.667,
+      "latest_at": "2026-08-19T14:06:55.769450+00:00",
+      "rows": 6922,
+      "states": {
+        "ok": 184
+      },
+      "status": "ok"
+    },
+    "evm_contract": {
+      "age_seconds": 174.008,
+      "latest_at": "2026-08-19T14:05:26.428444+00:00",
+      "rows": 1985,
+      "states": {
+        "ok": 61
+      },
+      "status": "ok"
+    },
+    "feed": {
+      "age_seconds": 9.102,
+      "latest_at": "2026-08-19T14:08:11.333792+00:00",
+      "rows": 23086,
+      "states": {},
+      "status": "ok"
+    },
+    "flow": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 79415,
+      "states": {},
+      "status": "ok"
+    },
+    "holders": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 176630,
+      "states": {
+        "error": 1,
+        "ok": 666
+      },
+      "status": "error"
+    },
+    "market": {
+      "age_seconds": 9.102,
+      "latest_at": "2026-08-19T14:08:11.333792+00:00",
+      "rows": 3287453,
+      "states": {},
+      "status": "ok"
+    },
+    "most_held": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 7576,
+      "states": {},
+      "status": "ok"
+    },
+    "social": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 93560,
+      "states": {
+        "empty": 46,
+        "error": 10,
+        "ok": 1019
+      },
+      "status": "error"
+    },
+    "traders": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 4614,
+      "states": {
+        "empty": 40,
+        "error": 528,
+        "ok": 4076
+      },
+      "status": "error"
+    },
+    "trending": {
+      "age_seconds": 9.102,
+      "latest_at": "2026-08-19T14:08:11.333792+00:00",
+      "rows": 23066,
+      "states": {},
+      "status": "ok"
+    },
+    "verified": {
+      "age_seconds": 69.095,
+      "latest_at": "2026-08-19T14:07:11.341487+00:00",
+      "rows": 23061,
+      "states": {},
+      "status": "ok"
+    }
+  },
+  "tables": {
+    "activity_events": 190,
+    "chain_authority": 6922,
+    "chain_concentration": 292113,
+    "evm_backfill_state": 179,
+    "evm_balances": 2033180,
+    "evm_contract": 1985,
+    "evm_replay_state": 275,
+    "market_ticks": 3287453,
+    "model_training_rows": 9690,
+    "outcomes": 108676,
+    "signal_events": 98195,
+    "snapshots": 77681,
+    "token_bars": 2074801,
+    "token_flow": 79415,
+    "token_holders": 176630,
+    "token_social": 93560,
+    "traders": 4614,
+    "training_rows": 95434,
+    "watch_windows": 24957,
+    "watchlist": 1074
+  }
+}

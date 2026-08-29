@@ -1,8 +1,12 @@
-import asyncio, sys, time
+import asyncio
+import sys
+import time
+
 sys.path.insert(0, "src")
+from fomo_api.auth.credential_store import CredentialStore
 from fomo_api.clients.fomo_client import FomoClient
 from fomo_api.config import settings
-from fomo_api.auth.credential_store import CredentialStore
+
 
 async def main():
     creds = CredentialStore(settings.credential_state_file).load()

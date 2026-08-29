@@ -1,9 +1,9 @@
 services:
   redis:
     image: redis:7-alpine
-    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme}
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -12,10 +12,10 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
-      FOMO_API_REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
-      FOMO_API_UPSTREAM_BASE: https://fomo.family
+      FOMO_API_REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/0
+      FOMO_API_UPSTREAM_BASE: https://prod-api.fomo.family
     depends_on:
       redis:
         condition: service_healthy

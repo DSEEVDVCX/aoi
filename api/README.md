@@ -42,14 +42,13 @@ Interactive docs: http://localhost:8000/docs
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FOMO_API_REDIS_URL` | `redis://localhost:6379/0` | Redis (volatile sessions, rate limits, pub/sub) |
-| `FOMO_API_UPSTREAM_BASE` | `https://fomo.family` | fomo.family base URL |
+| `FOMO_API_UPSTREAM_BASE` | `https://prod-api.fomo.family` | fomo.family data API base URL |
 | `FOMO_API_SESSION_TTL_SECONDS` | `900` | Session token TTL |
 | `FOMO_API_RATE_LIMIT_PER_MINUTE` | `60` | Per-consumer request limit |
 | `FOMO_API_ALERT_POLL_INTERVAL_SECONDS` | `10` | Alert poller cadence |
 
-Note: `FOMO_API_UPSTREAM_BASE` actually defaults to `https://prod-api.fomo.family`
-(the data API). `https://fomo.family` is `FOMO_API_UPSTREAM_APP_BASE`, used only
-for the Privy OAuth login step.
+`https://fomo.family` is `FOMO_API_UPSTREAM_APP_BASE`, used only for the Privy
+OAuth login step.
 
 ## Endpoints
 
@@ -62,7 +61,7 @@ All under `/v1`, all read-only, all requiring `Authorization: Bearer <consumer_k
 | `GET /health` | — (liveness + Redis + جاهزية اعتماد Privy للتجديد؛ بلا كشف أي سر، no auth) |
 | `POST /v1/auth/login` · `/logout` · `/dev-token` | Privy |
 | `GET /v1/leaderboard?period=all\|24h\|7d\|30d` | `/v2/leaderboard[/{period}]` |
-| `GET /v1/traders/{id}` | `/v2/users/{id}` |
+| `GET /v1/traders/{id}` | `/v2/users?userIds={id}` (repeated query parameter) |
 | `GET /v1/traders/by-handle/{handle}` | `/v2/users/userHandle/{handle}` |
 | `GET /v1/traders/{id}/activity` | `/v2/users/{id}/swaps` |
 | `GET /v1/traders/{id}/trades` | `/trades?userId=` |

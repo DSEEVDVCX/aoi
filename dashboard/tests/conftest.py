@@ -47,4 +47,10 @@ def isolate_live_state(tmp_path, monkeypatch):
     # غيرُ موجودٍ عن قصد: الغيابُ حالةٌ صالحةٌ يجب أن تُحتمَل، ولا يصحّ أن يكون
     # البديلُ الصامتُ هو ملفَّ الأسرار الحقيقيّ.
     monkeypatch.setattr(config, "CHAIN_KEYS_PATH", str(tmp_path / "isolated_keys.json"))
+    # وملفُّ اعتماد Privy معه ولنفس السبب حرفيّاً، بل أشدّ: `keystore` يحذف
+    # مفتاحاً واحداً، أمّا `account.switch` فيكتب هويّةَ الحساب كلَّها فوق
+    # `api/.privy_state.json` — واختبارٌ نسي العزل كان يُسكت الجمعَ كلَّه على
+    # هذا الجهاز، والاختبارُ يمرّ. غيرُ موجودٍ عن قصد كذلك: الغيابُ حالةٌ
+    # صالحةٌ يجب أن تُحتمَل (لم يُسجَّل دخولٌ بعد).
+    monkeypatch.setattr(config, "PRIVY_STATE_PATH", str(tmp_path / "isolated_privy.json"))
     return path

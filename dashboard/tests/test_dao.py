@@ -185,6 +185,24 @@ def test_status_missing_meta_keys_default(db_path):
     conn.close()
 
 
+def test_status_exposes_per_network_evm_admission(db_path):
+    _seed_meta(
+        db_path,
+        evm_admission_network_state=json.dumps({
+            "143": {"percent": 100, "paused": False, "reason": "ok"},
+            "8453": {"percent": 0, "paused": True, "reason": "active_retry"},
+        }),
+        evm_admission_paused_networks=json.dumps(["8453"]),
+    )
+    conn = _conn(db_path)
+    status = dao.recorder_status(conn, 150, 2000)
+    conn.close()
+
+    assert status["evm_admission_networks"]["143"]["percent"] == 100
+    assert status["evm_admission_networks"]["8453"]["reason"] == "active_retry"
+    assert status["evm_admission_paused_networks"] == ["8453"]
+
+
 # --- errors ---
 def test_recorder_errors_absent_is_none(db_path):
     conn = _conn(db_path)
@@ -1165,4 +1183,47 @@ def test_status_without_feed_stamp_does_not_claim_staleness(db_path):
     st = dao.recorder_status(conn, 150, 2000)
     assert st["feed_age_seconds"] is None
     assert st["feed_stale"] is False
+    conn.close()
+
+
+def test_a_healthy_recorder_no_longer_heals_a_queue_that_has_not_succeeded(db_path):
+    """صحّةُ المسجّل لا تشفي خطأَ طابورٍ له ختمُه ولم ينجح بعد.
+
+    قِيس 2026-08-19: حُجب مسارُ التجّار 21 ساعة والمسجّل يُتمّ دوراتِه بـ
+    `errors: 0` كلَّ دقيقة. مع `max(own, recorder)` كان أيُّ خطأٍ يُكتب هناك
+    يُعلَن «متعافياً» بعد دقيقةٍ من كتابته — أي أنّ نفسَ الصحّةِ الكاذبة التي
+    أخفت الانقطاع كانت ستُخفي إعلانَه أيضاً.
+    """
+    _seed_meta(
+        db_path,
+        last_ok_cycle_at="2026-08-20T13:00:00+00:00",       # المسجّل بخير الآن
+        traders_last_ok_at="2026-08-19T14:53:51+00:00",     # وهذا المسار لا
+        last_error_traders="2026-08-20T12:00:00+00:00: ShutoutSuspected: 50",
+    )
+    conn = _conn(db_path)
+    row = next(
+        e for e in dao.recorder_errors(
+            conn, ("traders",), ok_stamps={"traders": ("traders_last_ok_at",)},
+        ) if e["source"] == "traders"
+    )
+    assert row["stale"] is False
+    assert row["ok_at"] == "2026-08-19T14:53:51+00:00"
+    conn.close()
+
+
+def test_an_own_stamp_newer_than_the_error_still_heals_it(db_path):
+    """والشفاءُ يبقى ممكناً: ختمٌ خاصٌّ أحدثُ من الخطأ يُقادمه كما كان."""
+    _seed_meta(
+        db_path,
+        last_ok_cycle_at="2026-08-20T13:00:00+00:00",
+        traders_last_ok_at="2026-08-20T13:05:00+00:00",
+        last_error_traders="2026-08-20T12:00:00+00:00: ShutoutSuspected: 50",
+    )
+    conn = _conn(db_path)
+    row = next(
+        e for e in dao.recorder_errors(
+            conn, ("traders",), ok_stamps={"traders": ("traders_last_ok_at",)},
+        ) if e["source"] == "traders"
+    )
+    assert row["stale"] is True
     conn.close()

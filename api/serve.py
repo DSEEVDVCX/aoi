@@ -16,7 +16,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)                       # لضمان قراءة .privy_state.json بمسار نسبي
 sys.path.insert(0, os.path.join(HERE, "src"))
 
-log = open(os.path.join(HERE, "server_boot.log"), "a", encoding="utf-8", buffering=1)
+log = open(  # noqa: SIM115 — يبقى مفتوحاً عمر العملية كلها (pythonw بلا stdout)
+    os.path.join(HERE, "server_boot.log"), "a", encoding="utf-8", buffering=1,
+)
 
 
 def _setup_logging() -> None:

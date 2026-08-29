@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 DATA_HOST = "https://prod-api.fomo.family"
 OUT = "captured_endpoints.json"

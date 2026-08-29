@@ -17,6 +17,8 @@ async def test_alert_stream_requires_auth(app_client):
 async def test_alert_stream_delivers_events(authed_client, monkeypatch):
     """Verify the SSE manager publishes alert events for tracked traders
     and deduplicates by Alert.id (contracts/alerts-sse.md)."""
+    from sse_starlette.sse import ServerSentEvent
+
     from fomo_api.realtime.sse import SSEManager
 
     events: list[dict[str, str]] = []
@@ -63,3 +65,9 @@ async def test_alert_stream_delivers_events(authed_client, monkeypatch):
     assert "al_1" in alert_ids
     assert alert_ids.count("al_1") == 1  # deduplicated
     assert "al_2" not in alert_ids  # t_2 not tracked
+    alert = next(e for e in alert_events if json.loads(e["data"])["id"] == "al_1")
+    assert alert["id"] == "al_1"
+    assert alert["retry"] == 5000
+    # Exercise the same formatter used by EventSourceResponse, not only the
+    # internal event dictionary.
+    ServerSentEvent(**alert).encode()

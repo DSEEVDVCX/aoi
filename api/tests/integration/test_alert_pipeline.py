@@ -26,14 +26,14 @@ def _feed(*items) -> dict:
     return {"success": True, "responseObject": {"feed": list(items)}, "statusCode": 200}
 
 
-def _event(eid: str, trader: str, ts: str) -> dict:
+def _event(eid: str, trader: str, ts: str, event_type: str = "large_buy") -> dict:
     return {
         "id": eid,
         "userId": trader,
         "createdAt": ts,
         "networkId": 56,
         "tokenAddress": "0xtok",
-        "type": "large_buy",
+        "type": event_type,
     }
 
 
@@ -110,6 +110,7 @@ async def test_poller_publishes_new_alerts_and_advances_watermark(
     published = await poller.poll_once("t_1")
 
     assert [a["id"] for a in published] == ["a1"]
+    assert "type" not in published[0]
     assert await fake_redis.get("fomo:watermark:t_1") == "2026-07-26T10:00:00Z"
 
 
@@ -123,6 +124,18 @@ async def test_poller_does_not_republish_already_seen_alerts(
 
     assert len(await poller.poll_once("t_1")) == 1
     assert await poller.poll_once("t_1") == []  # watermark suppresses the repeat
+
+
+async def test_poller_ignores_sell_activity(fake_redis, respx_mock, fomo_json):
+    respx_mock.get(_FEED_PATH).mock(
+        return_value=fomo_json(
+            _feed(_event("sell-1", "t_1", "2026-07-26T10:00:00Z", "large_sell"))
+        )
+    )
+    poller = AlertPoller(AlertPubSub(fake_redis), lambda _tid: _token())
+
+    assert await poller.poll_once("t_1") == []
+    assert await fake_redis.get("fomo:watermark:t_1") is None
 
 
 async def test_poller_refreshes_tracked_traders_from_subscriptions(fake_redis):
