@@ -1,3 +1,4 @@
+import json
 import os
 
 import config
@@ -21,41 +22,85 @@ def db(tmp_path):
     recorder._evm_admission_paused_runtime = False
 
 
-def _backlog(db, count):
+def _backlog(db, count, *, span=2):
+    db.set_evm_cursor("8453", 100, NOW, "ok")
     for index in range(count):
         token = f"0x{index:040x}"
         db.upsert_watch(token, "8453", "large_buy", f"s-{index}", 48, NOW)
         db.set_evm_backfill_state(
-            "8453", token, "partial", NOW, from_block=1, to_block=2,
+            "8453", token, "partial", NOW, from_block=1, to_block=span,
         )
 
 
 @pytest.mark.parametrize(
     ("backlog", "percent"),
-    [(0, 100), (14, 100), (15, 75), (29, 75), (30, 50), (44, 50), (45, 0)],
+    [(0, 100), (14, 100), (480, 75), (960, 50), (1920, 0)],
 )
-def test_policy_levels_follow_backlog(db, monkeypatch, backlog, percent):
+def test_policy_levels_follow_network_rpc_capacity(db, monkeypatch, backlog, percent):
     monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
     _backlog(db, backlog)
 
     policy = recorder.evm_admission_policy(db)
 
     assert policy.backlog == backlog
-    assert policy.percent == percent
+    assert policy.network_percent("8453") == percent
+
+
+def test_policy_isolated_per_network_and_records_rpc_budget(db, monkeypatch):
+    """شبكة متوقفة لا توقف شبكة أخرى ذات RPC سليم."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "143"))
+    for index in range(60):
+        token = f"0x{index + 100:040x}"
+        db.upsert_watch(token, "8453", "large_buy", f"b-{index}", 48, NOW)
+        db.set_evm_backfill_state(
+            "8453", token, "partial", NOW, from_block=1, to_block=2,
+        )
+    db.upsert_watch("0x" + "f" * 40, "143", "large_buy", "m-1", 48, NOW)
+    db.set_evm_backfill_state(
+        "143", "0x" + "f" * 40, "retry", NOW, last_error="429",
+    )
+    db.set_evm_cursor("8453", 100, NOW, "ok")
+
+    policy = recorder.evm_admission_policy(db)
+
+    assert policy.network("143").paused is True
+    assert policy.network("143").reason == "active_retry"
+    assert policy.network("8453").paused is False
+    assert policy.network_percent("8453") == 100
+    state = json.loads(db.get_meta("evm_admission_network_state"))
+    assert set(state) == {"143", "8453"}
+
+
+def test_healthy_network_can_admit_when_other_network_is_paused(db, monkeypatch):
+    """الحالة السليمة تبقى مستقلة حتى لو توقفت Monad."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "143"))
+    db.upsert_watch("0x" + "1" * 40, "143", "large_buy", "m-1", 48, NOW)
+    db.set_evm_backfill_state(
+        "143", "0x" + "1" * 40, "retry", NOW, last_error="429",
+    )
+    db.set_evm_cursor("8453", 100, NOW, "ok")
+
+    policy = recorder.evm_admission_policy(db)
+
+    assert policy.network("143").paused is True
+    assert policy.network("8453").paused is False
+    assert policy.network_percent("8453") == 100
+    assert policy.allows("signal", "0x" + "2" * 40, "8453", "event") is True
+    assert policy.allows("signal", "0x" + "3" * 40, "143", "event") is False
 
 
 def test_paused_policy_resumes_only_below_low_watermark(db, monkeypatch):
     monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
-    db.set_meta("evm_admission_paused", "1")
+    db.set_meta("evm_admission_network_state", json.dumps({"8453": {"paused": True}}))
     _backlog(db, 20)
-    assert recorder.evm_admission_policy(db).percent == 0
+    assert recorder.evm_admission_policy(db).network_percent("8453") == 100
 
     db._conn.execute(
         "UPDATE evm_backfill_state SET status='done' WHERE token_address=?",
         ("0x0000000000000000000000000000000000000000",),
     )
     db._conn.commit()
-    assert recorder.evm_admission_policy(db).percent == 75
+    assert recorder.evm_admission_policy(db).network_percent("8453") == 100
 
 
 def test_non_evm_network_is_never_throttled():
@@ -115,6 +160,10 @@ def test_comparison_windows_throttle_only_evm(db):
         ("evm", "0xabc", "8453"),
         ("sol", "sol-token", "1399811149"),
     ):
+        db.upsert_static({
+            "token_address": token, "network_id": network, "recorded_at": NOW,
+            "token_created_at": "1600000000", "raw_json": "{}",
+        })
         db.insert_signal({
             "id": event_id, "token_address": token, "network_id": network,
             "ts": NOW, "recorded_at": NOW, "signal_type": "large_buy",
@@ -139,6 +188,10 @@ def test_comparison_windows_throttle_only_evm(db):
 
 
 def test_existing_evm_watch_bypasses_pause_for_comparison(db):
+    db.upsert_static({
+        "token_address": "0xabc", "network_id": "8453", "recorded_at": NOW,
+        "token_created_at": "1600000000", "raw_json": "{}",
+    })
     db.upsert_watch("0xabc", "8453", "large_buy", "old", 48, NOW)
     db.insert_signal({
         "id": "new", "token_address": "0xabc", "network_id": "8453",
@@ -177,10 +230,11 @@ async def test_feed_signal_survives_watch_admission_failure(db, monkeypatch):
     policy = recorder.EVMAdmissionPolicy(
         frozenset({"8453"}), 0, 1, 1, False,
     )
-    # عمرٌ معروفٌ وقديم: البوّابة ليست موضوع هذا الاختبار، فلا تحجب المسار عنه.
+    # عمرٌ معروفٌ وحديث (2026-08-29): بوابة العمر وسقف EVM الأعلى ليسا
+    # موضوع هذا الاختبار، فلا يحجبان المسار عن الإشارة. (عمر ~10 أيام.)
     db.upsert_static({
         "token_address": "0xabc", "network_id": "8453", "recorded_at": NOW,
-        "token_created_at": "1600000000", "raw_json": "{}",
+        "token_created_at": "1786368000", "raw_json": "{}",
     })
     monkeypatch.setattr(db, "upsert_watch", lambda *args, **kwargs: (_ for _ in ()).throw(
         RuntimeError("watch failed")
@@ -199,6 +253,13 @@ async def test_feed_signal_survives_watch_admission_failure(db, monkeypatch):
 def test_control_sample_throttles_only_evm(db):
     db.upsert_watch("signal-sol", "1399811149", "large_buy", "s1", 48, NOW)
     db.upsert_watch("signal-evm", "8453", "large_buy", "s2", 48, NOW)
+    # عمرٌ معروفٌ وقديم للمرشّحين: موضوعُ الاختبار خنقُ EVM لا بوّابةُ العمر،
+    # وبلا تاريخٍ يرفضهما الضابطُ كمجهولَي العمر فيُقاس الخنق على مجموعةٍ خالية.
+    for addr, net in (("control-sol", "1399811149"), ("control-evm", "8453")):
+        db.upsert_static({
+            "token_address": addr, "network_id": net, "recorded_at": NOW,
+            "token_created_at": "1600000000", "raw_json": "{}",
+        })
     policy = recorder.EVMAdmissionPolicy(
         frozenset({"8453"}), 45, 0, 1, True,
     )

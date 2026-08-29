@@ -29,6 +29,8 @@ from typing import Any
 _ZLIB_LEVEL = 6
 # بادئة zlib القياسية (0x78) — نميّز بها الخام المضغوط عن النصّ القديم.
 _ZLIB_MAGIC = 0x78
+_EVM_NETWORK_IDS = frozenset({"56", "143", "4663", "8453"})
+_EVM_NETWORK_IDS_SQL = "'56', '143', '4663', '8453'"
 
 
 class StaleEVMState(RuntimeError):
@@ -70,6 +72,10 @@ class RecorderDB:
         # الازدحام فترمي "database is locked" بلا داعٍ.
         self._db_path = db_path
         self._conn = sqlite3.connect(db_path, timeout=30)
+        # سقفُ حجمِ WAL بعدَ الـcheckpoint (256MB): بلا هذا السقفَ نما الملفُّ
+        # إلى ~5GB تحت الكتّاب المتوازيين (مسجّل+موسِّم+EVM) وأعاد أخطاء
+        # «database is locked» على القرّاء الطويلين. القياسُ 2026-08-24.
+        self._conn.execute("PRAGMA journal_size_limit=268435456")
         self._conn.row_factory = sqlite3.Row
         self._batching = False
         self._savepoint_counter = 0
@@ -116,6 +122,7 @@ class RecorderDB:
                     raise
                 time.sleep(0.4 * (attempt + 1))
         self._backfill_watch_windows()
+        self._backfill_age_observed_at()
         self._quarantine_legacy_outcomes()
         self._set_current_feature_version()
         self._conn.commit()
@@ -129,6 +136,49 @@ class RecorderDB:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(FEATURE_VERSION),),
         )
+
+    def _backfill_age_observed_at(self) -> None:
+        """Recover when the stored creation timestamp was actually observable."""
+        from features import epoch_of
+
+        rows = self._conn.execute(
+            """SELECT token_address, network_id, recorded_at,
+                      token_created_at, raw_json
+                 FROM token_static
+                WHERE token_created_at IS NOT NULL
+                  AND token_created_at <> ''
+                  AND token_created_at_observed_at IS NULL"""
+        ).fetchall()
+        for row in rows:
+            observed_at = None
+            try:
+                raw = decode_raw(row["raw_json"])
+            except (OSError, TypeError, UnicodeError, ValueError, zlib.error):
+                raw = None
+            if isinstance(raw, Mapping):
+                token = raw.get("token")
+                token = token if isinstance(token, Mapping) else {}
+                raw_created = token.get("createdAt") or raw.get("createdAt")
+                if (
+                    epoch_of(raw_created) is not None
+                    and epoch_of(raw_created) == epoch_of(row["token_created_at"])
+                ):
+                    observed_at = row["recorded_at"]
+            if observed_at is None:
+                state = self._conn.execute(
+                    """SELECT last_lookup_at FROM token_age_lookup_state
+                        WHERE token_address=? AND network_id=?
+                          AND last_status='ok'""",
+                    (row["token_address"], row["network_id"]),
+                ).fetchone()
+                if state is not None:
+                    observed_at = state["last_lookup_at"]
+            if observed_at is not None:
+                self._conn.execute(
+                    """UPDATE token_static SET token_created_at_observed_at=?
+                        WHERE token_address=? AND network_id=?""",
+                    (observed_at, row["token_address"], row["network_id"]),
+                )
 
     def _quarantine_legacy_outcomes(self) -> None:
         """يعزل كل نتيجة watch أقدم من تصميم المقارنة الحالي."""
@@ -420,7 +470,17 @@ class RecorderDB:
             f"INSERT OR IGNORE INTO token_static({', '.join(cols)}) "
             f"VALUES({placeholders})"
         )
-        self._conn.execute(sql, _with_compressed_raw({c: row.get(c) for c in cols}))
+        values = {c: row.get(c) for c in cols}
+        if str(values.get("network_id") or "") in _EVM_NETWORK_IDS:
+            address = values.get("token_address")
+            if isinstance(address, str) and address.lower().startswith("0x"):
+                values["token_address"] = address.lower()
+        if (
+            values.get("token_created_at") not in (None, "")
+            and values.get("token_created_at_observed_at") in (None, "")
+        ):
+            values["token_created_at_observed_at"] = values.get("recorded_at")
+        self._conn.execute(sql, _with_compressed_raw(values))
         self._commit()
 
     def static_exists(self, token_address: str, network_id: str) -> bool:
@@ -429,6 +489,46 @@ class RecorderDB:
             (token_address, network_id),
         ).fetchone()
         return row is not None
+
+    def set_age_lookup_state(
+        self, token_address: str, network_id: str, status: str, now_iso: str,
+    ) -> None:
+        self._conn.execute(
+            """INSERT INTO token_age_lookup_state(
+                   token_address, network_id, last_lookup_at, last_status, attempts)
+               VALUES(?, ?, ?, ?, 1)
+               ON CONFLICT(token_address, network_id) DO UPDATE SET
+                   last_lookup_at=excluded.last_lookup_at,
+                   last_status=excluded.last_status,
+                   attempts=token_age_lookup_state.attempts + 1""",
+            (token_address, network_id, now_iso, status),
+        )
+        self._commit()
+
+    def age_lookup_due(
+        self, token_address: str, network_id: str, now_iso: str,
+        missing_retry_seconds: int, error_retry_seconds: int,
+    ) -> bool:
+        row = self._conn.execute(
+            """SELECT last_lookup_at, last_status FROM token_age_lookup_state
+                WHERE token_address=? AND network_id=?""",
+            (token_address, network_id),
+        ).fetchone()
+        if row is None or str(row["last_status"] or "") == "ok":
+            return row is None
+        try:
+            elapsed = (
+                datetime.fromisoformat(now_iso)
+                - datetime.fromisoformat(str(row["last_lookup_at"]))
+            ).total_seconds()
+        except (TypeError, ValueError):
+            return True
+        delay = (
+            error_retry_seconds
+            if row["last_status"] == "error"
+            else missing_retry_seconds
+        )
+        return elapsed >= max(0, int(delay))
 
     # --- snapshots ---
     def insert_snapshot(self, source: str, raw: Any, recorded_at: str | None = None) -> None:
@@ -872,7 +972,8 @@ class RecorderDB:
         return cur.rowcount > 0
 
     def set_static_created_at(
-        self, token_address: str, network_id: str, created_at: str
+        self, token_address: str, network_id: str, created_at: str,
+        observed_at: str,
     ) -> bool:
         """يملأ `token_created_at` **حين يكون فارغاً فقط**.
 
@@ -887,10 +988,56 @@ class RecorderDB:
         عملةٍ مقبولةٍ أصلاً.
         """
         cur = self._conn.execute(
-            """UPDATE token_static SET token_created_at=?
+            """UPDATE token_static
+                  SET token_created_at=?, token_created_at_observed_at=?
                 WHERE token_address=? AND network_id=?
                   AND (token_created_at IS NULL OR token_created_at='')""",
-            (created_at, token_address, network_id),
+            (created_at, observed_at, token_address, network_id),
+        )
+        self._commit()
+        return cur.rowcount > 0
+
+    def observe_static_created_at(
+        self, token_address: str, network_id: str, expected_created_at: str,
+        observed_at: str,
+    ) -> bool:
+        """Record when an existing creation timestamp was seen in a live item."""
+        cur = self._conn.execute(
+            """UPDATE token_static SET token_created_at_observed_at=?
+                WHERE token_address=? AND network_id=?
+                  AND token_created_at=?
+                  AND token_created_at_observed_at IS NULL""",
+            (observed_at, token_address, network_id, expected_created_at),
+        )
+        self._commit()
+        return cur.rowcount > 0
+
+    def replace_unobserved_static_created_at(
+        self, token_address: str, network_id: str, old_created_at: str,
+        created_at: str, observed_at: str,
+    ) -> bool:
+        """Atomically replace only an unproven value the caller just read."""
+        cur = self._conn.execute(
+            """UPDATE token_static
+                  SET token_created_at=?, token_created_at_observed_at=?
+                WHERE token_address=? AND network_id=?
+                  AND token_created_at=?
+                  AND token_created_at_observed_at IS NULL""",
+            (created_at, observed_at, token_address, network_id, old_created_at),
+        )
+        self._commit()
+        return cur.rowcount > 0
+
+    def replace_static_created_at(
+        self, token_address: str, network_id: str, created_at: str,
+        observed_at: str,
+    ) -> bool:
+        """Replace a timestamp only after the caller validated the new value."""
+        cur = self._conn.execute(
+            """UPDATE token_static
+                  SET token_created_at=?, token_created_at_observed_at=?
+                WHERE token_address=? AND network_id=?""",
+            (created_at, observed_at, token_address, network_id),
         )
         self._commit()
         return cur.rowcount > 0
@@ -1336,11 +1483,18 @@ class RecorderDB:
         rows = self._conn.execute(
             f"""SELECT w.token_address, w.network_id, w.first_seen_at,
                        w.entry_signal_id, w.is_control,
+                       s.token_created_at, s.token_created_at_observed_at,
                        b.status AS backfill_status, b.from_block, b.to_block,
                        b.transfers AS backfill_transfers,
                        b.calls AS backfill_calls,
                        b.last_try_at AS backfill_last_try_at
                   FROM watchlist w
+                  LEFT JOIN token_static s
+                    ON CASE WHEN s.network_id IN ('56','143','4663','8453')
+                            THEN lower(s.token_address)=lower(w.token_address)
+                            ELSE s.token_address=w.token_address END
+                   AND s.network_id=w.network_id
+                   AND s.recorded_at <= w.first_seen_at
                   LEFT JOIN evm_backfill_state b
                     ON lower(b.token_address)=lower(w.token_address)
                    AND b.network_id=w.network_id
@@ -1348,7 +1502,13 @@ class RecorderDB:
                   ORDER BY w.is_control, w.first_seen_at DESC""",
             params,
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [
+            dict(row) for row in rows
+            if self._age_gate_allows_window(
+                row["first_seen_at"], row["token_created_at"],
+                row["token_created_at_observed_at"],
+            )
+        ]
 
     def assert_evm_done_tokens(
         self, network_id: str, expected_tokens: Sequence[str],
@@ -1368,14 +1528,27 @@ class RecorderDB:
         self, token_address: str, network_id: str,
     ) -> list[dict[str, str]]:
         rows = self._conn.execute(
-            """SELECT first_seen_at, watch_until FROM watch_windows
-                WHERE token_address=? AND network_id=? ORDER BY first_seen_at""",
+            """SELECT w.first_seen_at, w.watch_until, s.token_created_at,
+                      s.token_created_at_observed_at
+                 FROM watch_windows w
+                 LEFT JOIN token_static s
+                   ON CASE WHEN s.network_id IN ('56','143','4663','8453')
+                           THEN lower(s.token_address)=lower(w.token_address)
+                           ELSE s.token_address=w.token_address END
+                  AND s.network_id=w.network_id
+                  AND s.recorded_at <= w.first_seen_at
+                WHERE w.token_address=? AND w.network_id=?
+                ORDER BY w.first_seen_at""",
             (token_address.lower(), str(network_id)),
         ).fetchall()
         return [
             {"first_seen_at": str(row["first_seen_at"]),
              "watch_until": str(row["watch_until"])}
             for row in rows
+            if self._age_gate_allows_window(
+                row["first_seen_at"], row["token_created_at"],
+                row["token_created_at_observed_at"],
+            )
         ]
 
     def assert_evm_replay_windows(
@@ -1426,6 +1599,7 @@ class RecorderDB:
             f"""SELECT w.token_address, w.network_id, w.first_seen_at,
                        w.watch_until, w.entry_signal_id, w.is_control,
                        COALESCE(l.active, 0) AS active,
+                       s.token_created_at, s.token_created_at_observed_at,
                        r.status AS replay_status, r.last_try_at AS replay_last_try_at,
                        r.snapshots AS replay_snapshots,
                        r.from_block AS replay_from_block,
@@ -1437,6 +1611,12 @@ class RecorderDB:
                   FROM watch_windows w
                   LEFT JOIN watchlist l
                     ON l.token_address=w.token_address AND l.network_id=w.network_id
+                  LEFT JOIN token_static s
+                    ON CASE WHEN s.network_id IN ('56','143','4663','8453')
+                            THEN lower(s.token_address)=lower(w.token_address)
+                            ELSE s.token_address=w.token_address END
+                   AND s.network_id=w.network_id
+                   AND s.recorded_at <= w.first_seen_at
                   LEFT JOIN evm_replay_state r
                     ON r.token_address=w.token_address AND r.network_id=w.network_id
                  WHERE w.network_id IN ({marks})
@@ -1445,6 +1625,11 @@ class RecorderDB:
         ).fetchall()
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for raw in rows:
+            if not self._age_gate_allows_window(
+                raw["first_seen_at"], raw["token_created_at"],
+                raw["token_created_at_observed_at"],
+            ):
+                continue
             row = dict(raw)
             key = (str(row["token_address"]).lower(), str(row["network_id"]))
             current = grouped.get(key)
@@ -1585,6 +1770,34 @@ class RecorderDB:
             self._conn.execute(
                 "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
                 (token, net),
+            )
+
+    def restart_evm_backfill_from(
+        self, token_address: str, network_id: str, from_block: int, now_iso: str,
+    ) -> None:
+        """يعيد فتح تعبئة دفتر EVM لعملة من كتلة بداية جديدة.
+
+        للعملات العالقة في `partial` بمدى مستحيل (عشرات ملايين الكتل): يمحو
+        الدفتر الجزئي القديم (أرصدته بُنيت على مدًى سيعاد قراءته) ويصفّر
+        الحالة إلى `retry` من `from_block`. صفوف التدريب القائمة لا تُمسّ —
+        الدفتر تراكميّ فوق النقطة الجديدة والصفوف الجديدة تُبنى فوق الحاضر.
+        """
+        token, net = token_address.lower(), str(network_id)
+        with self.batch():
+            self._conn.execute(
+                "DELETE FROM evm_balances WHERE token_address=? AND network_id=?",
+                (token, net),
+            )
+            self._conn.execute(
+                """INSERT INTO evm_backfill_state(
+                       network_id, token_address, status, from_block, to_block,
+                       transfers, calls, last_try_at, last_error)
+                   VALUES(?,?, 'retry', ?, NULL, 0, NULL, ?, NULL)
+                   ON CONFLICT(network_id, token_address) DO UPDATE SET
+                       status='retry', from_block=excluded.from_block,
+                       to_block=NULL, transfers=0, calls=NULL,
+                       last_try_at=excluded.last_try_at, last_error=NULL""",
+                (net, token, int(from_block), now_iso),
             )
 
     def assert_evm_replay_state(
@@ -1810,26 +2023,80 @@ class RecorderDB:
                 (token_address, network_id),
             )
             # إعادة التنشيط قد تأتي بعد فجوة كان دفتر EVM خلالها غير مراقَب.
-            # الحالة النهائية القديمة لا تثبت تغطية تلك الفجوة، لذلك نعيد دفتر
-            # العملة وreplay من genesis بدلاً من قبول رصيد ناقص بصمت.
-            self._conn.execute(
-                "DELETE FROM evm_balances WHERE token_address=? AND network_id=?",
-                (token_address.lower(), str(network_id)),
-            )
-            self._conn.execute(
-                "DELETE FROM evm_backfill_state WHERE token_address=? AND network_id=?",
-                (token_address.lower(), str(network_id)),
-            )
-            self._conn.execute(
-                "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
-                (token_address.lower(), str(network_id)),
-            )
+            # الفجوةُ القصيرة (≤ EVM_REACTIVATION_KEEP_LEDGER_SECONDS، 2026-08-29)
+            # تحفظ الدفتر ونقطة الاستئناف وتُوسِّع to_block فقط: محوُها كان
+            # يُصفِّر تقدّم التعبئة كلهً فتُبنى الطوابير من الصفر أبدًا (قياس
+            # 08-29: 43 عملة على روبن‑هود عادت للصفر بهذا المسار). الفجوةُ
+            # الأطول تعيد البناء من genesis كما كان — الحالة النهائية القديمة
+            # لا تثبت تغطية فجوةٍ طويلة، وقبولُ رصيدٍ ناقص أسوأ من إعادة بناء.
+            if self._reactivation_gap_exceeds_keep(
+                token_address, network_id, now,
+            ):
+                self._conn.execute(
+                    "DELETE FROM evm_balances WHERE token_address=? AND network_id=?",
+                    (token_address.lower(), str(network_id)),
+                )
+                self._conn.execute(
+                    "DELETE FROM evm_backfill_state WHERE token_address=? AND network_id=?",
+                    (token_address.lower(), str(network_id)),
+                )
+                self._conn.execute(
+                    "DELETE FROM evm_replay_state WHERE token_address=? AND network_id=?",
+                    (token_address.lower(), str(network_id)),
+                )
+            else:
+                # الدفتر باقٍ: التعبئة تستأنف من نقطتها وتُلحق الفجوة عبر
+                # `to_block` الموسَّع (الخطوة 2 في evm_layer تقرأ حتى مؤشّر
+                # الدورة الجديد للعملات partial قبل إعلانها done).
+                self._conn.execute(
+                    """UPDATE evm_backfill_state
+                          SET to_block = COALESCE(to_block, 0),
+                              status = CASE WHEN status = 'done'
+                                            THEN 'partial' ELSE status END
+                        WHERE token_address=? AND network_id=?""",
+                    (token_address.lower(), str(network_id)),
+                )
             self._insert_watch_window(
                 token_address, network_id, now, source, until, entry_signal_id, 0,
                 admission_price_usd,
             )
         self._commit()
         return cur.rowcount > 0
+
+    def _reactivation_gap_exceeds_keep(
+        self, token_address: str, network_id: str, now_iso: str,
+    ) -> bool:
+        """هل الفجوة منذ انتهاء النافذة السابقة أطول من سقف حفظ الدفتر؟
+
+        تُقارن آخر نافذة **منتهية** (`watch_until` الأقدم في watch_windows)
+        بوقت إعادة التنشيط. غيابُ النوافذ السابقة أو فشلُ قراءة الوقت يعني
+        «فجوة غير معروفة» ⇒ إعادة بناء (الأمان قبل كل شيء). وتُقرأ من
+        `watch_windows` لا من watchlist لأن `watch_until` هناك يُكتَب فوقه
+        فور إعادة التنشيط فلا يبقى أثرٌ للنافذة المنتهية.
+        """
+        try:
+            import config
+            keep = float(config.EVM_REACTIVATION_KEEP_LEDGER_SECONDS or 0)
+        except (ImportError, TypeError, ValueError):
+            keep = 0.0
+        if keep <= 0:
+            return True  # السقف معطَّل: السلوك القديم (حذف كامل)
+        row = self._conn.execute(
+            """SELECT MIN(watch_until) AS oldest_end
+                 FROM watch_windows
+                WHERE token_address=? AND network_id=?""",
+            (token_address, str(network_id)),
+        ).fetchone()
+        if row is None or row["oldest_end"] is None:
+            return True
+        try:
+            gap = (
+                datetime.fromisoformat(now_iso)
+                - datetime.fromisoformat(row["oldest_end"])
+            ).total_seconds()
+        except (TypeError, ValueError):
+            return True
+        return gap > keep
 
     def admit_control(
         self,
@@ -1977,6 +2244,83 @@ class RecorderDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def _age_gate_allows_window(
+        first_seen_at: Any, token_created_at: Any,
+        token_created_at_observed_at: Any = None,
+    ) -> bool:
+        """Return whether a post-gate window may consume worker RPC budget."""
+        from config import AGE_GATE_ENABLED_AT, MIN_TOKEN_AGE_DAYS
+
+        if not MIN_TOKEN_AGE_DAYS:
+            return True
+        from features import epoch_of
+
+        entry = epoch_of(first_seen_at)
+        gate = epoch_of(AGE_GATE_ENABLED_AT)
+        if entry is None or gate is None or entry < gate:
+            return True
+        observed = epoch_of(token_created_at_observed_at)
+        if observed is None or observed > entry:
+            return False
+        created = epoch_of(token_created_at)
+        return (
+            created is not None
+            and entry >= created
+            and entry - created >= float(MIN_TOKEN_AGE_DAYS) * 86400.0
+        )
+
+    def quarantine_age_invalid_active(
+        self, now_iso: str, min_age_days: float, *, since_iso: str,
+    ) -> int:
+        """Deactivate active rows that violated the gate; preserve history."""
+        if min_age_days <= 0:
+            return 0
+        from features import epoch_of
+
+        rows = self._conn.execute(
+            """SELECT w.token_address, w.network_id, w.first_seen_at,
+                      s.token_created_at, s.token_created_at_observed_at
+                 FROM watchlist w
+                 LEFT JOIN token_static s
+                   ON CASE WHEN s.network_id IN ('56','143','4663','8453')
+                           THEN lower(s.token_address)=lower(w.token_address)
+                           ELSE s.token_address=w.token_address END
+                  AND s.network_id=w.network_id
+                  AND s.recorded_at <= w.first_seen_at
+                WHERE w.active=1""",
+        ).fetchall()
+        gate = epoch_of(since_iso)
+        minimum_seconds = float(min_age_days) * 86400.0
+        invalid: list[tuple[str, str]] = []
+        for row in rows:
+            entry = epoch_of(row["first_seen_at"])
+            observed = epoch_of(row["token_created_at_observed_at"])
+            created = epoch_of(row["token_created_at"])
+            if (
+                entry is None
+                or gate is None
+                or entry < gate
+            ):
+                continue
+            if (
+                observed is None
+                or observed > entry
+                or created is None
+                or entry < created
+                or entry - created < minimum_seconds
+            ):
+                invalid.append((row["token_address"], row["network_id"]))
+        if not invalid:
+            return 0
+        self._conn.executemany(
+            """UPDATE watchlist SET active=0
+                WHERE token_address=? AND network_id=? AND active=1""",
+            invalid,
+        )
+        self._commit()
+        return len(invalid)
+
     def deactivate_expired(self, now_iso: str | None = None) -> int:
         """يعطّل النافذة بعد اكتمال سحب شموعها النهائيّ، لا عند الساعة 48 فوراً."""
         now = now_iso or utcnow_iso()
@@ -2054,16 +2398,24 @@ class RecorderDB:
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, w.source, w.is_control,
                       w.first_seen_at, w.admission_price_usd, w.design_version,
+                      ts.token_created_at,
+                      ts.token_created_at_observed_at,
                       CAST(strftime('%s', w.first_seen_at) AS INTEGER) AS entry_epoch,
                       w.token_address || ':' || w.network_id || ':' || w.first_seen_at
                         AS key
                  FROM watch_windows w
+                 LEFT JOIN token_static ts
+                   ON CASE WHEN ts.network_id IN ('56','143','4663','8453')
+                           THEN lower(ts.token_address)=lower(w.token_address)
+                           ELSE ts.token_address=w.token_address END
+                  AND ts.network_id=w.network_id
+                  AND ts.recorded_at <= w.first_seen_at
                 WHERE CAST(strftime('%s', w.first_seen_at) AS INTEGER) <= ?
                   AND EXISTS (
                       SELECT 1 FROM bars_fetch_state s
                        WHERE s.token_address = w.token_address
                          AND s.network_id = w.network_id
-                         AND ((s.last_status = 'ok' AND s.last_fetch_at >= w.watch_until)
+                         AND ((s.last_status = 'ok')
                               OR (s.last_status = 'no_data' AND s.attempts >= 3))
                   )
                   AND NOT EXISTS (SELECT 1 FROM outcomes o
@@ -2149,6 +2501,15 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "feature_version", "feature_version INTEGER NOT NULL DEFAULT 1"),
     ("training_rows", "ath_history_complete", "ath_history_complete INTEGER"),
     ("training_rows", "ath_history_days", "ath_history_days REAL"),
+    ("training_rows", "pre_signal_runup", "pre_signal_runup REAL"),
+    ("outcomes", "is_explosive", "is_explosive INTEGER"),
+    ("outcomes", "time_to_plus20_min", "time_to_plus20_min REAL"),
+    ("training_rows", "is_explosive", "is_explosive INTEGER"),
+    ("training_rows", "time_to_plus20_min", "time_to_plus20_min REAL"),
+    ("token_static", "social_channels_dex", "social_channels_dex INTEGER"),
+    ("token_static", "social_match_fomo_dex", "social_match_fomo_dex INTEGER"),
+    ("training_rows", "social_channels_dex", "social_channels_dex INTEGER"),
+    ("training_rows", "social_match_fomo_dex", "social_match_fomo_dex INTEGER"),
     ("watch_windows", "admission_price_usd", "admission_price_usd REAL"),
     ("watch_windows", "admission_source", "admission_source TEXT"),
     ("watch_windows", "design_version", "design_version INTEGER NOT NULL DEFAULT 1"),
@@ -2169,6 +2530,8 @@ _COLUMN_MIGRATIONS = (
     ("token_static", "description_len", "description_len INTEGER"),
     ("token_static", "has_banner", "has_banner INTEGER"),
     ("token_static", "has_image", "has_image INTEGER"),
+    ("token_static", "token_created_at_observed_at",
+     "token_created_at_observed_at TEXT"),
     # تموضع حشد المنصّة من /hodlers/top. أُضيفت بعد قياس حيّ أثبت أنّ المصدر
     # لا يعطي نِسب معروض إطلاقاً (فلا top1_pct منه)، بل مراكز مستخدمي fomo.
     # الجدول قد يكون أُنشئ بالشكل الأول، فالترحيل يكمله بلا فقد بيانات.
@@ -2352,6 +2715,8 @@ _OUTCOME_COLUMNS = (
     "max_gain_1h", "max_gain_4h", "max_gain_24h", "max_gain_48h",
     "max_drawdown_48h", "final_return_48h", "time_to_peak_h",
     "candles_48h", "suspect_bars", "last_bar_lag_h", "bars_truncated", "is_rug",
+    # (fv15) ليبل الانفجار وسنارة الدخول المبكر — يكتبهما الموسِّم مع البقية.
+    "is_explosive", "time_to_plus20_min",
     "split", "status", "labeled_at",
     "design_version", "analysis_eligible", "exclusion_reason",
 )
@@ -2381,9 +2746,10 @@ _STATIC_COLUMNS = (
     "token_address", "network_id", "recorded_at", "name", "symbol", "decimals",
     "mintable", "freezable", "is_scam", "creator_address", "launchpad_name",
     "migrated", "graduation_percent", "twitter", "telegram", "website", "discord",
-    "token_created_at", "exchanges_count", "exchanges_json", "cmc_id",
+    "token_created_at", "token_created_at_observed_at",
+    "exchanges_count", "exchanges_json", "cmc_id",
     "description", "description_len", "has_banner", "has_image",
-    "dex_protocol", "raw_json",
+    "dex_protocol", "social_channels_dex", "social_match_fomo_dex", "raw_json",
 )
 
 _HOLDERS_COLUMNS = (

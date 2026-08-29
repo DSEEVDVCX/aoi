@@ -25,9 +25,30 @@ from typing import Any
 import config
 import extract
 from db import RecorderDB, utcnow_iso
+from features import epoch_of
 from leaderboard_cache import LeaderboardCache
 
 _evm_admission_paused_runtime = False
+
+
+@dataclass(frozen=True)
+class EVMNetworkAdmission:
+    """Admission state for one EVM network and its current RPC budget."""
+
+    network: str
+    backlog: int
+    work_units: int
+    capacity_units: int
+    retry_count: int
+    rpc_healthy: bool
+    numerator: int
+    denominator: int
+    paused: bool
+    reason: str
+
+    @property
+    def percent(self) -> int:
+        return 100 * self.numerator // self.denominator
 
 
 def _fail_closed_evm_admission(networks: frozenset[str]) -> EVMAdmissionPolicy:
@@ -46,22 +67,35 @@ class EVMAdmissionPolicy:
     numerator: int
     denominator: int
     paused: bool
+    by_network: Mapping[str, EVMNetworkAdmission] | None = None
 
     @property
     def percent(self) -> int:
+        if self.by_network:
+            return min(state.percent for state in self.by_network.values())
         return 100 * self.numerator // self.denominator
+
+    def network(self, network: str) -> EVMNetworkAdmission | None:
+        return self.by_network.get(str(network)) if self.by_network else None
+
+    def network_percent(self, network: str) -> int:
+        state = self.network(network)
+        return state.percent if state is not None else 100
 
     def allows(self, kind: str, token: str, network: str, key: str) -> bool:
         if str(network) not in self.networks:
             return True
-        if self.numerator <= 0:
+        state = self.network(network)
+        numerator = state.numerator if state is not None else self.numerator
+        denominator = state.denominator if state is not None else self.denominator
+        if numerator <= 0:
             return False
-        if self.numerator >= self.denominator:
+        if numerator >= denominator:
             return True
         # All admission paths must make the same decision for one token. The
         # unused kind/key parameters remain part of the call contract only.
         digest = hashlib.sha256(f"{network!s}:{token.lower()}".encode()).digest()
-        return int.from_bytes(digest[:8], "big") % self.denominator < self.numerator
+        return int.from_bytes(digest[:8], "big") % denominator < numerator
 
     def score(self, kind: str, token: str, network: str) -> int:
         digest = hashlib.sha256(f"{network!s}:{token.lower()}".encode()).digest()
@@ -69,39 +103,172 @@ class EVMAdmissionPolicy:
 
 
 def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
-    global _evm_admission_paused_runtime
+    """Build independent admission budgets from each network's RPC limits.
 
-    networks = frozenset(str(network) for network in config.EVM_NETWORKS)
+    ``backlog`` remains as a compatibility aggregate for the dashboard, but
+    ``allows`` consumes ``by_network``. A slow/failed RPC therefore throttles
+    only its own network.
+    """
+    networks = tuple(str(network) for network in config.EVM_NETWORKS)
     if not networks:
-        return EVMAdmissionPolicy(networks, 0, 1, 1, False)
-    marks = ", ".join("?" for _ in networks)
-    backlog = int(db._conn.execute(
-        "SELECT COUNT(*) FROM watchlist w LEFT JOIN evm_backfill_state b "
-        "ON b.network_id=w.network_id AND lower(b.token_address)=lower(w.token_address) "
-        f"WHERE w.active=1 AND w.network_id IN ({marks}) "
-        "AND COALESCE(b.status, '') <> 'done'",
-        tuple(sorted(networks)),
-    ).fetchone()[0])
-    paused = _evm_admission_paused_runtime or db.get_meta("evm_admission_paused") == "1"
-    if paused and backlog < config.EVM_ADMISSION_RESUME_BELOW:
-        paused = False
-        _evm_admission_paused_runtime = False
-        db.set_meta("evm_admission_paused", "0")
-    elif not paused and backlog >= config.EVM_ADMISSION_PAUSE_AT:
-        paused = True
-        _evm_admission_paused_runtime = True
-        db.set_meta("evm_admission_paused", "1")
-    elif paused:
-        _evm_admission_paused_runtime = True
-    if paused:
-        fraction = (0, 1)
-    elif backlog < config.EVM_ADMISSION_FULL_BELOW:
-        fraction = (1, 1)
-    elif backlog < config.EVM_ADMISSION_REDUCED_BELOW:
-        fraction = (3, 4)
-    else:
-        fraction = (1, 2)
-    return EVMAdmissionPolicy(networks, backlog, *fraction, paused)
+        return EVMAdmissionPolicy(frozenset(), 0, 1, 1, False, {})
+
+    previous: dict[str, Any] = {}
+    raw_previous = db.get_meta("evm_admission_network_state")
+    if raw_previous:
+        try:
+            decoded = json.loads(raw_previous)
+            if isinstance(decoded, dict):
+                previous = decoded
+        except (TypeError, ValueError):
+            previous = {}
+
+    states: dict[str, EVMNetworkAdmission] = {}
+    for network in networks:
+        rows = db._conn.execute(
+            """SELECT b.status, b.from_block, b.to_block
+                 FROM watchlist w
+                 LEFT JOIN evm_backfill_state b
+                   ON b.network_id=w.network_id
+                  AND lower(b.token_address)=lower(w.token_address)
+                WHERE w.active=1 AND w.network_id=?""",
+            (network,),
+        ).fetchall()
+        cursor = db._conn.execute(
+            """SELECT last_status, last_run_at, last_block
+                 FROM evm_block_cursor WHERE network_id=?""",
+            (network,),
+        ).fetchone()
+
+        batch_size = max(1, int(config.EVM_BATCH_SIZE.get(network, 1)))
+        rpc_limit = int(getattr(config, "EVM_RPC_SUBREQUEST_LIMIT", {}).get(network, 0))
+        if rpc_limit:
+            batch_size = min(batch_size, rpc_limit)
+        range_hint = int(config.EVM_LOG_RANGE_HINT.get(network, 0)) or 10_000
+        pacing = (
+            config.EVM_BATCH_PACING_SECONDS
+            if batch_size > 1 else config.EVM_PACING_SECONDS
+        )
+        requests_by_time = max(
+            1,
+            int(
+                getattr(config, "EVM_BACKFILL_BUDGET_SECONDS_BY_NETWORK", {}).get(
+                    network, config.EVM_BACKFILL_BUDGET_SECONDS
+                ) / max(pacing, 0.1)
+            ),
+        )
+        request_capacity = min(
+            int(config.EVM_BACKFILL_MAX_CALLS), requests_by_time
+        )
+        capacity_units = max(
+            1,
+            request_capacity * batch_size * max(1, int(config.EVM_BACKFILL_TOKENS_PER_CYCLE)),
+        )
+
+        pending_rows = [
+            row for row in rows if str(row["status"] or "") != "done"
+        ]
+        backlog = len(pending_rows)
+        retry_count = sum(str(row["status"] or "") == "retry" for row in pending_rows)
+        # وحدة العمل = نداء تعبئة واحد، والنداء يقطع المدى المقيس في
+        # `EVM_BACKFILL_BLOCKS_PER_CALL` لا سقف المدى (range_hint). التقدير
+        # القديم بالسقف ضخّم العمل ×25 على روبن‑هود (سقف مدى غير معمول به
+        # هناك أصلًا) فأبقى البوابة موقوفة أبدًا — قياس 2026-08-29: عملة
+        # كاملة بـ79,894 تحويلًا اكتملت في 33 نداءً.
+        blocks_per_call = max(
+            1, int(config.EVM_BACKFILL_BLOCKS_PER_CALL.get(network, range_hint))
+        )
+        work_units = 0
+        head = int(cursor["last_block"]) if cursor and cursor["last_block"] else None
+        for row in pending_rows:
+            start = row["from_block"]
+            end = row["to_block"]
+            if start is None or end is None or head is None:
+                work_units += max(1, capacity_units // max(1, int(config.EVM_BACKFILL_TOKENS_PER_CYCLE)))
+                continue
+            remaining = max(0, int(end) - int(start) + 1)
+            work_units += max(1, (remaining + blocks_per_call - 1) // blocks_per_call)
+
+        rpc_healthy = not pending_rows or bool(
+            cursor and str(cursor["last_status"] or "") in ("", "ok")
+        )
+        reason = "ok"
+        if retry_count:
+            reason = "active_retry"
+        elif not rpc_healthy:
+            reason = "rpc_unhealthy_or_uninitialized"
+
+        utilization = work_units / capacity_units
+        old_paused = bool((previous.get(network) or {}).get("paused"))
+        if not rpc_healthy or retry_count:
+            paused = True
+            fraction = (0, 1)
+        elif old_paused and utilization > 0.5:
+            paused = True
+            fraction = (0, 1)
+            reason = "hysteresis_high_water"
+        elif utilization >= 4.0:
+            paused = True
+            fraction = (0, 1)
+            reason = "rpc_work_budget_exhausted"
+        elif utilization >= 2.0:
+            paused = False
+            fraction = (1, 2)
+            reason = "rpc_work_budget_reduced"
+        elif utilization >= 1.0:
+            paused = False
+            fraction = (3, 4)
+            reason = "rpc_work_budget_guard"
+        else:
+            paused = False
+            fraction = (1, 1)
+
+        states[network] = EVMNetworkAdmission(
+            network=network,
+            backlog=backlog,
+            work_units=work_units,
+            capacity_units=capacity_units,
+            retry_count=retry_count,
+            rpc_healthy=rpc_healthy,
+            numerator=fraction[0],
+            denominator=fraction[1],
+            paused=paused,
+            reason=reason,
+        )
+
+    snapshot = {
+        network: {
+            "backlog": state.backlog,
+            "work_units": state.work_units,
+            "capacity_units": state.capacity_units,
+            "retry_count": state.retry_count,
+            "rpc_healthy": state.rpc_healthy,
+            "percent": state.percent,
+            "paused": state.paused,
+            "reason": state.reason,
+        }
+        for network, state in states.items()
+    }
+    db.note_error("evm_admission_network_state", json.dumps(snapshot, sort_keys=True))
+    db.note_error(
+        "evm_admission_paused_networks",
+        json.dumps(sorted(network for network, state in states.items() if state.paused)),
+    )
+    db.note_error(
+        "evm_admission_paused",
+        "1" if any(state.paused for state in states.values()) else "0",
+    )
+
+    total_backlog = sum(state.backlog for state in states.values())
+    aggregate = min(states.values(), key=lambda state: state.percent)
+    return EVMAdmissionPolicy(
+        frozenset(networks),
+        total_backlog,
+        aggregate.numerator,
+        aggregate.denominator,
+        any(state.paused for state in states.values()),
+        states,
+    )
 
 
 def _load_access_token() -> str:
@@ -345,14 +512,12 @@ async def run_bars_cycle(
 
 def admit_control_sample(
     db: RecorderDB,
-    candidates: Sequence[
-        tuple[str, str]
-        | tuple[str, str, float | None]
-        | tuple[str, str, float | None, str]
-    ],
+    candidates: Sequence[tuple],
     recorded_at: str,
     rng: random.Random | None = None,
     policy: EVMAdmissionPolicy | None = None,
+    stats: dict[str, int] | None = None,
+    static_items: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> int:
     """يُدخل عملات ضابطة مختارة **عشوائياً** من نفس كون العملات. يعيد كم أُدخلت.
 
@@ -364,6 +529,13 @@ def admit_control_sample(
     - **يُستبعد كل ما أُشير إليه** ولو لم يدخل المراقبة — وإلّا لم يعد ضابطاً.
     - **بالتقسيط** (`CONTROL_PER_CYCLE`): أخذ الأربعين دفعةً واحدة يجعلها كلّها
       عيّنة من لحظة سوقية واحدة، فيختلط أثر الإشارة بأثر تلك اللحظة.
+    - **نفس بوّابة العمر** المطبَّقة على المُشار إليها (أُضيفت 2026-08-22): وإلّا
+      اختلف الذراعان في المتغيّر الأقوى أثراً. مقيسٌ يومَ أُضيفت البوّابة أنّ
+      1.5% من نوافذ الإشارة كانت لعملةٍ دون يومين مقابل **50%** من نوافذ الضابط
+      — فرقُ 48 نقطة في متغيّرٍ نسبةُ الانهيار فيه 29 ضعفاً ووسيطُ المردود
+      −46.2% مقابل −5.1%. وأيُّ «أثرٍ للإشارة» يُقاس على ذراعين كهذين هو أثرُ
+      عمرٍ مقنّعٌ في زيّ إشارة. ومجهولُ العمر يُرفض هنا كما يُرفض هناك — نفس
+      القاعدة لا قاعدةٌ ألطف — وثمنُه 12 عملة من 1,212 (0.99%).
     """
     need = config.CONTROL_GROUP_SIZE - db.active_watch_count(is_control=1)
     if need <= 0 or not candidates:
@@ -371,20 +543,26 @@ def admit_control_sample(
 
     known = db.known_tokens()
     signalled = db.signalled_tokens()
-    normalized: dict[tuple[str, str], tuple[float | None, str | None]] = {}
-    strict_comparison = any(len(candidate) == 4 for candidate in candidates)
+    normalized: dict[tuple[str, str], tuple[float | None, str | None, Any]] = {}
+    strict_comparison = any(len(candidate) >= 4 for candidate in candidates)
     for candidate in candidates:
         if len(candidate) == 2:
             addr, net = candidate
             price_usd = None
             admission_source = None
             has_price = False
+            created_at = None
         elif len(candidate) == 3:
             addr, net, price_usd = candidate
             admission_source = None
             has_price = True
-        else:
+            created_at = None
+        elif len(candidate) == 4:
             addr, net, price_usd, admission_source = candidate
+            has_price = True
+            created_at = None
+        else:
+            addr, net, price_usd, admission_source, created_at = candidate
             has_price = True
         # Production candidates carry the current tick price. A missing price
         # is not a valid entry point; legacy callers without a price remain
@@ -396,7 +574,35 @@ def admit_control_sample(
                 continue
             if price_usd is None or not math.isfinite(price_usd) or price_usd <= 0:
                 continue
-        normalized[(addr, net)] = (price_usd, admission_source)
+        normalized[(addr, net)] = (price_usd, admission_source, created_at)
+
+    # البوّابة **قبل** الترجيح لا بعده: الأوزان تطابق مزيجَ شبكات الضابط بمزيج
+    # شبكات الإشارة، فلو أُسقطت الصغيرةُ بعد الاختيار نقص نصيبُ شبكتها بلا أن
+    # يُعاد الترجيح — فيصير الذراعان مختلفَين في الشبكة بدل العمر.
+    age_rejected = 0
+
+    def _age_ok(key: tuple[str, str]) -> bool:
+        nonlocal age_rejected
+        if not config.MIN_TOKEN_AGE_DAYS:
+            return True
+        if static_items and key in static_items:
+            _write_filter_static(
+                db,
+                static_items[key],
+                key[0],
+                str(key[1] or ""),
+                recorded_at,
+                replace_invalid=True,
+            )
+        _stored, _observed = stored_age(db, key[0], str(key[1] or ""))
+        candidate_created = normalized[key][2]
+        verdict = stored_age_verdict(db, key[0], str(key[1] or ""), recorded_at)
+        if verdict == AGE_UNKNOWN and candidate_created is not None:
+            verdict = age_verdict(candidate_created, recorded_at, recorded_at)
+        if verdict == AGE_OK:
+            return True
+        age_rejected += 1
+        return False
 
     pool = sorted(
         key for key in normalized
@@ -405,7 +611,14 @@ def admit_control_sample(
             policy is None
             or policy.allows("control", key[0], str(key[1] or ""), recorded_at)
         )
+        and _age_ok(key)
     )
+    if age_rejected:
+        db.bump_counter("control_age_rejected_total", age_rejected)
+        if stats is not None:
+            stats["control_age_rejected"] = (
+                stats.get("control_age_rejected", 0) + age_rejected
+            )
     if not pool:
         return 0
 
@@ -514,20 +727,26 @@ def admit_control_sample(
 
 def admit_signal_comparison_windows(
     db: RecorderDB,
-    candidates: Sequence[tuple[str, str, float | None, str]],
+    candidates: Sequence[tuple],
     recorded_at: str,
     policy: EVMAdmissionPolicy | None = None,
     admitted_signals: set[str] | None = None,
+    stats: dict[str, int] | None = None,
+    static_items: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> int:
     """يدخل إشارات v3 فقط عندما تظهر في نفس قائمة المرشحين المستخدمة للضابطة."""
-    candidate_prices: dict[tuple[str, str], tuple[float, str]] = {}
-    for addr, net, price, admission_source in candidates:
+    candidate_prices: dict[tuple[str, str], tuple[float, str, Any]] = {}
+    for candidate in candidates:
+        addr, net, price, admission_source = candidate[:4]
+        candidate_created = candidate[4] if len(candidate) >= 5 else None
         try:
             value = float(price) if price is not None else None
         except (TypeError, ValueError):
             continue
         if value is not None and math.isfinite(value) and value > 0:
-            candidate_prices[(addr, str(net or ""))] = (value, admission_source)
+            candidate_prices[(addr, str(net or ""))] = (
+                value, admission_source, candidate_created,
+            )
 
     added = 0
     rows = db._conn.execute(
@@ -542,6 +761,23 @@ def admit_signal_comparison_windows(
         admission = candidate_prices.get(key)
         if admission is None:
             continue
+        _stored, _observed = stored_age(db, *key)
+        candidate_created = admission[2]
+        if static_items and key in static_items:
+            _write_filter_static(
+                db, static_items[key], key[0], str(key[1] or ""), recorded_at,
+                replace_invalid=True,
+            )
+            _stored, _observed = stored_age(db, *key)
+        verdict = stored_age_verdict(db, *key, recorded_at)
+        if verdict == AGE_UNKNOWN and candidate_created is not None:
+            verdict = age_verdict(candidate_created, recorded_at, recorded_at)
+        if verdict != AGE_OK:
+            if stats is not None:
+                stats["comparison_age_rejected"] = (
+                    stats.get("comparison_age_rejected", 0) + 1
+                )
+            continue
         if policy is not None:
             existing = db._conn.execute(
                 "SELECT active FROM watchlist WHERE token_address=? AND network_id=?",
@@ -553,7 +789,7 @@ def admit_signal_comparison_windows(
                 "signal", key[0], key[1], str(row["id"]),
             ):
                 continue
-        price, admission_source = admission
+        price, admission_source, _candidate_created = admission
         if db.add_signal_comparison_window(
             key[0], key[1], row["signal_type"], row["id"],
             config.WATCH_HOURS, recorded_at, price,
@@ -577,37 +813,113 @@ def token_age_days(created_at: Any, now_iso: str) -> float | None:
     العمرُ السالب (تاريخُ إنشاءٍ في المستقبل) ليس عمراً: يعود None فيُعامَل
     معاملةَ المجهول لا معاملةَ القديم، وإلّا لصار انحرافُ ساعةٍ بوّابةً مفتوحة.
     """
-    if created_at in (None, ""):
+    created = _created_epoch(created_at)
+    if created is None:
         return None
-    try:
-        created = int(float(created_at))
-    except (TypeError, ValueError):
+    now = _created_epoch(now_iso)
+    if now is None:
         return None
-    if created <= 0:
-        return None
-    age = (int(datetime.fromisoformat(now_iso).timestamp()) - created) / 86400.0
+    age = (now - created) / 86400.0
     return age if age >= 0 else None
 
 
-def age_verdict(created_at: Any, now_iso: str) -> str:
-    """حكمُ بوّابة العمر على تاريخِ إنشاءٍ واحد. `MIN_TOKEN_AGE_DAYS=0` يُلغيها."""
+def _created_epoch(value: Any) -> float | None:
+    """Normalize upstream creation timestamps to Unix seconds.
+
+    One parser for every consumer: admission, labeler, and the EVM gate all
+    read through ``features.epoch_of`` so a format one accepts, all accept.
+    Epoch ``0``/negative is not a creation date — unknown, never "old".
+    """
+    epoch = epoch_of(value)
+    return float(epoch) if epoch is not None else None
+
+
+def age_verdict(
+    created_at: Any, now_iso: str, observed_at: Any = None,
+) -> str:
+    """حكم بوابة العمر مع ختم اختياري لوقت معرفة التاريخ."""
     if not config.MIN_TOKEN_AGE_DAYS:
         return AGE_OK
+    if observed_at is not None:
+        observed = _created_epoch(observed_at)
+        now = _created_epoch(now_iso)
+        if observed is None or now is None or observed > now:
+            return AGE_UNKNOWN
     age = token_age_days(created_at, now_iso)
     if age is None:
         return AGE_UNKNOWN
     return AGE_OK if age >= config.MIN_TOKEN_AGE_DAYS else AGE_TOO_YOUNG
 
 
-def stored_created_at(db: RecorderDB, addr: str, net: str) -> str | None:
+def quarantine_active_age_violations(
+    db: RecorderDB, recorded_at: str, stats: dict[str, int],
+) -> int:
+    """Stop post-gate invalid active watches without deleting their history."""
+    quarantined = db.quarantine_age_invalid_active(
+        recorded_at,
+        config.MIN_TOKEN_AGE_DAYS,
+        since_iso=config.AGE_GATE_ENABLED_AT,
+    )
+    stats["age_active_quarantined"] = quarantined
+    if quarantined:
+        db.bump_counter("age_gate_active_quarantined_total", quarantined)
+        db.set_meta("age_gate_active_quarantined_last_at", recorded_at)
+    return quarantined
+
+
+def _token_lookup_key(value: Any, network_id: Any = None) -> str | None:
+    """Canonical address key: EVM is case-insensitive, Solana is not."""
+    return extract.canonical_token_address(value, network_id)
+
+
+def stored_age(db: RecorderDB, addr: str, net: str) -> tuple[str | None, str | None]:
+    key = _token_lookup_key(addr, net)
     row = db._conn.execute(
-        """SELECT token_created_at FROM token_static
-            WHERE token_address=? AND network_id=?""",
-        (addr, net),
+        """SELECT token_created_at, token_created_at_observed_at
+            FROM token_static WHERE token_address=? AND network_id=?""",
+        (key, net),
     ).fetchone()
     if row is None:
-        return None
-    return row["token_created_at"] or None
+        return None, None
+    return row["token_created_at"] or None, row["token_created_at_observed_at"] or None
+
+
+def _item_with_network(item: Mapping[str, Any], network_id: str) -> Mapping[str, Any]:
+    """Supply a requested network only when the upstream item omitted it."""
+    if extract.token_list_network(item):
+        return item
+    out = dict(item)
+    token = item.get("token")
+    if isinstance(token, Mapping):
+        token_copy = dict(token)
+        token_copy["networkId"] = str(network_id)
+        out["token"] = token_copy
+    else:
+        out["networkId"] = str(network_id)
+    return out
+
+
+def stored_age_verdict(db: RecorderDB, addr: str, net: str, recorded_at: str) -> str:
+    created, observed = stored_age(db, addr, net)
+    if not config.MIN_TOKEN_AGE_DAYS:
+        return AGE_OK
+    if created is None:
+        return AGE_UNKNOWN
+    if observed is None and _created_epoch(recorded_at) >= _created_epoch(
+        config.AGE_GATE_ENABLED_AT
+    ):
+        return AGE_UNKNOWN
+    return age_verdict(created, recorded_at, observed)
+
+
+def stored_created_at(db: RecorderDB, addr: str, net: str) -> str | None:
+    return stored_age(db, addr, net)[0]
+
+
+def _age_value_is_valid(value: Any, recorded_at: str) -> bool:
+    created = _created_epoch(value)
+    now = _created_epoch(recorded_at)
+    return created is not None and now is not None and created <= now
 
 
 async def resolve_ages(
@@ -616,6 +928,7 @@ async def resolve_ages(
     keys: Sequence[tuple[str, str]],
     recorded_at: str,
     stats: dict[str, int],
+    gecko_fallback: Any | None = None,
 ) -> None:
     """يجلب تاريخَ إنشاءِ المرشّحين المجهولين ويثبّته في `token_static`.
 
@@ -629,35 +942,126 @@ async def resolve_ages(
     في الدورة نفسها. والنتيجةُ تُخزَّن فلا يُسأل عن العملة نفسها ثانيةً: إشارةٌ
     لاحقة على عملةٍ رُفضت تُحكَم من التاريخ المخزَّن بلا شبكة.
 
-    الفشلُ يُميَّز عن الجهل: `age_lookup_failed` عدّادٌ وختمُ خطأ وسلسلةٌ في
-    `meta`، لأنّ 502 من المنبع يجعل كلّ مرشّح «مجهولاً» فتتوقّف المراقبة كلّها —
-    وهذا انقطاعٌ يجب أن يُسمع لا أن يُقرأ ترشيحاً عادياً.
+    `gecko_fallback` (2026-08-27): عندما لا يجد filterTokens العملة إطلاقاً
+    («مفقود» لا «خطأ») نسأل GeckoTerminal عن أقدم `pool_created_at`. مقيس:
+    يحلّ 17/18 من مجهولي fomo. المصدران مستقلّان فلو حُجب أحدهما كمُلأ الآخر.
+    فشل GT صامت بلا عدّاد فشل: هو fallback لا مساراً أساسيّاً — نجاحُه فقط
+    يُعدّ (`age_gecko_resolved`)، وعطبُه الأقصى أن تبقى الحالة كما كانت.
     """
     if not keys:
         return
-    symbols = [f"{addr}:{net}" for addr, net in keys]
+    due_keys = [
+        key for key in keys
+        if db.age_lookup_due(
+            key[0], key[1], recorded_at,
+            config.AGE_MISSING_RETRY_SECONDS,
+            config.AGE_ERROR_RETRY_SECONDS,
+        )
+    ]
+    if not due_keys:
+        return
+    symbols = [f"{addr}:{net}" for addr, net in due_keys]
     try:
         raw = await _fetch_filter_tokens_raw(client, symbols)
     except Exception as exc:  # noqa: BLE001 — الإشارة محفوظة أصلاً
-        stats["age_lookup_failed"] += len(keys)
+        stats["age_lookup_failed"] += len(due_keys)
         db.note_error("last_error_age_lookup", f"{recorded_at}: {_exc_note(exc)}")
         db.bump_counter("age_lookup_failed_streak")
-        db.bump_counter("age_lookup_failed_total", len(keys))
+        db.bump_counter("age_lookup_failed_total", len(due_keys))
+        with db.batch():
+            for addr, net in due_keys:
+                db.set_age_lookup_state(addr, net, "error", recorded_at)
         return
-    by_addr: dict[str, Any] = {}
+    by_key: dict[tuple[str, str], Any] = {}
+    by_address: dict[str, list[Any]] = {}
     for item in extract.unwrap_token_list(raw):
         a = extract.token_list_address(item)
         if a:
-            by_addr[a.lower()] = item
+            net = extract.token_list_network(item)
+            by_key[(a.lower(), net)] = item
+            by_address.setdefault(a.lower(), []).append(item)
+    ambiguous_addresses: set[str] = set()
+    requested_counts = {}
+    for addr, _net in due_keys:
+        requested_counts[addr.lower()] = requested_counts.get(addr.lower(), 0) + 1
     with db.batch():
-        for addr, net in keys:
-            item = by_addr.get(addr.lower())
+        for addr, net in due_keys:
+            item = by_key.get((addr.lower(), str(net or "")))
+            candidates = by_address.get(addr.lower(), [])
+            if item is None and len(candidates) == 1:
+                candidate = candidates[0]
+                if (
+                    requested_counts.get(addr.lower()) == 1
+                    and extract.token_list_network(candidate) == ""
+                ):
+                    item = candidate
+                elif candidates:
+                    ambiguous_addresses.add(addr.lower())
+            elif item is None and candidates:
+                ambiguous_addresses.add(addr.lower())
             if item is None:
-                continue          # حُذف بصمت (عنوان ميّت) — يبقى مجهولاً
-            if _write_filter_static(db, item, addr, net, recorded_at):
+                db.set_age_lookup_state(addr, net, "missing", recorded_at)
+                if gecko_fallback is not None:
+                    gecko_created = await _gecko_resolve_age(
+                        gecko_fallback, db, addr, net, recorded_at,
+                    )
+                    if gecko_created is not None:
+                        stats["age_gecko_resolved"] = (
+                            stats.get("age_gecko_resolved", 0) + 1
+                        )
+                        stats["age_resolved"] += 1
+                continue
+            tok = item.get("token") if isinstance(item.get("token"), Mapping) else {}
+            created = tok.get("createdAt") or item.get("createdAt")
+            item = _item_with_network(item, str(net))
+            if created in (None, "") or not _age_value_is_valid(created, recorded_at):
+                db.set_age_lookup_state(addr, net, "missing", recorded_at)
+                if gecko_fallback is not None:
+                    gecko_created = await _gecko_resolve_age(
+                        gecko_fallback, db, addr, net, recorded_at,
+                    )
+                    if gecko_created is not None:
+                        stats["age_gecko_resolved"] = (
+                            stats.get("age_gecko_resolved", 0) + 1
+                        )
+                        stats["age_resolved"] += 1
+                continue
+            if _write_filter_static(db, item, addr, net, recorded_at, replace_invalid=True):
                 stats["age_resolved"] += 1
+            db.set_age_lookup_state(addr, net, "ok", recorded_at)
+    if ambiguous_addresses:
+        schema_drift = len(ambiguous_addresses)
+        db.bump_counter("age_lookup_schema_drift_total", schema_drift)
+        db.note_error(
+            "last_error_age_lookup_schema",
+            f"{recorded_at}: missing networkId for {schema_drift} ambiguous age items",
+        )
     db.set_meta("age_lookup_last_ok_at", recorded_at)
     db.set_meta("age_lookup_failed_streak", "0")
+
+
+async def _gecko_resolve_age(
+    gecko: Any, db: RecorderDB, addr: str, net: str, recorded_at: str,
+) -> str | None:
+    """يسأل GeckoTerminal عن العمر ويكتبه إن صحّ. يعيد القيمة أو None.
+
+    نفس قاعدة الصلاحية التي تطبّق على fomo (`_age_value_is_valid`): مستقبلٌ
+    أو صيغةٌ فاسدة تُرفض — لا نكتب عمراً فاسداً من مصدر بديل. الكتابة عبر
+    `set_static_created_at` بختمِ ملاحظةٍ صريح، فالبوابة تُفرِّق بين عمرٍ
+    موثَّق وآخر بلا provenance.
+    """
+    canonical = extract.canonical_token_address(addr)
+    current, _observed = stored_age(db, canonical, str(net or ""))
+    if current not in (None, ""):
+        return None                      # عمرٌ موجود أصلاً — لا شأن لنا
+    try:
+        created = await gecko.pool_created_at(addr, str(net or ""))
+    except Exception:  # noqa: BLE001 — fallback لا يرفع أبدًا
+        return None
+    if created in (None, "") or not _age_value_is_valid(created, recorded_at):
+        return None
+    db.set_static_created_at(addr, str(net or ""), str(created), recorded_at)
+    return str(created)
 
 
 def _opens_window(existing: Any) -> bool:
@@ -670,6 +1074,35 @@ def _opens_window(existing: Any) -> bool:
     if existing is None:
         return True
     return not existing["active"] or bool(existing["is_control"])
+
+
+def _evm_age_exceeds_cap(
+    db: RecorderDB, token: str, network: str, recorded_at: str,
+) -> bool:
+    """هل عمر عملة EVM يتجاوز السقف الأعلى للإدخال؟
+
+    يقرأ التاريخ المخزَّن وحده (لا نداء شبكة): السقف يعمل لحظة فتح النافذة
+    والتاريخ المخزَّن حُكِم به في بوابة العمر الدنيا قبل قليل، فمجهوله رُفض
+    هناك أصلًا. يعيد False عند غياب السقف أو المعمّر — الحكم «ليس فوق السقف»
+    هنا لا يفتح بابًا: بوابة الدنيا ترفض المجهول.
+    """
+    cap = float(config.EVM_MAX_TOKEN_AGE_DAYS or 0)
+    if cap <= 0:
+        return False
+    created, _observed = stored_age(db, token, network)
+    if created is None:
+        return False
+    age = token_age_days(created, recorded_at)
+    return age is not None and age > cap
+
+
+def _evm_admission_networks() -> frozenset[str]:
+    """الشبكات التي تخضع لسقف العمر الأعلى: شبكات EVM المفعَّلة.
+
+    تُقرأ من الإعدادات لا من كائن السياسة: السقف حكمُ قبولٍ ثابت لا يتغير
+    بحالة الاكتظاظ، وبوابةٌ تتوقف على «هل هناك سياسة أصلًا» بوابةٌ مثقوبة.
+    """
+    return frozenset(str(net) for net in config.EVM_NETWORKS)
 
 
 async def record_feed(
@@ -722,11 +1155,25 @@ async def record_feed(
     if client is not None and config.MIN_TOKEN_AGE_DAYS:
         unknown = [
             key for key, existing in watch_state.items()
-            if _opens_window(existing) and stored_created_at(db, *key) is None
+            if _opens_window(existing)
+            and stored_age_verdict(db, key[0], key[1], recorded_at) == AGE_UNKNOWN
         ]
-        await resolve_ages(client, db, unknown, recorded_at, stats)
+        gecko = None
+        if config.AGE_GECKO_FALLBACK:
+            # زبون لكل دورة لا زبونٌ مشترك: الجلسة ترتبط بحلقة asyncio،
+            # والمسجّل يعمل حلقةً واحدة طويلة العمر فلا مشكلة، لكن الاختبارات
+            # تجرِي كلَّ اختبارٍ في حلقةٍ جديدة — فزبونٌ مشترك يوقظ مؤقّت
+            # curl_cffi من حلقةٍ ميتة (قِيس: PytestUnraisableExceptionWarning
+            # عبر filterwarnings=error). كلفة الإنشاء صفر: جلسة تُبنى أول
+            # نداء فعلي، والدورات بلا مجهولٍ لا تلمس الشبكة إطلاقاً.
+            from gecko_terminal import GeckoTerminalClient
+
+            gecko = GeckoTerminalClient()
+        await resolve_ages(client, db, unknown, recorded_at, stats,
+                           gecko_fallback=gecko)
 
     admitted: set[str] = set()
+    policy_networks = set(policy.networks) if policy is not None else set()
     for row in triggers:
         token = str(row["token_address"])
         network = str(row["network_id"] or "")
@@ -735,18 +1182,45 @@ async def record_feed(
         # `upsert_watch` يُحيي صفّاً منتهياً (active=0) أو ضابطاً بنافذةٍ جديدة،
         # فلو حُصِرت في الجديد لدخلت الصغيرةُ من باب الإحياء.
         if _opens_window(existing):
-            verdict = age_verdict(stored_created_at(db, token, network), recorded_at)
+            verdict = stored_age_verdict(db, token, network, recorded_at)
             if verdict != AGE_OK:
                 stats["age_rejected"] += 1
                 if verdict == AGE_UNKNOWN:
                     stats["age_unknown"] += 1
                 continue
+            # سقف العمر الأعلى لإدخال EVM (2026-08-29): بوابة العمر الدنيا
+            # وحدها تُدخل عملات عمرها سنتين فتُسقط الشبكة في إيقاف الإدخال
+            # (قياس 08-29: 26 إدخالًا فوق سنة على 8453). لا يُطبَّق على
+            # سولانا ولا على مجهول العمر (بوابة الدنيا تتكفل به).
+            if (
+                config.EVM_MAX_TOKEN_AGE_DAYS
+                and network in _evm_admission_networks()
+                and _evm_age_exceeds_cap(db, token, network, recorded_at)
+            ):
+                stats["evm_max_age_rejected"] = (
+                    stats.get("evm_max_age_rejected", 0) + 1
+                )
+                continue
+            # بوابة الصعود المسبق: تُطبَّق على النافذة الجديدة/المعاد تنشيطها
+            # مثل بوابة العمر نفسها. الإشارة نفسها محفوظة أعلاه دائمًا؛
+            # المرفوض هنا فتحُ المراقبة فقط (وإلا عادت من باب الإحياء).
+            row_ts = row.get("ts")
+            t0 = int(row_ts) if str(row_ts or "").isdigit() else None
+            if t0 is not None and runup_verdict(db, token, network, t0) == RUNUP_LATE:
+                stats["runup_rejected"] = (
+                    stats.get("runup_rejected", 0) + 1
+                )
+                continue
+        # بوابة إدخال EVM تُطبَّق على كل نافذةٍ ستُفتَح — الجديدة وإعادة
+        # التنشيط سواء (2026-08-29): فحصُها كان محصورًا في الجديد فكانت
+        # إعادةُ التنشيط تتجاوز الإيقاف كليًا وتُغذّي الطابور من باب خلفيّ.
+        if _opens_window(existing) and network in policy_networks:
+            if not policy.allows("signal", token, network, str(row["id"])):
+                if str(row["id"]) in inserted:
+                    stats["evm_admission_deferred"] += 1
+                continue
         if existing is None:
             if db.active_watch_count(is_control=0) >= config.WATCHLIST_CAP:
-                continue
-            if not policy.allows("signal", token, network, str(row["id"])):
-                if network in policy.networks and str(row["id"]) in inserted:
-                    stats["evm_admission_deferred"] += 1
                 continue
         try:
             added = db.upsert_watch(
@@ -762,14 +1236,70 @@ async def record_feed(
             if added:
                 stats["watch_added"] += 1
                 watch_state[(token, network)] = {"active": 1, "is_control": 0}
+                # (fv16) socials من DEX Screener لعملة تُقبل للتو — نداء واحد
+                # في عمر العملة عندنا: يُخزّن في token_static (تُكتب مرة)،
+                # فلا تُسأل ثانيةً مهما تكررت إشاراتها. الفشل صامت كليًا:
+                # الطبقة مساندة، وغيابها يترك العمودين NULL (لم يُقس).
+                if config.DEX_SCREENER_SOCIALS:
+                    try:
+                        await _enrich_dex_socials(db, token, network)
+                    except Exception:  # noqa: BLE001 — إثراء لا يُسقط القبول
+                        pass
         except Exception as exc:  # noqa: BLE001 - signal is already durable
             stats["errors"] += 1
             db.note_error("last_error_watch_admission", f"{recorded_at}: {_exc_note(exc)}")
     if stats["evm_admission_deferred"]:
         db.bump_counter("evm_admission_deferred_total", stats["evm_admission_deferred"])
+    if stats.get("evm_max_age_rejected"):
+        db.bump_counter("evm_max_age_rejected_total", stats["evm_max_age_rejected"])
     if stats["age_rejected"]:
         db.bump_counter("age_rejected_total", stats["age_rejected"])
+    if stats.get("age_gecko_resolved"):
+        db.bump_counter("age_gecko_resolved_total", stats["age_gecko_resolved"])
+    _persist_runup_rejection(db, stats)
     return admitted
+
+
+async def _enrich_dex_socials(db: RecorderDB, token: str, network: str) -> None:
+    """يسأل DEX Screener عن قنوات التواصل ويخزنها في token_static.
+
+    نداء واحد لكل عملة في عمرها عندنا — إن كان العمود قد كُتب سابقًا
+    (ولو NULL صريحًا من محاولة فاشلة) لا يُسأل ثانية: الإثراء فرصة لا
+    التزام. `social_match_fomo_dex` يقارن رؤية المصدرين: كلاهما يرى
+    socials أو كلاهما لا يرى = 1 (توافق)؛ واحد فقط = 0 (تعارض — نمط
+    ملف مزوّر). فشل النداء لا يكتب شيئًا (NULL = لم يُقس).
+    """
+    from dex_screener import DexScreenerClient
+
+    net = str(network or "")
+    row = db._conn.execute(
+        """SELECT twitter, telegram, discord, social_channels_dex
+             FROM token_static
+            WHERE token_address=? AND network_id=? ORDER BY recorded_at DESC
+            LIMIT 1""",
+        (token, net),
+    ).fetchone()
+    if row is None or row["social_channels_dex"] is not None:
+        return                       # سُئلت سابقًا (نجاحًا أو فشلًا موثقًا)
+    client = DexScreenerClient()
+    try:
+        channels = await client.social_channels(token, net)
+    finally:
+        await client.aclose()
+    if channels is None:
+        return                       # غير مفهرسة/عطب — تبقى NULL، تُسأل لاحقًا؟
+                                     # لا: العمود يبقى NULL لكن لا نعوّد السؤال
+                                     # كل دورة — الإخفاق المشوّش يحرق نداءات.
+    fomo_has = 1 if (row["twitter"] or row["telegram"] or row["discord"]) else 0
+    dex_has = 1 if channels > 0 else 0
+    match = 1 if fomo_has == dex_has else 0
+    with db.batch():
+        db._conn.execute(
+            """UPDATE token_static
+                  SET social_channels_dex=?, social_match_fomo_dex=?
+                WHERE token_address=? AND network_id=?""",
+            (channels, match, token, net),
+        )
 
 
 async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) -> Any:
@@ -908,7 +1438,7 @@ async def run_social_cycle(
     العملة بلا نقاش تُسجَّل بأصفار لا تُتخطّى: **الصمت إشارة**، وسلسلة الأصفار
     ثمّ الارتفاع المفاجئ هي بالضبط ما نريد التقاطه.
     """
-    stats = {"social_tokens": 0, "social_items": 0, "social_errors": 0}
+    stats = {"social_tokens": 0, "social_items": 0, "thesis_rows": 0, "social_errors": 0}
     now_dt = datetime.fromisoformat(recorded_at)
     stale_before = (now_dt - timedelta(seconds=config.SOCIAL_REFRESH_SECONDS)).isoformat()
     error_stale_before = (
@@ -927,6 +1457,8 @@ async def run_social_cycle(
             raw = await _fetch_thesis_raw(client, addr, net)
             row = extract.extract_social(raw, addr, net, recorded_at)
             db.insert_social(row)
+            thesis_rows = extract.extract_thesis_items(raw, addr, net, recorded_at)
+            stats["thesis_rows"] += db.insert_thesis_items(thesis_rows)
             stats["social_tokens"] += 1
             stats["social_items"] += row["thesis_total"]
             db.set_social_state(
@@ -1056,7 +1588,8 @@ async def run_holders_cycle(
 
 
 def _write_filter_static(
-    db: RecorderDB, item: Any, addr: str, net: str, recorded_at: str
+    db: RecorderDB, item: Any, addr: str, net: str, recorded_at: str,
+    *, replace_invalid: bool = False,
 ) -> bool:
     """يسدّ ثقب العمر من عنصر filterTokens. يعيد True إن كتب شيئاً.
 
@@ -1078,14 +1611,130 @@ def _write_filter_static(
         st = extract.extract_token_static(item, recorded_at)
         if st is None:
             return False
+        if not _age_value_is_valid(st.get("token_created_at"), recorded_at):
+            st["token_created_at"] = None
+            st["token_created_at_observed_at"] = None
         db.upsert_static(st)
         return True
     # الصفّ قائم والعمر مفقود (المنبع أغفله): أوّل إجابةٍ تحمله تسدّه.
     tok = item.get("token") if isinstance(item.get("token"), Mapping) else {}
     created = tok.get("createdAt") or item.get("createdAt")
-    if created in (None, ""):
+    if created in (None, "") or not _age_value_is_valid(created, recorded_at):
         return False
-    return db.set_static_created_at(addr, net, str(created))
+    canonical = extract.canonical_token_address(addr)
+    current, observed = stored_age(db, canonical, net)
+    if replace_invalid and current not in (None, ""):
+        if _age_value_is_valid(current, recorded_at):
+            if observed is None:
+                current_epoch = _created_epoch(current)
+                candidate_epoch = _created_epoch(created)
+                if current_epoch == candidate_epoch:
+                    return db.observe_static_created_at(
+                        addr, net, current, recorded_at,
+                    )
+                return db.replace_unobserved_static_created_at(
+                    addr, net, current, str(created), recorded_at,
+                )
+            return False
+        return db.replace_static_created_at(
+            addr, net, str(created), recorded_at,
+        )
+    return db.set_static_created_at(addr, net, str(created), recorded_at)
+
+
+# عدّاد شرائح filterTokens: يبدأ من -1 فأول دورة تأخذ الشريحة 0. يُصفَّر في
+# الاختبارات (fixture) لضمان الحتمية.
+_FILTER_STRIDE_TURN = -1
+
+# ----------------------------------------------------------------------------
+# بوابة الصعود المسبق (2026-08-27): إشارة على عملة صعدت كثيرًا قبلها = واصلون
+# متأخرون، لا بداية صعود. القياس على 2,968 إشارة موسومة: الذروة الوسطية بعد
+# الإشارة متقاربة بين كل المراحل (~28%)، لكن النهائي بعد 48س ينقلب سالبًا
+# كلما تأخرت الإشارة: -2.1% للمبكرة، -14.4% للمتأخرة، -36.0% للمتأخرة جدًا
+# (>150% صعود سابق) وrug يقفز 0.0%→7.1%. أي أن الإشارة المتأخرة فخُّ سيولة
+# لا فرصة: من اشترى «وسط الصعود» هو وقود خروج الحيتان.
+# ----------------------------------------------------------------------------
+RUNUP_OK = "ok"
+RUNUP_LATE = "late"
+
+# كاش أحكام «متأخر» (2026-08-28): العملة الصاعدة تتلقى 5-10 إشارات يوميًا
+# وكل واحدة كانت تعيد استعلام الشموع. الحكم الرافض يُخزَّن في الذاكرة
+# `RUNUP_RETRY_SECONDS` — نمط `token_age_lookup_state` نفسه: نتيجة سلبية
+# تُعاد قراءتها لا حسابها، وتُنسخ عند انقضاء المهلة (قد يهدأ الصعود فتصبح
+# الإشارة اللاحقة مبكرة بحق). حكم «مقبول» لا يُخزَّن أبدًا: الصعود متغير
+# سريع وكل صف يستحق قياسًا طازجًا.
+_RUNUP_STATE: dict[tuple[str, str], tuple[int, str]] = {}
+
+# نافذة قياس الصعود السابق: 24 ساعة شموع 5 دقائق (نفس نافذة السياق التي
+# يستعملها السوق؛ 12 شمعة كحد أدنى لرفض الضجيج، وأقل من ذلك = عملة جديدة
+# لا تاريخ لها = إشارة مبكرة بالتعريف).
+_RUNUP_WINDOW_BARS = 288
+_RUNUP_MIN_BARS = 12
+
+
+def pre_signal_runup(
+    db: RecorderDB, token: str, network: str, t0: int,
+) -> float | None:
+    """log(سعر الإشارة / أقدم سعر في نافذة 24س قبلها) — صعود ما قبل t0.
+
+    قانون النقطة الزمنية محفوظ بنيويًا: الاستعلام يشترط `ts <= t0` فلا
+    شمعة بعد الإشارة تدخل أبدًا. يعيد None حين لا تاريخ كافيًا (عملة
+    جديدة) — الغياب ليس صعودًا ولا هبوطًا.
+    """
+    rows = db._conn.execute(
+        """SELECT c FROM token_bars
+            WHERE token_address=? AND network_id=? AND resolution='5'
+              AND c_suspect=0 AND ts <= ?
+            ORDER BY ts DESC LIMIT ?""",
+        (token, str(network or ""), int(t0), _RUNUP_WINDOW_BARS),
+    ).fetchall()
+    if len(rows) < _RUNUP_MIN_BARS:
+        return None
+    closes = [float(r[0]) for r in rows if r[0] is not None and float(r[0]) > 0]
+    if len(closes) < _RUNUP_MIN_BARS or not closes[-1]:
+        return None
+    import math
+
+    return math.log(closes[0] / closes[-1])   # rows تنازلي: [0]=الأحدث
+
+
+def runup_verdict(
+    db: RecorderDB, token: str, network: str, t0: int,
+) -> str:
+    """حكم بوابة الصعود: RUNUP_OK أو RUNUP_LATE (أو OK إن عُطّل الفلتر).
+
+    الأحكام الرافضة تُقرأ من الكاش داخل نافذة `RUNUP_RETRY_SECONDS` —
+    نفس فلسفة backoff بوابة العمر، ومفتاحها العنوان+الشبكة.
+    """
+    limit = float(getattr(config, "MAX_PRE_SIGNAL_RUNUP", 0) or 0)
+    if limit <= 0:
+        return RUNUP_OK                       # معطّل — سلوك ما قبل الفلتر
+    key = (token, str(network or ""))
+    cached = _RUNUP_STATE.get(key)
+    if cached is not None and t0 - cached[0] < int(
+        getattr(config, "RUNUP_RETRY_SECONDS", 3600) or 3600
+    ):
+        return cached[1]                      # داخل نافذة الهدنة: من الذاكرة
+    runup = pre_signal_runup(db, token, network, t0)
+    if runup is None:
+        return RUNUP_OK                       # بلا تاريخ = مبكرة بالتعريف
+    verdict = RUNUP_LATE if runup > limit else RUNUP_OK
+    if verdict == RUNUP_LATE:
+        # لا نخزّن إلا الرفض: القبول متغير سريع ويستحق قياسًا طازجًا كل مرة.
+        _RUNUP_STATE[key] = (t0, verdict)
+    return verdict
+
+
+def _persist_runup_rejection(db: RecorderDB, stats: dict[str, int]) -> None:
+    """يثبّت رفضَ بوابة الصعود تراكميًا في meta — البوابة الصامتة عمياء.
+
+    اكتُشف 2026-08-28: البوابة كانت تعمل (المرفوض لا يدخل) لكن العدّاد
+    لم يُكتب أبدًا، فلا سبيل لمعرفة أثرها أو تعطلها. صفر رفضٍ لا يكتب
+    شيئًا — لا ضجيج كتابة في meta.
+    """
+    n = int(stats.get("runup_rejected", 0) or 0)
+    if n:
+        db.bump_counter("runup_rejected_total", n)
 
 
 async def run_filter_tokens_cycle(
@@ -1119,6 +1768,23 @@ async def run_filter_tokens_cycle(
     if not missing:
         return stats
 
+    # شرائح بالتناوب (2026-08-27): العنوان نفسه يحفظ موضعه في `missing` عبر
+    # الدورات لأنّ الترتيب `sorted` ثابت، فاختيار `idx % stride == turn`
+    # يقيس كلَّ عملة كلَّ N دورات. N=1 يُعيد السلوك القديم حرفيّاً. الشريحة
+    # الفارغة (لا شيء في دورتها) لا تكلّف نداءً أصلاً.
+    stride = max(1, int(config.FILTER_TOKENS_STRIDE))
+    if stride > 1:
+        # عدّاد دورة معلَق في وحدة recorder نفسها (bump_counter لا يعيد قيمة).
+        # `sorted(missing)` ثابت الترتيب عبر الدورات، فموضعُ العنوان فيه مستقرّ
+        # والشريحة `idx % stride == turn` تجعل كلَّ عملة تُقاس كلَّ N دورات.
+        global _FILTER_STRIDE_TURN
+        _FILTER_STRIDE_TURN += 1
+        cycle_turn = _FILTER_STRIDE_TURN % stride
+        missing = [tok for i, tok in enumerate(missing)
+                   if i % stride == cycle_turn]
+        if not missing:
+            return stats
+
     for start in range(0, len(missing), config.FILTER_TOKENS_BATCH):
         batch = missing[start : start + config.FILTER_TOKENS_BATCH]
         symbols = [f"{addr}:{net}" for addr, net in batch]
@@ -1126,16 +1792,16 @@ async def run_filter_tokens_cycle(
         try:
             raw = await _fetch_filter_tokens_raw(client, symbols)
             items = extract.unwrap_token_list(raw)
-            # خريطة العنوان → عنصر. العنوان يعود بحالة أحرف قد تخالف المخزَّنة
-            # (EVM checksummed)، فالمفتاح صغيرٌ كلّه على الطرفين.
-            by_addr: dict[str, Any] = {}
+            # العنوان وحده لا يكفي: نفس العنوان قد يوجد على شبكتين. حالة أحرف
+            # EVM قد تختلف، لذلك نصغّر العنوان ونُبقي network_id في المفتاح.
+            by_key: dict[tuple[str, str], Any] = {}
             for item in items:
                 a = extract.token_list_address(item)
                 if a:
-                    by_addr[a.lower()] = item
+                    by_key[(a.lower(), extract.token_list_network(item))] = item
             with db.batch():
                 for addr, _net in batch:
-                    item = by_addr.get(addr.lower())
+                    item = by_key.get((addr.lower(), str(_net or "")))
                     if item is None:
                         continue  # حُذف بصمت (عملة مشطوبة) — لا يكسر الدفعة
                     tick = extract.extract_market_tick(item, recorded_at, "filter")
@@ -1147,11 +1813,18 @@ async def run_filter_tokens_cycle(
                     # وهذا مصدره الوحيد — نملأه حين يكون العمود فارغاً فقط.
                     proto = extract.filter_item_protocol(item)
                     if proto:
-                        db.set_static_protocol(tick["token_address"],
-                                               str(tick["network_id"] or ""), proto)
+                        db.set_static_protocol(
+                            tick["token_address"],
+                            str(tick["network_id"] or ""),
+                            proto,
+                        )
                     if _write_filter_static(
-                        db, item, tick["token_address"],
-                        str(tick["network_id"] or ""), recorded_at,
+                        db,
+                        item,
+                        tick["token_address"],
+                        str(tick["network_id"] or ""),
+                        recorded_at,
+                        replace_invalid=True,
                     ):
                         stats["filter_static"] += 1
         except Exception as exc:  # noqa: BLE001 — دفعة واحدة لا تُسقط الباقي
@@ -1275,29 +1948,20 @@ async def run_cycle(
         "signals": 0, "watch_added": 0, "comparison_signal_added": 0,
         "control_added": 0, "ticks": 0, "static": 0,
         "bars_tokens": 0, "bars_rows": 0, "social_tokens": 0, "social_items": 0,
+        "thesis_rows": 0,
         "holders_tokens": 0, "holders_details": 0, "holders_top": 0,
         "flow_rows": 0, "filter_requested": 0, "filter_ticks": 0,
         "filter_static": 0,
         "traders_rows": 0,
         "evm_admission_backlog": 0, "evm_admission_percent": 100,
+        "evm_admission_network_state": "{}",
         "evm_admission_paused": 0, "evm_admission_deferred": 0,
         "age_rejected": 0, "age_unknown": 0, "age_resolved": 0,
+        "control_age_rejected": 0, "comparison_age_rejected": 0,
+        "age_active_quarantined": 0,
         "age_lookup_failed": 0,
         "macro_rows": 0, "macro_no_data": 0, "errors": 0,
     }
-
-    try:
-        admission_policy = evm_admission_policy(db)
-        stats["evm_admission_backlog"] = admission_policy.backlog
-        stats["evm_admission_percent"] = admission_policy.percent
-        stats["evm_admission_paused"] = 1 if admission_policy.paused else 0
-    except Exception as exc:  # noqa: BLE001 - admission must fail closed for EVM
-        _fail_policy_networks = frozenset(str(n) for n in config.EVM_NETWORKS)
-        admission_policy = _fail_closed_evm_admission(_fail_policy_networks)
-        stats["evm_admission_backlog"] = -1
-        stats["evm_admission_percent"] = 0
-        stats["evm_admission_paused"] = 1
-        db.note_error("last_error_evm_admission", f"{recorded_at}: {_exc_note(exc)}")
 
     def _fail(where: str, exc: Exception) -> None:
         stats["errors"] += 1
@@ -1315,6 +1979,43 @@ async def run_cycle(
             # لا نصمت تماماً: السجلّ آخرُ ما يبقى حين تُقفل القاعدة، و`_log`
             # نفسها محميّة فلا تُسقط الدورة.
             _log(f"note_error failed for {where}: القاعدة لا تستجيب للكتابة")
+
+    # أوقف أولاً أي مراقبة دخلت بعد تفعيل البوابة بعمر صغير/مجهول. النافذة
+    # التاريخية تبقى، لكن الصف لا يدخل حساب admission ولا طلبات الجمع المكلفة.
+    try:
+        quarantine_active_age_violations(db, recorded_at, stats)
+    except Exception as exc:  # noqa: BLE001 — التنظيف لا يُسقط المسجّل
+        _fail("age_cleanup", exc)
+
+    try:
+        admission_policy = evm_admission_policy(db)
+        stats["evm_admission_backlog"] = admission_policy.backlog
+        stats["evm_admission_percent"] = admission_policy.percent
+        stats["evm_admission_paused"] = 1 if admission_policy.paused else 0
+        stats["evm_admission_network_state"] = json.dumps({
+            network: {
+                "backlog": state.backlog,
+                "work_units": state.work_units,
+                "capacity_units": state.capacity_units,
+                "retry_count": state.retry_count,
+                "rpc_healthy": state.rpc_healthy,
+                "percent": state.percent,
+                "paused": state.paused,
+                "reason": state.reason,
+            }
+            for network, state in (admission_policy.by_network or {}).items()
+        }, sort_keys=True)
+    except Exception as exc:  # noqa: BLE001 - admission must fail closed for EVM
+        _fail_policy_networks = frozenset(str(n) for n in config.EVM_NETWORKS)
+        admission_policy = _fail_closed_evm_admission(_fail_policy_networks)
+        stats["evm_admission_backlog"] = -1
+        stats["evm_admission_percent"] = 0
+        stats["evm_admission_paused"] = 1
+        stats["evm_admission_network_state"] = json.dumps({
+            network: {"paused": True, "percent": 0, "reason": "policy_error"}
+            for network in _fail_policy_networks
+        }, sort_keys=True)
+        db.note_error("last_error_evm_admission", f"{recorded_at}: {_exc_note(exc)}")
 
     # 0) تحديث صدارة المتصدّرين (كل ساعة) + أرشفة الخام + تسجيل الفشل.
     try:
@@ -1344,6 +2045,7 @@ async def run_cycle(
     # مرشّحو المجموعة الضابطة: كل عملة نراها في هذه الدورة ولم تدخل من قبل.
     # نجمعها هنا مجّاناً — البيانات في اليد أصلاً، فلا نداء شبكة إضافيّ.
     control_candidates: list[tuple[str, str, float | None, str]] = []
+    static_items: dict[tuple[str, str], Mapping[str, Any]] = {}
     for source, fetch in (
         ("trending", _fetch_trending_raw),
         ("verified", _fetch_verified_raw),
@@ -1361,8 +2063,10 @@ async def run_cycle(
                     if tick is None:
                         continue
                     key = (tick["token_address"], str(tick["network_id"] or ""))
+                    static_items[key] = item
                     control_candidates.append(
-                        (key[0], key[1], tick.get("price_usd"), source)
+                        (key[0], key[1], tick.get("price_usd"), source,
+                         extract.token_list_created_at(item))
                     )
                     # نسجّل tick لكل عملة مراقَبة (المصدر الأساسي للسلسلة الزمنية).
                     # نسجّل أيضاً الثوابت لكل عملة نراها لأول مرّة إن كانت مراقَبة.
@@ -1397,7 +2101,8 @@ async def run_cycle(
     try:
         stats["comparison_signal_added"] = admit_signal_comparison_windows(
             db, control_candidates, recorded_at, policy=admission_policy,
-            admitted_signals=admitted_signals,
+            admitted_signals=admitted_signals, stats=stats,
+            static_items=static_items,
         )
     except Exception as exc:  # noqa: BLE001
         _fail("comparison_signal", exc)
@@ -1408,6 +2113,7 @@ async def run_cycle(
         try:
             stats["control_added"] = admit_control_sample(
                 db, control_candidates, recorded_at, policy=admission_policy,
+                stats=stats, static_items=static_items,
             )
         except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
             _fail("control", exc)
@@ -1448,6 +2154,7 @@ async def run_cycle(
         soc = await run_social_cycle(client, db, recorded_at)
         stats["social_tokens"] = soc["social_tokens"]
         stats["social_items"] = soc["social_items"]
+        stats["thesis_rows"] = soc["thesis_rows"]
         if soc["social_errors"]:
             stats["errors"] += soc["social_errors"]
     except Exception as exc:  # noqa: BLE001
@@ -1485,6 +2192,7 @@ async def run_cycle(
         "percent": stats["evm_admission_percent"],
         "paused": bool(stats["evm_admission_paused"]),
         "deferred": stats["evm_admission_deferred"],
+        "networks": json.loads(stats["evm_admission_network_state"]),
     }, sort_keys=True))
     db.set_meta("last_cycle_stats", str(stats))
     # دورة نجحت كلياً (بلا أي خطأ مصدر) → ختم يُبطل أخطاء meta الأقدم منه في اللوحة.

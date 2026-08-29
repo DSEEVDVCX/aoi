@@ -181,6 +181,14 @@ def test_readmission_clears_terminal_no_data_fetch_state(db):
 
 
 def test_evm_readmission_invalidates_stale_ledger_and_replay_state(db):
+    """إعادة تنشيط بعد فجوة طويلة (> سقف الحفظ) تعيد البناء من genesis.
+
+    تحديث 2026-08-29: إعادة التنشيط صارت تحفظ الدفتر عند الفجوة القصيرة
+    (≤ `EVM_REACTIVATION_KEEP_LEDGER_SECONDS`) وتحذفه عند الطويلة فقط —
+    كان الحذف unconditional فيُصفِّر تقدّم التعبئة كلهً فتُبنى الطوابير
+    من الصفر أبدًا. الفجوة هنا يومٌ واحد، وهي تحت السقف الافتراضي 48س،
+    فالحفظ هو المتوقع؛ اختبار الفجوة الطويلة في test_evm_admission_gate_fix.
+    """
     token = "0xaaaa000000000000000000000000000000000001"
     network = "4663"
     holder = "0x1111111111111111111111111111111111111111"
@@ -200,9 +208,11 @@ def test_evm_readmission_invalidates_stale_ledger_and_replay_state(db):
         token, network, "large_buy", "s2", 48, "2026-07-28T00:00:00+00:00"
     )
 
-    assert db.evm_backfill_state(network, token) is None
-    assert db.evm_replay_state(token, network) is None
-    assert db.evm_ledger_stats(network, token) == {"holder_count": 0, "supply": 0}
+    # فجوة يوم واحد ≤ 48س: الدفتر باقٍ والتعبئة عادت partial لِتلحق الفجوة
+    state = db.evm_backfill_state(network, token)
+    assert state is not None
+    assert state["status"] == "partial"
+    assert db.evm_ledger_stats(network, token)["holder_count"] == 1
 
 
 def test_a_new_window_stales_the_verdict_and_keeps_the_walk(db):
