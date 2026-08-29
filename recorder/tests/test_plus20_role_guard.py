@@ -27,8 +27,9 @@ def test_plus20_is_veto_filter_never_entry():
 
 def test_config_plus20_comment_declares_veto_role():
     """ثابت العتبة موثق بحدوده: فلتر، لا دخول."""
-    import config
     import inspect
+
+    import config
 
     src = inspect.getsource(config)
     assert "ليست قاعدة دخول" in src or "لا قاعدة دخول" in src

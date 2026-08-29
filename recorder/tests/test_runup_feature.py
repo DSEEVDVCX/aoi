@@ -1,8 +1,7 @@
 """اختبارات ميزة pre_signal_runup (fv13) — موضع الصعود كقياس مستمر."""
+import features
 import pytest
 from db import RecorderDB
-
-import features
 
 
 @pytest.fixture()

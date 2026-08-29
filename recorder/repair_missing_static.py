@@ -34,8 +34,9 @@ if HERE not in sys.path:
 
 import config  # noqa: E402
 import extract  # noqa: E402
-import recorder  # noqa: E402
 from db import RecorderDB, utcnow_iso  # noqa: E402
+
+import recorder  # noqa: E402
 
 BATCH = 150
 
@@ -75,7 +76,7 @@ async def repair(db: RecorderDB, *, apply: bool) -> dict[str, int]:
                 by_addr[a.lower()] = item
         matched = 0
         with db.batch():
-            for addr, net in chunk:
+            for addr, _net in chunk:
                 item = by_addr.get(addr.lower())
                 if item is None:
                     stats["dropped"] += 1

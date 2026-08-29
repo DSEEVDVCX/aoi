@@ -16,10 +16,9 @@ import asyncio
 import sqlite3
 import sys
 
-import pytest
-
 import config
 import db as db_module
+import pytest
 
 
 class _FakeDB:

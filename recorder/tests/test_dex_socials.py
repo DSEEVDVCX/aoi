@@ -1,10 +1,9 @@
 """اختبارات طبقة DEX Screener socials (fv16)."""
-import asyncio
 
+import dex_screener
 import pytest
 from db import RecorderDB
 
-import dex_screener
 import recorder
 
 

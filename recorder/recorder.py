@@ -1214,14 +1214,19 @@ async def record_feed(
         # بوابة إدخال EVM تُطبَّق على كل نافذةٍ ستُفتَح — الجديدة وإعادة
         # التنشيط سواء (2026-08-29): فحصُها كان محصورًا في الجديد فكانت
         # إعادةُ التنشيط تتجاوز الإيقاف كليًا وتُغذّي الطابور من باب خلفيّ.
-        if _opens_window(existing) and network in policy_networks:
-            if not policy.allows("signal", token, network, str(row["id"])):
-                if str(row["id"]) in inserted:
-                    stats["evm_admission_deferred"] += 1
-                continue
-        if existing is None:
-            if db.active_watch_count(is_control=0) >= config.WATCHLIST_CAP:
-                continue
+        if (
+            _opens_window(existing)
+            and network in policy_networks
+            and not policy.allows("signal", token, network, str(row["id"]))
+        ):
+            if str(row["id"]) in inserted:
+                stats["evm_admission_deferred"] += 1
+            continue
+        if (
+            existing is None
+            and db.active_watch_count(is_control=0) >= config.WATCHLIST_CAP
+        ):
+            continue
         try:
             added = db.upsert_watch(
                 token_address=token,
