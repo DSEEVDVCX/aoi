@@ -98,7 +98,8 @@ body {
 .workspace main[data-active-view="watchlist"] [data-view-section="watchlist"],
 .workspace main[data-active-view="signals"] [data-view-section="signals"],
 .workspace main[data-active-view="health"] [data-view-section="health"],
-.workspace main[data-active-view="networks"] [data-view-section="networks"] { display: block; }
+.workspace main[data-active-view="networks"] [data-view-section="networks"],
+.workspace main[data-active-view="labeling"] [data-view-section="labeling"] { display: block; }
 .workspace main[data-active-view="overview"] .overview,
 .workspace main[data-active-view="overview"] .grid2 { display: grid; }
 .page-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
@@ -377,6 +378,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <a class="nav-link" href="#performance" data-view-link="performance"><span class="nav-icon">04</span>الأداء</a>
     <a class="nav-link" href="#health" data-view-link="health"><span class="nav-icon">05</span>صحة البيانات</a>
     <a class="nav-link" href="#networks" data-view-link="networks"><span class="nav-icon">06</span>الشبكات</a>
+    <a class="nav-link" href="#labeling" data-view-link="labeling"><span class="nav-icon">07</span>التوسيم والنتائج</a>
   </nav>
   <div class="side-foot">قراءة فقط · تحديث تلقائي كل 10 ثوانٍ</div>
 </aside>
@@ -528,6 +530,58 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       </div>
     </details>
   </div>
+
+  <!-- التوسيم والنتائج: ما أنتجه الخط بعد اكتمال النوافذ (48 ساعة) -->
+  <section data-view-section="labeling" hidden>
+    <div class="card">
+      <header>
+        <h2>بوابة المرحلة الأولى — نضج المجموعة الضابطة</h2>
+        <span class="note" id="labeling-cache-note"></span>
+      </header>
+      <div class="body" id="labeling-gate"></div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <header>
+          <h2>حصيلة الإشارات الموسومة</h2>
+          <span class="note">نوافذ 48 ساعة مكتملة — نتائج نهائية لا مراكز مفتوحة</span>
+        </header>
+        <div class="body" id="labeling-signal"></div>
+      </div>
+      <div class="card">
+        <header>
+          <h2>حصيلة الضابطة الموسومة</h2>
+          <span class="note">نفس الكون، دخول بالاختيار العشوائي لا بالإشارة</span>
+        </header>
+        <div class="body" id="labeling-control"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <header>
+        <h2>التوسيم اليومي</h2>
+        <span class="note">كل الأنواع — آخر 14 يومًا</span>
+      </header>
+      <div class="body" id="labeling-days"></div>
+    </div>
+
+    <div class="card">
+      <header>
+        <h2>صفوف التدريب</h2>
+        <span class="note">جاهزية النمذجة — التدريب المعتمد ينتظر البوابة</span>
+      </header>
+      <div class="body" id="labeling-training"></div>
+    </div>
+
+    <div class="card">
+      <header>
+        <h2>حصيلة التوسيم حسب النوع والحالة</h2>
+        <span class="note">أين ذهبت كل عيّنة ولماذا</span>
+      </header>
+      <div class="body flush tablewrap" id="labeling-status"></div>
+    </div>
+  </section>
 
   <section data-view-section="networks" hidden>
     <div class="network-grid" id="network-summary">
@@ -892,7 +946,7 @@ function renderHero(counts, timeline) {
   host.replaceChildren(sparkline(series, { w: 240, h: 40 }));
 }
 
-function renderTiles(st, counts, bars, storage, api) {
+function renderTiles(st, counts, bars, storage, api, labeling) {
   const size = storage.mb == null ? "—"
     : storage.mb >= 1000 ? (storage.mb / 1000).toFixed(1) + " GB" : storage.mb + " MB";
   const admission = st.evm_admission_networks || {};
@@ -919,6 +973,20 @@ function renderTiles(st, counts, bars, storage, api) {
       d: st.cycle_crashes ? `${st.cycle_crashes} انهيار دورة` : "بلا انهيارات" },
     { l: "قبول EVM حسب الشبكة", v: admissionText, d: admissionDetail },
   ];
+  // بوابة المرحلة الأولى في النظرة العامة — من بيانات التوسيم المخزَّنة مؤقّتاً
+  if (labeling && labeling.gate) {
+    const g = labeling.gate;
+    const gateD = labeling.last_labeled_at ? `آخر توسيم ${ago(labeling.last_labeled_at)}` : "لم يُوسَّم بعد";
+    items.push({
+      l: "بوابة المرحلة الأولى",
+      v: `${num(g.completed)} / ${num(g.decision_target)}`,
+      d: g.decision_ready
+        ? "✓ مفتوحة — القرار متاح"
+        : g.eta
+          ? `${num(g.remaining)} متبقّي · ~${num(g.eta.days)} يوم (${num(g.avg_per_day)}/يوم)`
+          : `${num(g.remaining)} متبقّي · ${gateD}`,
+    });
+  }
   document.getElementById("tiles").innerHTML = items.map(i =>
     `<div class="tile"><div class="l">${esc(i.l)}</div><div class="v">${i.v}</div><div class="d">${esc(i.d)}</div></div>`
   ).join("");
@@ -1739,6 +1807,243 @@ function renderNetworks(rows, cacheMeta) {
   }).join("");
 }
 
+/* ---------- التوسيم والنتائج (outcomes/training_rows) ---------- */
+/* النتائج هنا **نهائية** (نوافذ 48 ساعة مكتملة) — على خلاف صفحة الأداء التي
+   تعرض مراكز مفتوحة في نافذة جارية. الخلط بين الاثنين يقرأ «كأنّ الإشارة
+   رابحة دائمًا» لأنّ القمّة لا تتحقّق إلّا ببيعٍ في لحظتها. */
+
+const KIND_LABEL = {
+  watch: "قرار مراقبة",
+  signal: "حدث إشارة",
+  activity: "نشاط",
+};
+const OUTCOME_STATUS_LABEL = {
+  ok: "سليمة",
+  no_entry: "بلا سعر دخول",
+  no_bars: "بلا شموع",
+  incomplete: "ناقصة",
+};
+
+/** وسيطُ نسبةٍ من القيم الكسريّة — القياس في العميل لا في SQL. */
+function renderLabeling(data) {
+  if (!data || data.live === false) {
+    document.getElementById("labeling-gate").innerHTML =
+      `<div class="empty">لا جدول نتائج بعد — الموسِّم لم يوسّم أيّ نافذة.</div>`;
+    return;
+  }
+  paintLabelingGate(data);
+  paintLabelingGroup("labeling-signal", data.signal, "signal");
+  paintLabelingGroup("labeling-control", data.control, "control");
+  paintLabelingDays(data.labeled_per_day || []);
+  paintLabelingTraining(data.training || {});
+  paintLabelingStatus(data.status_counts || [], data.exclusions || []);
+
+  // طزاجة الملخّص المخزَّن — نفس لغة الشفافيّة في صفحة الشبكات
+  const note = document.getElementById("labeling-cache-note");
+  const m = data.cache;
+  note.textContent = m
+    ? `الأرقام محسوبة منذ ${ago(m.computed_at)} (تُحدَّث كل ${num(Math.round(m.ttl_seconds))} ث) · آخر توسيم ${ago(data.last_labeled_at)}${m.error ? ` · تعذّر التجديد: ${m.error}` : ""}`
+    : "";
+}
+
+function paintLabelingGate(d) {
+  const host = document.getElementById("labeling-gate");
+  const g = d.gate;
+  const s = d.signal || {};
+  const c = d.control || {};
+  const pctDone = Math.min(100, (g.completed / g.decision_target) * 100);
+  const etaText = g.decision_ready
+    ? "البوابة مفتوحة — قرار المرحلة الأولى متاح"
+    : g.eta
+      ? `بمعدّل ${num(g.avg_per_day)} ضابطة/يوم · متوقّع خلال ${num(g.eta.days)} يوم`
+      : g.avg_per_day
+        ? `متبقّي ${num(g.remaining)} · بمعدّل ${num(g.avg_per_day)}/يوم`
+        : `متبقّي ${num(g.remaining)}`;
+
+  const etaBadge = g.decision_ready
+    ? `<span class="badge good">✓ جاهزة</span>`
+    : g.preliminary_ready
+      ? `<span class="badge warn">فحص أولي متاح</span>`
+      : `<span class="badge warn">جمع الضابطة جارٍ</span>`;
+
+  host.innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+      <span style="font-size:38px;font-weight:640;letter-spacing:-.02em" class="num">${num(g.completed)}</span>
+      <span style="color:var(--muted);font-size:14px">من ${num(g.decision_target)} ضابطة v${d.design_version ?? 3} مكتملة النافذة</span>
+      ${etaBadge}
+    </div>
+    <div class="meter" style="height:10px;margin-top:12px"><i style="width:${pctDone}%;background:${g.decision_ready ? "var(--good)" : "var(--s1)"}"></i></div>
+    <div style="display:flex;justify-content:space-between;gap:12px;font-size:11.5px;color:var(--muted);margin-top:5px">
+      <span>الفحص الأولي ${num(g.preliminary_target)} ${g.preliminary_ready ? "✓" : ""}</span>
+      <span>${esc(etaText)}</span>
+    </div>
+    <div class="opennote" style="margin-top:14px">
+      لا تدريب معتمد قبل البلوغ — بوابة ملزمة في <span class="mono">docs/PLAN.md</span>.
+      المجموعة الصالحة: <span class="mono">kind=watch · status=ok · analysis_eligible=1 · v${d.design_version ?? 3}+</span>.
+      الإشارة ${num(s.count ?? 0)} نافذة مقابل ${num(c.count ?? 0)} للضابطة.
+    </div>`;
+}
+
+/** حصيلة مجموعة (إشارة أو ضابطة) — الأرقام النهائية بلا قيد «مفتوح». */
+function paintLabelingGroup(hostId, g, kind) {
+  const host = document.getElementById(hostId);
+  if (!g || !g.count) {
+    host.innerHTML = `<div class="empty">${kind === "control" ? "لا ضابطة موسومة بعد." : "لا إشارات موسومة بعد."}</div>`;
+    return;
+  }
+  const explPct = g.explosive_pct ?? 0;
+  const cells = [
+    { l: "نوافذ موسومة", v: num(g.count) },
+    { l: "منفجرة (is_explosive)", v: `${num(g.explosive)} · ${pct(explPct, { sign: false })}` },
+    { l: "متوسط العائد النهائي", v: signed(g.avg_return_pct) },
+    { l: "وسيط العائد", v: signed(g.median_return_pct) },
+    { l: "متوسط أعلى ارتفاع", v: signed(g.avg_gain_pct) },
+  ];
+  host.innerHTML = `
+    <div class="summary" style="border-bottom:none">
+      ${cells.map(cel => `<div class="cell"><div class="l">${esc(cel.l)}</div><div class="v">${cel.v}</div></div>`).join("")}
+    </div>
+    <div class="opennote">المنفجرة = قمّة ≥ +100% خلال 48س ونصفها (+50%) خلال أول 24س. العائد النهائي = سعر إغلاق نهاية النافذة مقابل الدخول.</div>`;
+}
+
+/** أعمدة التوسيم اليومي — نفس مواصفات رسم الإشارات مع لوحات ألوان الأنواع. */
+function paintLabelingDays(days) {
+  const host = document.getElementById("labeling-days");
+  if (!days.length) {
+    host.innerHTML = `<div class="empty">لا توسيم بعد.</div>`;
+    return;
+  }
+  const W = 720, H = 170, m = { t: 10, r: 8, b: 24, l: 40 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const max = Math.max(1, ...days.map(d => d.count));
+  const step = niceStep(max);
+  const top = Math.ceil(max / step) * step;
+  const band = pw / days.length;
+  const bw = Math.min(22, band * 0.66);
+  const y = (v) => m.t + ph - (v / top) * ph;
+
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  const title = el("title", {});
+  title.textContent = "النوافذ الموسومة لكل يوم";
+  svg.append(title);
+
+  for (let gv = 0; gv <= top; gv += step) {
+    svg.append(el("line", { x1: m.l, x2: W - m.r, y1: y(gv), y2: y(gv), class: gv === 0 ? "baseline" : "gridline" }));
+    const tx = el("text", { x: m.l - 7, y: y(gv) + 3.5, class: "axis", "text-anchor": "end" });
+    tx.textContent = compact(gv);
+    svg.append(tx);
+  }
+
+  days.forEach((d, i) => {
+    const cx = m.l + band * i + band / 2;
+    svg.append(el("path", {
+      d: roundedTop(cx - bw / 2, y(d.count), bw, Math.max(1, y(0) - y(d.count)), 4),
+      fill: "var(--s3)",
+    }));
+    const hit = el("rect", { x: m.l + band * i, y: m.t, width: band, height: ph, fill: "transparent" });
+    hit.style.cursor = "crosshair";
+    hit.addEventListener("mousemove", (e) => showTip(e,
+      `<div class="t">${esc(d.day)}</div><div class="r"><span class="k">نوافذ موسومة</span><span class="v">${num(d.count)}</span></div>`));
+    hit.addEventListener("mouseleave", hideTip);
+    svg.append(hit);
+    if (i % Math.ceil(days.length / 7) === 0 || i === days.length - 1) {
+      const tx = el("text", { x: cx, y: H - 6, class: "axis", "text-anchor": "middle" });
+      tx.textContent = d.day.slice(5);  // MM-DD
+      svg.append(tx);
+    }
+  });
+
+  const box = document.createElement("div");
+  box.className = "chart";
+  box.append(svg);
+  host.replaceChildren(box);
+  host.insertAdjacentHTML("beforeend",
+    `<div class="opennote" style="margin-top:10px">اليومان الأخيران لم تكتمل نوافذهما بعد — الأرقام تنقص لا تزيد.</div>`);
+}
+
+function paintLabelingTraining(t) {
+  const host = document.getElementById("labeling-training");
+  if (!t.available) {
+    host.innerHTML = `<div class="empty">لا صفوف تدريب بعد — الباني يعمل كل ساعة.</div>`;
+    return;
+  }
+  const cur = t.current || {};
+  const curExplosivePct = cur.total ? (cur.explosive / cur.total * 100) : null;
+  const splitCells = ["train", "val", "test"].map(sp => {
+    const s = cur.splits?.[sp] || { count: 0, explosive: 0 };
+    return `<div class="cell">
+      <div class="l">${sp === "train" ? "تدريب" : sp === "val" ? "تحقّق" : "اختبار"}</div>
+      <div class="v">${num(s.count)}</div>
+      <div class="d">${s.count ? `${num(s.explosive)} منفجرة` : "—"}</div>
+    </div>`;
+  }).join("");
+  const versionsRows = (t.versions || []).map(v => `
+    <tr>
+      <td class="num">fv${v.feature_version}</td>
+      <td class="num">${num(v.total)}</td>
+      <td class="num">${num(v.explosive)}</td>
+      <td class="num">${v.explosive ? pct(v.explosive / v.total * 100, { sign: false }) : "—"}</td>
+      <td class="mono">${v.last_built_at ? ago(v.last_built_at) : "—"}</td>
+    </tr>`).join("");
+  host.innerHTML = `
+    <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+      <span style="font-size:26px;font-weight:640" class="num">${num(cur.total ?? 0)}</span>
+      <span style="color:var(--muted);font-size:13px">صفًّا في الإصدار الحاليّ fv${cur.feature_version ?? "—"}</span>
+      ${cur.building
+        ? `<span class="badge warn">قيد البناء</span>`
+        : `<span class="badge">مكتمل</span>`}
+      ${curExplosivePct != null ? `<span class="badge">${pct(curExplosivePct, { sign: false })} منفجرة</span>` : ""}
+    </div>
+    <div class="summary" style="border-bottom:none">${splitCells}</div>
+    <div class="tablewrap"><table>
+      <thead><tr><th>الإصدار</th><th>الصفوف</th><th>المنفجرة</th><th>النسبة</th><th>آخر بناء</th></tr></thead>
+      <tbody>${versionsRows}</tbody></table></div>
+    <div class="opennote">
+      «قيد البناء» = الإصدار الأعلى لم يكتمل رجوعُه التاريخيّ بعد؛ نسبته تنقص
+      لا تزيد حتى اكتماله. التدريب المعتمد يبقى محجوزًا خلف بوابة ${num(500)}.
+    </div>`;
+}
+
+function paintLabelingStatus(counts, exclusions) {
+  const host = document.getElementById("labeling-status");
+  if (!counts.length) {
+    host.innerHTML = `<div class="empty">لا نتائج بعد.</div>`;
+    return;
+  }
+  const total = counts.reduce((a, c) => a + c.count, 0);
+  const statusLabel = (s) => OUTCOME_STATUS_LABEL[s] || s;
+  const kindLabel = (k) => KIND_LABEL[k] || k;
+  // أسبابُ الاستبعاد مجمّعةٌ بالحالة: قد يتشارك سطران سببًا واحدًا (فُرقا
+  // بالنوع فقط)، وقد يجمع سطرٌ واحدٌ أسبابًا عدة. والسببُ «—» يعني أنّ
+  // المسجّل لم يسجّل سببًا — ونصٌّ عربيٌّ أوضحُ من شرطةٍ تُقرأ نقصًا.
+  const reasonsByStatus = new Map();
+  for (const e of exclusions) {
+    const list = reasonsByStatus.get(e.status) || [];
+    const label = e.reason === "—" ? "بدون سببٍ مسجّل" : e.reason;
+    list.push(`${esc(label)} (${num(e.count)})`);
+    reasonsByStatus.set(e.status, list);
+  }
+  host.innerHTML = `<table>
+    <thead><tr><th>النوع</th><th>الحالة</th><th>العدد</th><th>النسبة</th><th>الاستبعاد</th></tr></thead>
+    <tbody>${counts.map(c => {
+      const reason = c.status === "ok"
+        ? `<span class="badge good">✓ دخلت التحليل</span>`
+        : (reasonsByStatus.get(c.status) || ["—"]).join(" · ");
+      return `<tr>
+        <td>${esc(kindLabel(c.kind))}</td>
+        <td><span class="badge ${c.status === "ok" ? "good" : c.status === "incomplete" ? "bad" : ""}">${esc(statusLabel(c.status))}</span></td>
+        <td class="num">${num(c.count)}</td>
+        <td class="num">${pct(c.count / total * 100, { sign: false })}</td>
+        <td class="mono" style="font-size:11px">${reason}</td>
+      </tr>`;
+    }).join("")}</tbody></table>
+    ${exclusions.length ? `<div class="opennote">
+      <b>أسباب الاستبعاد:</b> ${exclusions.map(e => {
+        const label = e.reason === "—" ? "بدون سببٍ مسجّل" : e.reason;
+        return `${esc(label)} (${num(e.count)})`;
+      }).join(" · ")}</div>` : ""}`;
+}
+
 const VIEW_META = {
   overview: ["نظرة عامة", "حالة الالتقاط الحالية ونبض مصادر البيانات.", "آخر 24 ساعة"],
   signals: ["الإشارات", "آخر الإشارات المسجلة مع سياق السوق والمتداولين.", "الأحدث أولاً"],
@@ -1746,6 +2051,7 @@ const VIEW_META = {
   performance: ["أداء الإشارات", "الحركة منذ لحظة الدخول والمقارنة مع الضابطة.", "تحليل جاري"],
   health: ["صحة البيانات", "تغطية الشموع، أخطاء المصادر، وحالة الأرشيف.", "مراقبة تشغيلية"],
   networks: ["الشبكات", "تغطية السوق وقياسات الحائزين والتركيز حسب الشبكة.", "تغطية فعلية"],
+  labeling: ["التوسيم والنتائج", "النتائج النهائية بعد 48 ساعة وصفوف التدريب وبوابة المرحلة الأولى.", "نتائج نهائية"],
 };
 
 function setActiveView() {
@@ -1775,7 +2081,7 @@ let paused = false, inflight = false;
 /* آخرُ حمولةٍ للّوحات الثقيلة، وعدّادُ الدورات الذي يقرّر متى تُطلب مجدّداً.
    `null` تعني «لم تُجلب بعد» ⇒ تُطلب في الدورة القادمة أيّاً كان العدّاد. */
 let heavyTick = 0;
-const heavy = { counts: null, networks: null };
+const heavy = { counts: null, networks: null, labeling: null };
 
 /** ينفّذ رسم لوحة واحدة معزولاً؛ الفشل يُبلَّغ في مكانها ولا يوقف البقيّة. */
 function paint(id, fn) {
@@ -1803,7 +2109,7 @@ async function tick() {
     const wantHeavy = (heavyTick % HEAVY_EVERY === 0) || heavy.counts === null;
     heavyTick += 1;
     const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys,
-           acct] = await Promise.all([
+           acct, labeling] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -1821,15 +2127,19 @@ async function tick() {
       // اختياريّ: صفحةٌ محمَّلة قبل تحديث الخادم لا تفقد بقيّة اللوحات لأجل هذه.
       getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }),
       getOptionalJSON("/api/fomo-account", null),
+      wantHeavy
+        ? getOptionalJSON("/api/labeling", heavy.labeling || { live: false })
+        : heavy.labeling,
     ]);
     heavy.counts = cnt;
     heavy.networks = networks;
+    heavy.labeling = labeling;
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
     // كل لوحة تُرسم مستقلّة: عطبٌ في واحدة يُفرغ تلك وحدها لا اللوحة كلّها.
     // (بلا هذا العزل، خطأ واحد في رسم الأعمدة أفرغ أربع لوحات دفعةً واحدة.)
     paint("hero",      () => renderHero(cnt, tl));
-    paint("tiles",     () => renderTiles(st, cnt, bars, storage, api));
+    paint("tiles",     () => renderTiles(st, cnt, bars, storage, api, labeling));
     paint("perf",         () => renderPerf(rows));
     paint("perf-summary", () => renderPerfSummary(perf.summary));
     paint("comparison",   () => renderComparison(perf.comparison));
@@ -1842,6 +2152,7 @@ async function tick() {
     paint("provider-keys", () => renderProviderKeys(keys));
     paint("fomo-account", () => renderFomoAccount(acct));
     paint("network-summary", () => renderNetworks(networks.networks || [], networks.cache));
+    paint("labeling", () => renderLabeling(labeling));
     renderStatus(st);
     renderApi(api);
     lastRows.perf = rows; lastRows.tl = tl;

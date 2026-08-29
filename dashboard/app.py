@@ -259,6 +259,35 @@ def api_bars() -> dict[str, Any]:
     return _with_conn(lambda c: dao.bars_coverage(c, config.LIVE_START_TS))
 
 
+@app.get("/api/labeling")
+def api_labeling() -> dict[str, Any]:
+    """التوسيم والنتائج بعد 48 ساعة — مخرج الخط الأساسي، مخزَّن مؤقّتاً.
+
+    أثقلُ استعلامٍ في اللوحة بعد ملخّص الشبكات (1.2 ثانية مقيسة)، وأرقامُه
+    نهائيّةٌ لا تتغيّر إلّا بإيقاع الموسِّم (كل 15 دقيقة)، فيُخزَّن بخمس
+    دقائق عمراً. وآخرُ نشاطِ توسيمٍ يُقرأ حيّاً فوقه — بلا انتظارٍ للتجديد —
+    لأنّه نبضُ الموسِّم من مخرجاته، والفرقُ بين «خمس دقائق» و«متجدّد» يُرى.
+    """
+    summary, meta = _cached(
+        "labeling",
+        config.LABELING_TTL_SECONDS,
+        lambda c: dao.labeling_outcomes(
+            c,
+            config.LIVE_START_TS,
+            design_version=config.CONTROL_DESIGN_VERSION,
+            gate_targets=(
+                config.CONTROL_PRELIMINARY_TARGET,
+                config.CONTROL_DECISION_TARGET,
+            ),
+        ),
+    )
+    live_last = _with_conn(dao.last_labeled_at)
+    out = dict(summary)
+    out["last_labeled_at"] = live_last or out.get("last_labeled_at")
+    out["cache"] = meta
+    return out
+
+
 @app.get("/api/storage")
 def api_storage() -> dict[str, Any]:
     """حجم القاعدة ومعدّل نموّها — رقابة على الانفجار الصامت للأرشيف."""

@@ -100,9 +100,9 @@ def _counted(monkeypatch, name: str) -> list[int]:
     calls: list[int] = []
     original = getattr(dao, name)
 
-    def wrapper(conn):
+    def wrapper(*args, **kwargs):
         calls.append(1)
-        return original(conn)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(dao, name, wrapper)
     return calls
@@ -116,6 +116,22 @@ def test_networks_computes_the_heavy_query_once(client, monkeypatch):
         assert client.get("/api/networks", headers=HOST).status_code == 200
 
     assert len(calls) == 1
+
+
+def test_labeling_is_cached_like_other_heavy_panels(client, db, monkeypatch):
+    """ملخّص التوسيم أثقلُ لوحةٍ بعد الشبكات (1.2 ثانية) — يُخزَّن كذلك.
+
+    وآخرُ توسيمٍ فوقه حيٌّ: نبضُ الموسِّم يُقرأ في كلّ طلبٍ بلا انتظار التجديد.
+    """
+    calls = _counted(monkeypatch, "labeling_outcomes")
+
+    first = client.get("/api/labeling", headers=HOST).json()
+    second = client.get("/api/labeling", headers=HOST).json()
+
+    assert len(calls) == 1
+    assert first["live"] is False            # لا جدول outcomes في قاعدة الاختبار
+    assert second == first
+    assert first["cache"]["ttl_seconds"] == config.LABELING_TTL_SECONDS
 
 
 def test_counts_computes_once_within_its_ttl(client, monkeypatch):
@@ -146,6 +162,7 @@ def test_ticks_summary_is_cached_too(client, monkeypatch):
         ("/api/networks", "NETWORK_SUMMARY_TTL_SECONDS"),
         ("/api/counts", "TABLE_COUNTS_TTL_SECONDS"),
         ("/api/ticks-summary", "TICKS_SUMMARY_TTL_SECONDS"),
+        ("/api/labeling", "LABELING_TTL_SECONDS"),
     ],
 )
 def test_cached_routes_publish_their_freshness(client, path, ttl_attr):
@@ -235,6 +252,10 @@ def test_the_page_asks_for_the_heavy_panels_less_often(client):
     # الحرسُ الثاني: عدّادٌ وحدَه كان سيُبقي اللوحةَ فارغةً دقيقةً بعد جلبٍ فاشل.
     assert "heavy.counts === null" in page
     assert 'wantHeavy ? getJSON("/api/counts") : heavy.counts' in page
+    # ولوحةُ التوسيم كذلك: 5 دقائق عمرُها أطولُ من دورةِ الشبكات، لكنّها
+    # تركب نفس الإيقاع — لا طلبَ جديد إلا في دورةٍ «ثقيلة».
+    assert 'getOptionalJSON("/api/labeling", heavy.labeling' in page
+    assert "paint(\"labeling\", () => renderLabeling(labeling))" in page
 
 
 def test_the_page_says_which_numbers_are_cached_and_which_are_live(client):
@@ -270,7 +291,7 @@ def test_caching_writes_nothing_to_the_database(client, db):
         .execute("SELECT name FROM sqlite_master ORDER BY name")
         .fetchall()
     )
-    for path in ("/api/networks", "/api/counts", "/api/ticks-summary"):
+    for path in ("/api/networks", "/api/counts", "/api/ticks-summary", "/api/labeling"):
         client.get(path, headers=HOST)
 
     conn = sqlite3.connect(db)

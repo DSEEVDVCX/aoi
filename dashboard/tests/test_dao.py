@@ -175,6 +175,241 @@ def test_control_maturity_counts_only_completed_eligible_v3_controls(db_path):
     }
 
 
+# --- التوسيم والنتائج (labeling_outcomes) ---
+def _outcomes_schema(c):
+    """جدول outcomes بأعمدته الحقيقيّة كما يقرؤه `labeling_outcomes`.
+
+    الجدولُ المصغّر في SCHEMA أعلاه يُنشأ في كلّ قاعدة اختبار، فنُكمل أعمدته
+    الناقصة بدل إنشائه مرّتين. `IF NOT EXISTS` يحرس قواعدَ أخرى (كاختبار
+    انجراف المخطّط) تبني الجدول الكامل من `recorder/schema.sql` أوّلاً.
+    """
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS outcomes (
+          kind TEXT, key TEXT, token_address TEXT, network_id TEXT,
+          signal_type TEXT, is_control INTEGER, is_independent INTEGER,
+          entry_ts INTEGER, entry_px REAL, entry_lag_s REAL,
+          max_gain_1h REAL, max_gain_4h REAL, max_gain_24h REAL,
+          max_gain_48h REAL, max_drawdown_48h REAL, final_return_48h REAL,
+          time_to_peak_h REAL, candles_48h INTEGER, last_bar_lag_h REAL,
+          bars_truncated INTEGER, is_rug INTEGER, split TEXT, status TEXT,
+          labeled_at TEXT, suspect_bars INTEGER, design_version INTEGER,
+          analysis_eligible INTEGER, exclusion_reason TEXT,
+          is_explosive INTEGER, time_to_plus20_min REAL
+        )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS training_rows (
+          kind TEXT, key TEXT, token_address TEXT, network_id TEXT,
+          entry_ts INTEGER, split TEXT, is_explosive INTEGER,
+          built_at TEXT, feature_version INTEGER
+        )"""
+    )
+    # إكمال الأعمدة التي يغيب عنها الجدولُ المصغّر (INSERT بأسماء أعمدة
+    # يفشل على عمودٍ غير موجود).
+    needed = {
+        "outcomes": {
+            "signal_type": "TEXT",
+            "max_gain_48h": "REAL",
+            "final_return_48h": "REAL",
+            "labeled_at": "TEXT",
+            "exclusion_reason": "TEXT",
+            "is_explosive": "INTEGER",
+        },
+    }
+    for table, columns in needed.items():
+        existing = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+        for column, decl in columns.items():
+            if column not in existing:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _seed_outcome(c, **kv):
+    base = dict(
+        kind="watch", key=kv.get("key", "k"), token_address="t", network_id="56",
+        signal_type="large_buy", is_control=0, entry_ts=1_800_000_000,
+        final_return_48h=0.5, max_gain_48h=1.5, status="ok",
+        design_version=3, analysis_eligible=1, is_explosive=0,
+        labeled_at="2026-08-29T00:00:00+00:00",
+    )
+    base.update(kv)
+    cols = ",".join(base)
+    marks = ",".join("?" * len(base))
+    c.execute(
+        f"INSERT INTO outcomes({cols}) VALUES({marks})", tuple(base.values())
+    )
+
+
+def test_labeling_percentages_are_hundred_not_fraction(db_path):
+    """النِّسَب في القاعدة كسور (0.5 = +50%) — والحدود بالمئويّات.
+
+    انكشاف وحدةٍ خاطئة (0.5 بدل 50) يفسد كلّ قراءة في الواجهة.
+    """
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    _seed_outcome(c, key="s1", is_control=0, final_return_48h=0.5)
+    _seed_outcome(c, key="s2", is_control=0, final_return_48h=-0.25)
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(conn, live_start_ts=0, eta_days=14)
+    conn.close()
+
+    assert out["signal"]["count"] == 2
+    assert out["signal"]["avg_return_pct"] == 12.5       # (0.5 - 0.25) / 2
+    assert out["signal"]["median_return_pct"] == 12.5
+    assert out["signal"]["avg_gain_pct"] == 150.0       # 1.5 كسر → 150%
+
+
+def test_labeling_separates_signal_from_control_and_gates(db_path):
+    """البوابة تعدّ الضابطة الناضجة وحدها؛ الإشارة لا تدخلها."""
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    _seed_outcome(c, key="s1", is_control=0, is_explosive=1)
+    _seed_outcome(c, key="s2", is_control=0)
+    _seed_outcome(c, key="c1", is_control=1)
+    _seed_outcome(c, key="c2", is_control=1, is_explosive=1)
+    _seed_outcome(c, key="c3", is_control=1, status="no_bars")  # لا تدخل
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(
+        conn, live_start_ts=0, gate_targets=(1, 3)
+    )
+    conn.close()
+
+    assert out["signal"]["count"] == 2
+    assert out["signal"]["explosive"] == 1
+    assert out["control"]["count"] == 2                 # no_bars مُقصاة
+    assert out["gate"]["completed"] == 2
+    assert out["gate"]["preliminary_ready"] is True     # 2 >= 1
+    assert out["gate"]["decision_ready"] is False       # 2 < 3
+    assert out["gate"]["remaining"] == 1
+
+
+def test_labeling_eta_from_mature_days_only(db_path):
+    """اليومان الأخيران (نافذة 48س غير مكتملة) لا يدخلان معدّل البوابة."""
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+    now_ts = int(now.timestamp())
+    # يومٌ ناضج قبل 3 أيام: 10 ضوابط، واليوم الحاليّ: 10 (لم تنضج بعد)
+    for i in range(10):
+        _seed_outcome(c, key=f"m{i}", is_control=1,
+                      entry_ts=now_ts - 3 * 86400)
+    for i in range(10):
+        _seed_outcome(c, key=f"y{i}", is_control=1,
+                      entry_ts=now_ts - 3600)
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(
+        conn, live_start_ts=0, gate_targets=(100, 500), eta_days=14, now=now,
+    )
+    conn.close()
+
+    # 20 مكتملة، والمعدّل من اليوم الناضج وحده (10/يوم)، لا من 20/2.
+    assert out["gate"]["completed"] == 20
+    assert out["gate"]["avg_per_day"] == 10.0
+    assert out["gate"]["remaining"] == 480
+    assert out["gate"]["eta"]["days"] == pytest.approx(48.0)
+
+
+def test_labeling_excludes_pre_live_era(db_path):
+    """ما قبل الحِقبة الحيّة جمعٌ رجعيّ مُقصى — لا يدخل الحصيلة."""
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    _seed_outcome(c, key="old", entry_ts=100)            # قبل الحدّ
+    _seed_outcome(c, key="new", entry_ts=1_800_000_000)  # بعده
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(conn, live_start_ts=1_000_000_000)
+    conn.close()
+
+    assert out["signal"]["count"] == 1
+
+
+def test_labeling_training_versions_and_building_flag(db_path):
+    """الإصدار الأعلى «حاليّ»؛ بناؤه الحديث علامة «قيد البناء»."""
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    c.executemany(
+        "INSERT INTO training_rows(kind, key, split, is_explosive, built_at, feature_version)"
+        " VALUES('watch', ?, ?, ?, ?, ?)",
+        [
+            ("a", "train", 1, "2026-08-29T10:00:00+00:00", 16),
+            ("b", "train", 0, "2026-08-20T10:00:00+00:00", 12),
+            ("c", "test", 1, "2026-08-20T10:00:00+00:00", 12),
+        ],
+    )
+    c.commit()
+    c.close()
+
+    now = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(conn, live_start_ts=0, now=now)
+    conn.close()
+
+    assert out["training"]["available"] is True
+    assert [v["feature_version"] for v in out["training"]["versions"]] == [16, 12]
+    cur = out["training"]["current"]
+    assert cur["feature_version"] == 16
+    assert cur["building"] is True                    # بُني قبل ساعتين
+
+
+def test_labeling_status_counts_and_exclusions(db_path):
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    _seed_outcome(c, key="ok1", kind="watch", status="ok")
+    _seed_outcome(c, key="ne1", kind="signal", status="no_entry",
+                  exclusion_reason="signal_outcome_not_phase1_watch")
+    _seed_outcome(c, key="nb1", kind="watch", status="no_bars",
+                  exclusion_reason="age_unknown_at_entry")
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(conn, live_start_ts=0)
+    conn.close()
+
+    by_key = {(r["kind"], r["status"]): r["count"] for r in out["status_counts"]}
+    assert by_key == {("watch", "ok"): 1, ("signal", "no_entry"): 1, ("watch", "no_bars"): 1}
+    reasons = {e["reason"]: e["count"] for e in out["exclusions"]}
+    assert reasons["signal_outcome_not_phase1_watch"] == 1
+    assert reasons["age_unknown_at_entry"] == 1
+
+
+def test_labeling_without_outcomes_table(db_path):
+    """الغِياب حالةٌ صالحة — لا انهيار.
+
+    الجدولُ المصغّر في SCHEMA موجودٌ دائماً لكن تنقصه أعمدة التوسيم، فيمسكه
+    حرسُ الأعمدة — وهو بحدّ ذاته سلوكٌ محروس: لوحةٌ تسبق ترحيلَ المسجّل
+    تعرض «لا بيانات» لا انهياراً.
+    """
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(conn, live_start_ts=0)
+    conn.close()
+    assert out["live"] is False
+    assert "is_explosive" in out.get("missing_columns", [])
+
+
+def test_last_labeled_at_reads_the_latest_stamp(db_path):
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    _seed_outcome(c, key="a", labeled_at="2026-08-28T00:00:00+00:00")
+    _seed_outcome(c, key="b", labeled_at="2026-08-29T00:00:00+00:00")
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    assert dao.last_labeled_at(conn) == "2026-08-29T00:00:00+00:00"
+    conn.close()
+
+
 def test_status_missing_meta_keys_default(db_path):
     conn = _conn(db_path)
     st = dao.recorder_status(conn, 150, 2000)
@@ -1046,6 +1281,13 @@ def test_every_dao_read_runs_against_the_real_recorder_schema(tmp_path):
         assert dao.token_series(c, "x", "56", 0) == []
         assert dao.signal_timeline(c, 6)["types"] == []
         assert dao.storage_stats(p, c)["bytes"] > 0
+        # التوسيم والنتائج — على المخطّط الحقيقيّ (عمود entry_ts موجودٌ فيه)
+        labeling = dao.labeling_outcomes(c, live_start_ts=0)
+        assert labeling["live"] is True
+        assert labeling["signal"]["count"] == 0
+        assert labeling["control"]["count"] == 0
+        assert labeling["gate"]["completed"] == 0
+        assert dao.last_labeled_at(c) is None
     finally:
         c.close()
 

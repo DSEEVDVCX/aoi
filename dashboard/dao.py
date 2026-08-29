@@ -124,6 +124,262 @@ def control_maturity(
     }
 
 
+# --- التوسيم والنتائج (outcomes/training_rows) ---
+def _last_labeled(conn: sqlite3.Connection) -> str | None:
+    if not _table_exists(conn, "outcomes"):
+        return None
+    row = conn.execute("SELECT MAX(labeled_at) FROM outcomes").fetchone()
+    return row[0] if row else None
+
+
+def last_labeled_at(conn: sqlite3.Connection) -> str | None:
+    """آخر ختم توسيم — نبضُ الموسِّم من مخرجاته، بلا مسحِ جداول.
+
+    استعلامُ لحظةٍ واحدة، يُقرأ حيّاً في كلّ طلب فوق الملخّص المخزَّن
+    (انظر `/api/labeling` في app.py).
+    """
+    return _last_labeled(conn)
+
+
+def labeling_outcomes(
+    conn: sqlite3.Connection,
+    live_start_ts: int,
+    *,
+    design_version: int = 3,
+    gate_targets: tuple[int, int] = (100, 500),
+    eta_days: int = 14,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """ملخّص ما أنتجه الخط بعد اكتمال نوافذه — التوسيم وصفوف التدريب.
+
+    هذا هو المخرج الذي بُني المشروع لأجله، وهو غائبٌ عن اللوحة كلّها: عرضُ
+    «الأداء» يتحدّر من النافذة **الجارية** (مراكز مفتوحة لم تكتمل بعد)، أمّا
+    هنا فالحديث عن النتائج **النهائيّة** بعد 48 ساعة — التي يُوسَّم بها
+    `is_explosive` وتُبنى منها صفوف التدريب.
+
+    - الحصيلة تُقصر على الحِقبة الحيّة (`live_start_ts`): ما قبلها جمعٌ رجعيّ
+      بلا العائلات اللحظيّة، أُقصي من التدريب وحُذفت صفوفُه، فخلطُه بالحيّ
+      يفسد كلّ نسبة.
+    - النِّسَب (final_return_48h) كسور لا مئويّات، والوسيطُ يُحسب في بايثون —
+      `median()` ليست مدمجةً في SQLite فلا يُعتمد عليها في SQL.
+    - `eta` للبوابة يُقدَّر من متوسّط الإنتاج اليوميّ لا من آخر يومٍ واحد:
+      يومٌ صفرٌ واحد كان سيقول «البوابة لا تُبلَغ أبداً».
+    """
+    if not _table_exists(conn, "outcomes"):
+        return {"live": False, "has_outcomes_table": False}
+    # اللوحة قد تسبق ترحيلَ المسجّل (عمودٌ جديد لم يصل بعد)، فالنواقص تُخفي
+    # اللوحةَ لا تُسقطها — نفس حرس `control_maturity` فوق.
+    required = (
+        "kind", "status", "entry_ts", "is_control", "is_explosive",
+        "final_return_48h", "max_gain_48h", "design_version",
+        "analysis_eligible", "labeled_at",
+    )
+    missing = [c for c in required if not _has_column(conn, "outcomes", c)]
+    if missing:
+        return {"live": False, "has_outcomes_table": True, "missing_columns": missing}
+
+    moment = now or datetime.now(UTC)
+
+    def _median_pct(values: list[float]) -> float | None:
+        """وسيطُ نسبةٍ من قيمٍ كسريّة — في بايثون لا في SQL.
+
+        `median()` ليست دالةً مدمجةً في SQLite (امتدادٌ يُحمَّل شرطاً)، وفحصُ
+        الإصدار كان سيمرّها بثقةٍ ثم ينهار في الوجه. القائمةُ هنا صغيرةٌ
+        (عشرات الآلاف) فترتيبُها في الذاكرة أرخصُ من خطأٍ صامت.
+        """
+        if not values:
+            return None
+        ordered = sorted(values)
+        n = len(ordered)
+        mid = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+        return round(mid * 100, 1)
+
+    # حصيلة التوسيم في الحِقبة الحيّة — لكل kind×status، والبوابات (ok) تفصل
+    # استبعاداتها التي تُحصي أين ذهبت العيّنات ولماذا.
+    status_rows = conn.execute(
+        "SELECT kind, status, COUNT(*) AS n FROM outcomes"
+        " WHERE entry_ts >= ? GROUP BY kind, status",
+        (live_start_ts,),
+    ).fetchall()
+    status_counts = [
+        {"kind": r["kind"], "status": r["status"], "count": int(r["n"])}
+        for r in status_rows
+    ]
+    exclusion_rows = conn.execute(
+        "SELECT status, exclusion_reason, COUNT(*) AS n FROM outcomes"
+        " WHERE entry_ts >= ? AND status != 'ok'"
+        " GROUP BY status, exclusion_reason ORDER BY n DESC",
+        (live_start_ts,),
+    ).fetchall()
+    exclusions = [
+        {
+            "status": r["status"],
+            "reason": r["exclusion_reason"] or "—",
+            "count": int(r["n"]),
+        }
+        for r in exclusion_rows
+    ]
+
+    # المجموعة الصالحة للتحليل: نافذة موسومة سليمة في التصميم الحاليّ.
+    # (kind='watch' هو القرار المُقارَن — الإشارة والضابطة معاً — أمّا 'signal'
+    # فهو توسيمٌ محاسبيّ لكل حدثٍ ولا يدخل المقارنة.)
+    # والفلترة بالحِقبة الحيّة هنا أيضاً: الحصيلةُ الجانبيّة كانت تشمل الرجعيّ.
+    analysis_where = (
+        "kind='watch' AND status='ok' AND analysis_eligible=1 AND design_version>=?"
+        " AND entry_ts >= ?"
+    )
+    analysis_args = (design_version, live_start_ts)
+
+    def _group_stats(where_extra: str, args_extra: tuple = ()) -> dict[str, Any]:
+        where = analysis_where + where_extra
+        args = analysis_args + args_extra
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n, SUM(is_explosive) AS explosive,"
+            f"       AVG(final_return_48h) AS avg_ret,"
+            f"       AVG(max_gain_48h) AS avg_gain,"
+            f"       MAX(entry_ts) AS last_entry_ts"
+            f"  FROM outcomes WHERE {where}",
+            args,
+        ).fetchone()
+        # الوسيط من القيم نفسها في بايثون — انظر `_median_pct`.
+        median_values = [
+            float(r[0]) for r in conn.execute(
+                f"SELECT final_return_48h FROM outcomes WHERE {where}"
+                f" AND final_return_48h IS NOT NULL",
+                args,
+            )
+        ]
+        return {
+            "count": int(row["n"] or 0),
+            "explosive": int(row["explosive"] or 0),
+            "explosive_pct": round(row["explosive"] / row["n"] * 100, 1)
+            if row["n"] else None,
+            "avg_return_pct": round(row["avg_ret"] * 100, 1)
+            if row["avg_ret"] is not None else None,
+            "avg_gain_pct": round(row["avg_gain"] * 100, 1)
+            if row["avg_gain"] is not None else None,
+            "median_return_pct": _median_pct(median_values),
+            "last_entry_ts": row["last_entry_ts"],
+        }
+
+    signal_stats = _group_stats(" AND is_control=0")
+    control_stats = _group_stats(" AND is_control=1")
+
+    # بوابة القرار من إنتاج الضابطة الفعليّ: معدّل الأيام الناضجة + إسقاط
+    # وصولٍ إلى الهدفين. النافذة 48س، فأيّ يومٍ داخل آخر يومين قد لا تكتمل
+    # نوافذُه بعد (الموسِّم يوسّم المتاحة فقط) — إدخالُه في المعدّل يخفضه
+    # زوراً، فنقصيه ونقول متى آخر يومٍ دخل الحساب.
+    prelim_target, decision_target = gate_targets
+    now_ts = int(moment.timestamp())
+    per_day = conn.execute(
+        "SELECT CAST(entry_ts / 86400 AS INTEGER) AS day, COUNT(*) AS n"
+        "  FROM outcomes"
+        " WHERE kind='watch' AND is_control=1 AND status='ok'"
+        "   AND analysis_eligible=1 AND design_version>=?"
+        "   AND entry_ts >= ? AND entry_ts >= ?"
+        " GROUP BY day",
+        (design_version, live_start_ts, now_ts - eta_days * 86400),
+    ).fetchall()
+    today_day = now_ts // 86400
+    mature = [(int(r["day"]), int(r["n"])) for r in per_day if int(r["day"]) <= today_day - 2]
+    avg_per_day = (sum(n for _, n in mature) / len(mature)) if mature else None
+    remaining = max(0, decision_target - control_stats["count"])
+    eta = (
+        {"days": round(remaining / avg_per_day, 1)}
+        if avg_per_day and remaining else None
+    )
+
+    # الإنتاج اليوميّ الموسوم (كل الأنواع) لآخر eta_days — يظهر وقع الجمع.
+    recent_days = conn.execute(
+        "SELECT CAST(entry_ts / 86400 AS INTEGER) AS day, COUNT(*) AS n"
+        "  FROM outcomes"
+        " WHERE entry_ts >= ?"
+        " GROUP BY day ORDER BY day DESC LIMIT ?",
+        (int(moment.timestamp()) - eta_days * 86400, eta_days),
+    ).fetchall()
+    labeled_per_day = [
+        {
+            "day": datetime.fromtimestamp(d * 86400, UTC).date().isoformat(),
+            "count": n,
+        }
+        for d, n in (
+            (int(r["day"]), int(r["n"])) for r in reversed(recent_days)
+        )
+    ]
+
+    # صفوف التدريب — جاهزية النمذجة من غير تدريبٍ معتمدٍ (بوابة 500 ملزمة).
+    training: dict[str, Any] = {"available": False}
+    if _table_exists(conn, "training_rows"):
+        version_rows = conn.execute(
+            "SELECT feature_version, split, COUNT(*) AS n,"
+            "       SUM(is_explosive) AS explosive, MAX(built_at) AS last_built"
+            "  FROM training_rows GROUP BY feature_version, split"
+            " ORDER BY feature_version DESC, split",
+        ).fetchall()
+        versions: dict[int, dict[str, Any]] = {}
+        for r in version_rows:
+            v = versions.setdefault(int(r["feature_version"]), {
+                "feature_version": int(r["feature_version"]),
+                "splits": {},
+                "total": 0,
+                "explosive": 0,
+                "last_built_at": r["last_built"],
+            })
+            v["splits"][r["split"]] = {
+                "count": int(r["n"]),
+                "explosive": int(r["explosive"] or 0),
+            }
+            v["total"] += int(r["n"])
+            v["explosive"] += int(r["explosive"] or 0)
+        # «الحالية» = أعلى إصدار ميزات، وهي التي ستُدرَّب حين تفتح البوابة.
+        # أعلى إصدار قد يكون **نصفيّ البناء** (fv16 بدأت 08-28 ولم تكتمل بعد)
+        # فيُصنَّف «قيد البناء» بلا نسبة انفجارٍ مضلِّلة.
+        current = None
+        if versions:
+            top = max(versions.values(), key=lambda v: v["feature_version"])
+            # بناء كامل = تاريخُ آخر صفٍّ حديث (خلال يومٍ من الآن) — الباني
+            # يعمل كلَّ ساعة، فإصدارٌ لم يُبنَ منذ أكثر من يومٍ متوقّفٌ لا جارٍ.
+            last_built = _parse_iso(top["last_built_at"]) if top["last_built_at"] else None
+            building = bool(
+                last_built and (moment - last_built).total_seconds() <= 86400
+            )
+            current = {**top, "building": building}
+        training = {
+            "available": True,
+            "versions": sorted(
+                versions.values(), key=lambda v: -v["feature_version"]
+            ),
+            "current": current,
+        }
+
+    # آخر نشاط توسيم — نبضُ الموسِّم من مخرجاته لا من ختم دورته.
+    last_labeled_at = _last_labeled(conn)
+
+    return {
+        "live": True,
+        "has_outcomes_table": True,
+        "live_start_ts": live_start_ts,
+        "design_version": design_version,
+        "status_counts": status_counts,
+        "exclusions": exclusions,
+        "signal": signal_stats,
+        "control": control_stats,
+        "gate": {
+            "completed": control_stats["count"],
+            "preliminary_target": prelim_target,
+            "decision_target": decision_target,
+            "preliminary_ready": control_stats["count"] >= prelim_target,
+            "decision_ready": control_stats["count"] >= decision_target,
+            "avg_per_day": round(avg_per_day, 1) if avg_per_day else None,
+            "remaining": remaining,
+            "eta": eta,
+        },
+        "labeled_per_day": labeled_per_day,
+        "training": training,
+        "last_labeled_at": last_labeled_at,
+    }
+
+
 # --- recorder status ---
 def recorder_status(
     conn: sqlite3.Connection,
