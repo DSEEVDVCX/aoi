@@ -435,8 +435,11 @@ async def run_evm_cycle(
     pending.sort(key=lambda w: (w.get("backfill_last_try_at") or "",))
     stats["evm_backfill_due"] = len(pending)
     # ميزانية زمنيّة للخطوة كلّها: التعبئة هي الوحيدة التي يجوز قطعها (تُستأنف
-    # من نقطتها بلا فقدان سجلّ)، والطبقة السريعة على سولانا في نفس العملية تخسر
-    # إيقاعها إن أكلت التعبئةُ الفترة — مقيس: 118 ثانية والفترة 60.
+    # من نقطتها بلا فقدان سجلّ)، وما بعدها في نفس الدورة ونفس العمليّة يخسر
+    # إيقاعه إن أكلت التعبئةُ الفترة — الخطوة ٣ (اللقطات) هنا، ثمّ `bsc_layer`
+    # و`evm_contract` و`evm_replay` في `run_evm_replay.run_cycle`. مقيس: 118
+    # ثانية والفترة 60. (وليست «سولانا»: `chain_layer` عمليّةٌ أخرى — صُحّح
+    # 08-22، والتفصيل عند `EVM_BACKFILL_BUDGET_SECONDS` في config.)
     deadline = time.monotonic() + config.EVM_BACKFILL_BUDGET_SECONDS
     for i, w in enumerate(pending[: config.EVM_BACKFILL_TOKENS_PER_CYCLE]):
         if i and time.monotonic() >= deadline:

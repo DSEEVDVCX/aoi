@@ -112,7 +112,36 @@ _THESIS_PAGE_CAP = 380
 #    Base فـ19 من 22 عقداً كاملاً بأحجام 135B–14.8KB و`owner` في 7 و`mint` في 2
 #    ⇒ التباين حقيقيّ فالعمود يفرّق. والعائلتان ستُسقَطان من التدريب كعلامة
 #    حقبة حتى تمتدّ تغطيتهما إلى نصفَي الإطار — سلوك صحيح لا خلل.
-FEATURE_VERSION = 12
+# 13: **`pre_signal_runup`** — موضع الإشارة على منحنى الصعود كقياسٍ مستمرّ.
+#     البوابات ترى حدودًا قاطعة، والنموذج يستحقّ التدرّج كاملًا: log(إغلاق t0 /
+#     أقدم إغلاق في آخر 24س). القياس على 2,968 إشارة موسومة: هذه القيمة وحدها
+#     تفصل السكان أقوى من أي عائلة قائمة — نهائي 48س ينزل من -2.1% (مبكرة)
+#     إلى -36.0% (متأخرة جدًا >+150% صعود سابق)، وrug يقفز 0.0%→7.1%.
+#     بلا هذه الميزة يعامل النموذج صفًّا على حافة الرفض (140%) مثل صفًّا
+#     هادئًا تمامًا (0%) — وذاك فرقُ مصيرٍ لا نغفلُه عن النموذج.
+# 14: **إزالة 8 أعمدة ميّتة من قائمة الميزات** (قرار المالك 2026-08-28): حقول
+#     صيغة feed خام توقف المصدر عن إرسالها (امتلأت في 91 صفًا من 102,963 =
+#     0.09% في كل التاريخ، كلها بين 6-23 أغسطس من حقبة قديمة). بقاؤها في
+#     التصدير يضلّل المحلّل الخارجي (يعتقد الأعمدة حية، يجرب fillna، يشوّه
+#     النتيجة) — فتُرفع من FEATURE_COLUMNS فتسقط من كل تصدير و تدريب قادم،
+#     وتُحفظ في الجدول كأرشيف صادق (لا ترحيل على 102 ألف صف).
+#     المحذوفات: unique_traders, num_trades, minutes, price_change_pct,
+#     total_volume, volume_per_trader, are_top_traders, top_trader_match_ratio.
+#     وبقيت `onchain_holders_delta_5m` عمدًا: موتها كان إيقاعيًا (يحتاج لقطتين
+#     ≤15 دقيقة) وإصلاح backfill 2026-08-27 أنعشه — 93% من فجوات EVM الآن
+#     ضمن النافذة (مقيس)، فالعمود صاعد لا ميّت.
+# 15: **إزالة `is_scam`** (قرار المالك 2026-08-28): عمود بلا تباين — 36 صفًا
+#     فقط في كل التاريخ وكلها صفر، لم تظهر القيمة 1 ولا مرة. بلا تباين لا
+#     معلومة، وفلاتر الأمان (بوابات العمر/الصعود + p_danger القادم) تغطي
+#     الدور. الخام يظل يُستخرج في token_static كأرشيف؛ الميزة وحدها رُفعت.
+# 16: **socials من DEX Screener** — عمودان من مصدر مستقل عن fomo:
+#     `social_channels_dex` (عدد قنوات التواصل؛ تغطية مقيسة 92% للنشطة)
+#     و`social_match_fomo_dex` (توافق المصدرين — التعارض نمط ملف مزوّر).
+#     جرد كامل لبقية حقول DEx أظهرها مكررة أو أدنى من مخزوننا (flow عندنا
+#     أعمق: 5 دقائق بفريدين مقابل m5 مجرد عدد)، فالطبقة مقصورة على socials.
+#     نداء واحد لكل عملة **جديدة** عند القبول — يُخزّن في token_static
+#     (تُكتب مرة)، لا حلقة مستمرة.
+FEATURE_VERSION = 16
 
 
 # ---------------------------------------------------------------------------
@@ -132,17 +161,22 @@ def epoch_of(value: Any) -> int | None:
         num = float(value)
     else:
         text = str(value).strip()
-        if text.replace(".", "", 1).isdigit():
+        try:
             num = float(text)
-        else:
+        except (ValueError, TypeError):
             try:
-                return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                num = parsed.timestamp()
             except (ValueError, TypeError):
                 return None
     # مللي ثانية (13 خانة) أو ثوانٍ (10) — الحدّ يفصلهما بلا لبس
+    if not math.isfinite(num) or num <= 0:
+        return None
     if num > 1e11:
         num /= 1000.0
-    return int(num)
+    return int(num) if num > 0 else None
 
 
 def _log1p(v: Any) -> float | None:
@@ -192,8 +226,6 @@ def event_features(row: dict[str, Any], t0: int) -> dict[str, Any]:
     """ميزات الحدث المُشغِّل. يعمل على الشكلين (الأماميّ والرجعيّ) بلا فبركة:
     الحقول غير الموجودة في المصدر الرجعيّ تبقى None."""
     dt = datetime.fromtimestamp(t0, UTC)
-    total_volume = row.get("total_volume")
-    unique_traders = row.get("unique_traders")
     rank = row.get("buyers_best_rank")
     # الصفر قيمة **مقيسة** لا غياب: 1,640 حدثاً حجمه 0.0 (خروج كامل للمركز).
     # `a or b` كان يحوّلها إلى None فيخسر النموذج معلومة صحيحة — لهذا الفحص
@@ -225,20 +257,12 @@ def event_features(row: dict[str, Any], t0: int) -> dict[str, Any]:
         "log_market_cap": _log1p(row.get("market_cap")),
         "log_size_usd": _log1p(size),
         "size_to_mcap": _div(size, row.get("market_cap")),
-        "unique_traders": unique_traders,
-        "num_trades": row.get("num_trades"),
-        "minutes": row.get("minutes"),
-        "price_change_pct": row.get("price_change_pct"),
-        "total_volume": total_volume,
-        # التركيبة: أقوى أثر مقيس (نخبة كبار مقابل حشد صغار — README §8)
-        "volume_per_trader": _div(total_volume, unique_traders),
-        "are_top_traders": row.get("are_top_traders"),
+        # (fv14) الأعمدة الثمانية الميّتة رُفعت من قائمة الميزات؛ الخام يظل
+        # يُستخرج إلى signal_events (أرشيف) لكن لا ميزة تُحسب منه بعد الآن.
         "top_trader_match_count": row.get("top_trader_match_count"),
         # عدد المتصدّرين الذين أعلنتهم fomo مقابل من طابقناهم بصدارتنا:
         # النسبة تميّز «كتلة نخبة» من «كتلة اسمية».
         "top_traders_listed": len(top_ids) if top_ids is not None else None,
-        "top_trader_match_ratio": _div(row.get("top_trader_match_count"),
-                                       len(top_ids) if top_ids else None),
         "buyers_best_rank": rank,
         "rank_le_10": (1 if rank <= 10 else 0) if isinstance(rank, int) else None,
         "rank_le_50": (1 if rank <= 50 else 0) if isinstance(rank, int) else None,
@@ -295,13 +319,17 @@ def static_features(
     ).fetchone()
     out: dict[str, Any] = {
         "token_age_h": None, "launchpad_name": None, "migrated": None,
-        "graduation_percent": None, "is_scam": None, "mintable": None,
+        "graduation_percent": None, "mintable": None,
         "freezable": None, "socials_count": None, "has_twitter": None,
         "creator_prior_tokens": None, "decimals": None, "name_len": None,
         "name_non_ascii": None,
         # شرعية خارجية — كانت في الخام منذ اليوم الأول ولا تُستخرج
         "exchanges_count": None, "listed_on_exchange": None, "has_cmc_id": None,
         "description_len": None, "has_banner": None,
+        # (fv16) socials من DEX Screener: قنوات مستقلة عن fomo، والتوافق
+        # بين المصدرين — تعارضهما (fomo يرى تويتر وDEX لا شيء) نمط ملف
+        # مزوّر شائع في النصب. NULL = لم تُسأل DEX بعد (غياب لا صفر).
+        "social_channels_dex": None, "social_match_fomo_dex": None,
     }
     if row is None:
         return out
@@ -319,11 +347,15 @@ def static_features(
         "launchpad_name": row["launchpad_name"],
         "migrated": row["migrated"],
         "graduation_percent": row["graduation_percent"],
-        "is_scam": row["is_scam"],
+        # (fv15) is_scam رُفع من الميزات — يُستخرج في الخام كأرشيف فقط.
         "mintable": row["mintable"],
         "freezable": row["freezable"],
         "socials_count": sum(1 for s in socials if s),
         "has_twitter": 1 if row["twitter"] else 0,
+        # (fv16) DEX Screener socials — إن سُئل عن هذه العملة:
+        # عدد قنواته، وتوافقه مع fomo (كلاهما يرى socials أو كلاهما لا).
+        "social_channels_dex": row["social_channels_dex"],
+        "social_match_fomo_dex": row["social_match_fomo_dex"],
         "decimals": row["decimals"],
         # نصّ الاسم: محارف مخادعة/طول شاذّ إشارة جودة مقيسة في مشاريع مشابهة
         "name_len": len(name) if isinstance(name, str) else None,
@@ -491,6 +523,10 @@ def price_history_features(
         "ath_history_days": None, "bars_history_h": None, "bars_count_24h": None,
         "bar_vol_1h": None, "bar_vol_24h": None, "vol_surge_1h": None,
         "up_candle_ratio_24h": None,
+        # fv13: موضع الإشارة على منحنى الصعود — log(إغلاق t0 / أقدم إغلاق
+        # في نافذة 24س). القياس على 2,968 إشارة: أقوى فاصل سكّاني في المشروع
+        # (rug 0.0% للمبكرة ← 7.1% للمتأخرة جدًا، والنهائي 48س -2.1% ← -36%).
+        "pre_signal_runup": None,
     }
     if not bars:
         return out
@@ -513,6 +549,16 @@ def price_history_features(
 
     window = [b for b in bars if b["ts"] > t0 - 86400]
     out["bars_count_24h"] = len(window)
+
+    # fv13 — الصعود المسبق: آخر 288 شمعة (24س) قبل t0. `bars` يفرض
+    # `ts + مدة_الشمعة <= t0` فالشمعة المفتوحة قبل الإشارة والمنتهية بعدها
+    # لا تدخل أصلًا — قانون النقطة الزمنية بنيويّ لا تحقّقيّ.
+    runup_window = bars[-288:]
+    if len(runup_window) >= 12:
+        first_c = runup_window[0]["c"]
+        if (isinstance(first_c, (int, float)) and first_c > 0
+                and isinstance(last_c, (int, float)) and last_c > 0):
+            out["pre_signal_runup"] = math.log(last_c / first_c)
     if len(window) >= 3:
         rets = [
             _ret(window[i]["c"], window[i - 1]["c"]) for i in range(1, len(window))
@@ -1107,10 +1153,12 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "signal_type", "size_usd", "in_amount", "out_amount", "token_amount",
     "avg_cost", "price_to_avg_cost", "realized_pnl_usd", "num_swaps",
     "is_first_buy", "buyer_pnl_pct", "market_cap", "fdv", "price_usd",
-    "log_market_cap", "log_size_usd", "size_to_mcap", "unique_traders",
-    "num_trades", "minutes", "price_change_pct", "total_volume",
-    "volume_per_trader", "are_top_traders", "top_trader_match_count",
-    "top_traders_listed", "top_trader_match_ratio",
+    "log_market_cap", "log_size_usd", "size_to_mcap",
+    # (fv14) رُفعت 8 أعمدة ميّتة من هنا: unique_traders, num_trades, minutes,
+    # price_change_pct, total_volume, volume_per_trader, are_top_traders,
+    # top_trader_match_ratio — المصدر توقف عن إرسالها (0.09% في كل التاريخ).
+    "top_trader_match_count",
+    "top_traders_listed",
     "buyers_best_rank", "rank_le_10", "rank_le_50",
     "top_trader_match_count_24h", "buyers_best_rank_24h",
     "top_trader_match_count_7d", "buyers_best_rank_7d",
@@ -1118,8 +1166,12 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "top_trader_periods_matched", "top_trader_any_period", "best_rank_any_period",
     "ticker_len", "ticker_has_digit", "ticker_non_ascii", "hour_utc", "dow",
     # ب — الثوابت والمُنشئ
-    "token_age_h", "launchpad_name", "migrated", "graduation_percent", "is_scam",
+    # (fv15) is_scam رُفع: 36 صفًا في كل التاريخ وكلها 0 — لا تباين لا معلومة.
+    "token_age_h", "launchpad_name", "migrated", "graduation_percent",
     "mintable", "freezable", "socials_count", "has_twitter", "creator_prior_tokens",
+    # (fv16) socials من DEX Screener: قنوات مستقلة + توافق المصدرين
+    # (تعارضهما نمط ملف مزوّر). مقيس: تغطية 92% للعملات النشطة.
+    "social_channels_dex", "social_match_fomo_dex",
     "name_len", "name_non_ascii", "decimals",
     "exchanges_count", "listed_on_exchange", "has_cmc_id", "description_len",
     "has_banner",
@@ -1136,8 +1188,19 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "ath_history_complete", "ath_history_days",
     "bars_history_h", "bars_count_24h", "bar_vol_1h", "bar_vol_24h",
     "vol_surge_1h",
+    # fv13 — موضع الإشارة على منحنى الصعود (log-runup آخر 24س): أقوى فاصل
+    # سكّاني مقيس في المشروع؛ بوابة القبول ترى الحدّ القاطع والنموذج يرى التدرّج.
+    "pre_signal_runup",
     # هـ — لقطة السوق
-    "liquidity", "holders", "top10_holders_pct", "volume_24h", "buy_count_24h",
+    # `top10_holders_pct` **متروك عن قصد** (2026-08-22): صفر من 3,837,466 صفّ
+    # في `market_ticks` وصفر من 108,441 صفّ تدريب، لأنّ المصدر لا يرسل المفتاح
+    # إطلاقاً (صفر من 240 حمولة خام مفحوصة). وبديلاه يعملان: `chain_top10_pct`
+    # 4,506 قيمة غير فارغة (3,002 مميّزة) و`onchain_top10_pct` 2,608 (1,956).
+    # فيبقى العمود في الجدول — حذفُه ترحيلٌ على 108 آلاف صفّ بلا مكسب — ويخرج
+    # من قائمة الميزات وحدها. ولهذا `ROW_COLUMNS` 198 والجدول 199: فارقٌ مقصود
+    # وموثَّق، لا انحرافُ ترحيلٍ منسيّ. ولا يستدعي رفعَ `feature_version`: العمود
+    # فارغٌ في كلّ صفّ قائم أصلاً، فإسقاطه لا يغيّر بياناتِ صفٍّ واحد.
+    "liquidity", "holders", "volume_24h", "buy_count_24h",
     "sell_count_24h", "buy_sell_ratio_24h", "unique_buys_24h", "unique_sells_24h",
     "tick_age_min", "tick_change_1h", "tick_change_4h", "tick_change_24h",
     "tick_volume_1h", "tick_volume_4h", "tick_txn_1h", "tick_txn_24h",
@@ -1197,6 +1260,10 @@ META_COLUMNS: tuple[str, ...] = (
 LABEL_COLUMNS: tuple[str, ...] = (
     "final_return_48h", "max_gain_1h", "max_gain_4h", "max_gain_24h",
     "max_gain_48h", "max_drawdown_48h", "time_to_peak_h", "is_rug",
+    # (fv15) ليبل الانفجار القابل للالتقاط وسنارة الدخول المبكر —
+    # تعريفان مقيسان على 2,378 انفجارًا (config: EXPLOSIVE_*/PLUS20_*).
+    # حارس التسريب: هنا فقط، لا في FEATURE_COLUMNS أبدًا.
+    "is_explosive", "time_to_plus20_min",
 )
 
 ROW_COLUMNS: tuple[str, ...] = META_COLUMNS + FEATURE_COLUMNS + LABEL_COLUMNS

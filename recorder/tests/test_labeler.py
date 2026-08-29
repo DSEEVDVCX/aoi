@@ -257,8 +257,35 @@ def test_watch_entries_including_control_get_labeled(db):
     assert rows["tokC"]["is_rug"] == 1                         # -95%
     assert rows["tokC"]["is_independent"] is None              # لا يخصّ المراقبة
     assert rows["tokC"]["design_version"] == 2
-    assert rows["tokC"]["analysis_eligible"] == 0
-    assert rows["tokC"]["exclusion_reason"] == "superseded_comparison_design"
+
+
+def test_window_labeled_when_bars_stopped_before_watch_end(db):
+    """سلسلةٌ متقطّعة تُوسم `ok` بعلم `bars_truncated` — لا تُركب إلى الأبد.
+
+    قِياس حيّ 2026-08-24: 1900 نافذة ناضجة بلا توسيم لأنّ آخر سحب شموع سبق
+    `watch_until` بساعات، بينما الشموع نفسها تغطي النافذة. بوابةُ «آخر سحب»
+    كانت تحجب ما تملك بياناته أصلاً.
+    """
+    db.upsert_watch("tokT", "56", "large_buy", "s1", 48, _iso(ENTRY))
+    # سلسلة متقطّعة فعلاً: شمعة الدخول ثم فراغ حتى ما بعد النهاية.
+    db.insert_bars([
+        {"token_address": "tokT", "network_id": "56", "resolution": "5",
+         "ts": ENTRY, "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "fetched_at": "t"},
+        {"token_address": "tokT", "network_id": "56", "resolution": "5",
+         "ts": ENTRY + 3 * H, "o": 1.0, "h": 1.4, "l": 0.9, "c": 1.2,
+         "fetched_at": "t"},
+    ])
+    # آخر سحب قبل نهاية النافذة بساعتين — البوابة القديمة تحجب هذه الحالة.
+    db.set_bars_state("tokT", "56", "ok", 3, _iso(ENTRY + 46 * H))
+
+    stats = labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    assert stats["watches"] == 1
+    row = db._conn.execute(
+        "SELECT status, bars_truncated FROM outcomes WHERE kind='watch'"
+    ).fetchone()
+    assert row["status"] == "ok"
+    assert row["bars_truncated"] == 1
 
 
 def test_incomplete_watch_outcome_is_not_phase1_eligible(db):
@@ -311,6 +338,10 @@ def test_phase1_view_exposes_only_eligible_v2_watch_outcomes(db):
 
 
 def test_phase1_view_exposes_only_v3_outcomes(db):
+    db.upsert_static({
+        "token_address": "v3", "network_id": "56", "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY - 3 * 86400), "raw_json": "{}",
+    })
     db.admit_control(
         "v3", "56", 48, _iso(ENTRY), admission_price_usd=1.0,
         design_version=config.CONTROL_DESIGN_VERSION,
@@ -320,6 +351,151 @@ def test_phase1_view_exposes_only_v3_outcomes(db):
     labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
     rows = db._conn.execute("SELECT key FROM phase1_watch_outcomes").fetchall()
     assert [row["key"] for row in rows] == [f"v3:56:{_iso(ENTRY)}"]
+
+
+def test_young_v3_watch_is_quarantined_at_label_time(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "young", "network_id": "56", "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY - 3600), "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "young", "56", "large_buy", "s-young", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "young", ENTRY)
+    db.set_bars_state("young", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='young'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_gate_at_entry"
+
+
+def test_v3_watch_with_only_post_entry_age_is_unknown_at_entry(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "late-age", "network_id": "56",
+        "recorded_at": _iso(ENTRY + H),
+        "token_created_at": str(ENTRY - 3 * 86400), "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "late-age", "56", "large_buy", "s-late-age", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "late-age", ENTRY)
+    db.set_bars_state("late-age", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='late-age'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_v3_future_creation_timestamp_is_unknown_not_age_gate(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "future-age", "network_id": "56",
+        "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY + 86400), "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "future-age", "56", "large_buy", "s-future-age", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "future-age", ENTRY)
+    db.set_bars_state("future-age", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='future-age'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_age_filled_after_entry_is_not_treated_as_known_at_entry(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "filled-late", "network_id": "56",
+        "recorded_at": _iso(ENTRY), "token_created_at": None, "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "filled-late", "56", "large_buy", "s-filled-late", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    db.set_static_created_at(
+        "filled-late", "56", str(ENTRY - 3 * 86400), _iso(ENTRY + H)
+    )
+    _seed_bars(db, "filled-late", ENTRY)
+    db.set_bars_state("filled-late", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='filled-late'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_unproven_age_is_unknown_at_entry(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "unproven-age", "network_id": "56",
+        "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY - 3 * 86400), "raw_json": "{}",
+    })
+    db._conn.execute(
+        "UPDATE token_static SET token_created_at_observed_at=NULL "
+        "WHERE token_address='unproven-age'"
+    )
+    db._conn.commit()
+    db.add_signal_comparison_window(
+        "unproven-age", "56", "large_buy", "s-unproven", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "unproven-age", ENTRY)
+    db.set_bars_state("unproven-age", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='unproven-age'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_v3_window_before_gate_is_not_retroactively_age_filtered(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY + 10 * H))
+    db.add_signal_comparison_window(
+        "legacy-v3", "56", "large_buy", "s-legacy-v3", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "legacy-v3", ENTRY)
+    db.set_bars_state("legacy-v3", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='legacy-v3'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 1
+    assert row["exclusion_reason"] is None
 
 
 def test_signal_without_bars_gets_an_auditable_status_row(db):

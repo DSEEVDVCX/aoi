@@ -87,6 +87,18 @@ def test_extract_signal_event_core_fields():
     assert row["buyers_best_rank"] is None
 
 
+def test_evm_addresses_are_canonicalized_but_solana_case_is_preserved():
+    evm = dict(FEED_EVENT, tokenAddress="0xAbCd", networkId=8453)
+    sol = dict(FEED_EVENT, tokenAddress="SoAbCd", networkId=1399811149)
+
+    assert extract.extract_signal_event(evm, "t")["token_address"] == "0xabcd"
+    assert extract.extract_signal_event(sol, "t")["token_address"] == "SoAbCd"
+
+    item = {"token": {"address": "0xAbCd", "networkId": 8453}, "priceUSD": 1.0}
+    assert extract.extract_market_tick(item, "t", "trending")["token_address"] == "0xabcd"
+    assert extract.extract_token_static(item, "t")["token_address"] == "0xabcd"
+
+
 def test_extract_signal_event_top_trader_matching():
     """إشارة "أكثر من متصدّر اشترى": مطابقة id→رتبة تُحسب بدقّة."""
     rank_lookup = {"trader_A": 3, "trader_B": 17}  # trader_Z ليس متصدّراً

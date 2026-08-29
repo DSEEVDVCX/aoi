@@ -19,6 +19,7 @@
     py backfill_activity.py --pages 20              # ~1000 حدث رجوعاً
     py backfill_activity.py --until 2026-06-01      # حتى بلوغ تاريخ
     py backfill_activity.py --pages 40 --dry-run    # قياس العمق بلا كتابة
+    py backfill_activity.py --head --pages 100   # سدّ الفجوة من أحدث الأحداث
     py backfill_activity.py --reset                 # مسح نقطة الاستئناف والبدء من جديد
 """
 from __future__ import annotations
@@ -147,6 +148,72 @@ async def walk(
     return stats
 
 
+async def walk_head(
+    client: Any,
+    db: RecorderDB,
+    *,
+    max_pages: int,
+    dry_run: bool = False,
+    sleep=asyncio.sleep,
+) -> dict:
+    """Walk from the newest page until it overlaps stored activity.
+
+    The historical cursor may legitimately point at the end of an old run.
+    Starting from that cursor cannot discover events that arrived afterwards.
+    This repair path deliberately keeps the historical cursor untouched and
+    uses the durable event id as its stop boundary.
+    """
+    stats = {
+        "pages": 0, "events": 0, "added": 0, "types": {},
+        "oldest": None, "resumed_from": None, "dry_run": dry_run,
+        "stopped": None,
+    }
+    head_last_id: str | None = None
+    seen: set[str] = set()
+
+    for page in range(1, max_pages + 1):
+        fetched_at = utcnow_iso()
+        raw = await _fetch_page(client, head_last_id)
+        items, has_next = extract.activity_page(raw)
+        rows = [extract.extract_activity_event(e, fetched_at) for e in items]
+        rows = [r for r in rows if r and r["id"] not in seen]
+        if not rows:
+            stats["stopped"] = "empty_page"
+            break
+        seen.update(r["id"] for r in rows)
+
+        ids = [str(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        existing = {
+            str(row[0]) for row in db._conn.execute(
+                f"SELECT id FROM activity_events WHERE id IN ({placeholders})", ids
+            )
+        }
+        added = len(rows) if dry_run else db.insert_activity_events(rows)
+        stats["pages"] = page
+        stats["events"] += len(rows)
+        stats["added"] += added
+        for row in rows:
+            stats["types"][row["event_type"]] = (
+                stats["types"].get(row["event_type"], 0) + 1
+            )
+        ts_min = min((row["ts"] for row in rows if row["ts"]), default=None)
+        if ts_min and (stats["oldest"] is None or ts_min < stats["oldest"]):
+            stats["oldest"] = ts_min
+
+        if existing:
+            stats["stopped"] = "overlap"
+            break
+        if not has_next:
+            stats["stopped"] = "has_next_page_false"
+            break
+        head_last_id = rows[-1]["id"]
+        await sleep(_PACING)
+    else:
+        stats["stopped"] = "max_pages"
+    return stats
+
+
 def _load_client():
     from fomo_api.auth.credential_store import CredentialStore
     from fomo_api.clients.fomo_client import FomoClient
@@ -159,6 +226,9 @@ def _load_client():
 
 async def main() -> None:
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
+    head = "--head" in sys.argv
+    if head and "--reset" in sys.argv:
+        raise SystemExit("--head و --reset لا يجتمعان")
     if "--reset" in sys.argv:
         db._conn.execute(
             "DELETE FROM meta WHERE key IN (?, ?)", (META_LAST_ID, META_OLDEST)
@@ -167,12 +237,19 @@ async def main() -> None:
         print("مُسحت نقطة الاستئناف — يبدأ من الأحدث.")
     client = _load_client()
     try:
-        stats = await walk(
-            client, db,
-            max_pages=_arg_int("--pages", 20),
-            until=_arg_value("--until"),
-            dry_run="--dry-run" in sys.argv,
-        )
+        if head:
+            stats = await walk_head(
+                client, db,
+                max_pages=_arg_int("--pages", 20),
+                dry_run="--dry-run" in sys.argv,
+            )
+        else:
+            stats = await walk(
+                client, db,
+                max_pages=_arg_int("--pages", 20),
+                until=_arg_value("--until"),
+                dry_run="--dry-run" in sys.argv,
+            )
     finally:
         await client.aclose()
     tag = " (dry-run — بلا كتابة)" if stats["dry_run"] else ""

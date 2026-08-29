@@ -176,7 +176,8 @@ def test_event_features_derive_ratios_and_logs():
          "market_cap": 1_000_000.0, "total_volume": 60_000.0,
          "unique_traders": 12, "buyers_best_rank": 7}, T0)
     assert f["size_to_mcap"] == pytest.approx(0.01)
-    assert f["volume_per_trader"] == pytest.approx(5_000.0)
+    # (fv14) volume_per_trader رُفع من الميزات مع عائلته الميّتة — الحساب
+    # المتبقي يُختبر عبر أعمدته الحية فقط.
     assert f["rank_le_10"] == 1 and f["rank_le_50"] == 1
     assert f["log_market_cap"] > f["log_size_usd"]
 
@@ -184,7 +185,6 @@ def test_event_features_derive_ratios_and_logs():
 def test_event_features_missing_stay_none_not_zero():
     f = features.event_features({"signal_type": "large_buy"}, T0)
     assert f["size_to_mcap"] is None
-    assert f["volume_per_trader"] is None
     assert f["rank_le_10"] is None          # لا رتبة ⇒ لا علم (لا صفر)
 
 
@@ -729,7 +729,9 @@ def test_buyer_and_text_features(db):
     assert f["price_to_avg_cost"] == pytest.approx(2.0)   # يشتري أعلى من متوسّطه
     assert f["token_amount"] == 5_000.0
     assert f["top_traders_listed"] == 3
-    assert f["top_trader_match_ratio"] == pytest.approx(1 / 3)
+    # (fv14) top_trader_match_ratio رُفع مع عائلته الميّتة؛ العدد المطلق
+    # للمطابقات يظل ميزة حية ويُختبر هو.
+    assert f["top_trader_match_count"] == 1
     assert f["ticker_len"] == 6
     assert f["ticker_has_digit"] == 1
     assert f["ticker_non_ascii"] == 1

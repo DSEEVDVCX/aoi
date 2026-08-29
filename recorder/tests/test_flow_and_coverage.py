@@ -31,6 +31,13 @@ def db(tmp_path):
     d.close()
 
 
+@pytest.fixture(autouse=True)
+def _legacy_filter_stride(monkeypatch):
+    """اختبارات هذه الوحدة تفحص خرائط الربط لا الإيقاع — نعيدها للسلوك
+    الموحّد (كل عنوان كل دورة) كي لا يتقاسم الـstride عناصرها."""
+    monkeypatch.setattr(recorder.config, "FILTER_TOKENS_STRIDE", 1)
+
+
 def _watch(db, token, *, network="56"):
     db.upsert_watch(token, network, "large_buy", f"sig-{token}", 48, NOW)
 
@@ -210,6 +217,16 @@ def _filter_item(addr, *, net="56", price=1.0, protocol=None, created=None):
     return item
 
 
+def test_static_extractor_preserves_pair_protocol():
+    """البروتوكول الموجود في الخام لا يجوز أن يضيع من token_static."""
+    row = extract.extract_token_static(
+        _filter_item("tok", protocol="PumpAmm", created=1700000000), NOW
+    )
+
+    assert row is not None
+    assert row["dex_protocol"] == "PumpAmm"
+
+
 class _FilterClient:
     def __init__(self, items=None, fail=False):
         self.calls = []
@@ -282,6 +299,28 @@ async def test_filter_cycle_maps_by_address_not_position(db):
     assert prices == {"a": 1.0, "c": 3.0}   # لو رُبط بالفهرس لانعكست القيم
 
 
+async def test_filter_cycle_maps_by_address_and_network(db):
+    """العنوان قد يوجد على شبكتين؛ لا نخلط تاريخ/سعر شبكة بأخرى."""
+    _watch(db, "same", network="56")
+    _watch(db, "same", network="8453")
+    client = _FilterClient(items=[
+        _filter_item("same", net="8453", price=8.0, created=1700000008),
+        _filter_item("same", net="56", price=5.0, created=1700000005),
+    ])
+
+    await recorder.run_filter_tokens_cycle(
+        client, db, NOW, {("same", "56"), ("same", "8453")}, set(), sleep=_noop
+    )
+
+    rows = db._conn.execute(
+        "SELECT network_id, price_usd FROM market_ticks "
+        "WHERE token_address='same' ORDER BY network_id"
+    ).fetchall()
+    assert [(row["network_id"], row["price_usd"]) for row in rows] == [
+        ("56", 5.0), ("8453", 8.0),
+    ]
+
+
 async def test_filter_cycle_fills_dex_protocol(db):
     """`dex_protocol` غائب من trending (0 من 3,000) — هذا مصدره الوحيد."""
     _watch(db, "tok")
@@ -346,6 +385,22 @@ async def test_filter_cycle_fills_empty_age_on_existing_row(db):
     assert row["symbol"] == "OLD"          # لم يُستبدل الصفّ، مُلئ عمودُه فقط
 
 
+async def test_filter_cycle_does_not_persist_future_creation_date(db):
+    _watch(db, "future")
+    client = _FilterClient(items=[
+        _filter_item("future", created="2099-01-01T00:00:00Z"),
+    ])
+
+    await recorder.run_filter_tokens_cycle(
+        client, db, NOW, {("future", "56")}, set(), sleep=_noop
+    )
+
+    row = db._conn.execute(
+        "SELECT token_created_at FROM token_static WHERE token_address='future'"
+    ).fetchone()
+    assert row["token_created_at"] is None
+
+
 async def test_filter_cycle_never_overwrites_a_recorded_age(db):
     """قيمة المنبع نفسها **تتبدّل** (53 من 216 تخالف المخزَّن، وواحدة بفرق
     سنة). فلو تبعنا تبدُّلها لتبدّل حكمُ بوّابة العمر تحت عملةٍ مقبولةٍ
@@ -366,6 +421,30 @@ async def test_filter_cycle_never_overwrites_a_recorded_age(db):
         "SELECT token_created_at FROM token_static WHERE token_address='tok'"
     ).fetchone()["token_created_at"]
     assert age == "1600000000"
+
+
+async def test_market_list_stamps_an_unobserved_age_without_waiting_for_admission(db):
+    _watch(db, "tok")
+    db.upsert_static({
+        "token_address": "tok", "network_id": "56", "recorded_at": NOW,
+        "token_created_at": "1600000000", "raw_json": "{}",
+    })
+    db._conn.execute(
+        "UPDATE token_static SET token_created_at_observed_at=NULL "
+        "WHERE token_address='tok'"
+    )
+    db._conn.commit()
+
+    recorder._write_filter_static(
+        db, _filter_item("tok", created=1600000000), "tok", "56", NOW,
+        replace_invalid=True,
+    )
+
+    row = db._conn.execute(
+        "SELECT token_created_at_observed_at FROM token_static "
+        "WHERE token_address='tok'"
+    ).fetchone()
+    assert row["token_created_at_observed_at"] == NOW
 
 
 async def test_filter_cycle_error_does_not_raise(db):

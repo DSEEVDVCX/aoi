@@ -22,6 +22,7 @@ import shutil
 import sqlite3
 import sys
 import time
+from datetime import UTC
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
@@ -288,7 +289,18 @@ def main() -> None:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument(
+        "--since", default=None, metavar="YYYY-MM-DD",
+        help="تصدير مركّز: إشارات من هذا التاريخ فصاعداً فقط (entry_ts). "
+             "يُستعمل لتجميع عائلات ميزات حديثة (onchain/flow) تغطيتها ضعيفة "
+             "قبل تاريخ بدء جمعها — الغائب يبقى NULL لا صفراً في الحالتين.",
+    )
     args = ap.parse_args()
+    since_cut: int | None = None
+    if args.since:
+        from datetime import datetime
+        dt = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
+        since_cut = int(dt.timestamp())
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, "code"), exist_ok=True)
@@ -301,6 +313,12 @@ def main() -> None:
     con.execute("BEGIN")
     manifest: dict = {"feature_version": features.FEATURE_VERSION,
                       "window_hours": WINDOW_H, "files": []}
+    live_where = "is_live = 1"
+    if since_cut is not None:
+        # القيد يطبَّق على entry_ts (لحظة القرار) لا على recorded_at — وإلا
+        # تسلّلت صفوف قراراتٍ قديمة عبر أرشفةٍ متأخرة.
+        live_where += f" AND entry_ts >= {since_cut}"
+        manifest["since"] = args.since
     try:
         _log("1) صفوف التدريب (is_live=1 حصراً — البيانات الحيّة فقط)")
         skipped = con.execute(
@@ -311,23 +329,24 @@ def main() -> None:
             _log(f"   استُبعد {skipped:,} صفّاً غير حيّ (قيد ملزم: التدريب حيّ فقط)")
         manifest["files"].append(export_table(
             con, out_dir, "features.csv",
-            "SELECT * FROM training_rows WHERE is_live = 1 ORDER BY entry_ts"))
+            f"SELECT * FROM training_rows WHERE {live_where} ORDER BY entry_ts"))
 
         _log("\n2) النتائج (سعر الدخول وجودة الشموع — ليست كلّها في features.csv)")
         manifest["files"].append(export_table(
             con, out_dir, "outcomes.csv",
-            """SELECT o.* FROM outcomes o
+            f"""SELECT o.* FROM outcomes o
                 WHERE EXISTS (SELECT 1 FROM training_rows t
                                WHERE t.kind = o.kind AND t.key = o.key
-                                 AND t.is_live = 1)
+                                 AND t.is_live = 1{'' if since_cut is None else f' AND t.entry_ts >= {since_cut}'})
                 ORDER BY o.entry_ts"""))
 
         _log("\n3) الشموع داخل النوافذ")
         windows: dict = {}
         # إشارات + ضابطة. نستثني kind='activity' وحده: رجعيّ، والتدريب حيّ حصراً.
         for tok, ts in con.execute(
-            """SELECT token_address, entry_ts FROM training_rows
-                WHERE kind IN ('signal', 'watch') AND entry_ts IS NOT NULL"""
+            f"""SELECT token_address, entry_ts FROM training_rows
+                WHERE kind IN ('signal', 'watch') AND entry_ts IS NOT NULL
+                  AND {live_where}"""
         ):
             windows.setdefault(tok, []).append((ts, ts + WINDOW_H * 3600))
         _log(f"   {len(windows):,} عملة · {sum(len(v) for v in windows.values()):,} نافذة")
@@ -356,37 +375,38 @@ def main() -> None:
         _log("\n4ب) ميزات الضابطة (نفس الـ147 ميزة، نفس قانون النقطة الزمنية)")
         manifest["files"].append(export_table(
             con, out_dir, "control_features.csv",
-            """SELECT r.*, w.is_control, w.source AS watch_source
+            f"""SELECT r.*, w.is_control, w.source AS watch_source
                  FROM training_rows r
                  LEFT JOIN watchlist w
                         ON r.key = w.token_address || ':' || w.network_id
                                 || ':' || w.first_seen_at
-                WHERE r.kind = 'watch'
+                WHERE r.kind = 'watch' AND {live_where}
                 ORDER BY r.entry_ts"""))
 
-        _log("\n5) توزيعات مرجعيّة (لئلّا يعيد المحلّل التقسيم عشوائياً)")
+        _log("\n5) توزيعات مرجعيّة (لئلّا يعيد المحلّل التقسيم عشوائيًّا)")
         dist: dict = {}
         for label, sql in (
             ("by_split", "SELECT split, COUNT(*) FROM training_rows "
-                          "WHERE is_live=1 AND kind='signal' GROUP BY 1"),
+                          f"WHERE {live_where} AND kind='signal' GROUP BY 1"),
             ("by_kind", "SELECT kind, COUNT(*) FROM training_rows "
-                        "WHERE is_live=1 GROUP BY 1"),
+                        f"WHERE {live_where} GROUP BY 1"),
             ("by_status", "SELECT status, COUNT(*) FROM training_rows "
-                          "WHERE is_live=1 GROUP BY 1"),
+                          f"WHERE {live_where} GROUP BY 1"),
             ("by_is_independent", "SELECT is_independent, COUNT(*) FROM training_rows "
-                                  "WHERE is_live=1 AND kind='signal' GROUP BY 1"),
+                                  f"WHERE {live_where} AND kind='signal' GROUP BY 1"),
             ("by_asset_class", "SELECT asset_class, COUNT(*) FROM training_rows "
-                               "WHERE is_live=1 GROUP BY 1"),
+                               f"WHERE {live_where} GROUP BY 1"),
             ("by_feature_version", "SELECT feature_version, COUNT(*) FROM training_rows "
-                                   "WHERE is_live=1 GROUP BY 1"),
+                                   f"WHERE {live_where} GROUP BY 1"),
         ):
             dist[label] = {str(k): v for k, v in con.execute(sql)}
             _log(f"   {label:<20} {dist[label]}")
         manifest["distributions"] = dist
 
         n_model = con.execute(
-            """SELECT COUNT(*) FROM training_rows
-                WHERE kind='signal' AND is_live=1 AND is_independent=1
+            f"""SELECT COUNT(*) FROM training_rows
+                WHERE kind='signal' AND {live_where.replace('is_live = 1', 'is_live=1')}
+                  AND is_independent=1
                   AND asset_class='meme' AND status='ok'"""
         ).fetchone()[0]
         manifest["main_training_set_rows"] = n_model
@@ -398,15 +418,16 @@ def main() -> None:
         # المحلّل على ميزة سليمة بأنّها ميتة.
         feat_cols = list(features.FEATURE_COLUMNS)
         sel = ", ".join(f"SUM({c} IS NOT NULL)" for c in feat_cols)
+        since_clause = "" if since_cut is None else f" AND entry_ts >= {since_cut}"
         MAIN = ("kind='signal' AND is_live=1 AND is_independent=1 "
-                "AND asset_class='meme' AND status='ok'")
+                "AND asset_class='meme' AND status='ok'" + since_clause)
         r_main = con.execute(
             f"SELECT {sel} FROM training_rows WHERE {MAIN}").fetchone()
         r_all = con.execute(
-            f"SELECT {sel} FROM training_rows WHERE kind='signal' AND is_live=1"
-        ).fetchone()
+            f"SELECT {sel} FROM training_rows WHERE kind='signal' AND is_live=1{since_clause}").fetchone()
         n_all = con.execute(
-            "SELECT COUNT(*) FROM training_rows WHERE kind='signal' AND is_live=1"
+            "SELECT COUNT(*) FROM training_rows "
+            "WHERE kind='signal' AND is_live=1" + since_clause
         ).fetchone()[0]
         cov_path = os.path.join(out_dir, "feature_coverage.csv")
         fh, w = _writer(cov_path)
@@ -474,13 +495,14 @@ def main() -> None:
     manifest["code_files"] = copied
     manifest["export_seconds"] = round(time.time() - started, 1)
 
-    # القواعد التي تمنع الاستنتاج الخاطئ. تُكتب أخيراً ومع كل تشغيل: حزمة بلا
-    # دليلها تُقرأ خطأً — `fillna(0)` وإعادة تقسيم عشوائيّة وعمود مستقبليّ
-    # كميزة، ثلاثتها تُنتج AUC عالياً لا معنى له.
-    _log("\n8) دليل القراءة (README.md)")
-    with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as fh:
-        fh.write(README_TEXT)
-    _log(f"   README.md · {len(README_TEXT)/1024:.1f} KB")
+    # القواعد التي تمنع الاستنتاج الخاطئ موجودة في README_TEXT أعلاه، لكنّ
+    # المالك طلب عدم إصدار README.md في حزمة التصدير (قرار 2026-08-25) —
+    # فتُحذَف إن وُجد من تصديرٍ سابق، ولا يُكتَب جديد.
+    _log("\n8) دليل القراءة (README.md) — مُعطَّل بطلب المالك")
+    stale_readme = os.path.join(out_dir, "README.md")
+    if os.path.exists(stale_readme):
+        os.remove(stale_readme)
+        _log("   حُذف README.md قديم")
 
     with open(os.path.join(out_dir, "MANIFEST.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, ensure_ascii=False)

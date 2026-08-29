@@ -188,3 +188,37 @@ async def test_walk_empty_first_page_stops(db):
     stats = await ba.walk(client, db, max_pages=5, sleep=_noop)
     assert stats["stopped"] == "empty_page"
     assert stats["events"] == 0
+
+
+async def test_walk_head_repairs_gap_without_replacing_history_cursor(db):
+    """المسح من الرأس يضيف الجديد حتى أول تداخل ولا يمس مؤشر التاريخ."""
+    existing = dict(SWAP_BUY)
+    db.insert_activity_events([extract.extract_activity_event(existing, NOW)])
+    db.set_meta(ba.META_LAST_ID, "old-history-cursor")
+
+    newer = dict(SWAP_BUY, id="new-1", createdAt="2026-08-23T12:00:00.000Z")
+    client = _PagerClient([
+        _envelope([newer], has_next=True),
+        _envelope([existing, MULTI_BUY], has_next=True),
+    ])
+
+    stats = await ba.walk_head(client, db, max_pages=5, sleep=_noop)
+
+    assert stats["stopped"] == "overlap"
+    assert stats["added"] == 2
+    assert db.activity_count() == 3
+    assert db.get_meta(ba.META_LAST_ID) == "old-history-cursor"
+
+
+async def test_walk_head_follows_last_id_across_pages(db):
+    """الصفحةُ الثانية تُطلَب بـ`lastId` من الأولى — لا NameError ولا إعادة رأس."""
+    client = _PagerClient([
+        _envelope([dict(SWAP_BUY, id="h-1")], has_next=True),
+        _envelope([dict(SWAP_BUY, id="h-2")], has_next=False),
+    ])
+
+    stats = await ba.walk_head(client, db, max_pages=5, sleep=_noop)
+
+    assert stats["pages"] == 2
+    assert stats["added"] == 2
+    assert client.params_seen[1]["lastId"] == "h-1"

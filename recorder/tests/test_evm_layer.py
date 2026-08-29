@@ -377,6 +377,11 @@ class _BatchRPC(_PagingRPC):
         return out
 
 
+def test_monad_batch_size_stays_below_quicknode_subrequest_limit():
+    """QuickNode Monad يحسب كل subrequest داخل JSON-RPC batch ضمن 50/ث."""
+    assert 1 <= config.EVM_BATCH_SIZE["143"] <= 50
+
+
 def test_split_range_uses_the_hint_only_when_it_actually_shrinks():
     """مدًى طوله = التلميح بالضبط لا يُقسَم بالتلميح، وإلّا أعاد نفسه إلى الأبد.
 

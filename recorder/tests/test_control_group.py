@@ -6,6 +6,7 @@
 import math
 import os
 import random
+from datetime import datetime
 
 import config
 import pytest
@@ -26,6 +27,34 @@ def db(tmp_path):
 
 def _cands(n, net="56"):
     return [(f"tok{i:03d}", net) for i in range(n)]
+
+
+def _age_all(target, n=300, nets=("56", "1399811149", "8453", "4663")):
+    """يمنح كلّ مرشّحٍ محتمل عمراً **معروفاً وقديماً** (ثلاثون يوماً).
+
+    موضوعُ هذا الملفّ ميكانيكا الاختيار — عشوائيّته، مزيجُ شبكاته، استبعادُ
+    المُشار إليه، شرطُ السعر — لا العمر؛ وبوّابةُ العمر تُختبر وحدها في
+    `test_control_age_gate.py`. وبلا تاريخِ إنشاءٍ يرفض الضابطُ كلَّ مرشّحٍ
+    كمجهولِ العمر، فتُقاس الميكانيكا على مجموعةٍ خالية وتنجح بلا معنى.
+    """
+    created = str(int(datetime.fromisoformat(NOW).timestamp()) - 30 * 86400)
+    names = [f"tok{i:03d}" for i in range(n)]
+    # مرشّحون بأسماءٍ صريحة في اختباراتٍ بعينها — لا يلتقطها نمطُ `tok###`.
+    names += ["control", "tokA", "tokNew", "bad", "priced", "valid",
+              "base", "base0", "c1", "s1"]
+    with target.batch():
+        for net in nets:
+            for name in names:
+                target.upsert_static({
+                    "token_address": name, "network_id": net,
+                    "recorded_at": NOW, "token_created_at": created,
+                    "raw_json": "{}",
+                })
+
+
+@pytest.fixture(autouse=True)
+def _known_old_ages(db):
+    _age_all(db)
 
 
 def test_control_rows_are_marked_and_counted_separately(db):
@@ -153,6 +182,7 @@ def test_sample_is_random_not_positional(db, tmp_path):
     picks = []
     for seed in range(6):
         d = RecorderDB(str(tmp_path / f"s{seed}.db"), SCHEMA)
+        _age_all(d, 80)          # قواعد خاصّة بهذا الاختبار ⇒ تعمير صريح
         recorder.admit_control_sample(d, _cands(80), NOW, rng=random.Random(seed))
         picks.append(tuple(sorted(
             r["token_address"] for r in d._conn.execute(
@@ -269,6 +299,28 @@ def test_same_cycle_operational_window_is_finalized_as_v3(db):
         "FROM watch_windows WHERE token_address='tokNew'"
     ).fetchall()
     assert [tuple(row) for row in rows] == [(3, 0.002, "verified")]
+
+
+def test_young_active_watch_does_not_gain_a_v3_comparison_window(db):
+    created = int(datetime.fromisoformat(NOW).timestamp()) - 3600
+    db.upsert_static({
+        "token_address": "young", "network_id": "56", "recorded_at": NOW,
+        "token_created_at": str(created), "raw_json": "{}",
+    })
+    db.upsert_watch("young", "56", "large_buy", "old", 48, NOW)
+    db.insert_signal({
+        "id": "new", "token_address": "young", "network_id": "56",
+        "ts": NOW, "recorded_at": NOW, "signal_type": "large_buy",
+        "raw_json": "{}",
+    })
+
+    assert recorder.admit_signal_comparison_windows(
+        db, [("young", "56", 0.002, "verified")], NOW,
+        admitted_signals=set(),
+    ) == 0
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM watch_windows WHERE design_version>=3"
+    ).fetchone()[0] == 0
 
 
 def test_new_controls_use_current_comparison_design(db):

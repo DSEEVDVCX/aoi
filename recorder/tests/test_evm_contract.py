@@ -304,14 +304,35 @@ async def test_failure_marks_state_error_and_meta(db):
 
 
 async def test_only_configured_networks_are_scanned(db):
-    """روبن‑هود وBSC مستثناتان بقياس: العمود هناك ثابت لا معلومة فيه."""
-    _watch(db, "0xrh", network="4663")
+    """البوّابة تقرأ `EVM_CONTRACT_NETWORKS` لا «هل الشبكة EVM».
+
+    مونَد (143) شبكةُ EVM ومراقَبة، لكنّها خارج قائمة الفحص — فلو كان الشرط
+    «أيّ EVM» لفُحصت. وBase وBSC وروبن‑هود الثلاث داخلها بقياس 2026-08-22.
+    """
+    _watch(db, "0xmonad", network="143")
     _watch(db, TOK, network=BASE)
     rpc = _RPC(code={TOK: _code("owner()")})
 
     await evm_contract.run_evm_contract_cycle(rpc, db, NOW, sleep=_noop)
 
     assert [a for _, a in rpc.code_calls] == [TOK]
+
+
+async def test_bsc_and_robinhood_are_scanned_after_the_widening(db):
+    """`is_proxy` 26 من 40 على BSC هو أقوى عمودٍ مفرّقٍ قِسناه — فحصرُ الفحص على
+    Base كان يُهدره مع 40% من صفوف النموذج."""
+    _watch(db, "0xbsc", network="56")
+    _watch(db, "0xrh", network="4663")
+    rpc = _RPC(code={"0xbsc": _code("mint(address,uint256)"),
+                     "0xrh": _code("pause()")})
+
+    await evm_contract.run_evm_contract_cycle(rpc, db, NOW, sleep=_noop)
+
+    assert sorted(a for _, a in rpc.code_calls) == ["0xbsc", "0xrh"]
+    nets = {r[0] for r in db._conn.execute(
+        "SELECT network_id FROM evm_contract"
+    )}
+    assert nets == {"56", "4663"}
 
 
 async def test_row_per_measurement_not_updated_in_place(db):

@@ -3,6 +3,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import data_readiness
+import features
 import pytest
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
@@ -344,9 +345,12 @@ def test_load_model_rows_uses_direct_eligibility_and_deduplicates(tmp_path):
         """
     )
     rows = [
-        ("signal", "a", "tok", "1", 100, "meme", "ok", 1, 1, 12, "train", 0.1, 0.2),
-        ("signal", "b", "tok", "1", 100, "meme", "ok", 1, 1, 12, "train", 0.1, 0.2),
-        ("signal", "c", "old", "1", 90, "meme", "ok", 0, 1, 12, "train", 0.1, 0.2),
+        ("signal", "a", "tok", "1", 100, "meme", "ok", 1, 1,
+         features.FEATURE_VERSION, "train", 0.1, 0.2),
+        ("signal", "b", "tok", "1", 100, "meme", "ok", 1, 1,
+         features.FEATURE_VERSION, "train", 0.1, 0.2),
+        ("signal", "c", "old", "1", 90, "meme", "ok", 0, 1,
+         features.FEATURE_VERSION, "train", 0.1, 0.2),
     ]
     connection.executemany("INSERT INTO training_rows VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     connection.executemany(

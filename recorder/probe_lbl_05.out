@@ -1,0 +1,77 @@
+
+== model-eligible but stale feature_version, by fv x network
+    {'feature_version': 8, 'net': '4663', 'n': 1593}
+    {'feature_version': 8, 'net': '8453', 'n': 106}
+    {'feature_version': 12, 'net': '1399811149', 'n': 6468}
+    {'feature_version': 12, 'net': '56', 'n': 2496}
+    {'feature_version': 12, 'net': '4663', 'n': 1866}
+    {'feature_version': 12, 'net': '8453', 'n': 111}
+    {'feature_version': 12, 'net': '143', 'n': 1}
+
+TOTAL model-eligible-except-fv rows at fv!=12 = 1699
+
+== outcomes signal/ok/live/independent with NO training row, by network
+    {'net': '4663', 'n': 2323}
+    {'net': '8453', 'n': 362}
+    {'net': '1399811149', 'n': 10}
+    {'net': '143', 'n': 5}
+    {'net': '56', 'n': 1}
+
+== outcomes signal/ok/live/independent with NO *current-fv* training row, by network
+    {'net': '4663', 'n': 3952}
+    {'net': '8453', 'n': 477}
+    {'net': '1399811149', 'n': 10}
+    {'net': '143', 'n': 5}
+    {'net': '56', 'n': 1}
+
+== MODEL: bars_truncated (from outcomes)
+    {'bars_truncated': 0, 'n': 7344}
+    {'bars_truncated': 1, 'n': 3598}
+
+== MODEL: last_bar_lag_h buckets (hours the series ended BEFORE the 48h mark)
+    {'b': '<=1h (full window)', 'n': 7344}
+    {'b': '6-24h short', 'n': 1684}
+    {'b': '1-6h short', 'n': 1358}
+    {'b': '24-40h short', 'n': 411}
+    {'b': '>40h short', 'n': 145}
+
+== MODEL: candles_48h buckets (5m bars; a full 48h window = ~576)
+    {'b': '550+', 'n': 5092}
+    {'b': '400-549', 'n': 3359}
+    {'b': '200-399', 'n': 1685}
+    {'b': '50-199', 'n': 673}
+    {'b': '1-49', 'n': 133}
+
+== MODEL: median/percentiles of last_bar_lag_h
+    {'mn': 0.0, 'mx': 47.812222222222225, 'avg': 4.088199267856781}
+
+MODEL rows with bars_truncated=1 (label horizon < 47h) = 3598
+bars_truncated present in training_rows columns? -> False
+last_bar_lag_h present in training_rows columns? -> False
+candles_48h present in training_rows columns? -> False
+
+== MODEL: entry_lag_s buckets
+    {'b': '1-300s', 'n': 10394}
+    {'b': '301-900s', 'n': 397}
+    {'b': '901-1800s', 'n': 98}
+    {'b': '0', 'n': 53}
+
+MODEL time_to_peak_h = 48.0 exactly = 1
+MODEL time_to_peak_h >= 47.9 = 54
+
+== MODEL max_drawdown_48h=0 rows: candles_48h
+    {'candles_48h': 575, 'suspect_bars': 0, 'n': 6}
+    {'candles_48h': 566, 'suspect_bars': 0, 'n': 5}
+    {'candles_48h': 422, 'suspect_bars': 0, 'n': 4}
+    {'candles_48h': 426, 'suspect_bars': 0, 'n': 4}
+    {'candles_48h': 571, 'suspect_bars': 0, 'n': 4}
+    {'candles_48h': 364, 'suspect_bars': 0, 'n': 3}
+    {'candles_48h': 567, 'suspect_bars': 0, 'n': 3}
+    {'candles_48h': 1, 'suspect_bars': 0, 'n': 2}
+    {'candles_48h': 298, 'suspect_bars': 0, 'n': 2}
+    {'candles_48h': 299, 'suspect_bars': 0, 'n': 2}
+    {'candles_48h': 533, 'suspect_bars': 0, 'n': 2}
+    {'candles_48h': 561, 'suspect_bars': 0, 'n': 2}
+MODEL max_gain_48h=0 exactly = 173
+
+outcomes: distinct (token,entry_ts) with BOTH a signal and a watch row = 23550

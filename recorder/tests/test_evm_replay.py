@@ -164,6 +164,41 @@ def test_reactivated_token_replays_each_window_without_filling_gap(db):
     assert not any(gap_lo < point < gap_hi for point in grid)
 
 
+def test_post_gate_young_window_is_not_sent_to_evm_workers(db, monkeypatch):
+    """العمر المرفوض لا يستهلك RPC حيّاً ولا إعادةً تاريخية."""
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", "2026-08-22T00:00:00+00:00")
+    entry = "2026-08-23T12:00:00+00:00"
+    db.upsert_static({
+        "token_address": TOK, "network_id": NET, "recorded_at": entry,
+        "token_created_at": "2026-08-23T00:00:00+00:00", "raw_json": "{}",
+    })
+    db.upsert_watch(TOK, NET, "large_buy", "young", 48, entry)
+
+    assert db.evm_watched([NET]) == []
+    assert db.evm_replay_targets([NET]) == []
+
+
+def test_replay_window_assertion_ignores_a_rejected_later_window(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", "2026-08-22T00:00:00+00:00")
+    old_entry = NOW
+    young_entry = "2026-08-23T12:00:00+00:00"
+    db.upsert_watch(TOK, NET, "large_buy", "old", 48, old_entry)
+    db._conn.execute(
+        "UPDATE watchlist SET active=0 WHERE token_address=? AND network_id=?",
+        (TOK, NET),
+    )
+    db._conn.commit()
+    db.upsert_static({
+        "token_address": TOK, "network_id": NET, "recorded_at": young_entry,
+        "token_created_at": "2026-08-23T00:00:00+00:00", "raw_json": "{}",
+    })
+    db.upsert_watch(TOK, NET, "large_buy", "young", 48, young_entry)
+
+    target = db.evm_replay_targets([NET])[0]
+    assert [row["first_seen_at"] for row in target["replay_windows"]] == [old_entry]
+    assert db.evm_replay_windows(TOK, NET) == target["replay_windows"]
+
+
 def test_old_live_coverage_does_not_swallow_a_later_window(db):
     first = _iso_dt(T0 - 10_000)
     second = _iso_dt(T0 - 3_600)

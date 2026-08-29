@@ -1,11 +1,24 @@
-"""أنبوب التدريب النهائي: walk-forward زمني + منع انتقال العملة + هدف من المحاكاة.
+"""أنبوب التدريب: نموذج توقّع العملات الانفجارية (fv15).
 
-يعمل على `model_training_rows` (نظيف، بلا تكرار) ويقيّم على العملات الجديدة فقط
-بالإضافة إلى كل الإشارات. يرفض الاستنتاج عند تسريب هدف مشتق في الميزات.
+**تغيير المنهج 2026-08-28 (قرار المالك بعد قياس)**: الهدف القديم كان
+`win_trade` من محاكاة TP+20%/SL−30% — قياس 14,870 صفًا أثبت أن تلك
+الاستراتيجية هامشية (+0.14%/صفقة تأكله الرسوم) لأنها تقصّ أجنحة
+الرابحين (16% من الإشارات تصعد +100% وTP يخرج عند +20) وتترك الخسائر
+تمشي. المنهج الجديد: **التنبؤ بالانفجار القابل للالتقاط** مباشرة —
+ليبل `is_explosive` (قمة ≥2x ونصفها خلال 24س) الذي وُلد من نفس القياس،
+مع `time_to_plus20_min` (سنارة إعلان القوة) كمتغير تحليل وفلتر إسقاط
+مرشحين — **ليست قاعدة دخول أبدًا** (قياس المالك 2026-08-28: الدخول بعد
++20% خاسر صافيًا في كل النوافذ، -1% إلى -11% مقابل +0.74% عند الإشارة).
+
+التقييم بقي ثلاثي الأمان: walk-forward زمني، AUC على عملات غير مرئية
+أثناء التدريب، وbootstrap بالعملة — لكن **المقياس الاقتصادي** صار
+"أعلى 20% بحسب النموذج: كم فيها من الانفجارات" بدل متوسط net_return
+لمحاكاة مهجورة.
 
 الاستعمال:
-    py train_pipeline.py                 # تشغيل كامل
-    py train_pipeline.py --target up20   # هدف لمس +20% بدل الربح الصافي
+    py train_pipeline.py                      # هدف الانفجار (الافتراضي الجديد)
+    py train_pipeline.py --target explosive   # صريحًا (نفسه)
+    py train_pipeline.py --target win_trade   # الهدف القديم — للمرجعية فقط
     py train_pipeline.py --min-train-days 5
 """
 
@@ -24,10 +37,16 @@ from db import RecorderDB  # noqa: E402
 FORBIDDEN = {
     "key", "token_address", "network_id", "entry_ts", "asset_class", "split",
     "kind", "status", "is_independent", "built_at", "is_live", "feature_version",
-    "suspect_bars", "final_return_48h", "max_gain_1h", "max_gain_4h", "max_gain_24h",
-    "max_gain_48h", "max_drawdown_48h", "time_to_peak_h", "is_rug", "net_return",
-    "win_trade", "up20_48h", "up100", "up200", "up300", "up500", "up1000", "up2000",
+    "suspect_bars", "final_return_48h", "max_gain_1h", "max_gain_4h",
+    "max_gain_24h", "max_gain_48h", "max_drawdown_48h", "time_to_peak_h",
+    "is_rug", "net_return", "win_trade", "up20_48h", "up100", "up200",
+    "up300", "up500", "up1000", "up2000",
+    # (fv15) ليبلان جديدان — مستقبلٌ صرف لا يجوز لمسهما كميزات أبدًا.
+    "is_explosive", "time_to_plus20_min",
 }
+
+# أهداف معتمدة: الانفجار هو الافتراضي الجديد؛ القديم يُترك للمرجعية.
+TARGETS = ("explosive", "win_trade")
 
 
 DEFAULT_PARAMS = {"lr": 0.05, "depth": 3, "leaf": 40, "l2": 1.0, "iters": 300}
@@ -39,32 +58,44 @@ PARAM_GRID = [
 
 
 def load_frame():
-    """الإطار النظيف + المحاكاة الفعلية (TP+20%/SL−30%/24س/تكلفة 2%)."""
+    """الإطار النظيف: المجموعة الرئيسية + ليبل الانفجار من outcomes.
+
+    ليبل `is_explosive` موسوم في `outcomes` (التوسيم/backfill 2026-08-28)
+    — لا محاكاة صفقات هنا إطلاقًا: الهدف قمة/سرعة مقيسة لا استراتيجية
+    خروج. `model_training_rows` يضم العمودين أصلًا (fv15 migration) لكن
+    الصفوف المبنية قبل التوسيم الجديد تحمل NULL — فنستبدلها من outcomes
+    بالمصدر الموثوق نفسه، ونحصر الإطار على الصفوف المحكومة.
+    """
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     frame = pd.read_sql_query(
-        "SELECT * FROM model_training_rows WHERE suspect_bars = 0", db._conn
+        """SELECT t.*,
+                  o.is_explosive     AS explosive_label,
+                  o.time_to_plus20_min AS hook_label
+             FROM model_training_rows t
+             JOIN outcomes o ON o.kind = t.kind AND o.key = t.key
+            WHERE t.suspect_bars = 0
+              AND o.is_explosive IS NOT NULL""",
+        db._conn,
     )
-    from exit_sim import ExitRule, simulate_trade
-
-    rule = ExitRule(0.20, 0.30, None, 24, 0.02)
-    sims = []
-    for r in frame.itertuples(index=False):
-        bars = db.bars_for(
-            r.token_address, str(r.network_id or ""),
-            int(r.entry_ts), int(r.entry_ts) + 48 * 3600,
-        )
-        s = simulate_trade(bars, int(r.entry_ts), rule) if bars else None
-        sims.append(s["net_return"] if s else np.nan)
     db.close()
-    frame["net_return"] = sims
-    frame["win_trade"] = (frame["net_return"] > 0).astype(float)
+    # عمودا t المحليان (fv15) يُستبدلان بقيم outcomes الموثوقة:
+    # source-of-truth واحدة، وأي صف بُني قبل التوسيم يساوي صفه في outcomes.
+    frame = frame.drop(columns=["is_explosive", "time_to_plus20_min"],
+                       errors="ignore")
+    frame = frame.rename(columns={
+        "explosive_label": "is_explosive",
+        "hook_label": "time_to_plus20_min",
+    })
     frame["day"] = frame["entry_ts"] // 86400
     return frame.sort_values("entry_ts").reset_index(drop=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", default="win_trade", choices=["win_trade", "up20"])
+    parser.add_argument("--target", default="explosive",
+                        choices=list(TARGETS),
+                        help="explosive (الجديد): قمة ≥2x ونصفها خلال 24س · "
+                             "win_trade (قديم): محاكاة TP/SL — مرجعية فقط")
     parser.add_argument("--min-train-days", type=int, default=4,
                         help="عدد أيام التدريب قبل أول fold اختبار")
     parser.add_argument("--val-folds", type=int, default=1,
@@ -72,21 +103,40 @@ def main() -> None:
     args = parser.parse_args()
 
     frame = load_frame()
-    target = args.target
-    if target == "up20":
-        frame[target] = (frame["max_gain_48h"] >= 0.20).astype(float)
+    target = "is_explosive" if args.target == "explosive" else "win_trade"
+
+    if args.target == "win_trade":
+        # الهدف القديم — يبقى متاحًا للمقارنة التاريخية حصرًا.
+        print("⚠️  win_trade هدف مهجور (قياس 2026-08-28: +0.14%/صفقة) — "
+              "تشغيل مرجعي فقط.")
+        from exit_sim import ExitRule, simulate_trade
+
+        db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
+        rule = ExitRule(0.20, 0.30, None, 24, 0.02)
+        sims = []
+        for r in frame.itertuples(index=False):
+            bars = db.bars_for(
+                r.token_address, str(r.network_id or ""),
+                int(r.entry_ts), int(r.entry_ts) + 48 * 3600,
+            )
+            s = simulate_trade(bars, int(r.entry_ts), rule) if bars else None
+            sims.append(s["net_return"] if s else np.nan)
+        db.close()
+        frame["net_return"] = sims
+        frame["win_trade"] = (frame["net_return"] > 0).astype(float)
 
     feat_cols = [c for c in frame.columns if c not in FORBIDDEN]
-    # عمود الهدف نفسه ممنوع مهما كان اسمه
     if target in feat_cols:
         feat_cols.remove(target)
-    for c in ("max_gain_48h", "final_return_48h"):
+    for c in ("max_gain_48h", "final_return_48h", "is_explosive",
+              "time_to_plus20_min"):
         assert c not in feat_cols, f"تسريب: {c} ضمن الميزات!"
     # أعمدة نصية قليلة القيم → رقمية
     for c in feat_cols:
         if isinstance(frame[c].dtype, pd.StringDtype) or frame[c].dtype == object:
             frame[c] = pd.factorize(frame[c], use_na_sentinel=True)[0].astype(float)
-    print(f"إجمالي: {len(frame)} · ميزات: {len(feat_cols)} · هدف: {target}")
+    print(f"إجمالي: {len(frame)} · ميزات: {len(feat_cols)} · هدف: {target} "
+          f"· إيجاب: {frame[target].mean():.1%}")
 
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import roc_auc_score
@@ -120,7 +170,8 @@ def main() -> None:
 
     # اختبار walk-forward
     print("\n=== الاختبار الزمني ===")
-    print(f"{'يوم':<8}{'n':>5}{'AUC الكل':>9}{'AUC جديد':>10}{'أعلى20% متوسط':>15}")
+    print(f"{'يوم':<8}{'n':>5}{'AUC الكل':>9}{'AUC جديد':>10}"
+          f"{'أعلى20%: نسبة الانفجار':>22}")
     all_p, all_te = [], []
     for d in test_days:
         tr = frame[frame["day"] < d]
@@ -133,9 +184,13 @@ def main() -> None:
         auc_new = np.nan
         if m_new.sum() >= 10:
             auc_new = roc_auc_score(te.loc[m_new, target], p[m_new.values])
+        # المقياس الاقتصادي الجديد: في أعلى 20% بحسب النموذج، كم انفجارًا
+        # اصطدنا مقابل معدل اليوم؟ (lift) — هذا السؤال التشغيلي الحقيقي.
         n = max(1, int(len(te) * 0.20))
-        avg20 = te.iloc[np.argsort(p)[::-1][:n]]["net_return"].mean()
-        print(f"{d:<8}{len(te):>5}{auc:>9.3f}{auc_new:>10.3f}{avg20:>+15.2%}")
+        top = te.iloc[np.argsort(p)[::-1][:n]]
+        lift = top[target].mean() / max(te[target].mean(), 1e-9)
+        print(f"{d:<8}{len(te):>5}{auc:>9.3f}{auc_new:>10.3f}"
+              f"{top[target].mean():>13.1%} (×{lift:.1f})")
         all_p.append(p)
         all_te.append(te)
 
@@ -147,9 +202,16 @@ def main() -> None:
     auc_all = roc_auc_score(TE[target], P)
     known_all = set(frame.loc[frame["day"] < test_days[0], "token_address"])
     m_new_all = ~TE["token_address"].isin(known_all)
-    auc_new = roc_auc_score(TE.loc[m_new_all, target], P[m_new_all.values]) if m_new_all.sum() >= 10 else np.nan
-    print(f"\nالمجموع (n={len(TE)}): AUC الكل={auc_all:.3f} · AUC عملات جديدة={auc_new:.3f} "
-          f"(n={int(m_new_all.sum())}) · baseline={TE[target].mean():.1%}")
+    auc_new = (roc_auc_score(TE.loc[m_new_all, target], P[m_new_all.values])
+               if m_new_all.sum() >= 10 else np.nan)
+    # الخلاصة الاقتصادية الكلية: أعلى 20% من كل أيام الاختبار
+    n_all = max(1, int(len(TE) * 0.20))
+    top_all = TE.iloc[np.argsort(P)[::-1][:n_all]]
+    print(f"\nالمجموع (n={len(TE)}): AUC الكل={auc_all:.3f} · "
+          f"AUC عملات جديدة={auc_new:.3f} (n={int(m_new_all.sum())}) · "
+          f"baseline={TE[target].mean():.1%}")
+    print(f"أعلى 20% بحسب النموذج: {top_all[target].mean():.1%} انفجارًا "
+          f"(lift ×{top_all[target].mean() / max(TE[target].mean(), 1e-9):.1f})")
 
     # bootstrap بالعملة على AUC العملات الجديدة
     if m_new_all.sum() >= 10:
@@ -165,8 +227,14 @@ def main() -> None:
         b = np.asarray(b)
         print(f"AUC عملات جديدة: CI 95%=[{np.percentile(b, 2.5):.3f}, "
               f"{np.percentile(b, 97.5):.3f}] · P(أفضلية)={(b > 0.5).mean():.1%}")
-    if auc_new < 0.55:
-        print("الخلاصة: لا أفضلية قابلة للتعميم على العملات الجديدة — النموذج لا يُعتمد للاكتشاف.")
+    if np.isnan(auc_new):
+        print("الخلاصة: لا عملات جديدة كافية للتقييم.")
+    elif auc_new < 0.55:
+        print("الخلاصة: لا أفضلية قابلة للتعميم على العملات الجديدة — "
+              "النموذج لا يُعتمد للاكتشاف.")
+    else:
+        print("الخلاصة: أفضلية مرئية على العملات الجديدة — قيّم الحجم "
+              "الاقتصادي (lift) قبل الاعتماد.")
 
 
 if __name__ == "__main__":

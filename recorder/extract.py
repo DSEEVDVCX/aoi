@@ -38,8 +38,23 @@ def _str(v: Any) -> str | None:
     if v is None:
         return None
     if isinstance(v, str):
-        return v
-    return str(v)
+        # Upstream occasionally sends a lone UTF-16 surrogate in user text.
+        # Preserve it as a JSON-style escape so SQLite can encode the field;
+        # raw_json still retains the original payload separately.
+        return v.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return str(v).encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def canonical_token_address(value: Any, network_id: Any = None) -> str | None:
+    """Canonicalize EVM hex addresses without changing case-sensitive mints."""
+    address = _str(value)
+    if (
+        address is not None
+        and str(network_id or "") != config.SOLANA_NETWORK_ID
+        and address.lower().startswith("0x")
+    ):
+        return address.lower()
+    return address
 
 
 def _bool_to_int(v: Any) -> int | None:
@@ -155,7 +170,9 @@ def extract_signal_event(
     تبقى None في أعمدتها — غائب ≠ صفر (FR-007).
     """
     ev_id = _str(event.get("id"))
-    token_address = _str(event.get("tokenAddress"))
+    token_address = canonical_token_address(
+        event.get("tokenAddress"), event.get("networkId")
+    )
     if not ev_id or not token_address:
         return None  # FR-007: لا مفتاح → نُسقط، لا نفبرك
 
@@ -299,7 +316,10 @@ def _token_obj(item: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _token_address(item: Mapping[str, Any]) -> str | None:
     tok = _token_obj(item)
-    return _str(tok.get("address")) or _str(item.get("address"))
+    network = tok.get("networkId") or item.get("networkId")
+    return canonical_token_address(
+        tok.get("address") or item.get("address"), network
+    )
 
 
 def token_list_address(item: Mapping[str, Any]) -> str | None:
@@ -309,6 +329,18 @@ def token_list_address(item: Mapping[str, Any]) -> str | None:
     فالفهرس ينزلق والترتيب يكذب. هذه الواجهة العامّة لما يفعله المستخرِج داخلياً.
     """
     return _token_address(item)
+
+
+def token_list_network(item: Mapping[str, Any]) -> str:
+    """Network identifier carried by a token-list item."""
+    tok = _token_obj(item)
+    return _str(tok.get("networkId")) or _str(item.get("networkId")) or ""
+
+
+def token_list_created_at(item: Mapping[str, Any]) -> str | None:
+    """Creation timestamp carried by a token-list item, if present."""
+    tok = _token_obj(item)
+    return _str(tok.get("createdAt")) or _str(item.get("createdAt"))
 
 
 def filter_item_protocol(item: Mapping[str, Any]) -> str | None:
@@ -396,6 +428,8 @@ def extract_token_static(
     socials = tok.get("socialLinks") if isinstance(tok.get("socialLinks"), Mapping) else {}
     launchpad = tok.get("launchpad") if isinstance(tok.get("launchpad"), Mapping) else {}
     info = tok.get("info") if isinstance(tok.get("info"), Mapping) else {}
+    pair = item.get("pair")
+    pair = pair if isinstance(pair, Mapping) else {}
 
     # إشارات شرعية خارجية — كانت تُهدر بالكامل. المنصّات قائمة كائنات
     # {name} أو سلاسل؛ نعدّها ونحفظ الأسماء (المصدر قد يغيّر الشكل).
@@ -441,6 +475,9 @@ def extract_token_static(
         "website": _str(socials.get("website")),
         "discord": _str(socials.get("discord")),
         "token_created_at": _str(tok.get("createdAt")),
+        "token_created_at_observed_at": (
+            recorded_at if tok.get("createdAt") not in (None, "") else None
+        ),
         "exchanges_count": exchanges_count,
         "exchanges_json": exchanges_json,
         "cmc_id": _str(info.get("cmcId")),
@@ -448,6 +485,7 @@ def extract_token_static(
         "description_len": len(desc) if desc else 0,
         "has_banner": 1 if banner else 0,
         "has_image": 1 if has_image else 0,
+        "dex_protocol": _str(pair.get("protocol")),
         "raw_json": _dumps(item),
     }
 

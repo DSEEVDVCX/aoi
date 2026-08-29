@@ -75,6 +75,15 @@ def main() -> None:
                 import traceback
 
                 _log("labeler cycle crashed:\n" + traceback.format_exc())
+                # وأنقِذ الاتّصال قبل الدورة القادمة: لقطةُ قراءةٍ سُبقت في WAL
+                # تردّ كلَّ كتابةٍ من هذا الاتّصال بـ`database is locked` **بلا
+                # أن تنفع المهلة**، فتبقى كلّ دورةٍ تالية تنهار إلى إعادة تشغيل
+                # يدويّة (وقع في السلسلة 382 دورة، 2026-08-22/23). التفصيل في
+                # `db.recover_connection`.
+                try:
+                    _log(f"connection recovery: {db.recover_connection()}")
+                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                    _log(f"connection recovery failed: {type(rec_exc).__name__}")
             n += 1
             if cycles is not None and n >= cycles:
                 break

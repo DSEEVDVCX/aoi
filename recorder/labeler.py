@@ -21,11 +21,12 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import config
 from db import RecorderDB, utcnow_iso
+from features import epoch_of
 
 # نوافذ المكاسب الجزئية (بالساعات) — أعمدة max_gain_*
 _GAIN_WINDOWS = (1, 4, 24, 48)
@@ -72,6 +73,19 @@ def compute_labels(
         "max_drawdown_48h": None, "final_return_48h": None,
         "time_to_peak_h": None, "candles_48h": 0, "suspect_bars": 0,
         "last_bar_lag_h": None, "bars_truncated": None, "is_rug": None,
+        # (fv15) ليبل الانفجار: قمة ≥2x **و** +50% منها متاحة خلال أول 24س —
+        # قياس 2026-08-28 على 2,378 انفجارًا: 82-96% من الانفجارات الحقيقية
+        # تبلغ نصف قمتها في يومها الأول (كلما ضخم الانفجار زادت النسبة)،
+        # والفائتة (345) وسيط ما كان متاحًا منها خلال 24س هو +26% فقط —
+        # صيد هامشي، فالليبل يفرّز «قابلًا للالتقاط» من «قمة متأخرة».
+        "is_explosive": None,
+        # (fv15) سنارة إعلان القوة: دقائق حتى أول إغلاق ≥ +20% — **فلتر
+        # إسقاط مرشحين فقط، لا قاعدة دخول أبدًا** (قرار المالك 2026-08-28
+        # بعد قياس: كل الدخول بعد +20% خاسر صافيًا -1% إلى -11% لأنك تشتري
+        # بسعر أعلى فيبقى جزء صغير من الصعود وكامل الهبوط). الاستخدام
+        # الوحيد الصالح: عملة لم تبلغ +20% خلال ~4 ساعات ⇒ احتمال انفجارها
+        # ضعيف (وسيط المنفجرة 259د مقابل 816د لغيرها) — تُسقط من المراقبة.
+        "time_to_plus20_min": None,
     }
 
     # شمعة الدخول: أولى الشموع عند/بعد اللحظة، ضمن مهلة قصوى.
@@ -130,6 +144,22 @@ def compute_labels(
     if close_ok:
         out["final_return_48h"] = float(close_ok[-1]["c"]) / entry_px - 1
         out["is_rug"] = 1 if out["final_return_48h"] <= config.LABEL_RUG_THRESHOLD else 0
+
+    # (fv15) الليبلان الجديدان — من نفس الشموع المحسوبة أعلاه، بلا كلفة:
+    # الانفجار يستعمل الذرى السليمة (hi_ok) لا الإغلاقات، والسنارة عكسه.
+    # ⚠️ time_to_plus20_min ليس قاعدة دخول أبدًا (قياس المالك 2026-08-28):
+    # الدخول بعد +20% خاسر صافيًا في كل النوافذ — استخدامه الوحيد فلترُ
+    # إسقاط مرشحين (من لم تبلغ +20% خلال ~4س ⇒ انفجارها غير مرجّح).
+    peak_48 = out["max_gain_48h"]
+    if peak_48 is not None and out["max_gain_24h"] is not None:
+        out["is_explosive"] = 1 if (
+            peak_48 >= config.EXPLOSIVE_MIN_PEAK
+            and out["max_gain_24h"] >= config.EXPLOSIVE_HALF_AT_24H
+        ) else 0
+    for b in close_ok:
+        if float(b["c"]) >= entry_px * (1.0 + config.PLUS20_THRESHOLD):
+            out["time_to_plus20_min"] = (b["ts"] - entry_ts) / 60
+            break
     out["last_bar_lag_h"] = (window_end - last_bar["ts"]) / 3600
     out["bars_truncated"] = 1 if out["last_bar_lag_h"] > 1.0 else 0
     required = ("final_return_48h", "max_gain_24h", "is_rug")
@@ -141,6 +171,26 @@ def compute_labels(
 
 def _epoch(iso: str) -> int:
     return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+
+
+def _iso_from_epoch(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat()
+
+
+def token_age_days(
+    created_at: Any, now_iso: str, observed_at: Any = None,
+) -> float | None:
+    if observed_at is not None:
+        observed = epoch_of(observed_at)
+        now = epoch_of(now_iso)
+        if observed is None or now is None or observed > now:
+            return None
+    created = epoch_of(created_at)
+    now = epoch_of(now_iso)
+    if created is None or now is None:
+        return None
+    age = (now - created) / 86400.0
+    return age if age >= 0 else None
 
 
 def label_pending(
@@ -196,7 +246,34 @@ def label_pending(
         labels = compute_labels(
             bars, entry, admission_price_usd=w.get("admission_price_usd")
         )
-        analysis_eligible = w["design_version"] >= 3 and labels["status"] != "incomplete"
+        age_at_entry = token_age_days(
+            w.get("token_created_at"), _iso_from_epoch(w["entry_epoch"]),
+            w.get("token_created_at_observed_at"),
+        )
+        gate_applies = (
+            w["design_version"] >= 3
+            and _epoch(w["first_seen_at"]) >= _epoch(config.AGE_GATE_ENABLED_AT)
+        )
+        age_observed_at_entry = (
+            not gate_applies
+            or (
+                epoch_of(w.get("token_created_at_observed_at")) is not None
+                and epoch_of(w.get("token_created_at_observed_at")) <= entry
+            )
+        )
+        age_ok = (
+            True if not gate_applies or not config.MIN_TOKEN_AGE_DAYS
+            else (
+                age_observed_at_entry
+                and age_at_entry is not None
+                and age_at_entry >= config.MIN_TOKEN_AGE_DAYS
+            )
+        )
+        analysis_eligible = (
+            w["design_version"] >= 3
+            and labels["status"] != "incomplete"
+            and age_ok
+        )
         db.insert_outcome({
             "kind": "watch", "key": w["key"],
             "token_address": w["token_address"],
@@ -208,9 +285,14 @@ def label_pending(
             "labeled_at": labeled_at, "design_version": w["design_version"],
             "analysis_eligible": 1 if analysis_eligible else 0,
             "exclusion_reason": (
-                None if analysis_eligible else (
-                    "incomplete_metrics" if labels["status"] == "incomplete"
-                    else "superseded_comparison_design"
+                ("age_gate_at_entry" if (
+                    age_observed_at_entry and age_at_entry is not None
+                ) else "age_unknown_at_entry")
+                if gate_applies and not age_ok else (
+                    None if analysis_eligible else (
+                        "incomplete_metrics" if labels["status"] == "incomplete"
+                        else "superseded_comparison_design"
+                    )
                 )
             ),
             **labels,

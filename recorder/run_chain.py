@@ -144,6 +144,17 @@ async def main_loop(cycles: int | None = None) -> None:
                 import traceback
 
                 _log("chain cycle crashed:\n" + traceback.format_exc())
+                # ثمّ أنقِذ الاتّصال: الدرعُ وحده يجعل العطبَ الدائم دورةً ساقطة
+                # كلّ دقيقة إلى الأبد. مقيس: **382 دورة متتالية** انهارت كلّها
+                # عند `set_chain_state` بـ`database is locked` من 2026-08-22
+                # 19:26:58Z إلى 08-23 11:13:47Z، ولم تُفرج عنها إلّا إعادةُ
+                # تشغيل المهمّة عند 10:57Z — لا الحلقة. والقفلُ كان حرّاً:
+                # اتّصالٌ جديد أخذ `BEGIN IMMEDIATE` في 0ث في 12 من 12 عيّنة،
+                # فالعالقُ لقطةُ قراءتنا لا القاعدة (`db.recover_connection`).
+                try:
+                    _log(f"connection recovery: {db.recover_connection()}")
+                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                    _log(f"connection recovery failed: {type(rec_exc).__name__}")
             # تقرير الأحواض **خارج** حرس السلسلة: حالة المفاتيح أهمّ ما يُقرأ حين
             # تتعثّر الدورة، فلا يصحّ أن يسقط مع الفرع الذي تعثّر.
             try:

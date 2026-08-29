@@ -52,3 +52,8 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 playwright/.cache/
+
+# مخلّفات المسابر: ملفات بيانات مؤقتة تُفرغها probe_*.py أثناء الفحص
+recorder/probe_*.json
+recorder/probe_*.out
+recorder/probe_*.pkl

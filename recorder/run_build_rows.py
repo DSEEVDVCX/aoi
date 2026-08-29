@@ -151,6 +151,14 @@ def main() -> None:
                 import traceback
 
                 _log("build_rows cycle crashed:\n" + traceback.format_exc())
+                # وأنقِذ الاتّصال قبل الدورة القادمة: لقطةُ قراءةٍ سُبقت في WAL
+                # تردّ كلَّ كتابةٍ من هذا الاتّصال بـ`database is locked` **بلا
+                # أن تنفع المهلة**، وفترةُ هذه الحلقة ساعة — فعطبٌ دائم هنا
+                # يكلّف ساعةً لكلّ دورة ساقطة. التفصيل في `db.recover_connection`.
+                try:
+                    _log(f"connection recovery: {db.recover_connection()}")
+                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                    _log(f"connection recovery failed: {type(rec_exc).__name__}")
             n += 1
             if cycles is not None and n >= cycles:
                 break

@@ -192,6 +192,16 @@ async def _main(cycles: int | None = None) -> None:
                 import traceback
 
                 _log("cycle crashed:\n" + traceback.format_exc())
+                # الإنقاذُ **قبل** الختم: لقطةُ قراءةٍ سُبقت في WAL تردّ كلَّ
+                # كتابةٍ من هذا الاتّصال بـ`database is locked` بلا أن تنفع
+                # المهلة، فلو كُتب `note_error` أوّلاً سقط هو أيضاً وضاع السطر
+                # الوحيد الذي تعرضه اللوحة. وهذا العامل أخطرُ الأربعة على هذا
+                # الباب: `run_cycle` كلُّها اتّصالٌ واحد بأربع طبقاتٍ كاتبة.
+                # التفصيل والحادثة المقيسة في `db.recover_connection`.
+                try:
+                    _log(f"connection recovery: {db.recover_connection()}")
+                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                    _log(f"connection recovery failed: {type(rec_exc).__name__}")
                 # وفي `meta` أيضاً: السجلُّ ملفٌّ على القرص لا يقرأه أحد، واللوحة
                 # كانت تعرض كل طابور إلّا هذا — فتعثّرٌ دائم هنا كان صامتاً
                 # مرّتين. سطرٌ واحد بالنوع والرسالة، والأثر الكامل في السجلّ.

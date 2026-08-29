@@ -65,6 +65,33 @@ async def test_social_cycle_writes_a_snapshot_per_token(db):
     assert db.social_count("tokA", "56") == 1
 
 
+async def test_social_cycle_archives_individual_thesis_items(db):
+    """اللقطة الحيّة تحفظ العناصر الفردية اللازمة لميزات الزمن عند t0."""
+    _watch(db, "tokA")
+
+    stats = await recorder.run_social_cycle(_SocialClient(), db, NOW, sleep=_noop)
+
+    rows = db._conn.execute(
+        "SELECT id, token_address, network_id, fetched_at "
+        "FROM token_thesis ORDER BY id"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("t0", "tokA", "56", NOW),
+        ("t1", "tokA", "56", NOW),
+    ]
+    assert stats["thesis_rows"] == 2
+
+
+def test_thesis_extractor_sanitizes_lone_unicode_surrogates():
+    """نصّ التعليق الشاذ لا يجب أن يوقف إدراج دفعة الأطروحات."""
+    raw = _envelope(1)
+    raw["responseObject"]["items"][0]["comment"]["comment"] = "bad\ud83dtext"
+
+    row = recorder.extract.extract_thesis_items(raw, "tokA", "56", NOW)[0]
+
+    assert row["comment"] == r"bad\ud83dtext"
+
+
 async def test_social_request_carries_token_and_network(db):
     _watch(db, "tokA")
     client = _SocialClient()

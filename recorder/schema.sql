@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS token_static (
     website            TEXT,
     discord            TEXT,
     token_created_at   TEXT,                     -- createdAt للعملة من fomo
+    token_created_at_observed_at TEXT,           -- متى عرفنا createdAt فعلياً
     -- إشارات شرعية خارجية: كانت في الخام ولا تُستخرج. عملة مدرَجة في
     -- CoinMarketCap أو متداولة على عدّة منصّات ليست عملة أُطلقت قبل ساعة.
     -- نخزّن الأسماء لا العدد وحده: «Uniswap» ليست «PumpSwap».
@@ -205,9 +206,25 @@ CREATE TABLE IF NOT EXISTS token_static (
     -- trending** (صفر من 3,000 عنصر) ويأتي من filterTokens وحده — وفي المستوى
     -- الأعلى للعنصر لا تحت token. حوض المُطلِق ليس حوضاً مهاجَراً.
     dex_protocol       TEXT,
+    -- (fv16) socials من DEX Screener — تُسأل مرة عند القبول وتخزن هنا:
+    social_channels_dex INTEGER,          -- عدد قنوات التواصل عند DEX
+    social_match_fomo_dex INTEGER,        -- 1=المصدران متفقان، 0=تعارض (نمط ملف مزور)
     raw_json           TEXT NOT NULL,
     PRIMARY KEY (token_address, network_id)
 );
+
+-- آخر محاولة لجلب عمر العملة، بمفتاح العنوان+الشبكة. الرد بلا createdAt
+-- يُرفض عند القبول، لكنه لا يستهلك نداءً جديداً في كل دورة.
+CREATE TABLE IF NOT EXISTS token_age_lookup_state (
+    token_address TEXT NOT NULL,
+    network_id TEXT NOT NULL,
+    last_lookup_at TEXT NOT NULL,
+    last_status TEXT NOT NULL, -- ok / missing / error
+    attempts INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (token_address, network_id)
+);
+CREATE INDEX IF NOT EXISTS idx_age_lookup_due
+    ON token_age_lookup_state (last_status, last_lookup_at);
 
 -- أرشيف خام دوري لكل مصدر كاملاً (لإعادة الاشتقاق مستقبلاً).
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -457,6 +474,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
     bars_truncated   INTEGER,                   -- 1 = السلسلة انتهت مبكراً (>1س)
                                                 --   غالباً موت العملة — إشارة لا نقص!
     is_rug           INTEGER,                   -- 1 = العائد النهائي ≤ -90%
+    is_explosive     INTEGER,                   -- (fv15) 1 = قمة ≥2x ونصفها خلال 24س
+    time_to_plus20_min REAL,                    -- (fv15) دقائق حتى أول إغلاق ≥ +20%
     split            TEXT,                      -- train/val/test (تجزئة ثابتة بالعملة)
     status           TEXT NOT NULL,             -- ok | no_entry | no_bars | incomplete
     labeled_at       TEXT NOT NULL,
@@ -596,6 +615,7 @@ CREATE TABLE IF NOT EXISTS training_rows (
     vol_24h_before   REAL,
     flat_ratio_24h   REAL,
     up_candle_ratio_24h REAL,
+    pre_signal_runup REAL,              -- fv13: log-runup آخر 24س قبل t0
     dist_from_ath    REAL,
     ath_history_complete INTEGER,
     ath_history_days REAL,
@@ -726,6 +746,10 @@ CREATE TABLE IF NOT EXISTS training_rows (
     max_drawdown_48h REAL,
     time_to_peak_h   REAL,
     is_rug           INTEGER,
+    is_explosive     INTEGER,          -- (fv15) ليبل الانفجار — من outcomes
+    time_to_plus20_min REAL,           -- (fv15) سنارة الدخول المبكر — من outcomes
+    social_channels_dex INTEGER,       -- (fv16) قنوات التواصل عند DEX Screener
+    social_match_fomo_dex INTEGER,     -- (fv16) توافق socials المصدرين
     PRIMARY KEY (kind, key)
 );
 CREATE INDEX IF NOT EXISTS idx_training_split
@@ -1086,19 +1110,24 @@ CREATE TABLE IF NOT EXISTS evm_backfill_state (
     PRIMARY KEY (network_id, token_address)
 );
 
--- ═══ سلامة عقد EVM — Base وحدها، بقياس لا بتقصير ═══
--- مقيس 2026-08-13 على المراقَبة الحيّة بفحص البايت‑كود (`eth_getCode`) ومطابقة
--- مُعرّفات الدوالّ بقاموس keccak محسوب:
+-- ═══ سلامة عقد EVM — الشبكات الثلاث، بقياسٍ نقض قياساً ═══
+-- قِيس أوّلاً 2026-08-13 على المراقَبة الحيّة بفحص البايت‑كود (`eth_getCode`)
+-- ومطابقة مُعرّفات الدوالّ بقاموس keccak محسوب، فحُصر الفحص على Base:
 --   Base 8453 : 19 من 22 عقداً كاملاً، أحجام 135B–14.8KB، `owner` في 7 من 19،
 --               `mint` في 2، `limits` في 1 ⇒ **تباين حقيقيّ ⇒ معلومة**
---   BSC  56   : 21 من 27 وكيلاً صغيراً (EIP-1167، طابقت البادئة واللاحقة في
---               21/21) تشير إلى **عقدَي تنفيذ** فقط، 20 منها إلى واحد،
---               والملكيّة متروكة في كليهما ⇒ العمود ثابت لا معلومة فيه
+--   BSC  56   : 21 من 27 وكيلاً صغيراً (EIP-1167) تشير إلى عقدَي تنفيذ فقط
+--               ⇒ استُنتج «العمود ثابت لا معلومة فيه»
 --   RH   4663 : 51 من 57 عقداً كاملاً لكنّ الأحجام تتكرّر في ستّة قوالب
---               متطابقة (4830 ×10، 7154 ×6، 5274 ×6…) و`owner` في 5 من 51
--- فالفحص يُشغَّل على `EVM_CONTRACT_NETWORKS` = Base وحدها، ويُوسَّع إن تباينت
--- شبكة أخرى لاحقاً. صفٌّ لكل قياس لا صفٌّ واحد: تركُ الملكيّة **حدث** يقع وسط
--- النافذة، وصفّ يُحدَّث فوق نفسه يمحو تاريخه (نفس علّة `chain_authority`).
+-- وأُعيد القياس 2026-08-22 فنقض الاستنتاج، لا الأرقام: تكرارُ القوالب قِيس في
+-- `code_size` وحده، أمّا `is_proxy` **فهو نفسه المعلومة** لا ضجيجٌ يخفيها.
+--   BSC  56   : 26 من 40 وكيلاً ⇒ انقسام 65/35 — أقوى عمودٍ مفرّقٍ على أيّ شبكة
+--               (Base 3 من 40، روبن‑هود 2 من 36)، و`code_size` 8 قيم مميّزة
+--   RH   4663 : `code_size` 20 قيمة و`function_count` 16، ويتباين `has_pause`
+--               (1 من 36) حيث Base ثابتة ⇒ أكثرُ تبايناً لا أقلّ
+-- الثابت فعلاً على الثلاث: `has_blacklist` و`has_fee_setter` (صفر في 116 عقداً).
+-- فالفحص يُشغَّل على `EVM_CONTRACT_NETWORKS` = الثلاث. صفٌّ لكل قياس لا صفٌّ
+-- واحد: تركُ الملكيّة **حدث** يقع وسط النافذة، وصفّ يُحدَّث فوق نفسه يمحو
+-- تاريخه (نفس علّة `chain_authority`).
 CREATE TABLE IF NOT EXISTS evm_contract (
     token_address       TEXT NOT NULL,
     network_id          TEXT NOT NULL,
