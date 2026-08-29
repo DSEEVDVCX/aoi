@@ -33,13 +33,24 @@ def main() -> None:
         # log_config=None: تحت pythonw يكون sys.stdout = None، ومنسّق uvicorn
         # الافتراضي يستدعي sys.stdout.isatty() فيتعطّل. تعطيله يتجنّب ذلك
         # (نفس ما يفعله api/serve.py).
-        uvicorn.run(
+        server_config = uvicorn.Config(
             "app:app",
             host=config.DASHBOARD_HOST,
             port=config.DASHBOARD_PORT,
             log_config=None,
             access_log=False,
         )
+        server = uvicorn.Server(server_config)
+
+        # تسخينُ الذاكرة المؤقّتة قبل الاستماع: أوّلُ زائرٍ لا يدفع ثمن الحساب
+        # البارد (3.4ث للشبكات مقيسةً). الخيطُ خفيٌّ وفشلُه لا يُسقط الإقلاع —
+        # وأصحابُ الطلبات يُجابون بالحساب البارد كما كانوا إن سبقوه.
+        import warmup
+
+        warmup.start_warmup_thread()
+        _boot_log("[boot] warmup thread started")
+
+        server.run()
     except Exception:
         _boot_log("[boot] FATAL:\n" + traceback.format_exc())
         raise
