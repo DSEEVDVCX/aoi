@@ -29,7 +29,7 @@ pip install -e ".[dev]"
 playwright install chromium
 # Configure environment
 export FOMO_API_REDIS_URL=redis://localhost:6379/0
-export FOMO_API_UPSTREAM_BASE=https://fomo.family
+export FOMO_API_UPSTREAM_BASE=https://prod-api.fomo.family
 uvicorn fomo_api.main:app --reload --port 8000
 ```
 
