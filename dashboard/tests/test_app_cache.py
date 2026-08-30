@@ -118,6 +118,11 @@ def test_networks_computes_the_heavy_query_once(client, monkeypatch):
     assert len(calls) == 1
 
 
+def test_network_summary_ttl_does_not_rescan_the_archive_aggressively():
+    """الملخّص يمسح ملايين ticks؛ آخرُ سوق حيٌّ فوقه فلا داعي لمسحه كل دقيقتين."""
+    assert config.NETWORK_SUMMARY_TTL_SECONDS >= 600
+
+
 def test_labeling_is_cached_like_other_heavy_panels(client, db, monkeypatch):
     """ملخّص التوسيم أثقلُ لوحةٍ بعد الشبكات (1.2 ثانية) — يُخزَّن كذلك.
 

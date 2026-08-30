@@ -51,7 +51,8 @@ async def main():
 
     print("=== /trades?tokenAddress= DEPTH ===")
     import sqlite3
-    db = sqlite3.connect(r"C:\Users\rr\Desktop\aoi\recorder\recorder.db")
+    db_uri = "file:C:/Users/rr/Desktop/aoi/recorder/recorder.db?mode=ro"
+    db = sqlite3.connect(db_uri, uri=True)
     tok = db.execute(
         "SELECT token_address, network_id FROM signal_events ORDER BY ts DESC LIMIT 1"
     ).fetchone()

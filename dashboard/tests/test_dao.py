@@ -524,8 +524,13 @@ def test_one_queue_stamp_does_not_heal_another_queues_error(db_path):
     conn.close()
 
 
-def test_recorder_boundary_still_heals_a_source_that_has_no_own_stamp_yet(db_path):
-    """قبل أن تُكتب الأختام الجديدة أوّل مرّة، حدُّ المسجّل يبقى سبيلَ الشفاء."""
+def test_recorder_boundary_cannot_heal_a_source_with_a_missing_own_stamp(db_path):
+    """مصدرٌ مستقل فشل قبل أول نجاح: ختم المسجّل لا يثبت تعافيه.
+
+    كان fallback القديم يفيد أثناء ترحيل الأختام، لكنه يخفي الآن فشل أول تشغيل:
+    `activity_head` كتب 401 بينما المسجّل سليم، فكان سيظهر الخطأ قديمًا بلا نجاح
+    واحد للعامل نفسه. وجود المصدر في `ok_stamps` عقدٌ fail-closed.
+    """
     _seed_meta(
         db_path,
         last_ok_cycle_at="2026-08-17T19:00:00+00:00",
@@ -537,7 +542,8 @@ def test_recorder_boundary_still_heals_a_source_that_has_no_own_stamp_yet(db_pat
             conn, ("evm",), ok_stamps={"evm": ("evm_last_ok_at",)},
         ) if e["source"] == "evm"
     )
-    assert row["stale"] is True
+    assert row["stale"] is False
+    assert row["ok_at"] is None
     conn.close()
 
 

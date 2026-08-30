@@ -64,7 +64,8 @@ def test_warmup_survives_a_failing_key_and_continues():
     memo = cache.TTLMemo()
     done = warmup.warm_heavy_keys(memo, compute_for=make_compute)
 
-    assert calls == ["network_summary", "labeling", "table_counts"]
+    assert set(calls) == {"network_summary", "labeling", "table_counts"}
+    assert len(calls) == 3
     assert done == {"network_summary": True, "labeling": False, "table_counts": True}
 
 

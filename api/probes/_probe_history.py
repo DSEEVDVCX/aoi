@@ -43,7 +43,8 @@ async def main():
 
     # 2) شموع عملة قديمة فعلاً (أطروحات 2025-08/2025-11) وقت كتابتها
     print("=== BARS AT OLD THESIS TIME ===")
-    db = sqlite3.connect(r"C:\Users\rr\Desktop\aoi\recorder\recorder.db")
+    db_uri = "file:C:/Users/rr/Desktop/aoi/recorder/recorder.db?mode=ro"
+    db = sqlite3.connect(db_uri, uri=True)
     olds = db.execute(
         "SELECT token_address, network_id, MIN(created_at) FROM token_thesis "
         "GROUP BY token_address ORDER BY 3 LIMIT 4"

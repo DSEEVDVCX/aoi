@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import secrets
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -128,6 +129,57 @@ def test_network_view_distinguishes_no_active_watches_from_bad_data():
     assert response.status_code == 200
     assert 'total === 0' in response.text
     assert '"لا مراقبات"' in response.text
+
+
+def test_activity_head_failures_are_monitored_with_their_own_success_stamp():
+    """عاملُ activity مستقلٌّ: نجاح المسجّل لا يجوز أن يشفي خطأه الصامت.
+
+    العطب الحيّ 2026-08-29: المهمة ظلت Running وهي تكتب UnauthorizedError كل
+    خمس دقائق، لكنّ اللوحة لم تعرض المصدر أصلًا. ختمُ نجاحه مستقل كذلك.
+    """
+    assert "activity_head" in config.RECORDER_SOURCES
+    assert config.SOURCE_OK_STAMPS["activity_head"] == (
+        "activity_head_last_run_at",
+    )
+
+
+def test_activity_head_success_stamp_heals_its_older_error(tmp_path):
+    """إضافة المصدر إلى config ليست كافية: طبقة DAO تستعمل ختمه المستقل فعلًا."""
+    from dao import recorder_errors
+
+    db_path = tmp_path / "errors.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    conn.executemany(
+        "INSERT INTO meta(key, value) VALUES (?, ?)",
+        [
+            ("last_error_activity_head", "2026-08-29T10:00:00+00:00: UnauthorizedError"),
+            ("activity_head_last_run_at", "2026-08-29T10:05:00+00:00"),
+        ],
+    )
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+
+    row = next(
+        error for error in recorder_errors(
+            conn,
+            config.RECORDER_SOURCES,
+            ok_stamps=config.SOURCE_OK_STAMPS,
+        ) if error["source"] == "activity_head"
+    )
+
+    assert row["stale"] is True
+    assert row["ok_at"] == "2026-08-29T10:05:00+00:00"
+    conn.close()
+
+
+def test_overview_tile_values_are_html_escaped():
+    """حالة EVM تأتي من meta؛ لا تُحقن قيمة بلا تهريب داخل innerHTML."""
+    client = TestClient(dashboard_app.app)
+    response = client.get("/", headers=HOST)
+
+    assert response.status_code == 200
+    assert '<div class="v">${esc(i.v)}</div>' in response.text
 
 
 def test_state_changing_request_without_token_is_refused():

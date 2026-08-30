@@ -68,12 +68,14 @@ Set-Location -LiteralPath $root
 & $python -m ruff check recorder/ dashboard/
 if ($LASTEXITCODE -ne 0) { $failed += "lint(recorder/dashboard)" }
 
-# رسمُ لوحة المفاتيح جافاسكربت لا يمسّها pytest: هذه الأداةُ تستخرج الدوالّ من
-# الصفحة وتشغّلها على حمولةٍ تغطّي كلّ حالة. تُتخطّى بلا node بدل أن تُفشل.
+# رسمُ أجزاء اللوحة جافاسكربت لا يمسّه pytest: الأداتان تستخرجان الدوالّ من
+# الصفحة نفسها وتشغّلانها على حمولاتٍ خبيثة وحالات التشغيل. تُتخطّيان بلا node.
 Write-Output "`n=== PAGE (node) ==="
 if (Get-Command node -ErrorAction SilentlyContinue) {
     & node "$root\dashboard\tools\check_key_render.mjs"
     if ($LASTEXITCODE -ne 0) { $failed += "page(check_key_render)" }
+    & node "$root\dashboard\tools\check_tile_render.mjs"
+    if ($LASTEXITCODE -ne 0) { $failed += "page(check_tile_render)" }
 } else {
     Write-Output "node not found - skipping the render check"
 }

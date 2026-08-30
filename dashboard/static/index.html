@@ -1059,7 +1059,7 @@ function renderTiles(st, counts, bars, storage, api, labeling) {
     });
   }
   document.getElementById("tiles").innerHTML = items.map(i =>
-    `<div class="tile"><div class="l">${esc(i.l)}</div><div class="v">${i.v}</div><div class="d">${esc(i.d)}</div></div>`
+    `<div class="tile"><div class="l">${esc(i.l)}</div><div class="v">${esc(i.v)}</div><div class="d">${esc(i.d)}</div></div>`
   ).join("");
 }
 

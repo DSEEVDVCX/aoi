@@ -41,7 +41,9 @@ def assign_split(token_address: str) -> str:
     - lower() لتوحيد عناوين EVM المتفاوتة الحالة؛ عناوين سولانا حسّاسة للحالة
       لكنّ توحيدها هنا لا يضرّ (أسوأ حالة: عملتان مختلفتان في قسم واحد).
     """
-    digest = hashlib.sha1(token_address.strip().lower().encode()).hexdigest()
+    digest = hashlib.sha1(
+        token_address.strip().lower().encode(), usedforsecurity=False
+    ).hexdigest()
     bucket = int(digest[:8], 16) % 10
     if bucket <= 6:
         return "train"

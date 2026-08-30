@@ -18,7 +18,8 @@ def ro_items(env):
 async def main():
     creds = CredentialStore(settings.credential_state_file).load()
     client = FomoClient(session_token=creds.access_token)
-    db = sqlite3.connect(r"C:\Users\rr\Desktop\aoi\recorder\recorder.db")
+    db_uri = "file:C:/Users/rr/Desktop/aoi/recorder/recorder.db?mode=ro"
+    db = sqlite3.connect(db_uri, uri=True)
 
     # اجمع ~200 حدثاً (4 صفحات) وقاطع معرفاتها مع signal_events
     ids_by_type = {}

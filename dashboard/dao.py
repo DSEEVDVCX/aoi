@@ -477,8 +477,10 @@ def recorder_errors(
     و`last_ok_cycle_at`، ولا يكتبهما إلّا `recorder.py`؛ فحين مات المسجّل ٣س١٤د
     يوم 2026-08-17 تجمّد الحدُّ فبقيت شارات chain/chain_auth/evm حمراء وأخطاؤها
     قد شُفيت — و`FomoChain` تُتمّ دوراتها النظيفة بلا أن يعنيَ ذلك شيئاً. فصار
-    لكلّ طابورٍ ختمُ نجاحٍ من كاتبه (`chain_last_ok_at`…)، ويُضاف إليه حدُّ
-    المسجّل كي لا يخسر خطأٌ قديمٌ سبيلَ الشفاء قبل أن يُكتب ختمُه أوّل مرّة.
+    لكلّ طابورٍ ختمُ نجاحٍ من كاتبه (`chain_last_ok_at`…). المصدر المعرّف له
+    ختمٌ مستقل لا يرجع إلى ختم المسجّل عند غيابه: غيابُ ختمه يعني أنه لم يثبت
+    نجاحه بعد، وشفاؤه بختم عمليّة أخرى يخفي فشل أول تشغيل. وحدُّ المسجّل يبقى
+    فقط للمصادر التي لا تُعرّف أختاماً مستقلة في `ok_stamps`.
     """
     meta = all_meta(conn)
     stamps = ok_stamps or {}
@@ -493,13 +495,12 @@ def recorder_errors(
         val = meta.get(f"last_error_{src}")
         # الختم في القيمة بصيغة "<iso>: <msg>" — نفصله على أول ": ".
         err_dt = _parse_iso(val.split(": ", 1)[0]) if val else None
-        own = _boundary(stamps.get(src, ()))
-        # ختمُ المصدر نفسه يحكم إن وُجد، وحدُّ المسجّل بديلٌ عند غيابه لا شريكٌ
-        # له. كان `max(own, recorder_boundary)`، وهو نفسُ عيبِ الحدّ الموحّد
-        # مقلوباً: صحّةُ المسجّل تشفي خطأَ طابورٍ لم ينجح. وقِيس 2026-08-19: حُجب
-        # مسارُ التجّار 21 ساعة والمسجّل يُتمّ دوراتِه بـ`errors: 0` كلَّ دقيقة —
-        # فأيّ خطأٍ يُكتب هناك كان يُعلَن «متعافياً» بعد دقيقةٍ من كتابته.
-        boundary = own if own is not None else recorder_boundary
+        own_keys = stamps.get(src)
+        own = _boundary(own_keys or ())
+        # وجودُ المصدر في الخريطة عقدٌ مستقل، حتى لو لم يُكتب ختمه بعد. الرجوع
+        # إلى حد المسجّل مسموح فقط لمصدرٍ لا يملك عقد أختام أصلًا؛ وإلا فإن فشل
+        # أول تشغيل يُعلن «متعافيًا» بعد دورة سليمة لعملية أخرى.
+        boundary = own if own_keys is not None else recorder_boundary
         stale = bool(val) and boundary is not None and err_dt is not None and err_dt < boundary
         out.append({
             "source": src,

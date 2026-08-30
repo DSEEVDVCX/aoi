@@ -21,6 +21,38 @@ import config  # noqa: E402
 from db import RecorderDB, utcnow_iso  # noqa: E402
 
 
+def _load_access_token() -> str | None:
+    """يقرأ توكن Privy الحالي من القرص بلا طباعته أو الاحتفاظ بنسخةٍ قديمة."""
+    from fomo_api.auth.credential_store import CredentialStore
+
+    creds = CredentialStore(config.credential_state_path()).load()
+    return creds.access_token if creds and creds.access_token else None
+
+
+def _build_client(access_token: str):
+    """يبني عميلًا من توكن معلوم؛ فصلُ البناء يجعل التدوير قابلًا للاختبار."""
+    from fomo_api.clients.fomo_client import FomoClient
+
+    return FomoClient(session_token=access_token)
+
+
+async def _maybe_rotate_client(client, current_token: str):
+    """يلتقط توكن القرص المتجدد؛ التغيير يغلق العميل القديم ويبني آخر فورًا."""
+    try:
+        fresh_token = _load_access_token()
+    except Exception:  # noqa: BLE001 — قراءة عابرة فشلت؛ نكمل بالعميل الحالي
+        return client, current_token
+    if not fresh_token or fresh_token == current_token:
+        return client, current_token
+    fresh_client = _build_client(fresh_token)
+    try:
+        await client.aclose()
+    except Exception:  # noqa: BLE001 — تنظيف القديم لا يهدر العميل الطازج
+        pass
+    _log("token rotated → client rebuilt")
+    return fresh_client, fresh_token
+
+
 def _log(message: str) -> None:
     """Write a bounded diagnostic line without exposing credentials."""
     try:
@@ -31,13 +63,21 @@ def _log(message: str) -> None:
 
 
 async def main_loop(cycles: int | None = None) -> None:
-    client = activity._load_client()
+    current_token = _load_access_token()
+    if not current_token:
+        raise RuntimeError("لا يوجد اعتماد صالح — شغّل خدمة الـ api أولاً.")
+    client = _build_client(current_token)
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
         count = 0
         while cycles is None or count < cycles:
             started = time.monotonic()
             try:
+                # خادم الـAPI يجدّد Privy على القرص؛ العامل طويلُ العمر يلتقط
+                # التغيير قبل كل دورة بدل الاحتفاظ بتوكن الإقلاع حتى يردّ 401.
+                client, current_token = await _maybe_rotate_client(
+                    client, current_token
+                )
                 stats = await activity.walk_head(
                     client,
                     db,
