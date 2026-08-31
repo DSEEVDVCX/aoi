@@ -37,6 +37,7 @@ HEAVY_KEYS: tuple[tuple[str, float], ...] = (
     ("network_summary", config.NETWORK_SUMMARY_TTL_SECONDS),
     ("labeling", config.LABELING_TTL_SECONDS),
     ("table_counts", config.TABLE_COUNTS_TTL_SECONDS),
+    ("watchlist_market", config.WATCHLIST_MARKET_TTL_SECONDS),
 )
 
 # `ticks_summary` is a public path that costs 1.5 seconds but the page doesn't
@@ -103,6 +104,8 @@ def _dao_compute(key: str) -> Callable[[], Any]:
                 )
             if key == "table_counts":
                 return dao.table_counts(conn)
+            if key == "watchlist_market":
+                return dao.watchlist_market(conn)
             raise KeyError(f"unknown warmup key: {key}")
         finally:
             conn.close()

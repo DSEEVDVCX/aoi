@@ -75,15 +75,17 @@ Set-Location -LiteralPath $root
 & $python -m ruff check recorder/ dashboard/
 if ($LASTEXITCODE -ne 0) { $failed += "lint(recorder/dashboard)" }
 
-# The dashboard's JavaScript rendering is not covered by pytest: both tools
+# The dashboard's JavaScript rendering is not covered by pytest: the tools
 # extract the functions from the page itself and run them on hostile payloads
-# and operating states. Both are skipped when node is absent.
+# and operating states. All are skipped when node is absent.
 Write-Output "`n=== PAGE (node) ==="
 if (Get-Command node -ErrorAction SilentlyContinue) {
     & node "$root\dashboard\tools\check_key_render.mjs"
     if ($LASTEXITCODE -ne 0) { $failed += "page(check_key_render)" }
     & node "$root\dashboard\tools\check_tile_render.mjs"
     if ($LASTEXITCODE -ne 0) { $failed += "page(check_tile_render)" }
+    & node "$root\dashboard\tools\check_watchlist_render.mjs"
+    if ($LASTEXITCODE -ne 0) { $failed += "page(check_watchlist_render)" }
 } else {
     Write-Output "node not found - skipping the render check"
 }

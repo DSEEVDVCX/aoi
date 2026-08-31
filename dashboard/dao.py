@@ -683,9 +683,20 @@ def active_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         if _table_exists(conn, "watch_windows")
         else "w.first_seen_at AS first_ever_at"
     )
+    # The control pill on the watchlist page: control coins are watched and
+    # recorded exactly like signal coins (that is the point of the comparison),
+    # but the reader must be able to tell them apart at a glance.
+    control_sel = (
+        "w.is_control AS is_control,"
+        if _has_column(conn, "watchlist", "is_control")
+        else "0 AS is_control,"
+    )
     rows = conn.execute(
         f"""SELECT w.token_address, w.network_id, w.source, w.first_seen_at, w.watch_until,
                    {first_ever},
+                   {control_sel}
+                   (SELECT ts.symbol FROM token_static ts
+                      WHERE ts.token_address = w.token_address LIMIT 1) AS symbol,
                    (SELECT COUNT(*) FROM market_ticks m
                       WHERE m.token_address = w.token_address) AS tick_count
               FROM watchlist w
@@ -1017,6 +1028,70 @@ def token_series(
     sampled = [closes[int(i * step)] for i in range(points)]
     sampled[-1] = closes[-1]
     return sampled
+
+
+# Sparkline buckets per watch: 40 points over the 48-hour window — the same
+# resolution `token_series` gives the performance page, without its per-token
+# query.
+_SPARK_POINTS = 40
+_WINDOW_SECONDS = 48 * 3600
+
+
+def watchlist_market(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Market data for the active watches, keyed `"{address}|{network}"`.
+
+    One dict feeds the whole watchlist row: the movement numbers come from
+    `_performance_rows` (same math and same suspect-close guards as the
+    performance page — one definition of "since entry", not two), and the
+    sparkline comes from a **single** bucketed pass over the live bars.
+    Calling `token_series` per coin instead would mean one full candle scan
+    per coin per refresh; the GROUP BY walks the same rows once for all coins.
+
+    Coins without a clean entry price yet (the candle sweep hasn't reached
+    them) are absent from the map, exactly as they are absent from
+    /api/performance — the watchlist row still renders, with dashes.
+
+    Control coins are included: the watchlist page has always shown every
+    active watch, and the row carries the flag so the UI can badge it.
+    The caller caches this (60 s) — the entry/peak numbers are glance
+    material, and the 48-hour countdown itself stays live via /api/watchlist.
+    """
+    market: dict[str, dict[str, Any]] = {
+        f"{r['token_address']}|{r['network_id']}": r for r in _performance_rows(conn)
+    }
+
+    if not _table_exists(conn, "token_bars") or not _table_exists(conn, "watchlist"):
+        return {k: {**v, "spark": []} for k, v in market.items()}
+
+    # Same guard as `_performance_rows`: a suspect close must not bend the
+    # sparkline either. When the column is absent the CASE collapses to `b.c`.
+    clean_c = "CASE WHEN b.c_suspect = 1 THEN NULL ELSE b.c END" \
+        if _has_column(conn, "token_bars", "c_suspect") else "b.c"
+    rows = conn.execute(
+        f"""WITH w AS (
+               SELECT token_address, network_id,
+                      CAST(strftime('%s', first_seen_at) AS INTEGER) AS entry_ts
+                 FROM watchlist WHERE active = 1
+           )
+           SELECT w.token_address AS a, w.network_id AS n,
+                  MIN({_SPARK_POINTS - 1},
+                      (b.ts - w.entry_ts) * {_SPARK_POINTS} / {_WINDOW_SECONDS}) AS bucket,
+                  AVG({clean_c}) AS px
+             FROM w JOIN token_bars b
+               ON b.token_address = w.token_address AND b.network_id = w.network_id
+              AND b.ts >= w.entry_ts AND b.c IS NOT NULL
+            GROUP BY a, n, bucket
+            ORDER BY a, n, bucket"""
+    ).fetchall()
+
+    sparks: dict[str, list[float]] = {}
+    for r in rows:
+        if r["px"] is None:
+            continue
+        sparks.setdefault(f"{r['a']}|{r['n']}", []).append(float(r["px"]))
+    for key, row in market.items():
+        row["spark"] = sparks.get(key, [])
+    return market
 
 
 # --- Signal flow over time ---

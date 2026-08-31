@@ -198,5 +198,13 @@ TICKS_SUMMARY_TTL_SECONDS = 120.0
 # re-scanning on every refresh.
 LABELING_TTL_SECONDS = 300.0
 
+# Watchlist market data (entry/peak/change + sparklines for every active
+# watch): one `_performance_rows` pass plus one bucketed candle scan — 64 ms
+# measured for 97 watches (2026-08-31), the same rows `/api/performance`
+# already aggregates every 10 s uncached. 60 s also matches the client's
+# heavy cycle: the watchlist page re-fetches this on every sixth refresh, so
+# a longer TTL would serve nothing.
+WATCHLIST_MARKET_TTL_SECONDS = 60.0
+
 # A busy database drops a refresh; without backoff every request becomes a fresh failed attempt.
 CACHE_ERROR_BACKOFF_SECONDS = 15.0

@@ -1405,6 +1405,154 @@ def test_dao_tolerates_a_database_without_the_is_control_column(tmp_path):
     conn.close()
 
 
+# --- watchlist market view (the row's numbers + sparkline, one map) ---
+def _market_schema(db_path):
+    """token_bars with the suspect flags — the guard paths only run when the
+    columns exist, and the plain `_bars_schema` fixture has none."""
+    c = sqlite3.connect(db_path)
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS token_bars (
+            token_address TEXT, network_id TEXT, resolution TEXT, ts INTEGER,
+            o REAL, h REAL, l REAL, c REAL, v REAL, fetched_at TEXT,
+            c_suspect INTEGER NOT NULL DEFAULT 0,
+            h_suspect INTEGER NOT NULL DEFAULT 0,
+            l_suspect INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (token_address, network_id, resolution, ts));
+    """)
+    return c
+
+
+def _bar(c, tok, ts, px, suspect=0):
+    # a poisoned candle is poisoned whole: the close and the high are guarded
+    # by separate flags upstream (c_suspect / h_suspect)
+    c.execute(
+        "INSERT INTO token_bars VALUES(?, '56', '5', ?, ?, ?, ?, ?, 1, 't', ?, ?, 0)",
+        (tok, ts, px, px, px, px, suspect, suspect),
+    )
+
+
+def _watch(c, tok, iso, control=0):
+    c.execute(
+        "INSERT INTO watchlist(token_address, network_id, source, first_seen_at,"
+        " watch_until, active, is_control) VALUES(?, '56', 'large_buy', ?, 't', 1, ?)",
+        (tok, iso, control),
+    )
+
+
+def test_active_watchlist_carries_symbol_and_control_flag(db_path):
+    """The watchlist page's identity cell: the ticker from token_static and the
+    control pill — without them the row is a bare address."""
+    c = sqlite3.connect(db_path)
+    _watch(c, "tokA", "2026-08-30T00:00:00Z")
+    _watch(c, "tokC", "2026-08-30T00:00:00Z", control=1)
+    c.execute("INSERT INTO token_static VALUES('tokA', '56', 'AAA')")
+    c.commit()
+    c.close()
+    conn = _conn(db_path)
+    rows = {r["token_address"]: r for r in dao.active_watchlist(conn)}
+    assert rows["tokA"]["symbol"] == "AAA"
+    assert rows["tokA"]["is_control"] == 0
+    assert rows["tokC"]["symbol"] is None              # no static row yet — the UI falls back
+    assert rows["tokC"]["is_control"] == 1
+    conn.close()
+
+
+def test_watchlist_market_joins_movement_and_spark(db_path):
+    """One map: the movement numbers of _performance_rows plus the bucketed
+    sparkline — bars 30 minutes apart share a bucket (averaged), bars 20 hours
+    apart land in their own."""
+    entry = 1_785_000_000
+    iso = datetime.fromtimestamp(entry, UTC).isoformat()
+    c = _market_schema(db_path)
+    _watch(c, "a", iso)
+    c.execute("INSERT INTO token_static VALUES('a', '56', 'AAA')")
+    _bar(c, "a", entry, 1.0)
+    _bar(c, "a", entry + 1800, 2.0)          # bucket 0 together with the entry bar
+    _bar(c, "a", entry + 72_000, 3.0)        # 20h in → bucket 16
+    c.commit()
+    c.close()
+    conn = _conn(db_path)
+    m = dao.watchlist_market(conn)
+    row = m["a|56"]
+    assert row["symbol"] == "AAA"
+    assert row["entry_px"] == 1.0
+    assert row["last_px"] == 3.0
+    assert row["change_pct"] == pytest.approx(200.0)
+    assert row["spark"] == pytest.approx([1.5, 3.0])   # bucket 0 averaged, bucket 16 alone
+    conn.close()
+
+
+def test_watchlist_market_spark_skips_suspect_closes_and_clamps_the_far_end(db_path):
+    """A corrupted close must not bend the sparkline (the same guard the entry
+    price uses), and a candle past the 48-hour window folds into the last
+    bucket instead of indexing past the array."""
+    entry = 1_785_000_000
+    iso = datetime.fromtimestamp(entry, UTC).isoformat()
+    c = _market_schema(db_path)
+    _watch(c, "a", iso)
+    _bar(c, "a", entry, 1.0)
+    _bar(c, "a", entry + 1800, 99.0, suspect=1)   # poisoned close
+    _bar(c, "a", entry + 172_800, 2.0)            # exactly 48h → bucket 40, clamped to 39
+    c.commit()
+    c.close()
+    conn = _conn(db_path)
+    row = dao.watchlist_market(conn)["a|56"]
+    assert row["spark"] == pytest.approx([1.0, 2.0])
+    assert row["last_px"] == 2.0                  # the poisoned close is not the latest either
+    assert row["peak_px"] == 2.0                  # and not the peak
+    conn.close()
+
+
+def test_watchlist_market_spark_ignores_bars_before_entry(db_path):
+    """Retro candles predate the signal: they're price history, not the bot
+    watching, and must not leak into the window."""
+    entry = 1_785_000_000
+    iso = datetime.fromtimestamp(entry, UTC).isoformat()
+    c = _market_schema(db_path)
+    _watch(c, "a", iso)
+    _bar(c, "a", entry - 86_400, 0.1)             # a day before the signal
+    _bar(c, "a", entry, 1.0)
+    c.commit()
+    c.close()
+    conn = _conn(db_path)
+    row = dao.watchlist_market(conn)["a|56"]
+    assert row["spark"] == pytest.approx([1.0])
+    assert row["entry_px"] == 1.0
+    conn.close()
+
+
+def test_watchlist_market_includes_controls_and_skips_coins_without_entry(db_path):
+    """Controls are watched exactly like signals — the row carries the flag.
+    A coin with no clean entry price yet is absent from the map (same rule as
+    /api/performance); the watchlist row still renders, with dashes."""
+    entry = 1_785_000_000
+    iso = datetime.fromtimestamp(entry, UTC).isoformat()
+    c = _market_schema(db_path)
+    _watch(c, "ctrl", iso, control=1)
+    _watch(c, "bare", iso)                        # watched, but the sweep hasn't reached it
+    _bar(c, "ctrl", entry, 1.0)
+    _bar(c, "ctrl", entry + 3600, 1.5)
+    c.commit()
+    c.close()
+    conn = _conn(db_path)
+    m = dao.watchlist_market(conn)
+    assert m["ctrl|56"]["is_control"] is True
+    assert m["ctrl|56"]["change_pct"] == pytest.approx(50.0)
+    assert "bare|56" not in m
+    conn.close()
+
+
+def test_watchlist_market_without_token_bars_is_empty_not_error(db_path):
+    """An old database with no candle table: an empty map, not an exception."""
+    c = sqlite3.connect(db_path)
+    _watch(c, "a", "2026-08-30T00:00:00Z")
+    c.commit()
+    c.close()
+    conn = _conn(db_path)
+    assert dao.watchlist_market(conn) == {}
+    conn.close()
+
+
 # --- the upstream feed's freshness ---
 def test_status_flags_a_frozen_upstream_feed(db_path):
     """The recorder can run without an error while the source feed is frozen for hours (observed 3 hours).

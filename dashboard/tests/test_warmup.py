@@ -45,9 +45,11 @@ def test_warmup_heats_all_heavy_keys():
     memo = cache.TTLMemo()
     done = warmup.warm_heavy_keys(memo, compute_for=make_compute)
 
-    assert set(done) == {"network_summary", "labeling", "table_counts"}
+    # the full key list (its completeness is guarded by the drift test below)
+    expected = {key for key, _ttl in warmup.HEAVY_KEYS}
+    assert set(done) == expected
     assert all(done.values())
-    assert computed == {"network_summary", "labeling", "table_counts"}
+    assert computed == expected
 
 
 def test_warmup_survives_a_failing_key_and_continues():
@@ -70,9 +72,10 @@ def test_warmup_survives_a_failing_key_and_continues():
     memo = cache.TTLMemo()
     done = warmup.warm_heavy_keys(memo, compute_for=make_compute)
 
-    assert set(calls) == {"network_summary", "labeling", "table_counts"}
-    assert len(calls) == 3
-    assert done == {"network_summary": True, "labeling": False, "table_counts": True}
+    expected = {key for key, _ttl in warmup.HEAVY_KEYS}
+    assert set(calls) == expected
+    assert len(calls) == len(expected)
+    assert done == {key: (key != "labeling") for key in expected}
 
 
 def test_a_warmed_cache_answers_the_first_request_without_cold_compute():
@@ -134,6 +137,7 @@ def test_warmup_uses_the_live_memo_and_config_ttls():
         "network_summary": config_ttls()["NETWORK_SUMMARY_TTL_SECONDS"],
         "labeling": config_ttls()["LABELING_TTL_SECONDS"],
         "table_counts": config_ttls()["TABLE_COUNTS_TTL_SECONDS"],
+        "watchlist_market": config_ttls()["WATCHLIST_MARKET_TTL_SECONDS"],
     }
 
     def fake_get(key, ttl, compute, **kwargs):
@@ -154,13 +158,14 @@ def config_ttls():
         "NETWORK_SUMMARY_TTL_SECONDS": config.NETWORK_SUMMARY_TTL_SECONDS,
         "LABELING_TTL_SECONDS": config.LABELING_TTL_SECONDS,
         "TABLE_COUNTS_TTL_SECONDS": config.TABLE_COUNTS_TTL_SECONDS,
+        "WATCHLIST_MARKET_TTL_SECONDS": config.WATCHLIST_MARKET_TTL_SECONDS,
     }
 
 
-@pytest.mark.parametrize("missing", ["network_summary", "labeling", "table_counts"])
+@pytest.mark.parametrize("missing", ["network_summary", "labeling", "table_counts", "watchlist_market"])
 def test_every_heavy_key_is_covered_by_warmup(missing):
     """The guard against drift: a new heavy key without warming is caught immediately."""
     keys = {key for key, _ttl in warmup.HEAVY_KEYS}
 
     assert missing in keys
-    assert keys == {"network_summary", "labeling", "table_counts"}
+    assert keys == {"network_summary", "labeling", "table_counts", "watchlist_market"}

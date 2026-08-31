@@ -179,6 +179,23 @@ def api_watchlist() -> dict[str, Any]:
     return {"watchlist": rows}
 
 
+@app.get("/api/watchlist-market")
+def api_watchlist_market() -> dict[str, Any]:
+    """Price movement + sparkline per active watch — the heavy half of the watchlist page.
+
+    The 48-hour countdown must tick every 10 s, but recomputing entry/peak/
+    sparkline for ~150 coins on that cadence would hammer the bars table for
+    numbers that barely move. So the light `/api/watchlist` carries the window
+    and this cached route carries the market half; the page merges them by
+    `address|network`. Same split as `/api/networks`: cached heavy body, live
+    freshness layered on top.
+    """
+    rows, meta = _cached(
+        "watchlist_market", config.WATCHLIST_MARKET_TTL_SECONDS, dao.watchlist_market,
+    )
+    return {"market": rows, "cache": meta}
+
+
 @app.get("/api/ticks-summary")
 def api_ticks_summary() -> dict[str, Any]:
     summary, meta = _cached(

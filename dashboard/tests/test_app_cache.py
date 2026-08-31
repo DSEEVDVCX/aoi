@@ -164,6 +164,19 @@ def test_ticks_summary_is_cached_too(client, monkeypatch):
     assert body["total"] == 1
 
 
+def test_watchlist_market_is_cached_like_other_heavy_panels(client, monkeypatch):
+    """The watchlist's market view re-aggregates every coin on the page; the
+    48-hour countdown stays live via /api/watchlist, this one is cached."""
+    calls = _counted(monkeypatch, "watchlist_market")
+
+    first = client.get("/api/watchlist-market", headers=HOST).json()
+    second = client.get("/api/watchlist-market", headers=HOST).json()
+
+    assert len(calls) == 1
+    assert second == first
+    assert first["market"] == {}              # no token_bars in the test database
+
+
 # --- the payload states its age ---
 @pytest.mark.parametrize(
     ("path", "ttl_attr"),
@@ -172,6 +185,7 @@ def test_ticks_summary_is_cached_too(client, monkeypatch):
         ("/api/counts", "TABLE_COUNTS_TTL_SECONDS"),
         ("/api/ticks-summary", "TICKS_SUMMARY_TTL_SECONDS"),
         ("/api/labeling", "LABELING_TTL_SECONDS"),
+        ("/api/watchlist-market", "WATCHLIST_MARKET_TTL_SECONDS"),
     ],
 )
 def test_cached_routes_publish_their_freshness(client, path, ttl_attr):

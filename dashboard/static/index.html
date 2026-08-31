@@ -294,7 +294,15 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 
 /* --- tables --- */
-.tablewrap { overflow-x: auto; }
+/* Long tables scroll inside their panel with the header pinned, so the columns
+   stay labeled while scanning — the page itself never turns into one long
+   anonymous strip. */
+.tablewrap { overflow: auto; max-height: min(64vh, 680px); }
+.tablewrap thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--surface);
+  box-shadow: inset 0 -1px 0 var(--line);
+}
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td {
   padding: 9px 16px; text-align: start; border-bottom: 1px solid var(--line);
@@ -317,6 +325,20 @@ a.ext:hover .ico, a.ext:focus-visible .ico { opacity: .75; }
 .up { color: var(--up); } .down { color: var(--down); }
 .empty { padding: 26px 18px; color: var(--muted); text-align: center; }
 
+/* --- skeleton: the panel's shape before its data arrives ---
+   The first load used to show "—" and "…" text, which reads as missing data
+   rather than loading data. A skeleton keeps the promise structural: bars
+   where content will land, pulsing until the first paint replaces them. */
+.skel { display: grid; gap: 10px; padding: 18px; }
+.skel > i {
+  display: block; height: 12px; border-radius: 6px;
+  background: var(--surface-2); animation: skel-pulse 1.4s ease-in-out infinite;
+}
+.skel > i:nth-child(2n) { width: 72%; }
+.skel > i:nth-child(3n) { width: 54%; }
+@keyframes skel-pulse { 0%, 100% { opacity: .45; } 50% { opacity: .95; } }
+@media (prefers-reduced-motion: reduce) { .skel > i { animation: none; opacity: .6; } }
+
 /* --- meter --- */
 .meter { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; min-width: 60px; }
 .meter > i { display: block; height: 100%; border-radius: 3px; background: var(--s1); }
@@ -324,6 +346,29 @@ a.ext:hover .ico, a.ext:focus-visible .ico { opacity: .75; }
 .meter > i { animation: meter-in .5s ease-out; transform-origin: inline-start; }
 @keyframes meter-in { from { transform: scaleX(0); } }
 @media (prefers-reduced-motion: reduce) { .meter > i { animation: none; } }
+
+/* --- watchlist filter bar --- */
+.wlbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 16px 2px; }
+.wlbar .chip {
+  font: inherit; font-size: 12px; color: var(--ink-2); cursor: pointer;
+  padding: 3px 11px; border-radius: 999px; border: 1px solid var(--line);
+  background: transparent; transition: color .12s, border-color .12s, background-color .12s;
+}
+.wlbar .chip:hover { color: var(--ink); border-color: var(--muted); }
+.wlbar .chip.on { color: var(--page); background: var(--ink); border-color: var(--ink); }
+.wlbar .chip .key { width: 8px; height: 8px; border-radius: 3px; display: inline-block; margin-inline-end: 6px; }
+.wlcount { color: var(--muted); font-size: 12px; margin-inline-start: auto; white-space: nowrap; }
+.wlsearch { width: 190px; text-align: start; color: var(--ink); }
+.wlsearch::placeholder { color: var(--muted); }
+
+/* the network name and the control tag sit beside the ticker — identity at
+   a glance, the address below stays the technical key */
+.netpill {
+  font-size: 10.5px; color: var(--muted); border: 1px solid var(--line);
+  padding: 1px 7px; border-radius: 999px; margin-inline-start: 7px; vertical-align: 1px;
+  white-space: nowrap;
+}
+.badge.ctrl { color: var(--muted); border-color: var(--line); }
 
 /* --- charts --- */
 .chart { direction: ltr; }          /* time series run left-to-right */
@@ -489,7 +534,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
         <div class="chart" id="hero-spark" style="margin-top:10px"></div>
       </div>
     </div>
-    <div class="tiles" id="tiles"></div>
+    <div class="tiles" id="tiles"><div class="skel"><i></i><i></i><i></i><i></i></div></div>
   </div>
 
   <!-- the most important chart: is the signal any good? -->
@@ -505,8 +550,8 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       </select>
       <button class="btn" data-toggle="perf" aria-pressed="false">Show as table</button>
     </header>
-    <div id="perf-summary"></div>
-    <div class="body flush" id="perf"></div>
+    <div id="perf-summary"><div class="skel"><i></i><i></i><i></i></div></div>
+    <div class="body flush" id="perf"><div class="skel"><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="grid2" data-view-section="overview">
@@ -517,14 +562,14 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
         <span class="spacer"></span>
         <button class="btn" data-toggle="timeline" aria-pressed="false">Show as table</button>
       </header>
-      <div class="body" id="timeline"></div>
+      <div class="body" id="timeline"><div class="skel"><i></i><i></i><i></i></div></div>
     </div>
 
   </div>
 
   <div class="card" data-view-section="health">
     <header><h2>Collection health</h2></header>
-    <div class="body" id="health"></div>
+    <div class="body" id="health"><div class="skel"><i></i><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="card" data-view-section="performance">
@@ -532,26 +577,33 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       <h2>Signal vs control group</h2>
       <span class="note">Does the signal beat coins that entered by random selection?</span>
     </header>
-    <div class="body" id="control-progress" aria-live="polite"></div>
-    <div class="body flush" id="comparison"></div>
+    <div class="body" id="control-progress" aria-live="polite"><div class="skel"><i></i><i></i><i></i></div></div>
+    <div class="body flush" id="comparison"><div class="skel"><i></i><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="card" data-view-section="watchlist">
     <header>
       <h2>Watchlist</h2>
       <span class="note">A 48-hour window per coin</span>
+      <span class="spacer"></span>
+      <input id="wl-search" type="search" class="btn wlsearch" placeholder="Ticker or address"
+             aria-label="Filter the watchlist by ticker or address"
+             autocomplete="off" spellcheck="false">
     </header>
-    <div class="body flush tablewrap" id="watchlist"></div>
+    <!-- chips are re-rendered with the data; the search input lives outside so
+         re-rendering never steals focus or clears what was typed -->
+    <div class="wlbar" id="wl-bar" aria-label="Watchlist filters"></div>
+    <div class="body flush tablewrap" id="watchlist"><div class="skel"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="card" data-view-section="signals">
     <header><h2>Latest signals</h2></header>
-    <div class="body flush tablewrap" id="signals"></div>
+    <div class="body flush tablewrap" id="signals"><div class="skel"><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="card" data-view-section="health">
     <header><h2>Errors by source</h2></header>
-    <div class="body flush" id="errors"></div>
+    <div class="body flush" id="errors"><div class="skel"><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="card" data-view-section="health">
@@ -571,7 +623,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       <button type="submit" class="keybtn go">Add</button>
       <span class="keymsg" id="key-msg" role="status" aria-live="polite"></span>
     </form>
-    <div class="body flush" id="provider-keys"></div>
+    <div class="body flush" id="provider-keys"><div class="skel"><i></i><i></i><i></i></div></div>
   </div>
 
   <div class="card" data-view-section="health">
@@ -579,7 +631,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
       <h2>fomo account — the data source</h2>
       <span class="note">Identity fingerprint and last 4 characters only — the token is neither displayed nor logged</span>
     </header>
-    <div class="body flush" id="fomo-account"></div>
+    <div class="body flush" id="fomo-account"><div class="skel"><i></i><i></i><i></i></div></div>
     <!-- switching is collapsed on purpose: the account identity is the most
          dangerous thing the dashboard writes, so its field opens only
          deliberately. And `details` needs no JS and no managed state. -->
@@ -615,7 +667,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
         <h2>Stage-one gate — control group maturity</h2>
         <span class="note" id="labeling-cache-note"></span>
       </header>
-      <div class="body" id="labeling-gate"></div>
+      <div class="body" id="labeling-gate"><div class="skel"><i></i><i></i><i></i></div></div>
     </div>
 
     <div class="grid2">
@@ -624,14 +676,14 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
           <h2>Labeled signal outcomes</h2>
           <span class="note">Completed 48-hour windows — final results, not open positions</span>
         </header>
-        <div class="body" id="labeling-signal"></div>
+        <div class="body" id="labeling-signal"><div class="skel"><i></i><i></i><i></i></div></div>
       </div>
       <div class="card">
         <header>
           <h2>Labeled control outcomes</h2>
           <span class="note">Same universe, entered by random selection rather than by signal</span>
         </header>
-        <div class="body" id="labeling-control"></div>
+        <div class="body" id="labeling-control"><div class="skel"><i></i><i></i><i></i></div></div>
       </div>
     </div>
 
@@ -640,7 +692,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
         <h2>Daily labeling</h2>
         <span class="note">All kinds — last 14 days</span>
       </header>
-      <div class="body" id="labeling-days"></div>
+      <div class="body" id="labeling-days"><div class="skel"><i></i><i></i><i></i></div></div>
     </div>
 
     <div class="card">
@@ -648,7 +700,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
         <h2>Training rows</h2>
         <span class="note">Modeling readiness — approved training waits for the gate</span>
       </header>
-      <div class="body" id="labeling-training"></div>
+      <div class="body" id="labeling-training"><div class="skel"><i></i><i></i><i></i></div></div>
     </div>
 
     <div class="card">
@@ -656,13 +708,13 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
         <h2>Labeling outcomes by kind and status</h2>
         <span class="note">Where every sample went, and why</span>
       </header>
-      <div class="body flush tablewrap" id="labeling-status"></div>
+      <div class="body flush tablewrap" id="labeling-status"><div class="skel"><i></i><i></i><i></i><i></i></div></div>
     </div>
   </section>
 
   <section data-view-section="networks" hidden>
     <div class="network-grid" id="network-summary">
-      <div class="card"><div class="body empty">Loading network summary…</div></div>
+      <div class="card"><div class="body"><div class="skel"><i></i><i></i><i></i><i></i></div></div></div>
     </div>
   </section>
 </main>
@@ -1413,26 +1465,181 @@ function renderHealth(bars, storage, st) {
     </table>`;
 }
 
-function renderWatchlist(rows) {
-  const host = document.getElementById("watchlist");
-  if (!rows.length) { host.innerHTML = `<div class="empty">No active watched coins.</div>`; return; }
-  host.innerHTML = `<table><thead><tr>
-      <th>Address</th><th>Source</th><th>First catch</th><th style="width:22%">Remaining of 48 hours</th><th>Snapshots</th>
-    </tr></thead><tbody>${rows.map(w => {
-      const r = remaining(w.watch_until);
-      const low = r.frac < 0.15;
-      return `<tr>
-        <td class="mono">${extLink(fomoTokenUrl(w.token_address, w.network_id),
-              esc(shortAddr(w.token_address)))}</td>
-        <td><span class="badge"><i class="key" style="background:${typeColor(w.source)}"></i>${esc(typeLabel(w.source))}</span></td>
-        <td>${firstCatch(w)}</td>
-        <td><div style="display:flex;align-items:center;gap:9px">
-          <div class="meter" style="flex:1"><i style="width:${(r.frac * 100).toFixed(0)}%;background:${low ? "var(--warn)" : "var(--s1)"}"></i></div>
-          <span class="num" style="min-width:52px;color:${low ? "var(--warn)" : "inherit"}">${esc(r.txt)}</span>
-        </div></td>
-        <td class="num">${num(w.tick_count)}</td></tr>`;
-    }).join("")}</tbody></table>`;
+/* --- watchlist: market view + sort/filter/search (check_watchlist_render.mjs extracts this region) --- */
+/* Client-side state: the server delivers the full active set (no truncation),
+   so re-sorting, filtering, and searching re-render from the last payload
+   without refetching — the same deal as the perf table, kept in lastRows.wl. */
+const wlSort = { key: "first_seen_at", dir: "desc" };
+const wlFilter = { net: null, source: null };
+let wlQuery = "";
+
+const WL_COLS = [
+  { key: "symbol",        label: "Coin" },
+  { key: null,            label: "Source" },
+  { key: "first_seen_at", label: "Since" },
+  { key: "last_px",       label: "Price" },
+  { key: "change_pct",    label: "Since entry" },
+  { key: "peak_pct",      label: "Peak" },
+  { key: null,            label: "Path", width: "120px" },
+  { key: null,            label: "48h window", width: "22%" },
+  { key: "tick_count",    label: "Snapshots" },
+];
+
+function wlTh(c) {
+  if (!c.key) return `<th${c.width ? ` style="width:${c.width}"` : ""}>${esc(c.label)}</th>`;
+  const active = wlSort.key === c.key;
+  const arrow = active ? (wlSort.dir === "desc" ? "▼" : "▲") : "↕";
+  return `<th class="sortable" data-wl-sort="${c.key}"${c.width ? ` style="width:${c.width}"` : ""}
+    ${active ? `aria-sort="${wlSort.dir === "desc" ? "descending" : "ascending"}"` : ""}
+    title="Sort by ${esc(c.label)}">${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
 }
+
+/* -Infinity is the "field missing" marker: whatever the direction, a coin the
+   candle sweep hasn't reached yet sinks below the priced ones instead of
+   padding the top of a price sort with "—". */
+function wlSortValue(w, m, key) {
+  switch (key) {
+    case "symbol": return (m?.symbol || w.symbol || w.token_address || "").toLowerCase();
+    case "source": return w.source || "";
+    case "first_seen_at": return Date.parse(w.first_seen_at || "") || 0;
+    case "last_px": return m?.last_px ?? -Infinity;
+    case "change_pct": return m?.change_pct ?? -Infinity;
+    case "peak_pct": return m?.peak_pct ?? -Infinity;
+    case "tick_count": return w.tick_count ?? 0;
+    default: return 0;
+  }
+}
+
+/** Joins each watch with its market row (keyed `address|network`) and applies
+    the current filter + sort. Returns [{w, m}] for both the chips and the rows. */
+function wlVisible(rows, market) {
+  const keyed = rows.map(w => ({ w, m: market[`${w.token_address}|${w.network_id}`] }));
+  const q = wlQuery.trim().toLowerCase();
+  const kept = keyed.filter(({ w, m }) =>
+    (!wlFilter.net || String(w.network_id) === wlFilter.net)
+    && (!wlFilter.source || w.source === wlFilter.source)
+    && (!q
+      || (m?.symbol || w.symbol || "").toLowerCase().includes(q)
+      || (w.token_address || "").toLowerCase().includes(q)));
+  const mul = wlSort.dir === "asc" ? 1 : -1;
+  kept.sort((a, b) => {
+    const av = wlSortValue(a.w, a.m, wlSort.key), bv = wlSortValue(b.w, b.m, wlSort.key);
+    if ((av === -Infinity) !== (bv === -Infinity)) return av === -Infinity ? 1 : -1;
+    if (av !== bv) return (av < bv ? -1 : 1) * mul;
+    return 0;
+  });
+  return kept;
+}
+
+/* the chips are built from the **unfiltered** set: filtering must never remove
+   the option that un-filters it */
+function wlBar(keyed, shown) {
+  const nets = new Map(), srcs = new Map();
+  keyed.forEach(({ w }) => {
+    const n = String(w.network_id);
+    nets.set(n, (nets.get(n) || 0) + 1);
+    srcs.set(w.source, (srcs.get(w.source) || 0) + 1);
+  });
+  const chip = (on, attr, label) =>
+    `<button type="button" class="chip${on ? " on" : ""}" ${attr}>${esc(label)}</button>`;
+  const netChips = [...nets.entries()].sort((a, b) => b[1] - a[1]).map(([id, n]) =>
+    chip(wlFilter.net === id, `data-wl-net="${esc(id)}"`,
+      `${NETWORK_META[id]?.name || `network ${id}`} · ${num(n)}`)).join("");
+  const srcChips = [...srcs.entries()].sort((a, b) => b[1] - a[1]).map(([s, n]) =>
+    chip(wlFilter.source === s, `data-wl-src="${esc(s)}"`,
+      `${typeLabel(s)} · ${num(n)}`)).join("");
+  return `${netChips}${srcChips}<span class="wlcount">${num(shown.length)} of ${num(keyed.length)} coins</span>`;
+}
+
+function wlRow(rec, i) {
+  const { w, m } = rec;
+  const r = remaining(w.watch_until);
+  /* urgency ladder: plenty left → brand blue, the last quarter → warning, the
+     last tenth → critical, meter and text together (color never alone) */
+  const stage = r.frac > 0.25 ? { bar: "var(--s1)", txt: "inherit" }
+    : r.frac > 0.10 ? { bar: "var(--warn)", txt: "var(--warn)" }
+    : { bar: "var(--crit)", txt: "var(--crit)" };
+  const sym = m?.symbol || w.symbol;
+  const net = NETWORK_META[String(w.network_id)];
+  const url = fomoTokenUrl(w.token_address, w.network_id);
+  return `<tr>
+    <td>${extLink(url, `<b>${esc(sym || shortAddr(w.token_address))}</b>
+        <div class="mono">${esc(shortAddr(w.token_address))}</div>`,
+        `Open ${sym || "the coin"} on fomo.family`)}
+      <span class="netpill">${esc(net?.name || `net ${w.network_id}`)}</span>${
+        w.is_control || m?.is_control ? `<span class="badge ctrl netpill">control</span>` : ""}</td>
+    <td><span class="badge"><i class="key" style="background:${typeColor(w.source)}"></i>${esc(typeLabel(w.source))}</span></td>
+    <td>${firstCatch(w)}</td>
+    <td class="mono">${price(m?.last_px)}</td>
+    <td>${signed(m?.change_pct)}</td>
+    <td>${signed(m?.peak_pct)}</td>
+    <td data-spark="${i}" style="width:120px"></td>
+    <td><div style="display:flex;align-items:center;gap:9px">
+      <div class="meter" style="flex:1"><i style="width:${(r.frac * 100).toFixed(0)}%;background:${stage.bar}"></i></div>
+      <span class="num" style="min-width:52px;color:${stage.txt}">${esc(r.txt)}</span>
+    </div></td>
+    <td class="num">${num(w.tick_count)}</td></tr>`;
+}
+
+function renderWatchlist(rows, market) {
+  const bar = document.getElementById("wl-bar");
+  const host = document.getElementById("watchlist");
+  if (!rows.length) {
+    bar.innerHTML = "";
+    host.innerHTML = `<div class="empty">No active watched coins.</div>`;
+    return;
+  }
+  const shown = wlVisible(rows, market);
+  bar.innerHTML = wlBar(rows.map(w => ({ w })), shown);
+  if (!shown.length) {
+    host.innerHTML = `<div class="empty">No coin matches the current filter.<br>
+      <span class="mono">Clear the search box or click the active chip to un-filter.</span></div>`;
+    return;
+  }
+  host.innerHTML = `<div class="tablewrap"><table>
+    <thead><tr>${WL_COLS.map(wlTh).join("")}</tr></thead>
+    <tbody>${shown.map(wlRow).join("")}</tbody></table></div>`;
+
+  // sparklines are injected after the table is built (SVG isn't built from text here)
+  host.querySelectorAll("[data-spark]").forEach((cell) => {
+    const rec = shown[Number(cell.dataset.spark)];
+    if (!rec) return;
+    const rising = (rec.m?.change_pct ?? 0) >= 0;
+    cell.replaceChildren(sparkline(rec.m?.spark || [], {
+      w: 120, h: 30, color: rising ? "var(--up)" : "var(--down)",
+    }));
+  });
+
+  // sorting and the chips re-render from the payload already in hand — no refetch
+  host.querySelectorAll("th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.wlSort;
+      if (wlSort.key === key) wlSort.dir = wlSort.dir === "desc" ? "asc" : "desc";
+      else { wlSort.key = key; wlSort.dir = "desc"; }
+      renderWatchlistNow();
+    });
+  });
+  bar.querySelectorAll("[data-wl-net]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const id = b.dataset.wlNet;
+      wlFilter.net = wlFilter.net === id ? null : id;
+      renderWatchlistNow();
+    });
+  });
+  bar.querySelectorAll("[data-wl-src]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const s = b.dataset.wlSrc;
+      wlFilter.source = wlFilter.source === s ? null : s;
+      renderWatchlistNow();
+    });
+  });
+}
+
+/** Re-renders the watchlist from the last payload (sort/filter/search/theme). */
+function renderWatchlistNow() {
+  if (lastRows.wl) renderWatchlist(lastRows.wl.rows, lastRows.wl.market);
+}
+/* --- end watchlist --- */
 
 function renderSignals(rows) {
   const host = document.getElementById("signals");
@@ -2191,7 +2398,7 @@ let paused = false, inflight = false;
    to request them again. `null` means "not fetched yet" ⇒ requested on the next
    cycle regardless of the counter. */
 let heavyTick = 0;
-const heavy = { counts: null, networks: null, labeling: null };
+const heavy = { counts: null, networks: null, labeling: null, watchMarket: null };
 
 /** Renders one panel in isolation; a failure is reported in its place and
     doesn't stop the rest. */
@@ -2222,7 +2429,7 @@ async function tick() {
     const wantHeavy = (heavyTick % HEAVY_EVERY === 0) || heavy.counts === null;
     heavyTick += 1;
     const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys,
-           acct, labeling] = await Promise.all([
+           acct, labeling, watchMarket] = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
@@ -2244,10 +2451,16 @@ async function tick() {
       wantHeavy
         ? getOptionalJSON("/api/labeling", heavy.labeling || { live: false })
         : heavy.labeling,
+      // the market view is cached server-side for a minute, so it rides the
+      // heavy cycle — the 48h countdown itself stays live at 10s via /api/watchlist
+      wantHeavy
+        ? getOptionalJSON("/api/watchlist-market", heavy.watchMarket || { market: {} })
+        : heavy.watchMarket,
     ]);
     heavy.counts = cnt;
     heavy.networks = networks;
     heavy.labeling = labeling;
+    heavy.watchMarket = watchMarket;
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
     // every panel renders independently: a fault in one empties that one alone,
@@ -2261,7 +2474,7 @@ async function tick() {
     paint("control-progress", () => renderControlProgress(controlProgress));
     paint("timeline",     () => renderTimeline(tl));
     paint("health",    () => renderHealth(bars, storage, st));
-    paint("watchlist", () => renderWatchlist(wl.watchlist || []));
+    paint("watchlist", () => renderWatchlist(wl.watchlist || [], watchMarket?.market || {}));
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
     paint("provider-keys", () => renderProviderKeys(keys));
@@ -2271,6 +2484,7 @@ async function tick() {
     renderStatus(st);
     renderApi(api);
     lastRows.perf = rows; lastRows.tl = tl;
+    lastRows.wl = { rows: wl.watchlist || [], market: watchMarket?.market || {} };
 
     document.getElementById("alert").innerHTML = "";
     document.getElementById("updated").textContent =
@@ -2284,7 +2498,7 @@ async function tick() {
     inflight = false;
   }
 }
-const lastRows = { perf: [], tl: null };
+const lastRows = { perf: [], tl: null, wl: null };
 
 /* table-view buttons: every chart has a table equivalent */
 document.querySelectorAll("[data-toggle]").forEach(btn => {
@@ -2303,6 +2517,12 @@ document.getElementById("perf-limit").addEventListener("change", (e) => {
   refreshPerf();
 });
 
+/* bound once, outside the re-rendered hosts: typing never loses focus or text */
+document.getElementById("wl-search").addEventListener("input", (e) => {
+  wlQuery = e.target.value;
+  renderWatchlistNow();
+});
+
 document.getElementById("pause").addEventListener("click", (e) => {
   paused = !paused;
   e.target.setAttribute("aria-pressed", String(paused));
@@ -2318,6 +2538,7 @@ document.getElementById("theme").addEventListener("click", () => {
   // charts read their colors from CSS, so they're rebuilt to pick up the new theme
   renderPerf(lastRows.perf);
   if (lastRows.tl) renderTimeline(lastRows.tl);
+  renderWatchlistNow();
 });
 
 addEventListener("hashchange", setActiveView);
