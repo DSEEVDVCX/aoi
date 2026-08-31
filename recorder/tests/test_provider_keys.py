@@ -25,10 +25,11 @@ def test_read_keys_supports_comma_separated_environment(monkeypatch, tmp_path):
 
 
 def test_read_keys_skips_keys_the_dashboard_paused(monkeypatch, tmp_path):
-    """الإيقاف المؤقّت: يبقى في الملفّ لتعيده اللوحة، ولا يدخل الحوض فلا يُنادى."""
+    """A temporary pause: it stays in the file for the dashboard to restore,
+    and never enters the pool, so it is never called."""
     path = tmp_path / "keys.json"
     path.write_text(json.dumps({"helius_api_keys": [
-        {"key": "live-one", "label": "الرئيسي"},
+        {"key": "live-one", "label": "main"},
         {"key": "paused-one", "enabled": False},
         {"key": "live-two"},
     ]}), encoding="utf-8")
@@ -38,27 +39,30 @@ def test_read_keys_skips_keys_the_dashboard_paused(monkeypatch, tmp_path):
 
 
 def test_what_the_dashboard_writes_is_exactly_what_the_pool_reads(monkeypatch, tmp_path):
-    """الكاتبُ والقارئ مربوطان في اختبارٍ واحد — وإلّا فالعطبُ عطلٌ كامل.
+    """The writer and the reader are tied together in one test — otherwise the
+    failure is a full outage.
 
-    الشكلُ القديم كان يُبقي النصوص فقط (`isinstance(value, str)`)، فأوّلُ كتابةٍ
-    باللوحة على عمليّةٍ تشغّل ذلك الكود كانت ستُرجع **صفرَ مفاتيح**: لا مفتاحٌ
-    واحدٌ يفشل بل الطبقةُ كلّها تتوقّف. هذا الاختبار يمرّ بالكاتب الحقيقيّ
-    (`key_file.save_entries`) لا بملفٍّ مكتوبٍ بيدٍ في الاختبار، فأيّ تباعدٍ
-    بين الشكلين يسقط هنا لا في الإنتاج.
+    The old shape kept only strings (`isinstance(value, str)`), so the first
+    dashboard write onto a process running that code would have returned
+    **zero keys**: not one key failing but the whole layer stopping. This
+    test goes through the real writer (`key_file.save_entries`), not a file
+    written by hand in the test, so any drift between the two shapes falls
+    here, not in production.
     """
     path = tmp_path / "keys.json"
     monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(path))
 
     key_file.save_entries(str(path), "helius_api_keys", "helius_api_key", [
-        {"key": "dashboard-added-1", "label": "حسابٌ أضافته اللوحة"},
-        {"key": "dashboard-paused", "label": "موقوف", "enabled": False},
+        {"key": "dashboard-added-1", "label": "added by the dashboard"},
+        {"key": "dashboard-paused", "label": "paused", "enabled": False},
     ])
 
     assert provider_keys.read_keys("helius_api_keys", "helius_api_key") == ["dashboard-added-1"]
 
 
 def test_read_keys_reflects_an_edit_made_while_the_process_runs(monkeypatch, tmp_path):
-    """مفتاحٌ يُضاف من اللوحة يجب أن يعمل بلا إعادة تشغيل: القراءة من القرص كلَّ نداء."""
+    """A key added from the dashboard must work without a restart: read from
+    disk on every call."""
     path = tmp_path / "keys.json"
     path.write_text(json.dumps({"helius_api_keys": ["first-key"]}), encoding="utf-8")
     monkeypatch.setattr(provider_keys.config, "chain_keys_path", lambda: str(path))
@@ -79,7 +83,8 @@ def test_key_pool_rotates_and_cools_down_current_key(monkeypatch):
 
 
 def test_stats_counts_blocked_keys_and_rotations():
-    """اللوحة تحتاج «كم مفتاحاً متاحاً الآن» لا «كم مفتاحاً في الملف»."""
+    """The dashboard needs "how many keys are available right now", not "how
+    many are in the file"."""
     pool = provider_keys.KeyPool(["a", "b", "c"], cooldown_seconds=60)
 
     fresh = pool.stats()
@@ -92,40 +97,45 @@ def test_stats_counts_blocked_keys_and_rotations():
 
 
 def test_blocked_count_forgets_keys_whose_cooldown_expired():
-    """التبريد مؤقّت: لوحةٌ تعدّ «بُرِّد يوماً» تبقى حمراء بعد الشفاء."""
+    """The cooldown is temporary: a dashboard that counts "cooled once" would
+    stay red after healing."""
     pool = provider_keys.KeyPool(["a", "b"], cooldown_seconds=60)
     pool.rotate(block_current=True)
 
     assert pool.blocked_count() == 1
-    # ساعةٌ لاحقاً على نفس الساعة الرتيبة ⇒ لا شيء مبرَّد.
+    # One hour later on the same monotonic clock ⇒ nothing is cooling down.
     assert pool.blocked_count(now=time.monotonic() + 3600) == 0
 
 
 def test_stats_says_which_key_is_cooled_not_just_how_many():
-    """«واحدٌ من ثلاثة مرفوض» لا يقول أيُّها ⇒ ثلاثُ نقاطٍ حمراء ويُلام السليم."""
+    """"One of three rejected" does not say which one ⇒ three red dots and the
+    healthy one gets blamed."""
     pool = provider_keys.KeyPool(["a", "b", "c"], cooldown_seconds=60)
-    pool.rotate(block_current=True)   # يبرّد "a" وينتقل إلى "b"
+    pool.rotate(block_current=True)   # cools "a" and moves to "b"
 
     stats = pool.stats()
     assert stats["blocked_index"] == [0]
     assert stats["index"] == 1
-    # العددُ والقائمة وجهان لحقيقةٍ واحدة، فلا يتناقضان في العرض.
+    # The count and the list are two faces of one truth, so they must not
+    # contradict each other in the display.
     assert stats["blocked"] == len(stats["blocked_index"])
     assert pool.stats(now=time.monotonic() + 3600)["blocked_index"] == []
 
 
 def test_blocked_index_positions_match_the_order_the_dashboard_shows():
-    """الموضعُ يقابل سطرَ اللوحة: ترتيبُ القائمة هو ترتيبُ المفعّلة في الملفّ."""
+    """The position matches a dashboard row: the list order is the order of
+    the enabled ones in the file."""
     pool = provider_keys.KeyPool(["a", "b", "c"], cooldown_seconds=60)
-    pool.rotate(block_current=True)          # a مبرَّد، المؤشّر على b
-    pool.rotate(block_current=True)          # b مبرَّد أيضاً، المؤشّر على c
+    pool.rotate(block_current=True)          # a is cooling, the pointer is on b
+    pool.rotate(block_current=True)          # b is cooling too, the pointer is on c
 
     assert pool.stats()["blocked_index"] == [0, 1]
     assert pool.current() == "c"
 
 
 def test_stats_never_leaks_a_key_value_or_a_fragment_of_one():
-    """FR-013: التقرير أعدادٌ ومؤشّرات. لا قيمة، ولا كسرٌ منها، ولا بصمة."""
+    """FR-013: the report is counts and indexes. No value, no fragment of
+    one, no fingerprint."""
     secret = "sk-live-abcdef123456"
     pool = provider_keys.KeyPool([secret, "second-secret"])
     pool.rotate(block_current=True)
@@ -141,10 +151,12 @@ def test_stats_never_leaks_a_key_value_or_a_fragment_of_one():
 
 
 def test_pool_report_names_its_owner_so_two_processes_do_not_overwrite():
-    """مزوّدٌ واحد في عمليّتين بحالتين مختلفتين؛ صفٌّ واحد لهما كذبة.
+    """One provider in two processes with two different states; a single row
+    for both is a lie.
 
-    لا مزوّدَ مشتركاً اليوم — مسارُ الإعادة بلا مفتاح بعد حذف GoldRush — لكنّ
-    حقلَ المالك هو ما يمنع الأحدثَ من مسح صفِّ الأخرى يومَ يُضاف مزوّدٌ للطرفين.
+    No provider is shared today — the replay path is keyless since GoldRush
+    was removed — but the owner field is what stops the newer one from
+    wiping the other's row the day a provider is added to both sides.
     """
     report = json.loads(provider_keys.pool_report(
         {"nodereal": {"keys": 1}}, at="2026-08-17T00:00:00+00:00", owner="replay",
@@ -170,7 +182,8 @@ def test_write_pool_report_stamps_one_meta_row_per_owner():
 
 
 def test_write_pool_report_returns_false_on_a_locked_database():
-    """القاعدة المقفلة تُفقد التقرير ولا تُسقط الدورة — تقريرٌ لا قياس."""
+    """A locked database loses the report but does not take down the cycle —
+    it is a report, not a measurement."""
     class _Locked:
         def note_error(self, _key, _value):
             return False
@@ -179,6 +192,7 @@ def test_write_pool_report_returns_false_on_a_locked_database():
 
 
 def test_write_pool_report_tolerates_a_database_without_the_helper():
-    """قاعدةٌ وهميّة في اختبارٍ قديم لا تُسقط منادياً يكتب تقريراً فحسب."""
+    """A fake database from an old test does not take down a caller that only
+    writes a report."""
     assert provider_keys.write_pool_report(object(), "chain", {}, "t0") is False
 

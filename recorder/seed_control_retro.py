@@ -1,24 +1,29 @@
-"""استرجاع رجعيّ: بناء مجموعة ضابطة تغطّي **نفس فترة الإشارات**.
+"""Retro backfill: build a control group covering **the same period as the signals**.
 
-لماذا: المجموعة الضابطة الحيّة تدخل من لحظة تفعيلها، بينما عملات الإشارة دخلت
-على مدى يومين — فأي مقارنة بينهما تخلط «أثر الإشارة» بـ«أثر لحظة الدخول».
-هذا السكربت يلغي الخلط: يختار عملات من **أرشيف اللقطات نفسه**، ويمنح كلّاً منها
-ختم دخول من لحظة ظهورها الفعليّ في الأرشيف.
+Why: the live control group enters from the moment it is activated, while
+signal tokens entered over the course of two days — so any comparison between
+them mixes "the effect of the signal" with "the effect of the entry moment".
+This script removes the mixing: it picks tokens from **the snapshot archive
+itself** and gives each one an entry stamp from the moment it actually
+appeared in the archive.
 
-ممكن أصلاً لأنّ `snapshots` تحفظ قوائم trending/verified كاملةً لكل دورة، ولأنّ
-`getBarsNew` تعيد تاريخاً سعرياً يمتدّ أشهراً — فسعر أي عملة في الماضي متاح.
+Possible in the first place because `snapshots` stores full trending/verified
+lists for every cycle, and because `getBarsNew` returns price history
+stretching back months — so any token's price in the past is available.
 
-شروط صلاحية المقارنة (نفس شروط الضابطة الحيّة):
-- **لم يُشَر إليها قطّ** (لا في `signal_events` ولا في `watchlist`).
-- **اختيار عشوائيّ** من كون العملات لا حسب ترتيبها في القائمة.
-- **ختم الدخول من لقطة عشوائية** ظهرت فيها — لا أوّل ظهور (وإلّا انحاز
-  الاختيار إلى العملات القديمة) ولا الآن (وإلّا عاد الخلط الزمني).
-- **بلا نظر إلى الأداء**: لا يُستشار سعر ولا نتيجة في الاختيار إطلاقاً.
+Comparison validity conditions (same as the live control group):
+- **Never signalled** (neither in `signal_events` nor in `watchlist`).
+- **Random selection** from the token universe, not by list position.
+- **Entry stamp from a random snapshot** in which it appeared — not the first
+  appearance (otherwise selection is biased toward old tokens) and not now
+  (otherwise the temporal mixing returns).
+- **Blind to performance**: no price or outcome is consulted in selection at all.
 
-تُوسم `source='control_retro'` لتمييزها عن الضابطة الحيّة (`'control'`).
-الشموع تصلها تلقائياً عبر دورة المسجّل العادية.
+Labeled `source='control_retro'` to distinguish them from the live control
+group (`'control'`). Bars reach them automatically through the recorder's
+normal cycle.
 
-الاستعمال:
+Usage:
     Stop-ScheduledTask -TaskName FomoRecorder
     py seed_control_retro.py --dry-run
     py seed_control_retro.py --count 60
@@ -65,13 +70,13 @@ def _recorder_is_running() -> bool:
              "Where-Object { $_.CommandLine -like '*run_recorder.py*' }).ProcessId"],
             capture_output=True, text=True, timeout=30,
         )
-    except Exception:  # noqa: BLE001 — تعذّر الفحص — القرار للمشغّل
+    except Exception:  # noqa: BLE001 — check failed — the caller decides
         return False
     return bool(out.stdout.strip())
 
 
 def build_appearance_map(db: RecorderDB) -> dict[tuple[str, str], list[str]]:
-    """(عنوان، شبكة) → أختام اللقطات التي ظهرت فيها العملة."""
+    """(address, network) → stamps of the snapshots in which the token appeared."""
     seen: dict[tuple[str, str], list[str]] = {}
     rows = db._conn.execute(
         "SELECT recorded_at, raw_json FROM snapshots "
@@ -80,8 +85,8 @@ def build_appearance_map(db: RecorderDB) -> dict[tuple[str, str], list[str]]:
     for row in rows:
         try:
             items = extract.unwrap_token_list(decode_raw(row["raw_json"]))
-        except Exception:  # noqa: BLE001 — لقطة تالفة تُتخطّى ولا تُسقط البناء
-            continue  # لقطة تالفة تُتخطّى ولا تُسقط البناء
+        except Exception:  # noqa: BLE001 — a corrupt snapshot is skipped, it does not fail the build
+            continue  # a corrupt snapshot is skipped, it does not fail the build
         for it in items:
             addr = extract._token_address(it)
             if not addr:
@@ -99,15 +104,15 @@ def main() -> None:
 
     if not dry_run and _recorder_is_running():
         raise SystemExit(
-            "مهمّة FomoRecorder تعمل الآن. أوقفها أوّلاً:\n"
+            "The FomoRecorder task is running right now. Stop it first:\n"
             "  Stop-ScheduledTask -TaskName FomoRecorder"
         )
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
-        print("قراءة أرشيف اللقطات…", flush=True)
+        print("Reading the snapshot archive…", flush=True)
         appearances = build_appearance_map(db)
-        print(f"  عملات ظهرت في الأرشيف: {len(appearances)}")
+        print(f"  tokens that appeared in the archive: {len(appearances)}")
 
         signalled = db.signalled_tokens()
         known = db.known_tokens()
@@ -115,9 +120,9 @@ def main() -> None:
             key for key in appearances
             if key[0] not in signalled and key not in known
         )
-        print(f"  منها بلا إشارة ولم تدخل المراقبة: {len(pool)}")
+        print(f"  of those, never signalled and never watched: {len(pool)}")
         if not pool:
-            print("لا مرشّحين.")
+            print("No candidates.")
             return
 
         rng = random.Random(seed)
@@ -127,7 +132,8 @@ def main() -> None:
         added = 0
         for addr, net in picks:
             stamps = appearances[(addr, net)]
-            # ختم دخول من لقطة عشوائية ظهرت فيها — لا الأولى ولا الآن
+            # Entry stamp from a random snapshot it appeared in — not the
+            # first, and not now
             entry = rng.choice(stamps)
             if dry_run:
                 added += 1
@@ -138,15 +144,17 @@ def main() -> None:
                 added += 1
         if not dry_run:
             db._conn.commit()
-            # نافذة 48 ساعة قد تكون انتهت لبعضها؛ نطبّق نفس قاعدة المسجّل
+            # A 48-hour window may already have ended for some of them; apply
+            # the same rule the recorder applies
             expired = db.deactivate_expired(now.isoformat())
-            print(f"  انتهت نافذتها فوراً (أرشيف أقدم من 48س): {expired}")
+            print(f"  whose window already expired (archive older than 48h): {expired}")
 
-        print(f"\n{'[معاينة] ' if dry_run else ''}عملات ضابطة رجعية: {added}")
+        print(f"\n{'[preview] ' if dry_run else ''}retro control tokens: {added}")
         if not dry_run:
-            print(f"  ضابطة نشطة إجمالاً: {db.active_watch_count(is_control=1)}")
-            print(f"  مُشار إليها نشطة:   {db.active_watch_count(is_control=0)}")
-            print("\nالشموع ستصلها تلقائياً عبر دورة المسجّل (الأقدم سحباً أوّلاً).")
+            print(f"  total active control: {db.active_watch_count(is_control=1)}")
+            print(f"  active signalled:     {db.active_watch_count(is_control=0)}")
+            print("\nBars will reach them automatically through the recorder "
+                  "cycle (oldest pulls first).")
     finally:
         db.close()
 

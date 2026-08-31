@@ -1,4 +1,4 @@
-"""نبضاتُ خطوط الأنابيب ونموُّ الجداول — قراءة فقط."""
+"""Pipeline heartbeats and table growth — read-only."""
 import os
 import sqlite3
 from datetime import datetime, timezone

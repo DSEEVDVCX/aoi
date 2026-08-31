@@ -66,7 +66,7 @@ def test_finalize_refuses_while_active_backfill_is_pending(db, monkeypatch):
     monkeypatch.setattr(repair_evm_ledger.config, "EVM_NETWORKS", (NET,))
     monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", (NET,))
     db.upsert_watch(TOK, NET, "large_buy", "sig", 48, NOW)
-    with pytest.raises(RuntimeError, match="غير مكتمل"):
+    with pytest.raises(RuntimeError, match="incomplete"):
         repair_evm_ledger.finalize_training(db, [NET])
 
 
@@ -75,7 +75,7 @@ def test_finalize_refuses_while_replay_is_pending(db, monkeypatch):
     monkeypatch.setattr(repair_evm_ledger.config, "EVM_REPLAY_NETWORKS", (NET,))
     db.upsert_watch(TOK, NET, "large_buy", "sig", 0, NOW)
     db.set_evm_backfill_state(NET, TOK, "done", NOW)
-    with pytest.raises(RuntimeError, match="إعادة EVM"):
+    with pytest.raises(RuntimeError, match="incomplete EVM replays"):
         repair_evm_ledger.finalize_training(db, [NET])
 
 
@@ -138,7 +138,7 @@ def test_reset_rejects_a_non_evm_network_without_deleting_it(db):
         "is_control": 0, "top1_pct": 25.0, "is_replay": 0, "raw_json": {},
     })
 
-    with pytest.raises(ValueError, match="غير مسموح"):
+    with pytest.raises(ValueError, match="disallowed"):
         repair_evm_ledger.reset(db, [solana])
 
     assert db._conn.execute(
@@ -160,7 +160,7 @@ def test_finalize_queues_training_rebuild_only_once(db, monkeypatch):
 
 
 def test_reset_requires_the_complete_configured_network_set(db):
-    with pytest.raises(ValueError, match="مجموعة شبكات EVM كاملة"):
+    with pytest.raises(ValueError, match="full EVM network set"):
         repair_evm_ledger.reset(db, [NET])
 
 

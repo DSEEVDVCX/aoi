@@ -1,40 +1,47 @@
-"""منع الجهاز من النوم التلقائي أثناء عمل المسجّل (ويندوز فقط).
+"""Keep the machine from sleeping automatically while the recorder runs (Windows only).
 
-**لماذا**: قياس على 1–9 أغسطس أظهر **74.4 ساعة توقّف من 214** (34.8%) موزّعة على
-21 فجوة، كلّها من سكون تلقائي بعد خمول على البطارية — أكّده سجلّ النظام
-(`Kernel-Power 42` ثم `107`) بأوقات تطابق الفجوات دقيقةً بدقيقة. الساعة 04:00 UTC
-غائبة من **كل** الأيام التسعة.
+**Why**: measurement over August 1–9 showed **74.4 stalled hours out of 214**
+(34.8%) spread over 21 gaps, all from automatic sleep after idle on battery —
+confirmed by the system log (`Kernel-Power 42` then `107`) at times matching
+the gaps minute for minute. The 04:00 UTC hour is missing from **all** nine
+days.
 
-**ما يضيع بالنوم ليس متساوياً**: الشموع تُسحب تاريخياً بعد الصحوة فتُعوَّض
-بالكامل، لكنّ `signal_events` و`token_social` و`token_holders` قياسات لحظية من
-feed حيّ **لا أرشيف لها** — عملة اشتعلت في الرابعة فجراً لم يرَها البوت أصلاً.
-فالضرر ليس ثقوباً في البيانات بل **تحيّز زمني** في مجموعة التدريب: تمثّل عملات
-ساعات النهار وحدها، وهو أثر لا يُصلَح رجعيّاً من الخام بخلاف كل ما أُصلح سابقاً.
+**What sleep costs is not uniform**: bars are fetched historically after the
+wake-up and fully recovered, but `signal_events`, `token_social` and
+`token_holders` are moment-in-time measurements from the live feed **with no
+archive** — a coin that fired at 4 a.m. was simply never seen by the bot. The
+damage is not holes in the data but **time-of-day bias** in the training set:
+only daytime coins get represented, and that is an effect that cannot be fixed
+retroactively from raw data, unlike everything fixed before it.
 
-**كيف**: `SetThreadExecutionState` يعلن للنظام أنّ هذه العملية تعمل، فيمتنع عن
-السكون التلقائي. القفل **أضيق من إعداد الطاقة**: مربوط بحياة العملية، فإن توقّف
-المسجّل عاد الجهاز ينام كالعادة — بخلاف `powercfg` الذي يعطّل النوم للأبد.
+**How**: `SetThreadExecutionState` tells the system this process is active, so
+it refrains from automatic sleep. The lock is **narrower than a power setting**:
+tied to the process's lifetime — if the recorder stops, the machine sleeps as
+usual — unlike `powercfg`, which disables sleep forever.
 
-**ما لا يفعله** (ولا حيلة فيه): الإطفاء اليدوي أو `Sleep` من قائمة ابدأ يوقف
-العملية كأي عملية أخرى. `ES_SYSTEM_REQUIRED` يمنع النوم **التلقائي** وحده، ولا
-يعصي أمر المستخدم الصريح. ولا يمنع إطفاء الشاشة (لم نطلب `ES_DISPLAY_REQUIRED`:
-الشاشة لا تعني شيئاً لجمع البيانات، وإبقاؤها مضاءة استهلاك بلا مقابل).
+**What it does not do** (nothing can): a manual shutdown or `Sleep` from the
+start menu stops the process like any other. `ES_SYSTEM_REQUIRED` blocks
+**automatic** sleep only and does not defy an explicit user command. Nor does
+it keep the screen on (`ES_DISPLAY_REQUIRED` was not requested: the screen
+means nothing to data collection, and keeping it lit is cost without benefit).
 """
 from __future__ import annotations
 
 import sys
 
-# رايات SetThreadExecutionState من winbase.h
-_ES_CONTINUOUS = 0x80000000        # الحالة تدوم حتى تُلغى، لا نبضة واحدة
-_ES_SYSTEM_REQUIRED = 0x00000001   # لا تُنِم النظام تلقائياً
+# SetThreadExecutionState flags from winbase.h
+_ES_CONTINUOUS = 0x80000000        # state persists until cleared, not a one-shot pulse
+_ES_SYSTEM_REQUIRED = 0x00000001   # do not put the system to sleep automatically
 
 
 def keep_awake() -> bool:
-    """يطلب قفل استيقاظ للعملية الحالية. يعيد True إن نجح.
+    """Requests a wake lock for the current process. Returns True on success.
 
-    الفشل غير قاتل: المسجّل يعمل كما هو ويعود النوم يثقب البيانات كما كان، فلا
-    معنى لإسقاط جمعٍ ناجح لأجل تحسينٍ تعذّر. والقفل مربوط بـ**الخيط** الذي
-    ينادي، ولذلك يُنادى من الخيط الرئيس قبل `asyncio.run` لا من مهمّة فرعية.
+    Failure is not fatal: the recorder keeps running and sleep keeps punching
+    holes in the data as before, so there is no sense in dropping a working
+    collection over an enhancement that failed. The lock is tied to the
+    **thread** that calls it, which is why it is called from the main thread
+    before `asyncio.run`, never from a subtask.
     """
     if not sys.platform.startswith("win"):
         return False
@@ -45,12 +52,12 @@ def keep_awake() -> bool:
             _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED
         )
         return r != 0
-    except Exception:  # noqa: BLE001 — تحسين لا شرط تشغيل
+    except Exception:  # noqa: BLE001 — an enhancement, not a requirement
         return False
 
 
 def release() -> bool:
-    """يُسقط القفل فيعود الجهاز ينام كالعادة."""
+    """Drops the lock so the machine sleeps as usual."""
     if not sys.platform.startswith("win"):
         return False
     try:

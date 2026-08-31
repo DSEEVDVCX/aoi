@@ -1,9 +1,9 @@
-"""طبقة قياس BSC اللحظي عبر NodeReal.
+"""Live BSC measurement layer via NodeReal.
 
-تطلب NodeReal أعلى 20 رصيداً مرتبة، وعدد الحائزين، بينما يُقرأ totalSupply
-من العقد نفسه. لا نستخدم هذه الطبقة لبناء دفتر Transfer: NodeReal هو المصدر
-المفهرس للحالة الحالية، وRPC القياسي يبقى مسار التحويلات للشبكات التي اكتمل
-تاريخها.
+NodeReal serves the sorted top-20 balances and the holder count, while totalSupply
+is read from the contract itself. This layer is not used to build a Transfer
+ledger: NodeReal is the indexer of current state, and standard RPC remains the
+transfers route for networks whose history is complete.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def build_bsc_concentration_row(
     total_supply: int, top: Sequence[tuple[str, int]],
     burn_balances: Sequence[tuple[str, int]] = (),
 ) -> dict[str, Any] | None:
-    """يبني صف التركّز من قيم uint256، مع استبعاد الحرق من النسب."""
+    """Builds the concentration row from uint256 values, excluding burns from the ratios."""
     burn_supply = sum(int(balance) for _, balance in burn_balances)
     supply = max(0, int(total_supply) - burn_supply)
     amounts = [int(balance) for address, balance in top if address.lower() not in _BURN and int(balance) > 0]
@@ -75,7 +75,7 @@ async def _maybe_sleep(sleep, seconds: float) -> None:
 async def run_bsc_cycle(
     rpc: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep,
 ) -> dict[str, int]:
-    """يحدّث شريحة BSC المستحقة ويحفظ لقطة لكل عملة نجحت."""
+    """Refreshes the due BSC slice and saves a snapshot for every token that succeeded."""
     stats = {"bsc_due": 0, "bsc_rows": 0, "bsc_errors": 0, "bsc_rate_limits": 0}
     now = datetime.fromisoformat(recorded_at)
     stale_before = (now - timedelta(seconds=config.BSC_NODEREAL_REFRESH_SECONDS)).isoformat()
@@ -94,8 +94,8 @@ async def run_bsc_cycle(
             await _maybe_sleep(sleep, config.BSC_NODEREAL_CALL_PACING_SECONDS)
             total_supply = await rpc.total_supply(token)
             await _maybe_sleep(sleep, config.BSC_NODEREAL_CALL_PACING_SECONDS)
-            # نطلب مقعدين إضافيين: إن دخل عنوانا الحرق أعلى القائمة يبقى لدينا
-            # أعلى 20 حائزاً فعلياً بعد استبعادهما.
+            # Request two extra seats: if the burn addresses enter the top of the
+            # list we still have the true top 20 holders after excluding them.
             top = await rpc.top_holders(token, top_n=20 + len(evm_rpc.BURN_ADDRESSES))
             burn_balances = []
             for address in evm_rpc.BURN_ADDRESSES:
@@ -120,11 +120,11 @@ async def run_bsc_cycle(
             db.set_chain_state(token, config.BSC_NODEREAL_NETWORK, "ok", row["top1_pct"], recorded_at)
         except NodeRealRateLimit as exc:
             stats["bsc_rate_limits"] += 1
-            # `note_error`: كتابةٌ دفتريّة داخل معالج خطأ ⇒ قفلُ القاعدة عندها
-            # كان سيُسقط بقيّة الشريحة بدل عملةٍ واحدة (انظر `db.note_error`).
+            # `note_error`: a bookkeeping write inside the error handler would have
+            # locked the DB at that point, dropping the rest of the slice instead of a single token (see `db.note_error`).
             db.note_error("last_error_bsc_nodereal", f"{recorded_at}: {type(exc).__name__}")
             db.set_chain_state(token, config.BSC_NODEREAL_NETWORK, "error", None, recorded_at)
-        except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تسقط الشريحة
+        except Exception as exc:  # noqa: BLE001 — one token does not sink the whole slice
             stats["bsc_errors"] += 1
             db.note_error("last_error_bsc_nodereal", f"{recorded_at}: {type(exc).__name__}: {exc}")
             db.set_chain_state(token, config.BSC_NODEREAL_NETWORK, "error", None, recorded_at)

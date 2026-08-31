@@ -1,19 +1,21 @@
-"""يبدّل حسابَ المسجّل إلى الحساب المسجَّل دخولُه في `.chk_profile`.
+"""Switches the recorder's account to the one signed in inside `.chk_profile`.
 
-هذا التوأمُ الخفيّ لزرّ «بدّل الحساب» في اللوحة: نفسُ المسار بالحرف
-(`POST /api/fomo-account/switch`) ونفسُ الحرس ونفسُ النسخة الاحتياطيّة، لكن بلا
-إنسانٍ يفتح DevTools وينسخ مخزنَ المتصفّح بيده. اللوحةُ للحالة العاديّة، وهذا
-لحالةِ أنّ الجلسةَ العاملة موجودةٌ أصلاً في الملفّ الشخصيّ الدائم الذي تستعمله
-`check_account_block.py` و`probe_feed_liveness.py`.
+This is the invisible twin of the "Switch account" button in the dashboard:
+the same path to the letter (`POST /api/fomo-account/switch`), the same guards
+and the same backup, but without a human opening DevTools and copying the
+browser store by hand. The dashboard is for the normal case; this is for the
+case where a working session already lives in the persistent profile that
+`check_account_block.py` and `probe_feed_liveness.py` use.
 
-ولا تُطبَع قيمةُ توكنٍ ولا كسرٌ منها: المخزنُ يُقرأ في الذاكرة، ويُرسل إلى
-اللوحة، ويُطبع منه البصمةُ وآخرُ أربعة أحرف فقط. فلا يبقى سرٌّ في سجلٍّ ولا في
-شريط أوامر.
+No token value, nor any fragment of one, is ever printed: the store is read
+in memory, sent to the dashboard, and only its fingerprint and last four
+characters are printed. So no secret stays in a log or on a command line.
 
-**ولا يُقبل التوكنُ الأوّلُ الذي يظهر**: Privy يكتب `privy:token` لجلسةٍ مجهولةٍ
-عند إقلاع الـSDK قبل أن يستعيد الجلسةَ المحفوظة (قِيس مرّتين 2026-08-20)، فمن
-قرأ أوّلَ قيمةٍ يجدها كتب هويّةً لا تملك شيئاً وقرأ «تمّ». فالانتظارُ هنا على
-البصمة لا على وجود المفتاح.
+**The first token that appears is not accepted**: Privy writes `privy:token`
+for an anonymous session when the SDK boots, before it restores the saved
+session (measured twice on 2026-08-20) — whoever reads the first value they
+find writes down an identity that owns nothing and reads "done". So the wait
+here is on the fingerprint, not on the key's mere existence.
 
     py switch_recorder_account.py
 """
@@ -38,7 +40,7 @@ APP = "https://fomo.family"
 PROFILE_DIR = pathlib.Path(__file__).with_name(".chk_profile")
 DASHBOARD = os.environ.get("AOI_DASHBOARD", "http://127.0.0.1:8090")
 
-# هويّةُ جلسة Privy المجهولة — نفسُ الثابت في `dashboard/account.py`.
+# The anonymous Privy session identity — the same constant as in `dashboard/account.py`.
 ANON_DID = "did:privy:cmt0phbhk00080dla83dtghph"
 
 _READ_PRIVY = (
@@ -48,7 +50,7 @@ _READ_PRIVY = (
 
 
 def did_of(token: str | None) -> str:
-    """بصمةُ الهويّة من حِمل الـJWT بلا تحقّقٍ من التوقيع — للعرض والمقارنة."""
+    """The identity's fingerprint from the JWT payload, no signature check — for display and comparison."""
     if not token:
         return ""
     try:
@@ -60,7 +62,7 @@ def did_of(token: str | None) -> str:
 
 
 async def read_store() -> dict[str, str]:
-    """يفتح الملفَّ الشخصيّ الدائم ويقرأ مفاتيحَ Privy بعد استعادة الجلسة."""
+    """Opens the persistent profile and reads the Privy keys after the session is restored."""
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
@@ -76,7 +78,7 @@ async def read_store() -> dict[str, str]:
             with contextlib.suppress(Exception):
                 store = await page.evaluate(_READ_PRIVY) or {}
             did = did_of(store.get("privy:token"))
-            if did and did != ANON_DID:      # الجلسةُ المحفوظة، لا المجهولة
+            if did and did != ANON_DID:      # the saved session, not the anonymous one
                 break
             await asyncio.sleep(1.0)
         with contextlib.suppress(Exception):
@@ -85,11 +87,11 @@ async def read_store() -> dict[str, str]:
 
 
 def post_switch(store: dict[str, str]) -> dict:
-    """يرسل المخزنَ إلى اللوحة — نفسُ المسار الذي يستعمله الزرّ، بحراسه كلِّها."""
+    """Sends the store to the dashboard — the same path the button uses, with all its guards."""
     page = urllib.request.urlopen(DASHBOARD + "/", timeout=10).read().decode("utf-8")
     match = re.search(r'const DASHBOARD_TOKEN = "([0-9a-f]{64})"', page)
     if not match:
-        raise SystemExit(">>> لم أجد رمزَ حماية اللوحة — هل اللوحةُ تعمل على 8090؟")
+        raise SystemExit(">>> Dashboard token not found — is the dashboard running on 8090?")
     request = urllib.request.Request(
         DASHBOARD + "/api/fomo-account/switch",
         data=json.dumps(store).encode("utf-8"),
@@ -105,7 +107,7 @@ def post_switch(store: dict[str, str]) -> dict:
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
         body = json.loads(error.read() or b"{}")
-        raise SystemExit(f">>> رفضت اللوحة ({error.code}): {body.get('error')}") from None
+        raise SystemExit(f">>> The dashboard refused ({error.code}): {body.get('error')}") from None
 
 
 async def main() -> None:
@@ -113,20 +115,20 @@ async def main() -> None:
     did = did_of(store.get("privy:token"))
     if not did:
         raise SystemExit(
-            ">>> لا جلسة في .chk_profile — شغّل check_account_block.py وسجّل دخولاً أوّلاً."
+            ">>> No session in .chk_profile — run check_account_block.py and sign in first."
         )
     if did == ANON_DID:
         raise SystemExit(
-            ">>> الملفُّ الشخصيّ يحمل جلسةً مجهولةً لا حساباً: انتهى الانتظارُ قبل أن "
-            "يستعيد Privy الجلسةَ المحفوظة، أو أنّ الجلسةَ انتهت وتحتاج دخولاً جديداً."
+            ">>> The profile holds an anonymous session, not an account: the wait ended "
+            "before Privy restored the saved session, or the session expired and needs a fresh sign-in."
         )
-    print(f"وُجد في الملفّ الشخصيّ: {did}")
-    print(f"مفاتيحُ Privy المقروءة: {len(store)}")
+    print(f"Found in the profile: {did}")
+    print(f"Privy keys read: {len(store)}")
 
     result = post_switch(store)
     print(f"\n>>> {result['message']}")
-    print(f"الهويّةُ الآن : {result['did']} (…{result['token_tail']})")
-    print(f"نسخةُ الرجوع : {result['backup']}")
+    print(f"Identity now : {result['did']} (…{result['token_tail']})")
+    print(f"Rollback copy: {result['backup']}")
 
 
 if __name__ == "__main__":

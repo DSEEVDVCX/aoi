@@ -1,17 +1,17 @@
-"""طبقة قاعدة البيانات لمسجّل البيانات التاريخي.
+"""Database layer for the historical data recorder.
 
-مغلّف رقيق حول sqlite3: إنشاء المخطّط، إدراج idempotent (INSERT OR IGNORE /
-UPSERT حسب الجدول)، وقراءة watchlist. لا منطق شبكة هنا — قابل للاختبار كاملاً
-بقاعدة بيانات مؤقّتة.
+A thin wrapper around sqlite3: schema creation, idempotent inserts (INSERT OR IGNORE /
+UPSERT depending on the table), and watchlist reads. No network logic here — fully
+testable with a temporary database.
 
-المبدأ: كل صفّ يحمل raw_json الخام دائماً. الحقول المستخرجة للاستعلام السريع؛
-الخام للحقيقة الكاملة وإعادة الاشتقاق.
+Principle: every row always carries the full raw_json. Extracted fields serve fast
+queries; the raw serves the complete truth and re-derivation.
 
-**ضغط الخام**: الخام يُخزَّن مضغوطاً بـ zlib (BLOB) لا نصّاً. بلا ضغط كانت
-القاعدة تكبر ~1.3 GB يومياً (`snapshots` وحدها 577 MB خلال 20 ساعة) لأنّ لقطة
-كاملة من trending/verified/feed تُكتب كل دقيقة. الضغط بلا خسارة (نسبة ~4.7x)
-فلا يُفقد أي بايت من الأرشيف — راجع `decode_raw` للقراءة. الصفوف القديمة
-المكتوبة نصّاً تبقى مقروءة (decode_raw يقبل النوعين).
+**Raw compression**: raw is stored zlib-compressed (BLOB), not as text. Without
+compression the database grew ~1.3 GB daily (`snapshots` alone 577 MB over 20 hours)
+because a full trending/verified/feed snapshot is written every minute. Compression is
+lossless (~4.7x ratio), so not a byte of the archive is lost — see `decode_raw` for
+reading. Old rows written as text remain readable (decode_raw accepts both types).
 """
 from __future__ import annotations
 
@@ -24,35 +24,35 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-# مستوى ضغط zlib: 6 هو أفضل مقايضة قياساً على البيانات الحيّة
-# (4.7x بـ 5.6ms/لقطة مقابل 5.9x بـ 49ms لـ lzma).
+# zlib compression level: 6 is the best trade-off measured on live data
+# (4.7x at 5.6ms/snapshot vs 5.9x at 49ms for lzma).
 _ZLIB_LEVEL = 6
-# بادئة zlib القياسية (0x78) — نميّز بها الخام المضغوط عن النصّ القديم.
+# The standard zlib prefix (0x78) — how we tell compressed raw apart from legacy text.
 _ZLIB_MAGIC = 0x78
 _EVM_NETWORK_IDS = frozenset({"56", "143", "4663", "8453"})
 _EVM_NETWORK_IDS_SQL = "'56', '143', '4663', '8453'"
 
 
 class StaleEVMState(RuntimeError):
-    """تغيّرت حالة دفتر EVM أثناء نداء شبكة؛ لا يجوز تثبيت جوابه القديم."""
+    """EVM ledger state changed during a network call; its stale answer must not be committed."""
 
 
 def utcnow_iso() -> str:
-    """الوقت الحالي ISO-8601 UTC — الختم الزمني الموحّد للمسجّل."""
+    """Current ISO-8601 UTC time — the recorder's unified timestamp."""
     return datetime.now(UTC).isoformat()
 
 
 def encode_raw(raw: Any) -> bytes:
-    """أي كائن (أو نصّ JSON جاهز) → BLOB مضغوط للتخزين في عمود raw_json."""
+    """Any object (or ready JSON text) → a compressed BLOB for storage in the raw_json column."""
     text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-    # بعض تعليقات المنبع تحمل نصف زوج UTF-16 مثل `\ud83d`. هذا ليس Unicode
-    # صالحاً للـUTF-8، لكن تمثيله كـJSON escape يحفظ الخام ولا يسقط لقطة العملة.
+    # Some upstream comments carry a lone UTF-16 surrogate such as `\ud83d`. This is not
+    # valid UTF-8, but representing it as a JSON escape preserves the raw instead of dropping the token snapshot.
     return zlib.compress(text.encode("utf-8", errors="backslashreplace"), _ZLIB_LEVEL)
 
 
 def decode_raw(value: Any) -> Any:
-    """عمود raw_json → الكائن الأصلي. يقبل الصفوف الجديدة (BLOB مضغوط)
-    والقديمة (نصّ JSON عاديّ) على السواء، فلا يُكسر الأرشيف الموجود."""
+    """The raw_json column → the original object. Accepts new rows (compressed BLOB)
+    and old ones (plain JSON text) alike, so the existing archive is never broken."""
     if value is None:
         return None
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -64,17 +64,17 @@ def decode_raw(value: Any) -> Any:
 
 
 class RecorderDB:
-    """اتصال SQLite واحد للمسجّل (حلقة أحادية الخيط، فلا حاجة لتجمّع اتصالات)."""
+    """A single SQLite connection for the recorder (single-threaded loop, so no connection pool)."""
 
     def __init__(self, db_path: str, schema_path: str) -> None:
-        # timeout=30: عمليتان تكتبان الآن (المسجّل + الموسِّم FomoLabeler)؛
-        # WAL يسلسل الكتابات لكنّ مهلة بايثون الافتراضية (5ث) قد تضيق وقت
-        # الازدحام فترمي "database is locked" بلا داعٍ.
+        # timeout=30: two writers are active now (recorder + the FomoLabeler labeler);
+        # WAL serializes writes, but Python's default timeout (5s) can be too tight
+        # under contention and throw "database is locked" needlessly.
         self._db_path = db_path
         self._conn = sqlite3.connect(db_path, timeout=30)
-        # سقفُ حجمِ WAL بعدَ الـcheckpoint (256MB): بلا هذا السقفَ نما الملفُّ
-        # إلى ~5GB تحت الكتّاب المتوازيين (مسجّل+موسِّم+EVM) وأعاد أخطاء
-        # «database is locked» على القرّاء الطويلين. القياسُ 2026-08-24.
+        # WAL size cap after checkpoint (256MB): without this cap the file grew
+        # to ~5GB under parallel writers (recorder+labeler+EVM) and re-raised
+        # "database is locked" errors on long readers. Measured 2026-08-24.
         self._conn.execute("PRAGMA journal_size_limit=268435456")
         self._conn.row_factory = sqlite3.Row
         self._batching = False
@@ -82,11 +82,11 @@ class RecorderDB:
         self._apply_schema(schema_path)
 
     def _apply_schema(self, schema_path: str) -> None:
-        # الترحيل **قبل** المخطّط: schema.sql ينشئ فهرساً على is_control، وهو
-        # يفشل على جدول قديم لا يملك العمود بعد. على قاعدة جديدة الترحيل بلا أثر
-        # (لا جداول بعد)، فالترتيب آمن في الحالتين.
-        # تبدأ عدة مهام معاً بعد تسجيل الدخول؛ أحدها قد يملك قفل الكتابة أثناء
-        # تهيئة المخطّط. نعيد المحاولة للقفل المؤقت فقط، ولا نخفي أخطاء المخطط.
+        # Migration **before** the schema: schema.sql creates an index on is_control,
+        # which fails on an old table that does not have the column yet. On a fresh
+        # database the migration is a no-op (no tables yet), so the order is safe either way.
+        # Several tasks start together after login; one of them may hold the write lock
+        # during schema setup. We retry only on a transient lock, and never hide schema errors.
         delay = 0.25
         for attempt in range(8):
             try:
@@ -105,14 +105,14 @@ class RecorderDB:
             raise
         with open(schema_path, encoding="utf-8") as fh:
             script = fh.read()
-        # سبعُ عمليّات تفتح القاعدة الآن، وإقلاعها قد يتزامن (إعادة تشغيل مهمّة،
-        # أو دخول Windows). المخطّط يحوي `DROP VIEW IF EXISTS v; CREATE VIEW v`
-        # لأنّ العرض يجب أن يُعاد بناؤه كي يرى الأعمدة الجديدة — وهذا الزوج غير
-        # ذرّي بين عمليّتين: تُسقط A ثم تُسقط B ثم تنشئ A، فيفشل إنشاء B بـ
-        # "view ... already exists". حدث فعلاً: FomoBuildRows مات عند الإقلاع
-        # وبقي ميّتاً 13 ساعة (2026-08-13، 02:09 ← 15:12) بلا سطر في سجلّه
-        # الدوريّ، فالفشل كان في سجلّ الإقلاع وحده. النافذة أجزاء من الثانية
-        # فإعادة المحاولة تكفي: الجارّ يكون قد أكمل.
+        # Seven processes open the database now, and their startups can coincide (a task
+        # restart, or a Windows login). The schema contains `DROP VIEW IF EXISTS v; CREATE VIEW v`
+        # because a view must be rebuilt to see new columns — and this pair is not
+        # atomic across two processes: A drops, then B drops, then A creates, so B's
+        # create fails with "view ... already exists". It actually happened: FomoBuildRows
+        # died at startup and stayed dead 13 hours (2026-08-13, 02:09 → 15:12) with no
+        # line in its periodic log — the failure was in the boot log alone. The window is
+        # a fraction of a second, so a retry suffices: the neighbour will have finished.
         for attempt in range(3):
             try:
                 self._conn.executescript(script)
@@ -181,7 +181,7 @@ class RecorderDB:
                 )
 
     def _quarantine_legacy_outcomes(self) -> None:
-        """يعزل كل نتيجة watch أقدم من تصميم المقارنة الحالي."""
+        """Quarantines every watch outcome older than the current comparison design."""
         from config import CONTROL_DESIGN_VERSION
 
         self._conn.execute(
@@ -194,10 +194,10 @@ class RecorderDB:
         )
 
     def _backfill_watch_windows(self) -> None:
-        """يحفظ نوافذ الإشارات القديمة فقط قبل اعتماد السجلّ immutable.
+        """Preserves only the legacy signal windows before the log becomes immutable.
 
-        الضابطة v1 حُذفت بقرار المشروع ولا يجوز إعادتها من watchlist قديمة؛
-        وحدها نوافذ الإشارة غير الضابطة تُرحّل لأغراض التشغيل التاريخيّ.
+        The v1 control cohort was deleted by project decision and must never be
+        re-created from an old watchlist; only non-control signal windows are migrated, for historical operation.
         """
         self._conn.execute(
             """INSERT OR IGNORE INTO watch_windows(
@@ -212,12 +212,12 @@ class RecorderDB:
         )
 
     def _migrate(self) -> None:
-        """يضيف الأعمدة الناقصة إلى قاعدة قائمة.
+        """Adds missing columns to an existing database.
 
-        `CREATE TABLE IF NOT EXISTS` لا يمسّ جدولاً موجوداً، فعمود يُضاف إلى
-        schema.sql لا يظهر أبداً في قاعدة أُنشئت قبله — تعطب الاستعلامات في
-        الإنتاج بينما تمرّ على قاعدة اختبار جديدة. الفحص هنا idempotent،
-        والجدول الغائب يُتخطّى (`if cols`) فيتكفّل به المخطّط بعد قليل.
+        `CREATE TABLE IF NOT EXISTS` never touches an existing table, so a column added
+        to schema.sql never appears in a database created before it — queries break in
+        production while passing on a fresh test database. The check here is idempotent,
+        and a missing table is skipped (`if cols`) so the schema handles it shortly.
         """
         for table, column, ddl in _COLUMN_MIGRATIONS:
             cols = {
@@ -226,29 +226,29 @@ class RecorderDB:
             if cols and column not in cols:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
-        # outcomes v2: المفتاح القديم (token, entry_ts) يتصادم حتماً (201 إشارة
-        # لعملة واحدة). الجدول فارغ بالتصميم، فإسقاطه آمن؛ وإن حمل بيانات على
-        # غير المتوقّع نُبقيها باسم legacy بدل إتلافها.
+        # outcomes v2: the old key (token, entry_ts) inevitably collides (201 signals
+        # for a single token). The table is empty by design, so dropping it is safe; if
+        # it unexpectedly holds data we keep it under the legacy name instead of destroying it.
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(outcomes)")}
         if cols and "kind" not in cols:
             n = self._conn.execute("SELECT COUNT(*) FROM outcomes").fetchone()[0]
             if n == 0:
                 self._conn.execute("DROP TABLE outcomes")
-            else:  # pragma: no cover - لا يُفترض حدوثه
+            else:  # pragma: no cover - not expected to happen
                 self._conn.execute("ALTER TABLE outcomes RENAME TO outcomes_legacy")
 
     def _commit(self) -> None:
-        """يثبّت فوراً، إلّا داخل batch() حيث يؤجَّل التثبيت إلى نهاية الدفعة."""
+        """Commits immediately, except inside batch() where the commit is deferred to the end of the batch."""
         if not self._batching:
             self._conn.commit()
 
     @contextmanager
     def batch(self) -> Iterator[None]:
-        """يجمع إدراجات كثيرة في تثبيت واحد (fsync واحد بدل عشرات).
+        """Bundles many inserts into a single commit (one fsync instead of dozens).
 
-        الحلقة تكتب ~65 tick في الدورة؛ تثبيت كل صفّ على حدة كان يعني ~70
-        fsync في الدقيقة. الخروج بخطأ يُرجع الدفعة كاملة (rollback) — لذا
-        نستعملها حول حلقات الإدراج فقط، لا حول كتابة meta الخاصّة بالأخطاء.
+        The loop writes ~65 ticks per cycle; committing each row separately meant ~70
+        fsyncs per minute. An error on exit rolls the whole batch back (rollback) — hence
+        we use it only around insert loops, never around error-bookkeeping meta writes.
         """
         if self._batching:
             self._savepoint_counter += 1
@@ -266,9 +266,9 @@ class RecorderDB:
         savepoint: str | None = None
         self._batching = True
         try:
-            # احجز الكاتب قبل أي فحص حالة داخل الدفعة. بدء المعاملة عند أول
-            # INSERT يترك نافذة بين SELECT والكتابة يستطيع فيها reset/عامل آخر
-            # تغيير المؤشر، فتُطبّق نفس السجلات مرتين.
+            # Claim the writer before any state check inside the batch. Starting the
+            # transaction at the first INSERT leaves a window between the SELECT and
+            # the write where reset or another worker can move the cursor, applying the same records twice.
             if owns_transaction:
                 self._conn.execute("BEGIN IMMEDIATE")
             else:
@@ -294,35 +294,36 @@ class RecorderDB:
         self._conn.close()
 
     def recover_connection(self) -> str:
-        """ينقذ اتّصالاً عَلِق فصار يرفض كلّ كتابة بـ`database is locked`.
+        """Rescues a connection that got stuck and now refuses every write with `database is locked`.
 
-        الاتصال واحد وعمره عمر العملية (`__init__` تفتح واحداً)، فعطبٌ في حالته
-        يدوم إلى إعادة التشغيل. وأخطر ما يَعلق لقطةُ قراءة في WAL: إن سبق
-        الكاتبون لقطةَ اتّصالنا ردّ SQLite كلّ كتابةٍ منه بـ`SQLITE_BUSY_SNAPSHOT`
-        — ورسالته في بايثون `database is locked` نفسها، **والمهلة لا تنفع**: لا
-        يُنادى معالج الانتظار لهذه الحالة، فالثلاثون ثانية تنتهي كما بدأت ويبقى
-        الاتصال عاجزاً أبداً بلا سبب ظاهر.
+        The connection is single and lives as long as the process (`__init__` opens
+        one), so a fault in its state lasts until restart. And the most dangerous
+        thing that sticks is a WAL read snapshot: once writers pass our connection's
+        snapshot, SQLite answers every write from it with `SQLITE_BUSY_SNAPSHOT`
+        — and its Python message is the same `database is locked`, **and the timeout
+        does not help**: no busy handler is invoked for this state, so the thirty
+        seconds expire as they began and the connection stays helpless forever, with no visible cause.
 
-        حدث فعلاً: 2026-08-19، انقطع الجمع 22 دقيقة و40 ثانية (14:10:11 ←
-        14:32:51 UTC)، كل دورة تنهار عند `set_meta`، بينما أخذ اتّصالٌ جديد قفلَ
-        الكتابة في 0.09 ثانية — فالقفل حرّ والعالق اتّصالنا. بدأ ذلك 42 ثانية قبل
-        `VACUUM INTO` التي تجريها `FomoBackup` على 16.7 GB. ودرعُ الدورة كان
-        يسجّل ويُكمل، فلم يفرج عنه إلا إعادةُ تشغيلٍ يدويّة.
+        It actually happened: 2026-08-19, collection was down 22 minutes 40 seconds
+        (14:10:11 → 14:32:51 UTC), every cycle crashing at `set_meta`, while a fresh
+        connection took the write lock in 0.09 seconds — the lock was free and the
+        stuck one was ours. It began 42 seconds before the `VACUUM INTO` that
+        `FomoBackup` runs over 16.7 GB. And the cycle shield kept logging and completing, so only a manual restart released it.
 
-        ثلاث درجات تتوقّف عند أوّل ما يكفي: `rollback` إن كانت معاملةٌ مفتوحة،
-        ثمّ مسبار `BEGIN IMMEDIATE`/`ROLLBACK` يقطع بأنّ الكتابة عادت، وإلّا
-        اتّصالٌ جديد. وبلا `_apply_schema`: الترحيل والمخطّط عملُ إقلاعٍ ثقيل
-        وليس هذا موضعه — القاعدة بمخطّطها قائمة أصلاً.
+        Three tiers, stopping at the first that suffices: `rollback` if a transaction
+        is open, then a `BEGIN IMMEDIATE`/`ROLLBACK` probe that proves writes work
+        again, and otherwise a new connection. And no `_apply_schema`: migration and
+        schema are heavy boot work and this is not their place — the database already stands with its schema.
 
-        يعيد وصفاً قصيراً للسجلّ، ولا يرفع شيئاً بحال: يُنادى من مسار انهيار،
-        فيدُ الإنقاذ لا يجوز أن تُسقط الحلقة التي جاءت تُنجيها.
+        Returns a short description for the log and never raises anything: it is
+        called from a crash path, and the rescue hand must not take down the loop it came to save.
         """
         steps: list[str] = []
         try:
             if self._conn.in_transaction:
                 self._conn.rollback()
                 steps.append("rollback")
-        except Exception as exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+        except Exception as exc:  # noqa: BLE001 — a rescue hand must not take down the loop
             steps.append(f"rollback failed: {type(exc).__name__}")
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -332,7 +333,7 @@ class RecorderDB:
             steps.append(f"probe failed: {type(exc).__name__}")
         try:
             self._conn.close()
-        except Exception:  # noqa: BLE001 — قد يكون ميّتاً أصلاً
+        except Exception:  # noqa: BLE001 — it may already be dead
             pass
         try:
             self._conn = sqlite3.connect(self._db_path, timeout=30)
@@ -357,20 +358,20 @@ class RecorderDB:
         return row["value"] if row else None
 
     def note_error(self, key: str, value: str) -> bool:
-        """ختمٌ دفتريّ لا يجوز أن يُسقط مَن يكتبه. يعيد True إن كُتب.
+        """A bookkeeping stamp that must never take down its writer. Returns True if written.
 
-        `set_meta` العاديّة تُستعمل لحالةٍ يُعتمد عليها (`schema_version`، أختام
-        الدورات، جيل الدفتر) فيجب أن يُسمَع فشلها. أمّا أسطر `last_error_*` فهي
-        **وصفٌ لفشلٍ وقع أصلاً**، وتُكتب من داخل معالج الاستثناء — فإن كانت
-        القاعدة هي المورد المتعطّل رفعت هي أيضاً، فأسقطت المعالجَ ومعه ما بقي
-        من الدورة، ثم أسقطت درع الحلقة نفسه. قِيس 2026-08-17: `database is
-        locked` بهذا الطريق أخرج المسجّل بالرمز 1 فبقيت المهمّة `Ready` ثلاث
-        ساعات صامتة. فقدُ سطرٍ وصفيّ أرخص من فقد الدورة، والقياس لا يُكتب بهذه.
+        Plain `set_meta` is used for state that is relied upon (`schema_version`, cycle
+        stamps, ledger generation), so its failure must be heard. But `last_error_*`
+        lines are **a description of a failure that already happened**, and are written
+        from inside an exception handler — if the database is the failing resource it
+        would raise too, taking down the handler and with it the rest of the cycle, and
+        then the loop shield itself. Measured 2026-08-17: `database is locked` by this
+        path exited the recorder with code 1, leaving the task `Ready` for three silent hours. Losing a descriptive line is cheaper than losing the cycle, and measurements are not written this way.
         """
         try:
             self.set_meta(key, value)
             return True
-        except Exception:  # noqa: BLE001 — دفترٌ لا قياس
+        except Exception:  # noqa: BLE001 — bookkeeping, not a measurement
             return False
 
     def evm_ledger_generation(self) -> int:
@@ -381,7 +382,7 @@ class RecorderDB:
         current = self.evm_ledger_generation()
         if current != int(expected):
             raise StaleEVMState(
-                f"تغيّر جيل دفتر EVM أثناء الدورة: {expected} -> {current}"
+                f"EVM ledger generation changed mid-cycle: {expected} -> {current}"
             )
 
     def assert_evm_cursor(self, network_id: str, expected_block: int | None) -> None:
@@ -389,7 +390,7 @@ class RecorderDB:
         current = int(row["last_block"]) if row is not None else None
         if current != expected_block:
             raise StaleEVMState(
-                f"تغيّر مؤشر EVM [{network_id}] أثناء الجلب: "
+                f"EVM cursor [{network_id}] changed while fetching: "
                 f"{expected_block} -> {current}"
             )
 
@@ -409,7 +410,7 @@ class RecorderDB:
         )
         if current != expected:
             raise StaleEVMState(
-                f"تغيّرت حالة تعبئة EVM للعملة {token_address} أثناء الجلب"
+                f"EVM backfill state for token {token_address} changed while fetching"
             )
 
     def bump_evm_ledger_generation(self) -> int:
@@ -424,11 +425,11 @@ class RecorderDB:
 
     # --- signal_events ---
     def insert_signal(self, row: Mapping[str, Any]) -> bool:
-        """إدراج idempotent حسب id (feed event id). يعيد True إن أُدرج صف جديد.
+        """Idempotent insert keyed by id (feed event id). Returns True if a new row was inserted.
 
-        نبني الوسائط من قائمة أعمدة صريحة (كبقيّة الإدراجات) لا من مفاتيح
-        المُرسِل: تمرير القاموس كما هو كان يجعل أي عمود جديد يُسقط كل مُستدعٍ
-        لا يعرف به بعد — `ProgrammingError` بدل حقل فارغ.
+        We build the parameters from an explicit column list (like the other inserts),
+        not from the caller's keys: passing the dict as-is meant any new column would
+        crash every caller that did not yet know it — a `ProgrammingError` instead of a missing field.
         """
         cols = _SIGNAL_COLUMNS
         sql = (
@@ -450,7 +451,7 @@ class RecorderDB:
 
     # --- market_ticks ---
     def insert_tick(self, row: Mapping[str, Any]) -> bool:
-        """مفتاح مركّب (token, network, recorded_at, source) يمنع التكرار في الدورة."""
+        """Composite key (token, network, recorded_at, source) prevents duplicates within a cycle."""
         cols = _TICK_COLUMNS
         placeholders = ", ".join(f":{c}" for c in cols)
         sql = (
@@ -463,7 +464,7 @@ class RecorderDB:
 
     # --- token_static ---
     def upsert_static(self, row: Mapping[str, Any]) -> None:
-        """ثوابت العملة — تُكتب مرّة؛ نتركها كما هي إن وُجدت (INSERT OR IGNORE)."""
+        """Token constants — written once; left as-is if already present (INSERT OR IGNORE)."""
         cols = _STATIC_COLUMNS
         placeholders = ", ".join(f":{c}" for c in cols)
         sql = (
@@ -532,8 +533,8 @@ class RecorderDB:
 
     # --- snapshots ---
     def insert_snapshot(self, source: str, raw: Any, recorded_at: str | None = None) -> None:
-        """أرشيف خام كامل لمصدر. يُخزَّن مضغوطاً — هذا الجدول وحده كان 80% من
-        حجم القاعدة (لقطة ~310 KB × 3 مصادر × 1440 دورة يومياً)."""
+        """A full raw archive for a source. Stored compressed — this table alone was 80%
+        of the database size (~310 KB per snapshot × 3 sources × 1440 cycles daily)."""
         self._conn.execute(
             "INSERT INTO snapshots(recorded_at, source, raw_json) VALUES(?, ?, ?)",
             (recorded_at or utcnow_iso(), source, encode_raw(raw)),
@@ -541,17 +542,17 @@ class RecorderDB:
         self._commit()
 
     def read_snapshot(self, snapshot_id: int) -> Any:
-        """يقرأ لقطة ويفكّ ضغطها (يقبل الصفوف النصّية القديمة أيضاً)."""
+        """Reads a snapshot and decompresses it (accepts old text rows too)."""
         row = self._conn.execute(
             "SELECT raw_json FROM snapshots WHERE id=?", (snapshot_id,)
         ).fetchone()
         return decode_raw(row["raw_json"]) if row else None
 
     def prune_snapshots(self, older_than_iso: str) -> int:
-        """يحذف اللقطات الأقدم من ختم معطى. يعيد عدد المحذوفة.
+        """Deletes snapshots older than a given timestamp. Returns the number deleted.
 
-        اختياريّ ومعطّل افتراضياً (config.SNAPSHOT_RETENTION_DAYS = 0): اللقطات
-        هي أرشيف إعادة الاشتقاق، فحذفها قرار المالك لا سلوك ضمنيّ.
+        Optional and disabled by default (config.SNAPSHOT_RETENTION_DAYS = 0): snapshots
+        are the re-derivation archive, so deleting them is the owner's decision, not implicit behavior.
         """
         cur = self._conn.execute(
             "DELETE FROM snapshots WHERE recorded_at < ?", (older_than_iso,)
@@ -561,10 +562,10 @@ class RecorderDB:
 
     # --- token_bars ---
     def insert_bars(self, rows: Sequence[Mapping[str, Any]]) -> int:
-        """يُدرج شموع OHLCV. يعيد عدد الصفوف المكتوبة.
+        """Inserts OHLCV candles. Returns the number of rows written.
 
-        OR REPLACE لا OR IGNORE: الشمعة الأحدث تكون قيد التكوّن وقت السحب،
-        فقيمتها تُراجَع في السحب التالي — الأحدث هي الصحيحة.
+        OR REPLACE, not OR IGNORE: the newest candle is still forming at fetch time,
+        so its value gets revised by the next fetch — the newest is the correct one.
         """
         if not rows:
             return 0
@@ -580,13 +581,13 @@ class RecorderDB:
     def recompute_bar_flags(
         self, token_address: str, network_id: str, resolution: str = "5"
     ) -> int:
-        """يعيد حساب أعلام التشوّه لسلسلة عملة كاملة. يعيد عدد الصفوف المحدَّثة.
+        """Recomputes the distortion flags for a token's whole series. Returns the number of rows updated.
 
-        لازم بعد كل إدراج: حكم الجار (`bar_context_flags`) يحتاج الشمعة التالية،
-        والشمعة الأخيرة في أيّ دفعة بلا تالية بعد — فتُحكم عند وصولها. القيم
-        الخام لا تُلمس، الأعلام فقط.
+        Needed after every insert: the neighbour rule (`bar_context_flags`) needs the
+        next candle, and the last candle in any batch has none yet — so it is judged
+        when it arrives. Raw values are untouched; only the flags change.
         """
-        from extract import bar_context_flags  # استيراد موضعيّ: db لا يعتمد extract
+        from extract import bar_context_flags  # local import: db does not depend on extract
 
         rows = self._conn.execute(
             "SELECT ts, o, h, l, c, h_suspect, l_suspect, c_suspect FROM token_bars "
@@ -627,7 +628,7 @@ class RecorderDB:
     def set_bars_state(
         self, token_address: str, network_id: str, status: str, candles: int, now_iso: str
     ) -> None:
-        """يسجّل نتيجة آخر محاولة سحب. `attempts` يتراكم لكشف العملات الميّتة."""
+        """Records the outcome of the last fetch attempt. `attempts` accumulates to surface dead tokens."""
         self._conn.execute(
             """INSERT INTO bars_fetch_state(
                    token_address, network_id, last_fetch_at, last_status, candles, attempts)
@@ -644,12 +645,12 @@ class RecorderDB:
     def bars_fetch_due(
         self, limit: int, stale_before_iso: str, max_no_data_attempts: int
     ) -> list[dict[str, Any]]:
-        """العملات المراقَبة النشطة الأولى بالسحب — الأقدم سحباً أوّلاً.
+        """Active watched tokens due for a fetch — least recently fetched first.
 
-        جدولة دوّارة: كل دورة تأخذ شريحة صغيرة، فيكتمل المسح عبر عدّة دورات بلا
-        دفقة تُثقل الحلقة أو تُغرق fomo. العملة التي ردّ عليها fomo `no_data`
-        مراراً تُستبعد — لا معنى لإهدار محاولات على عملة بلا سلسلة سعرية.
-        `NULLS FIRST` يضمن أنّ التي لم تُسحب قطّ تسبق الجميع (backfill الدخول).
+        Round-robin scheduling: each cycle takes a small slice, so the sweep completes
+        over several cycles without a burst that loads the loop or floods fomo. A
+        token fomo answered `no_data` repeatedly is excluded — no point wasting
+        attempts on a token with no price series. `NULLS FIRST` guarantees the never-fetched come before everyone (entry backfill).
         """
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, w.first_seen_at,
@@ -659,9 +660,9 @@ class RecorderDB:
                  ON s.token_address = w.token_address AND s.network_id = w.network_id
                WHERE w.active = 1
                  AND (s.last_fetch_at IS NULL OR s.last_fetch_at < ?)
-                 -- COALESCE إلزاميّ: بلا صفّ حالة يصير الشرط
-                 -- NOT (NULL AND NULL) = NULL، فتُستبعد بصمت كل عملة لم تُسحب
-                 -- قطّ — وهي بالضبط الحالة التي يوجد الـ backfill من أجلها.
+                 -- COALESCE is mandatory: without a state row the condition
+                 -- becomes NOT (NULL AND NULL) = NULL, silently excluding every
+                 -- never-fetched token — exactly the case the backfill exists for.
                  AND NOT (COALESCE(s.last_status, '') = 'no_data'
                           AND COALESCE(s.attempts, 0) >= ?)
                ORDER BY s.last_fetch_at IS NOT NULL, s.last_fetch_at
@@ -672,7 +673,7 @@ class RecorderDB:
 
     # --- token_social ---
     def insert_social(self, row: Mapping[str, Any]) -> bool:
-        """لقطة اجتماعية. المفتاح (token, network, recorded_at) يمنع التكرار."""
+        """A social snapshot. The key (token, network, recorded_at) prevents duplicates."""
         cols = _SOCIAL_COLUMNS
         sql = (
             f"INSERT OR IGNORE INTO token_social({', '.join(cols)}) "
@@ -683,7 +684,7 @@ class RecorderDB:
         return cur.rowcount > 0
 
     def insert_thesis_items(self, rows: Sequence[Mapping[str, Any]]) -> int:
-        """يُدرج أطروحات فردية. idempotent حسب id. يعيد عدد المُدرَج فعلاً."""
+        """Inserts individual theses. Idempotent by id. Returns the number actually inserted."""
         if not rows:
             return 0
         cols = _THESIS_COLUMNS
@@ -701,7 +702,7 @@ class RecorderDB:
         return added
 
     def thesis_count_before(self, token_address: str, at_iso: str) -> int:
-        """كم أطروحة كانت موجودة قبل لحظة معطاة — إعادة بناء العدد التاريخي."""
+        """How many theses existed before a given moment — rebuilding the historical count."""
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM token_thesis "
             "WHERE token_address=? AND created_at <= ?",
@@ -709,10 +710,10 @@ class RecorderDB:
         ).fetchone()
         return int(row["n"])
 
-    # --- activity_events (يكتبها backfill_activity.py فقط، بأثر رجعيّ) ---
+    # --- activity_events (written only by backfill_activity.py, retroactively) ---
     def insert_activity_events(self, rows: Sequence[Mapping[str, Any]]) -> int:
-        """يُدرج أحداث tradingActivity. idempotent حسب id — إعادة المشيّاط من
-        نقطة الاستئناف تمرّ على المدرَج بلا أثر. يعيد عدد المُدرَج فعلاً."""
+        """Inserts tradingActivity events. Idempotent by id — resuming the walk from the
+        checkpoint passes over inserted rows harmlessly. Returns the number actually inserted."""
         if not rows:
             return 0
         cols = _ACTIVITY_COLUMNS
@@ -734,7 +735,7 @@ class RecorderDB:
         return int(row["n"])
 
     def activity_event_tokens(self) -> list[dict[str, Any]]:
-        """العملات ذات الأحداث القابلة للتوسيم مع مدى أزمنتها — لسحب الشموع."""
+        """Tokens with labelable events plus their time range — for fetching candles."""
         rows = self._conn.execute(
             """SELECT token_address, network_id, MIN(ts) AS min_ts, MAX(ts) AS max_ts,
                       COUNT(*) AS n
@@ -746,7 +747,7 @@ class RecorderDB:
         return [dict(r) for r in rows]
 
     def activity_events_for_token(self, token_address: str, network_id: str) -> list[dict[str, Any]]:
-        """أحداث عملة مرتّبة زمنياً (لعناقيد سحب الشموع)."""
+        """A token's events in chronological order (for candle-fetch clusters)."""
         rows = self._conn.execute(
             """SELECT id, ts FROM activity_events
                 WHERE token_address=? AND network_id=? AND ts IS NOT NULL
@@ -779,11 +780,11 @@ class RecorderDB:
         return dict(row) if row else None
 
     def activities_pending_label(self, mature_before_epoch: int, limit: int) -> list[dict[str, Any]]:
-        """أحداث نشاط نضجت ولم تُوسَم وشموع عملتها مسحوبة (status='ok').
+        """Activity events that matured, are unlabeled, and whose token's candles are fetched (status='ok').
 
-        البوّابة الأخيرة حاسمة: التوسيم idempotent لا يُراجَع، فتوسيم حدث قبل
-        وصول شموع عملته يكتب no_entry أبديّاً. `prev_ts` = ختم حدث النشاط
-        السابق على نفس العملة (لعلم الاستقلال بنفس قاعدة الإشارات).
+        The last gate is decisive: labeling is idempotent and never revised, so labeling
+        an event before its token's candles arrive writes an eternal no_entry. `prev_ts`
+        = timestamp of the previous activity event on the same token (for the independence flag, same rule as signals).
         """
         rows = self._conn.execute(
             """SELECT a.id, a.event_type, a.token_address, a.network_id, a.ts,
@@ -826,10 +827,10 @@ class RecorderDB:
         self, limit: int, stale_before_iso: str,
         error_stale_before_iso: str | None = None,
     ) -> list[dict[str, Any]]:
-        """العملات المستحقّة للقطة اجتماعية — الأقدم سحباً أوّلاً.
+        """Tokens due for a social snapshot — least recently fetched first.
 
-        بخلاف الشموع لا نستبعد العملة الفارغة: غياب النقاش **إشارة بذاته**
-        وتغيّره عبر الزمن هو المطلوب، فلا معنى لإسقاط عملة صامتة اليوم.
+        Unlike candles, we do not exclude the empty token: the absence of discussion
+        is **a signal in itself**, and its change over time is what we want — so there is no point dropping a token that is silent today.
         """
         error_stale = error_stale_before_iso or stale_before_iso
         rows = self._conn.execute(
@@ -857,7 +858,7 @@ class RecorderDB:
 
     # --- token_holders ---
     def insert_holders(self, row: Mapping[str, Any]) -> bool:
-        """لقطة تركّز حيازة؛ المفتاح يشمل source فلا يطمس مصدرٌ الآخر."""
+        """A holding-concentration snapshot; the key includes source so one source never masks another."""
         cols = _HOLDERS_COLUMNS
         sql = (
             f"INSERT OR IGNORE INTO token_holders({', '.join(cols)}) "
@@ -887,7 +888,7 @@ class RecorderDB:
 
     # --- token_flow ---
     def insert_flow(self, row: Mapping[str, Any]) -> bool:
-        """صفّ تدفّق تداول (شراء/بيع). نفس ردّ tokenDetails الذي يغذّي الحيازة."""
+        """A trade flow row (buy/sell). The same tokenDetails reply that feeds holdings."""
         cols = _FLOW_COLUMNS
         sql = (
             f"INSERT OR IGNORE INTO token_flow({', '.join(cols)}) "
@@ -899,8 +900,8 @@ class RecorderDB:
 
     # --- traders ---
     def upsert_trader(self, row: Mapping[str, Any]) -> None:
-        """ملفّ متداول. الملفّ **يتغيّر** (متابعون، عدد صفقات) فنكتب فوقه —
-        بخلاف token_static الثابت بطبعه."""
+        """A trader profile. The profile **changes** (followers, trade count) so we
+        overwrite it — unlike token_static, which is constant by nature."""
         cols = _TRADER_COLUMNS
         sql = (
             f"INSERT OR REPLACE INTO traders({', '.join(cols)}) "
@@ -926,14 +927,14 @@ class RecorderDB:
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
         min_events: int = 3,
     ) -> list[dict[str, Any]]:
-        """المتداولون المستحقّون للجلب: **المتكرّرون وحدهم** (≥`min_events` حدثاً).
+        """Traders due for fetching: **repeat traders only** (≥`min_events` events).
 
-        مقيس: 5,572 مشترياً مميّزاً لكنّ 3,202 فقط بـ≥3 أحداث — ومن ظهر مرّة
-        واحدة لا سلوك له نتعلّمه، فجلبه يستهلك ميزانية الدورة بلا مقابل.
-        الترتيب: من لم يُجلَب قطّ أولاً، ثم الأكثر نشاطاً (أحداثه أكثر معلومة).
+        Measured: 5,572 distinct buyers but only 3,202 with ≥3 events — someone who
+        appeared once has no behavior for us to learn, so fetching them spends cycle
+        budget for nothing. Ordering: never-fetched first, then the most active (their events carry the most information).
 
-        `COALESCE(s.last_status,'') <> 'error'` إلزاميّ: بدونه يصير الشرط NULL
-        لمن لا صفّ حالة له فيُستبعد إلى الأبد.
+        `COALESCE(s.last_status,'') <> 'error'` is mandatory: without it the condition
+        becomes NULL for anyone without a state row, excluding them forever.
         """
         rows = self._conn.execute(
             """SELECT e.buyer_id AS trader_id, e.n AS event_count,
@@ -957,11 +958,11 @@ class RecorderDB:
     def set_static_protocol(
         self, token_address: str, network_id: str, protocol: str
     ) -> bool:
-        """يملأ `dex_protocol` **حين يكون فارغاً فقط**.
+        """Fills `dex_protocol` **only when it is empty**.
 
-        `upsert_static` هو INSERT OR IGNORE فلا يحدّث صفّاً قائماً، والبروتوكول
-        لا يأتي إلّا من filterTokens (غائب من خام trending: صفر من 3,000) —
-        فيلزم مسار تحديث ضيّق. شرط `IS NULL` يمنع الكتابة فوق قياس قائم.
+        `upsert_static` is INSERT OR IGNORE so it never updates an existing row, and
+        the protocol comes only from filterTokens (absent from raw trending: zero of
+        3,000) — so a narrow update path is needed. The `IS NULL` condition prevents overwriting an existing measurement.
         """
         cur = self._conn.execute(
             """UPDATE token_static SET dex_protocol=?
@@ -975,17 +976,17 @@ class RecorderDB:
         self, token_address: str, network_id: str, created_at: str,
         observed_at: str,
     ) -> bool:
-        """يملأ `token_created_at` **حين يكون فارغاً فقط**.
+        """Fills `token_created_at` **only when it is empty**.
 
-        حالة نادرة لكنها قائمة: المنبع أعاد العملة في قائمةٍ عامّة بلا تاريخ
-        إنشاء (3 من 406 مقيسة)، فصفّ الثوابت موجودٌ والعمر مفقود — و
-        `upsert_static` هو INSERT OR IGNORE فلا يصلحه. filterTokens يُسأل عن
-        هذه العملة كلَّ دورة، فأوّل إجابةٍ تحمل التاريخ تسدّ الثقب.
+        A rare but real case: the source returned the token in a public list without a
+        creation date (3 of 406 measured), so the static row exists while the age is
+        missing — and `upsert_static` is INSERT OR IGNORE so it cannot fix it. filterTokens
+        is asked about this token every cycle, so the first answer carrying the date closes the gap.
 
-        شرط الفراغ يمنع الكتابة فوق تاريخٍ مسجَّل: قيمة المنبع نفسها **تتبدّل**
-        (53 من 216 تخالف المخزَّن بأكثر من ساعة، وواحدة بفرق سنة)، فنُثبّت
-        أوّل ما رأيناه بدل أن نتبع تبدُّله — وإلا تبدّل حكمُ بوّابة العمر تحت
-        عملةٍ مقبولةٍ أصلاً.
+        The emptiness condition prevents overwriting a recorded date: the source's own
+        value **changes** (53 of 216 contradict the stored one by more than an hour, one
+        by a year), so we pin the first thing we saw instead of following its drift —
+        otherwise the age-gate verdict flips under a token that was already accepted.
         """
         cur = self._conn.execute(
             """UPDATE token_static
@@ -1045,7 +1046,7 @@ class RecorderDB:
     def holders_fetch_due(
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
     ) -> list[dict[str, Any]]:
-        """المراقَبات المستحقّة لقياس التركّز؛ الجديدة أولاً والإشارات قبل الضابطة."""
+        """Watches due for a concentration measurement; newest first and signals before controls."""
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, w.first_seen_at,
                       w.entry_signal_id, w.is_control, s.last_fetch_at, s.last_status
@@ -1066,18 +1067,18 @@ class RecorderDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # --- chain_concentration (قياس السلسلة المباشر) ---
+    # --- chain_concentration (direct on-chain measurement) ---
     def insert_chain_concentration(self, row: Mapping[str, Any]) -> bool:
-        """لقطة تركّز من السلسلة. المفتاح (عنوان، شبكة، وقت) فالتكرار لا يضرّ."""
+        """A concentration snapshot from the chain. The key is (address, network, time), so duplicates are harmless."""
         cols = _CHAIN_COLUMNS
         sql = (
             f"INSERT OR IGNORE INTO chain_concentration({', '.join(cols)}) "
             f"VALUES({', '.join(f':{c}' for c in cols)})"
         )
         payload = {c: row.get(c) for c in cols}
-        # صفر لا NULL: العمود `NOT NULL DEFAULT 0` وكاتبو الصفوف ثلاثة (سولانا،
-        # دفتر EVM الحيّ، الإعادة الرجعيّة) — والتطبيع هنا يعفيهم من تذكّره،
-        # وNULL صريح من أيّهم كان سيرفع `NOT NULL constraint failed`.
+        # Zero, not NULL: the column is `NOT NULL DEFAULT 0` and there are three row
+        # writers (Solana, the live EVM ledger, retroactive replay) — normalizing
+        # here spares them from remembering it, and an explicit NULL from any of them would raise `NOT NULL constraint failed`.
         payload["is_replay"] = 1 if payload.get("is_replay") else 0
         cur = self._conn.execute(sql, _with_compressed_raw(payload))
         self._commit()
@@ -1105,12 +1106,12 @@ class RecorderDB:
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
         networks: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """المراقَبات المستحقّة لقياس السلسلة — **من الشبكات المدعومة وحدها**.
+        """Watches due for an on-chain measurement — **supported networks only**.
 
-        الشبكات تُمرَّر ولا تُقرأ من `config` هنا: هذه الوحدة بلا معرفة بالمصادر
-        (انظر مقدّمة الملفّ) فتبقى قابلة للاختبار بقاعدة مؤقّتة. وقائمة فارغة
-        تعيد لا شيء بدل أن تعني «كل الشبكات» — الصمت أصدق من مسح شبكة لا
-        يعمل عليها المصدر.
+        Networks are passed in, not read from `config` here: this module knows nothing
+        about sources (see the file header) so it stays testable with a temporary
+        database. And an empty list returns nothing rather than meaning "all networks"
+        — silence is more honest than sweeping a network the source does not serve.
         """
         nets = [str(n) for n in networks]
         if not nets:
@@ -1141,7 +1142,7 @@ class RecorderDB:
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
         networks: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """عملات EVM ذات دفتر مكتمل والمستحقّة للقطة، مع التصفية قبل `LIMIT`."""
+        """EVM tokens with a complete ledger that are due for a snapshot, with filtering before `LIMIT`."""
         nets = [str(n) for n in networks]
         if not nets:
             return []
@@ -1170,10 +1171,10 @@ class RecorderDB:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    # --- chain_authority (الطبقة البطيئة: صلاحيات وقابليّة تعديل) ---
+    # --- chain_authority (the slow layer: authorities and mutability) ---
     def insert_chain_authority(self, row: Mapping[str, Any]) -> bool:
-        """لقطة صلاحيات. صفّ لكل قياس لا صفّ واحد للعملة: شطبُ صلاحية السكّ
-        **حدث** يقع وسط النافذة، وصفّ واحد يُحدَّث فوق نفسه يمحو تاريخه."""
+        """An authority snapshot. One row per measurement, not one per token: revoking
+        the mint authority **is an event** that happens mid-window, and a single row updated in place erases its history."""
         cols = _CHAIN_AUTH_COLUMNS
         sql = (
             f"INSERT OR IGNORE INTO chain_authority({', '.join(cols)}) "
@@ -1202,10 +1203,10 @@ class RecorderDB:
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
         networks: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """نفس منطق `chain_fetch_due` على جدول الحالة الساعيّ.
+        """Same logic as `chain_fetch_due` on the lazy state table.
 
-        استعلام منفصل لا معامل `table` مُصاغ في النصّ: الجدول لا يُبنى من مُدخل
-        أبداً، وتكرار عشرة أسطر أرخص من فتح باب حقن.
+        A separate query, not a `table` parameter interpolated into the text: a table
+        name is never built from input, and repeating ten lines is cheaper than opening an injection door.
         """
         nets = [str(n) for n in networks]
         if not nets:
@@ -1232,9 +1233,9 @@ class RecorderDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    # --- طبقة EVM: دفتر الأرصدة ومؤشّر الكتل ---
+    # --- EVM layer: the balance ledger and the block cursor ---
     def evm_cursor(self, network_id: str) -> dict[str, Any] | None:
-        """مؤشّر كتل الشبكة، أو None إن لم يُبنَ بعد."""
+        """The network's block cursor, or None if it has not been built yet."""
         row = self._conn.execute(
             "SELECT * FROM evm_block_cursor WHERE network_id=?", (str(network_id),),
         ).fetchone()
@@ -1244,8 +1245,8 @@ class RecorderDB:
         self, network_id: str, last_block: int, now_iso: str,
         status: str, logs_applied: int = 0, last_error: str | None = None,
     ) -> None:
-        """يحرّك المؤشّر. `logs_applied` يُجمَع تراكميّاً لا يُستبدل — رقم الدورة
-        الواحدة بلا معنى تشخيصيّ، والمجموع يقول هل الطبقة تعمل أصلاً."""
+        """Advances the cursor. `logs_applied` accumulates and is never replaced — a
+        single cycle's number carries no diagnostic meaning; the total is what says whether the layer works at all."""
         self._conn.execute(
             """INSERT INTO evm_block_cursor(
                    network_id, last_block, last_run_at, last_status,
@@ -1267,16 +1268,16 @@ class RecorderDB:
         deltas: Mapping[str, tuple[int, ...]], now_iso: str,
         allow_negative: Sequence[str] = (),
     ) -> int:
-        """يطبّق تغييرات أرصدة عملة واحدة. `deltas` = عنوان ⇒ (تغيّر، رقم كتلة).
+        """Applies balance changes for a single token. `deltas` = address ⇒ (change, block number).
 
-        التغيّر **موقَّع** ويُجمَع على الرصيد المخزَّن بحساب بايثون لا SQL: القيم
-        uint256 تتجاوز 64 بتّاً فـ`balance_hex + ?` في SQLite يفيض بصمت. القراءة
-        والكتابة في معاملة واحدة عبر `batch()` من المُنادي.
+        The change **is signed** and is added to the stored balance with Python
+        arithmetic, not SQL: uint256 values exceed 64 bits, so `balance_hex + ?` in
+        SQLite overflows silently. Read and write in one transaction via `batch()` from the caller.
 
-        الرصيد السالب مستحيل لعنوان عاديّ في ERC-20 صحيح؛ ظهوره يعني أنّ سجلاً
-        فُقد أو تكرّر، فيُرفع خطأ وتُرجَع المعاملة بدل تخزين دفتر يبدو سليماً.
-        وحدها عناوين السكّ/الحرق الممرّرة في `allow_negative` يجوز أن تنزل تحت
-        الصفر: رصيدها لا يدخل اللقطة أصلاً، فنثبّته عند صفر بلا إخفاء فساد حائز.
+        A negative balance is impossible for an ordinary address in a correct ERC-20;
+        seeing one means a record was lost or duplicated, so we raise and roll the
+        transaction back instead of storing a ledger that looks sound. Only the
+        mint/burn addresses passed in `allow_negative` may go below zero: their balance never enters the snapshot anyway, so we pin it at zero without hiding a holder's corruption.
         """
         if not deltas:
             return 0
@@ -1311,11 +1312,11 @@ class RecorderDB:
             if new < 0:
                 if holder.lower() not in allowed:
                     raise ValueError(
-                        f"رصيد EVM سالب للعنوان {holder} في {token} [{net}]"
+                        f"negative EVM balance for address {holder} in {token} [{net}]"
                     )
                 new = 0
-            # أوّل استلام: تُسجَّل الكتلة مرّة واحدة ولا تُحدَّث بعدها — «حائز جديد»
-            # يعني أوّل دخول لا آخر حركة.
+            # First receipt: the block is recorded once and never updated after — "new
+            # holder" means first entry, not the latest movement.
             if first_block is None:
                 if received_block is not None:
                     first_block = int(received_block)
@@ -1343,11 +1344,11 @@ class RecorderDB:
         self, network_id: str, token_address: str, limit: int,
         exclude: Sequence[str] = (),
     ) -> list[tuple[str, int]]:
-        """أعلى `limit` رصيداً بترتيب تنازليّ.
+        """The top `limit` balances in descending order.
 
-        الترتيب معجميّ على نصّ محشوّ بعرض 64 ⇒ مطابق للترتيب العدديّ، فالفهرس
-        `idx_evm_bal_rank` يخدمه بلا فرز. الرصيد صفر يُستثنى: عنوان باع كل شيء
-        يبقى صفّه في الدفتر (تاريخه معلومة) لكنّه ليس حائزاً.
+        The ordering is lexicographic over a width-64 padded string ⇒ identical to
+        numeric ordering, so the `idx_evm_bal_rank` index serves it unsorted. A zero
+        balance is excluded: an address that sold everything keeps its ledger row (its history is information) but is not a holder.
         """
         net, token = str(network_id), token_address.lower()
         params: list[Any] = [net, token]
@@ -1370,11 +1371,11 @@ class RecorderDB:
     def evm_ledger_stats(
         self, network_id: str, token_address: str, exclude: Sequence[str] = (),
     ) -> dict[str, Any]:
-        """عدد الحائزين والمعروض المتداول من الدفتر — بنداء SQL واحد.
+        """Holder count and circulating supply from the ledger — in a single SQL call.
 
-        `supply` هنا مجموع الأرصدة الحيّة لا `totalSupply()` من العقد: عناوين
-        الحرق تُستثنى، فالنسب تُحسب على ما يمكن بيعه فعلاً. عملة حُرق نصفها
-        تظهر بتركّز حقيقيّ لا مخفَّف بالنصف الميّت.
+        `supply` here is the sum of live balances, not the contract's `totalSupply()`:
+        burn addresses are excluded, so ratios are computed over what can actually be
+        sold. A token whose half was burned shows its true concentration, not one diluted by the dead half.
         """
         net, token = str(network_id), token_address.lower()
         params: list[Any] = [net, token]
@@ -1397,10 +1398,10 @@ class RecorderDB:
     def evm_new_holders_since(
         self, network_id: str, token_address: str, since_block: int,
     ) -> int:
-        """كم عنواناً استلم العملة أوّل مرّة بعد كتلة معيّنة.
+        """How many addresses first received the token after a given block.
 
-        هذا ما لا يعطيه أي مزوّد: كلّهم لقطة بلا تاريخ دخول. يُحسب من
-        `first_seen_block` وحده فلا يكلّف نداءً.
+        This is what no provider gives: all of them a snapshot with no entry history.
+        It is computed from `first_seen_block` alone, so it costs no call.
         """
         row = self._conn.execute(
             """SELECT COUNT(*) c FROM evm_balances
@@ -1450,11 +1451,11 @@ class RecorderDB:
         self, networks: Sequence[str],
         extra_tokens: Sequence[tuple[str, str]] = (),
     ) -> list[dict[str, Any]]:
-        """كل المراقَبات النشطة على شبكات EVM المفعَّلة، مع حالة تعبئتها.
+        """All active watches on the enabled EVM networks, with their backfill state.
 
-        صفٌّ واحد يجمع المراقبة والتعبئة: الطبقة تحتاج الاثنين في كل دورة (من
-        يُطبَّق عليه السجلّ، ومن ينتظر تعبئة)، ونداءان يفترقان بينهما.
-        قائمة شبكات فارغة تعيد لا شيء — لا «كل الشبكات».
+        One row joins the watch and the backfill: the layer needs both every cycle (who
+        the log applies to, and who awaits backfill), and two calls would drift apart.
+        An empty network list returns nothing — not "all networks".
         """
         nets = [str(n) for n in networks]
         if not nets:
@@ -1521,7 +1522,7 @@ class RecorderDB:
         expected = sorted(str(token).lower() for token in expected_tokens)
         if current != expected:
             raise StaleEVMState(
-                f"تغيّرت مجموعة دفاتر EVM المكتملة [{network_id}] أثناء الجلب"
+                f"completed EVM ledger set [{network_id}] changed while fetching"
             )
 
     def evm_replay_windows(
@@ -1565,7 +1566,7 @@ class RecorderDB:
         )
         if current != expected:
             raise StaleEVMState(
-                f"تغيّرت نوافذ replay للعملة {token_address} أثناء الجلب"
+                f"replay windows for token {token_address} changed while fetching"
             )
 
     def evm_training_rebuild_state(self) -> tuple[int, str, str]:
@@ -1579,17 +1580,17 @@ class RecorderDB:
         self, expected: tuple[int, str, str],
     ) -> None:
         if self.evm_training_rebuild_state() != expected:
-            raise StaleEVMState("تغيّرت حالة إعادة بناء التدريب أثناء حساب الدفعة")
+            raise StaleEVMState("training rebuild state changed while computing the batch")
 
-    # --- الإعادة الرجعيّة (evm_replay) ---
+    # --- Retroactive replay (evm_replay) ---
     def evm_replay_targets(self, networks: Sequence[str]) -> list[dict[str, Any]]:
-        """كل نافذة مراقبة على شبكات الإعادة — **المنتهية والنشطة معاً**.
+        """Every watch window on the replay networks — **ended and active together**.
 
-        `active=1` غير مشروط هنا بخلاف `evm_watched`: العملة المنتهية هي بالضبط
-        من فاتنا قياسها (طبقة EVM وُلدت بعدها)، وصفوف تدريبها موجودة بانتظار
-        أعمدتها. وقائمة شبكات فارغة تعيد لا شيء.
+        `active=1` is unconditional here, unlike `evm_watched`: an ended token is
+        exactly one we missed measuring (the EVM layer was born after it), and its
+        training rows exist waiting for their columns. An empty network list returns nothing.
 
-        الأقدم أوّلاً: تلك أبعد ما تكون عن التغطية الحيّة فلا تنافسها.
+        Oldest first: those are the furthest from live coverage, so they never compete with it.
         """
         nets = [str(n) for n in networks]
         if not nets:
@@ -1700,7 +1701,7 @@ class RecorderDB:
     def mark_evm_replay_error(
         self, token_address: str, network_id: str, now_iso: str, error: str,
     ) -> None:
-        """يسجّل خطأً عابراً مع إبقاء checkpoint ونقطة الاستئناف السابقة."""
+        """Records a transient error while keeping the checkpoint and previous resume point."""
         self._conn.execute(
             """INSERT INTO evm_replay_state(
                    token_address, network_id, status, last_try_at, last_error)
@@ -1714,41 +1715,41 @@ class RecorderDB:
         self._commit()
 
     def stale_evm_replay_verdict(self, token_address: str, network_id: str) -> None:
-        """نافذةٌ جديدة تُبطل الحكمَ وحدَه — والمشيُ يبقى.
+        """A new window voids the verdict alone — the walk stays.
 
-        كان هذا حذفاً للصفّ كلِّه، والفرقُ بين الحذف وهذا هو الفرقُ بين حقيقتين
-        خُلطتا في عمودٍ واحد: `status` جوابُ «هل غطّيتُ كلَّ نوافذ العملة؟» وهو
-        يبطل فعلاً بنافذةٍ جديدة، أمّا `from_block`/`to_block`/`checkpoint_json`
-        فجوابُ «إلى أين بلغ مشيي في السلسلة؟» وهو عن الكتل لا عن النوافذ، فلا
-        تُبطله نافذةٌ أُضيفت. والحذفُ كان يرمي الثاني مع الأوّل.
+        This used to be a deletion of the whole row, and the difference between deleting
+        and this is the difference between two truths conflated into one column:
+        `status` answers "did I cover all the token's windows?" and is indeed voided by
+        a new window, whereas `from_block`/`to_block`/`checkpoint_json` answer "how far
+        did my walk get in the chain?" — about blocks, not windows, so an added window does not void them. Deletion threw the second away with the first.
 
-        وثمنُ ذلك مقيسٌ لا متوقّع: العملةُ الساخنة تُشار إليها كلَّ دقائق، فصفُّ
-        حالتها يُحذف أسرعَ من أن يُكتب — واحدةٌ على Base لها 522 نافذة، وواحدةٌ
-        1440 — فتبدأ الإعادةُ من النشأة كلَّ مرّة ولا تبلغ أوّل لقطةٍ أبداً. ذلك
-        سببُ أنّ 51 عملةً على Base كانت `partial` بمراجعةٍ = 1 ومدًى = ‎−1‎:
-        محاولةٌ واحدةٌ بعد كلّ حذف، بلا تقدّم، إلى الأبد.
+        And its price was measured, not guessed: a hot token is signalled every few
+        minutes, so its state row was deleted faster than it could be written — one on
+        Base has 522 windows, another 1440 — so the replay restarted from genesis every
+        time and never reached the first snapshot. That is why 51 tokens on Base were
+        `partial` with revision = 1 and span = -1: one attempt after each deletion, no progress, forever.
 
-        والأسوأُ أنّ الحذفَ كان يُبطل الحارسَ الموضوع لهذا بعينه: سقفُ
-        `EVM_REPLAY_TOKEN_CALL_CAP` يُجمَع من `calls` في الصفّ، فمحوُ الصفّ يصفّر
-        العدّاد — فعملةٌ لا تكتمل أبداً لا تبلغ سقفَها أبداً. وبإبقاء الصفّ يتراكم
-        العدّادُ فتُحال إلى `budget` وتخرج من الطريق.
+        Worse, the deletion was defeating the very guard written for exactly this: the
+        `EVM_REPLAY_TOKEN_CALL_CAP` cap is accumulated from `calls` in the row, so
+        erasing the row zeroes the counter — a token that never completes never reaches
+        its cap. Keeping the row lets the counter accumulate, so it is moved to `budget` and out of the way.
 
-        و`window` ليست في `FINAL_STATUSES` فالجدولةُ لا تتغيّر: تُنتقى كما كانت
-        تُنتقى وهي بلا صفّ. وهي في مجموعةِ استئناف الـcheckpoint في
-        `evm_replay._replay_token` — وبغير ذلك يُقرأ الصفُّ ويُهمَل مشيُه.
+        And `window` is not in `FINAL_STATUSES`, so scheduling does not change: it is
+        picked as it was picked while it had no row. It is in the checkpoint-resume
+        set in `evm_replay._replay_token` — otherwise the row is read and its walk discarded.
 
-        و`budget` وحدَها تُستثنى. هي ليست حكماً على التغطية بل قراراً بوقف
-        الإنفاق: بلغت العملةُ `EVM_REPLAY_TOKEN_CALL_CAP` فتوقّفت بنقطة استئناف
-        محفوظة. وإبطالُ حكمها يعيدها إلى الطابور فتُنتقى، وتمشي شوطاً، ويعيدها
-        السقفُ إلى `budget` — بكلفةِ انتقاءٍ كامل لكلّ نافذة. والعملةُ التي تبلغ
-        السقفَ هي بطبيعتها العملةُ الحارّة صاحبةُ مئات النوافذ (522 لإحدى عملات
-        Base)، فذلك يُبطل السقفَ ثانيةً على مهل — وهو عينُ ما استعاده هذا
-        التغيير. فتبقى `budget` نهائيّةً حتى يُرفع السقفُ أو يُطلَب `--redo`،
-        وهو ما يقوله تعليقُ السقف في `config` أصلاً.
+        And `budget` alone is exempted. It is not a verdict on coverage but a decision
+        to stop spending: the token reached `EVM_REPLAY_TOKEN_CALL_CAP` and stopped
+        with a saved resume point. Voiding its verdict returns it to the queue, it is
+        picked, walks a stretch, and the cap sends it back to `budget` — at the cost
+        of a full selection pass per window. And a token that reaches the cap is by
+        nature the hot token with hundreds of windows (522 for one Base token), so
+        that slowly re-defeats the cap — exactly what this change restored. So
+        `budget` stays final until the cap is raised or `--redo` is requested, which is what the cap's comment in `config` says anyway.
 
-        والمراجعةُ تُزاد: تشغيلٌ جارٍ يحمل لقطةً أقدم يسقط في `StaleEVMState`
-        فيُترك للدورة التالية، بدل أن يكتب فوق نافذةٍ لم يرها. ولا `_commit` هنا:
-        النداءُ من داخل معاملة الإدخال، والالتزامُ لها.
+        And the revision is incremented: a running job holding an older snapshot falls
+        into `StaleEVMState` and is left for the next cycle, instead of writing over a
+        window it never saw. And no `_commit` here: the call comes from inside the insert transaction, which owns the commit.
         """
         self._conn.execute(
             """UPDATE evm_replay_state
@@ -1759,7 +1760,7 @@ class RecorderDB:
         )
 
     def reset_evm_replay_token(self, token_address: str, network_id: str) -> None:
-        """يمحو صفوف وحالة replay لعملة واحدة كي يكون `--redo` إعادة حقيقية."""
+        """Erases a single token's replay rows and state so that `--redo` is a true redo."""
         token, net = token_address.lower(), str(network_id)
         with self.batch():
             self._conn.execute(
@@ -1775,12 +1776,12 @@ class RecorderDB:
     def restart_evm_backfill_from(
         self, token_address: str, network_id: str, from_block: int, now_iso: str,
     ) -> None:
-        """يعيد فتح تعبئة دفتر EVM لعملة من كتلة بداية جديدة.
+        """Reopens a token's EVM ledger backfill from a new starting block.
 
-        للعملات العالقة في `partial` بمدى مستحيل (عشرات ملايين الكتل): يمحو
-        الدفتر الجزئي القديم (أرصدته بُنيت على مدًى سيعاد قراءته) ويصفّر
-        الحالة إلى `retry` من `from_block`. صفوف التدريب القائمة لا تُمسّ —
-        الدفتر تراكميّ فوق النقطة الجديدة والصفوف الجديدة تُبنى فوق الحاضر.
+        For tokens stuck in `partial` with an impossible range (tens of millions of
+        blocks): erases the old partial ledger (its balances were built over a range
+        that will be re-read) and resets the state to `retry` from `from_block`.
+        Existing training rows are untouched — the ledger is cumulative above the new point and new rows are built on top of the present.
         """
         token, net = token_address.lower(), str(network_id)
         with self.batch():
@@ -1820,11 +1821,11 @@ class RecorderDB:
         )
         if current != expected:
             raise StaleEVMState(
-                f"تغيّرت حالة replay للعملة {token_address} أثناء الجلب"
+                f"replay state for token {token_address} changed while fetching"
             )
 
     def delete_evm_replay_rows(self, token_address: str, network_id: str) -> int:
-        """يحذف الصفوف المشتقّة لهذه الإعادة فقط عند اكتشاف فساد متأخر."""
+        """Deletes the rows derived by this replay only, on late corruption detection."""
         cur = self._conn.execute(
             """DELETE FROM chain_concentration
                 WHERE token_address=? AND network_id=? AND is_replay=1""",
@@ -1836,7 +1837,7 @@ class RecorderDB:
     def add_block_anchor(
         self, network_id: str, block_number: int, block_ts: int, now_iso: str,
     ) -> None:
-        """مرساة وقت↔كتلة. `OR IGNORE`: الكتلة لا يتغيّر طابعها أبداً."""
+        """A time↔block anchor. `OR IGNORE`: a block's timestamp never changes."""
         self._conn.execute(
             """INSERT OR IGNORE INTO evm_block_time(
                    network_id, block_number, block_ts, fetched_at)
@@ -1849,11 +1850,11 @@ class RecorderDB:
         self, network_id: str, from_block: int | None = None,
         to_block: int | None = None,
     ) -> list[tuple[int, int]]:
-        """المراسي مرتّبة بالكتلة، مع مرساة واحدة **خارج** كل طرف إن وُجدت.
+        """Anchors ordered by block, with one anchor **outside** each end when one exists.
 
-        الطرفان مقصودان: الاستقراء يحتاج مرساةً على كل جانب من الكتلة المطلوبة،
-        وقصُّ القائمة على المدى بالضبط يترك أطرافه بلا جانب فيصير الاستقراء
-        امتداداً — وهو أوسع خطأً.
+        Both ends are deliberate: interpolation needs an anchor on each side of the
+        requested block, and clipping the list to exactly the range leaves its ends
+        without a side, turning interpolation into extrapolation — the wider error.
         """
         net = str(network_id)
         if from_block is None or to_block is None:
@@ -1882,11 +1883,11 @@ class RecorderDB:
     def chain_first_recorded_at(
         self, token_address: str, network_id: str, live_only: bool = True,
     ) -> str | None:
-        """أوّل لقطة تركّز موجودة لهذه العملة — حدُّ الإعادة الأعلى.
+        """The earliest concentration snapshot that exists for this token — the replay's upper bound.
 
-        الإعادة تتوقّف حيث تبدأ التغطية الحيّة: قياسان لنفس اللحظة من طريقين
-        مختلفين (الحيّ بتأخير تأكيد، والمُعاد عند الكتلة بالضبط) يتفاوتان قليلاً،
-        وتشابكهما في سلسلة واحدة يخلق فروق خمس‑دقائق وهميّة.
+        The replay stops where live coverage begins: two measurements of the same
+        moment by different routes (live with confirmation lag, replayed at the exact
+        block) differ slightly, and interleaving them in one series creates phantom five-minute gaps.
         """
         sql = """SELECT MIN(recorded_at) m FROM chain_concentration
                   WHERE token_address=? AND network_id=?"""
@@ -1919,10 +1920,10 @@ class RecorderDB:
     ) -> None:
         if self.chain_live_coverage(token_address, network_id) != dict(expected):
             raise StaleEVMState(
-                f"تغيّرت التغطية الحيّة للعملة {token_address} أثناء الجلب"
+                f"live coverage for token {token_address} changed while fetching"
             )
 
-    # --- evm_contract (سلامة العقد — Base وحدها) ---
+    # --- evm_contract (contract safety — Base only) ---
     def insert_evm_contract(self, row: Mapping[str, Any]) -> bool:
         cols = _EVM_CONTRACT_COLUMNS
         sql = (
@@ -1952,7 +1953,7 @@ class RecorderDB:
         self, limit: int, stale_before_iso: str, error_stale_before_iso: str,
         networks: Sequence[str],
     ) -> list[dict[str, Any]]:
-        """نفس منطق `chain_auth_due` على جدول حالة العقود."""
+        """Same logic as `chain_auth_due` on the contract state table."""
         nets = [str(n) for n in networks]
         if not nets:
             return []
@@ -1989,14 +1990,14 @@ class RecorderDB:
         now_iso: str | None = None,
         admission_price_usd: float | None = None,
     ) -> bool:
-        """يُدخل عملة للمراقبة، أو يُعيد تنشيط عملة انتهت مدّتها.
+        """Admits a token to watching, or re-activates a token whose window ended.
 
-        يعيد True إن دخلت العملة المراقبة الآن (جديدة أو مُعاد تنشيطها).
+        Returns True if the token entered watching now (new or re-activated).
 
-        - عملة **نشطة** أصلاً: لا شيء — لا نمدّد مدّتها (أوّل ظهور يبقى المرجع).
-        - عملة **معطّلة** (active=0 بعد 48س): تُعاد بنافذة جديدة وإشارة دخول
-          جديدة. بدون هذا الفرع يبقى الصفّ القديم فيبتلع INSERT OR IGNORE كل
-          إشارة لاحقة إلى الأبد، فتنزف القائمة حتى الصفر وتتوقّف الـ ticks.
+        - A token already **active**: nothing — we do not extend its window (the
+          first appearance stays the reference).
+        - A token **deactivated** (active=0 after 48h): re-admitted with a new window
+          and a new entry signal. Without this branch the old row stays and INSERT OR IGNORE swallows every later signal forever, so the list bleeds to zero and the ticks stop.
         """
         now = now_iso or utcnow_iso()
         until = (datetime.fromisoformat(now) + timedelta(hours=watch_hours)).isoformat()
@@ -2016,19 +2017,19 @@ class RecorderDB:
             (token_address, network_id, now, source, until, entry_signal_id),
         )
         if cur.rowcount > 0:
-            # نافذة جديدة تحتاج دورة سحب جديدة؛ حالة no_data/طزاجة النافذة
-            # السابقة لا يجوز أن تمنعها من الجدولة.
+            # A new window needs a fresh fetch cycle; the previous window's
+            # no_data/freshness state must not keep it out of scheduling.
             self._conn.execute(
                 "DELETE FROM bars_fetch_state WHERE token_address=? AND network_id=?",
                 (token_address, network_id),
             )
-            # إعادة التنشيط قد تأتي بعد فجوة كان دفتر EVM خلالها غير مراقَب.
-            # الفجوةُ القصيرة (≤ EVM_REACTIVATION_KEEP_LEDGER_SECONDS، 2026-08-29)
-            # تحفظ الدفتر ونقطة الاستئناف وتُوسِّع to_block فقط: محوُها كان
-            # يُصفِّر تقدّم التعبئة كلهً فتُبنى الطوابير من الصفر أبدًا (قياس
-            # 08-29: 43 عملة على روبن‑هود عادت للصفر بهذا المسار). الفجوةُ
-            # الأطول تعيد البناء من genesis كما كان — الحالة النهائية القديمة
-            # لا تثبت تغطية فجوةٍ طويلة، وقبولُ رصيدٍ ناقص أسوأ من إعادة بناء.
+            # Re-activation can arrive after a gap during which the EVM ledger went
+            # unwatched. A short gap (≤ EVM_REACTIVATION_KEEP_LEDGER_SECONDS, 2026-08-29)
+            # keeps the ledger and the resume point and only widens to_block: erasing
+            # it zeroed the whole backfill progress, so queues were rebuilt from
+            # scratch forever (measured 08-29: 43 tokens on Robinhood went back to
+            # zero by this path). A longer gap rebuilds from genesis as before — the
+            # old final state proves no coverage of a long gap, and accepting an incomplete balance is worse than rebuilding.
             if self._reactivation_gap_exceeds_keep(
                 token_address, network_id, now,
             ):
@@ -2045,9 +2046,9 @@ class RecorderDB:
                     (token_address.lower(), str(network_id)),
                 )
             else:
-                # الدفتر باقٍ: التعبئة تستأنف من نقطتها وتُلحق الفجوة عبر
-                # `to_block` الموسَّع (الخطوة 2 في evm_layer تقرأ حتى مؤشّر
-                # الدورة الجديد للعملات partial قبل إعلانها done).
+                # The ledger stays: backfill resumes from its point and the gap is
+                # caught up through the widened `to_block` (step 2 in evm_layer reads
+                # up to the cycle's new cursor for partial tokens before declaring them done).
                 self._conn.execute(
                     """UPDATE evm_backfill_state
                           SET to_block = COALESCE(to_block, 0),
@@ -2066,13 +2067,13 @@ class RecorderDB:
     def _reactivation_gap_exceeds_keep(
         self, token_address: str, network_id: str, now_iso: str,
     ) -> bool:
-        """هل الفجوة منذ انتهاء النافذة السابقة أطول من سقف حفظ الدفتر؟
+        """Is the gap since the previous window ended longer than the ledger-keep cap?
 
-        تُقارن آخر نافذة **منتهية** (`watch_until` الأقدم في watch_windows)
-        بوقت إعادة التنشيط. غيابُ النوافذ السابقة أو فشلُ قراءة الوقت يعني
-        «فجوة غير معروفة» ⇒ إعادة بناء (الأمان قبل كل شيء). وتُقرأ من
-        `watch_windows` لا من watchlist لأن `watch_until` هناك يُكتَب فوقه
-        فور إعادة التنشيط فلا يبقى أثرٌ للنافذة المنتهية.
+        The last **ended** window (the oldest `watch_until` in watch_windows) is
+        compared against the re-activation time. Missing previous windows or a
+        failed time parse means "unknown gap" ⇒ rebuild (safety first). And it is
+        read from `watch_windows`, not watchlist, because `watch_until` there is
+        overwritten the moment re-activation happens, leaving no trace of the ended window.
         """
         try:
             import config
@@ -2080,7 +2081,7 @@ class RecorderDB:
         except (ImportError, TypeError, ValueError):
             keep = 0.0
         if keep <= 0:
-            return True  # السقف معطَّل: السلوك القديم (حذف كامل)
+            return True  # cap disabled: the old behavior (full delete)
         row = self._conn.execute(
             """SELECT MIN(watch_until) AS oldest_end
                  FROM watch_windows
@@ -2109,11 +2110,11 @@ class RecorderDB:
         design_version: int = 2,
         admission_source: str | None = None,
     ) -> bool:
-        """يُدخل عملة **ضابطة** (بلا إشارة). يعيد True إن أُضيفت.
+        """Admits a **control** token (no signal). Returns True if added.
 
-        لا تلمس صفّاً موجوداً إطلاقاً: عملة أشارت إليها إشارة يجب ألّا تُخفَّض
-        إلى ضابطة، وعملة ضابطة نشطة لا تُعاد ضبط نافذتها. الترقية إلى «مُشار
-        إليها» تحدث في الاتجاه الآخر فقط، عبر upsert_watch.
+        It never touches an existing row: a token a signal pointed at must never be
+        demoted to control, and an active control token does not get its window reset.
+        Promotion to "signalled" happens only in the other direction, via upsert_watch.
         """
         now = now_iso or utcnow_iso()
         until = (datetime.fromisoformat(now) + timedelta(hours=watch_hours)).isoformat()
@@ -2144,10 +2145,10 @@ class RecorderDB:
         design_version: int,
         admission_source: str | None = None,
     ) -> bool:
-        """يضيف نافذة مقارنة مستقلة لإشارة من نفس كون الضابطة.
+        """Adds an independent comparison window for a signal from the control's own cohort.
 
-        لا يغيّر `watchlist`: التسجيل التشغيلي بدأ عند وصول الإشارة، أما هذه
-        النافذة فتوثق لحظة ظهور العملة في trending/verified وسعرها القابل للرصد.
+        It does not change `watchlist`: operational recording began when the signal
+        arrived, while this window documents the moment the token appeared in trending/verified and its observable price.
         """
         until = (
             datetime.fromisoformat(now_iso) + timedelta(hours=watch_hours)
@@ -2195,15 +2196,15 @@ class RecorderDB:
              design_version, admission_source),
         )
         if cur.rowcount > 0:
-            # حالة replay تخص اتحاد نوافذ العملة. إضافة نافذة تجعل أي حكم نهائي
-            # سابق قديماً؛ الصفوف السابقة تبقى صحيحة، والحكم وحده يُبطَل كي
-            # يضيف التشغيل التالي نقاط النافذة الجديدة بلا فجوة ولا حذف تاريخ.
+            # Replay state concerns the union of the token's windows. Adding a window
+            # makes any earlier final verdict stale; the previous rows stay correct,
+            # and only the verdict is voided so the next run adds the new window's points with no gap and no history loss.
             self.stale_evm_replay_verdict(token_address, network_id)
 
     def known_tokens(self) -> set[tuple[str, str]]:
-        """كل عملة سبق أن دخلت (مُشار إليها أو ضابطة، نشطة أو منتهية).
+        """Every token that has ever entered (signalled or control, active or ended).
 
-        تُستعمل لاستبعاد المرشّحين: لا نُدخل عملة ضابطة رأيناها من قبل.
+        Used to exclude candidates: we never admit a control token we have seen before.
         """
         return {
             (r["token_address"], str(r["network_id"] or ""))
@@ -2211,9 +2212,9 @@ class RecorderDB:
         }
 
     def signalled_tokens(self) -> set[str]:
-        """عناوين كل عملة ورد عليها حدث إشارة — حتى لو لم تدخل المراقبة.
+        """Addresses of every token a signal event has mentioned — even if it never entered watching.
 
-        المرشّح الضابط يجب ألّا يكون قد أُشير إليه أصلاً، وإلّا لم يعد ضابطاً.
+        A control candidate must never have been signalled at all, or it is no longer a control.
         """
         return {
             r["token_address"]
@@ -2221,10 +2222,10 @@ class RecorderDB:
         }
 
     def active_watch_count(self, is_control: int | None = None) -> int:
-        """عدد النشطات. `is_control=None` يشمل الجميع؛ 0 المُشار إليها؛ 1 الضابطة.
+        """Count of active tokens. `is_control=None` includes everyone; 0 signalled; 1 control.
 
-        السقف (`WATCHLIST_CAP`) يُطبَّق على المُشار إليها وحدها، وإلّا زاحمتها
-        الضابطة على مقاعدها.
+        The cap (`WATCHLIST_CAP`) applies to the signalled alone, or the controls
+        would compete with them for their seats.
         """
         if is_control is None:
             row = self._conn.execute(
@@ -2322,7 +2323,7 @@ class RecorderDB:
         return len(invalid)
 
     def deactivate_expired(self, now_iso: str | None = None) -> int:
-        """يعطّل النافذة بعد اكتمال سحب شموعها النهائيّ، لا عند الساعة 48 فوراً."""
+        """Deactivates the window after its final candle fetch completes, not at hour 48 sharp."""
         now = now_iso or utcnow_iso()
         cur = self._conn.execute(
             """UPDATE watchlist SET active=0
@@ -2340,10 +2341,10 @@ class RecorderDB:
         return cur.rowcount
 
 
-    # --- outcomes (يكتبها الـ labeler، عملية منفصلة) ---
+    # --- outcomes (written by the labeler, a separate process) ---
     def insert_outcome(self, row: Mapping[str, Any]) -> bool:
-        """إدراج نتيجة موسومة. idempotent حسب (kind, key) — التوسيم يُكتب مرّة
-        ولا يُراجَع (النافذة مكتملة والتاريخ لا يتغيّر)."""
+        """Inserts a labeled outcome. Idempotent by (kind, key) — a label is written
+        once and never revised (the window is complete and history does not change)."""
         cols = _OUTCOME_COLUMNS
         sql = (
             f"INSERT OR IGNORE INTO outcomes({', '.join(cols)}) "
@@ -2367,11 +2368,11 @@ class RecorderDB:
         return cur.rowcount > 0
 
     def signals_pending_label(self, mature_before_epoch: int, limit: int) -> list[dict[str, Any]]:
-        """إشارات نضجت نافذتها ولم تُوسَم بعد — الأقدم أوّلاً.
+        """Signals whose window has matured and are still unlabeled — oldest first.
 
-        زمن القرار هو `recorded_at`: أول لحظة صارت فيها الإشارة متاحة للنظام.
-        استعمال `ts` الأصلي يجعل دخولاً متخيلاً قبل وصول حدث متأخر إلى ساعتين.
-        `prev_ts` = وقت وصول القرار السابق على نفس العملة لحساب الاستقلال.
+        The decision time is `recorded_at`: the first moment the signal became
+        available to the system. Using the original `ts` makes an entry appear
+        before a late-arriving event, by up to two hours. `prev_ts` = arrival time of the previous decision on the same token, for computing independence.
         """
         rows = self._conn.execute(
             """SELECT s.id, s.token_address, s.network_id, s.signal_type,
@@ -2393,8 +2394,8 @@ class RecorderDB:
         return [dict(r) for r in rows]
 
     def watches_pending_label(self, mature_before_epoch: int, limit: int) -> list[dict[str, Any]]:
-        """دخولات مراقبة (إشارة وضابطة) نضجت نافذتها ولم تُوسَم — للمقارنة
-        على نوافذ مكتملة بدل النافذة الجارية."""
+        """Watch entries (signal and control) whose window matured and are unlabeled —
+        for comparison over completed windows rather than the running one."""
         rows = self._conn.execute(
             """SELECT w.token_address, w.network_id, w.source, w.is_control,
                       w.first_seen_at, w.admission_price_usd, w.design_version,
@@ -2430,12 +2431,12 @@ class RecorderDB:
         self, token_address: str, network_id: str, from_ts: int, to_ts: int,
         resolution: str = "5",
     ) -> list[dict[str, Any]]:
-        """شموع عملة داخل مدى زمنيّ، مرتّبة. الحقول الناقصة تُسقط صفّها —
-        شمعة بلا h/l/c لا تفيد التوسيم ولا نفبرك لها قيماً.
+        """A token's candles within a time range, in order. A missing field drops its
+        row — a candle without h/l/c is useless for labeling and we fabricate no values for it.
 
-        `h_suspect`/`l_suspect` تُمرَّر كما هي: الموسِّم يستبعد الذيل المعلَّم من
-        القمّة/القاع ويبقي جسم الشمعة (o/c) صالحاً — ذيل مستحيل من المنبع
-        (شوهد ×119 مليون) كان يسمّم max_gain بمليارات النسب المئوية.
+        `h_suspect`/`l_suspect` are passed through as-is: the labeler excludes the
+        flagged tail from the peak/trough and keeps the candle body (o/c) valid — an
+        impossible tail from the source (seen ×119 million) was poisoning max_gain with billions of percentage points.
         """
         rows = self._conn.execute(
             """SELECT ts, o, h, l, c, h_suspect, l_suspect, c_suspect FROM token_bars
@@ -2451,8 +2452,8 @@ class RecorderDB:
 
 
 def _with_compressed_raw(row: Mapping[str, Any]) -> dict[str, Any]:
-    """نسخة من الصفّ مع ضغط حقل raw_json (إن وُجد). الاستخراج ينتج نصّ JSON
-    خالصاً وقابلاً للاختبار؛ الضغط يبقى مسؤولية طبقة التخزين وحدها."""
+    """A copy of the row with the raw_json field compressed (if present). Extraction
+    yields pure, testable JSON text; compression stays the storage layer's job alone."""
     out = dict(row)
     raw = out.get("raw_json")
     if raw is not None and not isinstance(raw, (bytes, bytearray)):
@@ -2460,7 +2461,7 @@ def _with_compressed_raw(row: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-# ترتيب أعمدة market_ticks و token_static — مصدر واحد للحقيقة يطابق schema.sql.
+# Column order for market_ticks and token_static — one source of truth matching schema.sql.
 _TICK_COLUMNS = (
     "token_address", "network_id", "recorded_at", "source", "price_usd",
     "liquidity", "market_cap", "holders", "top10_holders_pct",
@@ -2474,10 +2475,10 @@ _TICK_COLUMNS = (
     "circulating_supply", "total_supply", "raw_json",
 )
 
-# ترحيلات الأعمدة: (الجدول، العمود، تعريفه). تُطبَّق مرّة واحدة عند الإقلاع.
+# Column migrations: (table, column, its definition). Applied once at startup.
 _COLUMN_MIGRATIONS = (
     ("watchlist", "is_control", "is_control INTEGER NOT NULL DEFAULT 0"),
-    # حقول حجم الصفقة — تُملأ رجعياً من raw_json عبر backfill_sizes.py
+    # Trade-size fields — backfilled from raw_json via backfill_sizes.py
     ("signal_events", "size_usd", "size_usd REAL"),
     ("signal_events", "in_amount", "in_amount REAL"),
     ("signal_events", "in_token_address", "in_token_address TEXT"),
@@ -2485,18 +2486,18 @@ _COLUMN_MIGRATIONS = (
     ("signal_events", "out_token_address", "out_token_address TEXT"),
     ("signal_events", "token_amount", "token_amount REAL"),
     ("signal_events", "realized_pnl_usd", "realized_pnl_usd REAL"),
-    # العدد الحقيقي للأطروحات — أُضيف بعد اكتشاف تشبّع العدّ عند 100
+    # The true thesis count — added after discovering the count saturating at 100
     ("token_social", "thesis_total", "thesis_total INTEGER"),
     ("token_social", "thesis_sampled", "thesis_sampled INTEGER"),
     ("token_social", "has_next_page", "has_next_page INTEGER"),
-    # أعلام الذيول المستحيلة — تُحسب رجعياً من o/h/l/c المخزّنة عبر
-    # backfill_bar_flags.py (لا شبكة: الخام يكفي).
+    # Impossible-tail flags — recomputed retroactively from stored o/h/l/c via
+    # backfill_bar_flags.py (no network: the raw suffices).
     ("token_bars", "h_suspect", "h_suspect INTEGER NOT NULL DEFAULT 0"),
     ("token_bars", "l_suspect", "l_suspect INTEGER NOT NULL DEFAULT 0"),
     ("token_bars", "c_suspect", "c_suspect INTEGER NOT NULL DEFAULT 0"),
     ("outcomes", "suspect_bars", "suspect_bars INTEGER"),
-    # راية الحيّ/الرجعيّ — تفصل حِقبة البيانات بوضوح للتدريب (قرار المشروع:
-    # الحيّ وحده)، لا تسريب حِقبة من نمط الغياب.
+    # The live/retro flag — separates the data epoch cleanly for training (project
+    # decision: live only), no epoch leakage from the absence pattern.
     ("training_rows", "is_live", "is_live INTEGER NOT NULL DEFAULT 0"),
     ("training_rows", "feature_version", "feature_version INTEGER NOT NULL DEFAULT 1"),
     ("training_rows", "ath_history_complete", "ath_history_complete INTEGER"),
@@ -2516,13 +2517,13 @@ _COLUMN_MIGRATIONS = (
     ("outcomes", "design_version", "design_version INTEGER NOT NULL DEFAULT 1"),
     ("outcomes", "analysis_eligible", "analysis_eligible INTEGER NOT NULL DEFAULT 0"),
     ("outcomes", "exclusion_reason", "exclusion_reason TEXT"),
-    # التفاعل على حدث الإشارة — كان في الخام (100% تغطية) ولا يُستخرج.
-    # يُملأ رجعياً من raw_json عبر backfill_engagement.py (لا شبكة).
+    # Engagement on the signal event — was in the raw (100% coverage) and is not extracted.
+    # Backfilled from raw_json via backfill_engagement.py (no network).
     ("signal_events", "likes", "likes INTEGER"),
     ("signal_events", "views", "views INTEGER"),
     ("signal_events", "num_replies", "num_replies INTEGER"),
     ("signal_events", "pinned", "pinned INTEGER"),
-    # إشارات الشرعية الخارجية — كذلك من الخام المحفوظ، بلا شبكة.
+    # External legitimacy signals — likewise from the saved raw, no network.
     ("token_static", "exchanges_count", "exchanges_count INTEGER"),
     ("token_static", "exchanges_json", "exchanges_json TEXT"),
     ("token_static", "cmc_id", "cmc_id TEXT"),
@@ -2532,9 +2533,9 @@ _COLUMN_MIGRATIONS = (
     ("token_static", "has_image", "has_image INTEGER"),
     ("token_static", "token_created_at_observed_at",
      "token_created_at_observed_at TEXT"),
-    # تموضع حشد المنصّة من /hodlers/top. أُضيفت بعد قياس حيّ أثبت أنّ المصدر
-    # لا يعطي نِسب معروض إطلاقاً (فلا top1_pct منه)، بل مراكز مستخدمي fomo.
-    # الجدول قد يكون أُنشئ بالشكل الأول، فالترحيل يكمله بلا فقد بيانات.
+    # Platform crowd positioning from /hodlers/top. Added after a live measurement
+    # proved the source gives no supply ratios at all (so no top1_pct from it), only
+    # fomo users' positions. The table may have been created in the first shape, so the migration completes it without data loss.
     ("token_holders", "platform_holders", "platform_holders INTEGER"),
     ("token_holders", "platform_holders_listed", "platform_holders_listed INTEGER"),
     ("token_holders", "platform_value_usd", "platform_value_usd REAL"),
@@ -2542,8 +2543,8 @@ _COLUMN_MIGRATIONS = (
     ("token_holders", "platform_median_hold_seconds",
      "platform_median_hold_seconds REAL"),
     ("token_holders", "platform_dev_holding", "platform_dev_holding INTEGER"),
-    # ميزات الإصدار 4 على صفوف التدريب القائمة (20,303 صفّاً). الصفوف القديمة
-    # تبقى NULL هنا — غائب ≠ صفر، والفارز يميّز feature_version.
+    # Version-4 features on the existing training rows (20,303 rows). Old rows stay
+    # NULL here — absent ≠ zero, and the splitter distinguishes feature_version.
     ("training_rows", "exchanges_count", "exchanges_count INTEGER"),
     ("training_rows", "listed_on_exchange", "listed_on_exchange INTEGER"),
     ("training_rows", "has_cmc_id", "has_cmc_id INTEGER"),
@@ -2561,8 +2562,8 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "platform_value_usd", "platform_value_usd REAL"),
     ("training_rows", "platform_median_hold_h", "platform_median_hold_h REAL"),
     ("training_rows", "platform_dev_holding", "platform_dev_holding INTEGER"),
-    # الملكية من السلسلة (v10): كانت سولانا وحدها، وصارت الشبكتين معاً في v12 —
-    # دفتر أرصدة من سجلّات Transfer (evm_layer) يكتب في نفس chain_concentration.
+    # On-chain ownership (v10): it was Solana only, and became both networks in v12 —
+    # a balance ledger from Transfer logs (evm_layer) writes into the same chain_concentration.
     ("training_rows", "onchain_top1_pct", "onchain_top1_pct REAL"),
     ("training_rows", "onchain_top5_pct", "onchain_top5_pct REAL"),
     ("training_rows", "onchain_top10_pct", "onchain_top10_pct REAL"),
@@ -2572,19 +2573,19 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "onchain_top1_delta_5m", "onchain_top1_delta_5m REAL"),
     ("training_rows", "onchain_top10_delta_5m", "onchain_top10_delta_5m REAL"),
     ("training_rows", "onchain_delta_span_min", "onchain_delta_span_min REAL"),
-    # (v12) عدد الحائزين مضبوطاً من الدفتر — EVM وحدها، وسولانا تبقى NULL إذ
-    # getTokenLargestAccounts يعيد 20 حساباً بحدّ أقصى ولا يعرف الإجمال.
+    # (v12) holder count exact from the ledger — EVM only, and Solana stays NULL since
+    # getTokenLargestAccounts returns at most 20 accounts and does not know the total.
     ("training_rows", "onchain_holder_count", "onchain_holder_count INTEGER"),
     ("training_rows", "onchain_holders_delta_5m", "onchain_holders_delta_5m INTEGER"),
-    # هـ٢-ج) الخطر البنيويّ من السلسلة (chain_authority، ساعيّ).
+    # H2-c) Structural risk from the chain (chain_authority, lazy).
     ("training_rows", "onchain_has_mint_authority", "onchain_has_mint_authority INTEGER"),
     ("training_rows", "onchain_has_freeze_authority", "onchain_has_freeze_authority INTEGER"),
     ("training_rows", "onchain_is_mutable", "onchain_is_mutable INTEGER"),
     ("training_rows", "onchain_is_token2022", "onchain_is_token2022 INTEGER"),
     ("training_rows", "onchain_dev_holding_pct", "onchain_dev_holding_pct REAL"),
     ("training_rows", "onchain_auth_age_min", "onchain_auth_age_min REAL"),
-    # هـ٢-د) نظيرها على EVM (evm_contract، ساعيّ، Base وحدها): من البايت‑كود
-    # مباشرة — ERC-20 لا يحمل صلاحيات معلنة، ووجود المُعرّف هو الدليل.
+    # H2-d) its EVM counterpart (evm_contract, lazy, Base only): straight from the
+    # bytecode — ERC-20 carries no declared authorities, and the marker's presence is the proof.
     ("training_rows", "onchain_code_size", "onchain_code_size INTEGER"),
     ("training_rows", "onchain_function_count", "onchain_function_count INTEGER"),
     ("training_rows", "onchain_is_proxy", "onchain_is_proxy INTEGER"),
@@ -2596,10 +2597,10 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "onchain_has_limit_setter", "onchain_has_limit_setter INTEGER"),
     ("training_rows", "onchain_has_trading_switch", "onchain_has_trading_switch INTEGER"),
     ("training_rows", "onchain_contract_age_min", "onchain_contract_age_min REAL"),
-    # صدارات المدد (v7): سقف المصدر 50 في الصدارة الأساسيّة وكل صيغ الترقيم
-    # مُهمَلة بصمت، لكنّ /24h و/7d و/30d تعيد كلٌّ 100 فاتّحاد الأربع 214 متداولاً
-    # (المطابقة 3.68% ← 15.26% على 7,200 حدثاً). لا سبيل لتعبئة الماضي: الأرشيف
-    # حفظ totalPnL وحدها فلا تاريخ لرتب المدد — الصفوف القديمة تبقى NULL بحقّ.
+    # Period leaderboards (v7): the source caps at 50 in the base leaderboard, and every
+    # ranking notation is silently ignored, but /24h and /7d and /30d each return 100, so the union of the four is 214 traders
+    # (match rate 3.68% → 15.26% over 7,200 events). There is no way to fill the past: the
+    # archive saved totalPnL alone, so there is no history of period ranks — old rows rightly stay NULL.
     ("signal_events", "top_trader_match_count_24h", "top_trader_match_count_24h INTEGER"),
     ("signal_events", "buyers_best_rank_24h", "buyers_best_rank_24h INTEGER"),
     ("signal_events", "top_trader_match_count_7d", "top_trader_match_count_7d INTEGER"),
@@ -2616,15 +2617,15 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "top_trader_periods_matched", "top_trader_periods_matched INTEGER"),
     ("training_rows", "top_trader_any_period", "top_trader_any_period INTEGER"),
     ("training_rows", "best_rank_any_period", "best_rank_any_period INTEGER"),
-    # v8 — سدّ فجوة الجمع. ثلاثة أشياء كانت متاحة ولا تُجمع:
-    # 1) بروتوكول الحوض: غائب من خام trending (صفر من 3,000) ويأتي من
-    #    filterTokens وحده. الصفوف القائمة تُملأ حين نراها لاحقاً (set_static_protocol).
+    # v8 — closing the collection gap. Three things were available and not collected:
+    # 1) Pool protocol: absent from raw trending (zero of 3,000) and coming from
+    #    filterTokens alone. Existing rows are filled when we see it later (set_static_protocol).
     ("token_static", "dex_protocol", "dex_protocol TEXT"),
-    # 2) وسم الحدث: body.tag بقيمة وحيدة 'Top Trader' في 3.4% من 4,000 حدث ⇒
-    #    الوجود هو المعلومة. الصفوف القديمة تبقى NULL (الخام يحفظها لو أُريد ملؤها).
+    # 2) Event tag: body.tag with the single value 'Top Trader' in 3.4% of 4,000 events ⇒
+    #    presence is the information. Old rows stay NULL (the raw keeps them if filling is ever wanted).
     ("signal_events", "is_top_trader_tagged", "is_top_trader_tagged INTEGER"),
-    # 3) ميزات التدفّق والدمج على صفوف التدريب — من tokenDetails المجلوب أصلاً.
-    #    كلّها NULL قبل بدء الجمع (FR-007: «لم نقس» لا «صفر»).
+    # 3) Flow and aggregation features on training rows — from tokenDetails already fetched.
+    #    All NULL before collection began (FR-007: "not measured" is not "zero").
     ("training_rows", "tick_rich_age_min", "tick_rich_age_min REAL"),
     ("training_rows", "flow_age_min", "flow_age_min REAL"),
     ("training_rows", "flow_buy_volume_5m", "flow_buy_volume_5m REAL"),
@@ -2647,24 +2648,24 @@ _COLUMN_MIGRATIONS = (
     ("training_rows", "flow_unique_ratio_5m", "flow_unique_ratio_5m REAL"),
     ("training_rows", "flow_trade_size_5m", "flow_trade_size_5m REAL"),
     ("training_rows", "flow_is_low_fees", "flow_is_low_fees INTEGER"),
-    # عدد الحائزين **المضبوط** من طبقة EVM. القاعدة الحيّة أنشأت
-    # chain_concentration قبل وجود هذه الطبقة، فبلا هذا السطر يبقى العمود
-    # مفقوداً هناك و`insert_chain_concentration` يرفع «no such column».
-    # يبقى NULL على سولانا: `getTokenLargestAccounts` يعيد 20 حساباً بحدّ أقصى
-    # ولا يعرف الإجمال (غياب مقيس لا صفر، FR-007).
+    # The **exact** holder count from the EVM layer. The live database created
+    # chain_concentration before this layer existed, so without this line the column
+    # stays missing there and `insert_chain_concentration` raises "no such column".
+    # It stays NULL on Solana: `getTokenLargestAccounts` returns at most 20 accounts
+    # and does not know the total (measured absence, not zero — FR-007).
     ("chain_concentration", "holder_count", "holder_count INTEGER"),
-    # علامة الصفّ المُعاد (`evm_replay.py`). القاعدة الحيّة أنشأت الجدول قبل
-    # وجود الإعادة، و`NOT NULL DEFAULT 0` يجعل كل صفوفها القديمة «حيّة» — وهي
-    # كذلك فعلاً. بلا العمود لا يمكن تدريب النموذج على المقيس حيّاً وحده.
+    # The replayed-row marker (`evm_replay.py`). The live database created the table
+    # before replay existed, and `NOT NULL DEFAULT 0` makes all its old rows "live" — which
+    # they truly are. Without the column, the model cannot be trained on live-measured data only.
     ("chain_concentration", "is_replay",
      "is_replay INTEGER NOT NULL DEFAULT 0"),
     ("evm_replay_state", "checkpoint_json", "checkpoint_json BLOB"),
     ("evm_replay_state", "revision", "revision INTEGER NOT NULL DEFAULT 0"),
-    # ملحوظة: `dex_protocol` و`is_top_trader_tagged` **ليسا** هنا. هما عمودا
-    # جمعٍ على token_static وsignal_events (وهناك مكانهما في الهجرة أعلاه)، ولا
-    # يُنتجهما `build_features`؛ فعمودٌ لهما في training_rows يبقى NULL أبداً —
-    # وهو بالضبط عطب top10_holders_pct (1.43 مليون صفّ فارغ). عمودُ صفوف تدريب
-    # لا يُضاف إلّا ومعه مفتاحٌ في ROW_COLUMNS يكتبه.
+    # Note: `dex_protocol` and `is_top_trader_tagged` are **not** here. They are
+    # collection columns on token_static and signal_events (their place is in the
+    # migration above), and `build_features` does not produce them; so a column for
+    # them in training_rows stays NULL forever — exactly the top10_holders_pct
+    # defect (1.43 million empty rows). A training-rows column is added only with a key in ROW_COLUMNS that writes it.
 )
 
 _BAR_COLUMNS = (
@@ -2687,7 +2688,7 @@ _SIGNAL_COLUMNS = (
     "num_replies", "pinned", "is_top_trader_tagged", "raw_json",
 )
 
-# ترتيب أعمدة token_flow — يطابق schema.sql (بلا طبقة 12h: المصدر لا يعطيها).
+# Column order for token_flow — matches schema.sql (no 12h tier: the source does not provide it).
 _FLOW_COLUMNS = (
     "token_address", "network_id", "recorded_at", "watch_first_seen_at",
     "entry_signal_id", "is_control",
@@ -2700,8 +2701,8 @@ _FLOW_COLUMNS = (
     "is_low_fees", "raw_json",
 )
 
-# ترتيب أعمدة traders — يطابق schema.sql، ويطابق ما يعطيه /v2/users/{id}
-# **مقيساً حيّاً** (26 مفتاحاً): لا ربح ولا نسبة نجاح في هذا الردّ إطلاقاً.
+# Column order for traders — matches schema.sql, and matches what /v2/users/{id}
+# returns **as measured live** (26 keys): no profit and no win-rate in that reply at all.
 _TRADER_COLUMNS = (
     "trader_id", "recorded_at", "handle", "display_name", "followers_count",
     "following_count", "swap_count", "num_trades", "total_volume_usd",
@@ -2715,7 +2716,7 @@ _OUTCOME_COLUMNS = (
     "max_gain_1h", "max_gain_4h", "max_gain_24h", "max_gain_48h",
     "max_drawdown_48h", "final_return_48h", "time_to_peak_h",
     "candles_48h", "suspect_bars", "last_bar_lag_h", "bars_truncated", "is_rug",
-    # (fv15) ليبل الانفجار وسنارة الدخول المبكر — يكتبهما الموسِّم مع البقية.
+    # (fv15) the explosion label and the early-entry hook — the labeler writes both with the rest.
     "is_explosive", "time_to_plus20_min",
     "split", "status", "labeled_at",
     "design_version", "analysis_eligible", "exclusion_reason",
@@ -2760,9 +2761,9 @@ _HOLDERS_COLUMNS = (
     "platform_dev_holding", "top_holders_json", "raw_json",
 )
 
-# ترتيب أعمدة chain_concentration — يطابق schema.sql. جدول منفصل عن
-# token_holders لأنّ ذاك مصدره FOMO بإيقاع 25 دقيقة ويخلط سكانَين (السلسلة
-# كاملةً ومستخدمي المنصّة)، وهذا قياس سلسلة مباشر بإيقاع 5 دقائق.
+# Column order for chain_concentration — matches schema.sql. A separate table from
+# token_holders because that one is sourced from FOMO at a 25-minute cadence and mixes
+# two populations (the whole chain and platform users), while this is direct on-chain measurement at a 5-minute cadence.
 _CHAIN_COLUMNS = (
     "token_address", "network_id", "recorded_at", "watch_first_seen_at",
     "entry_signal_id", "is_control", "supply", "decimals",
@@ -2770,9 +2771,9 @@ _CHAIN_COLUMNS = (
     "top_accounts", "is_replay", "raw_json",
 )
 
-# ترتيب أعمدة evm_contract — يطابق schema.sql. Base وحدها بقياس: هي الشبكة
-# الوحيدة التي تباينت فيها العقود فعلاً (19 عقداً كاملاً بأحجام 135B–14.8KB)،
-# أمّا BSC فوكلاء متطابقون وروبن‑هود ستّة قوالب مكرّرة ⇒ عمود ثابت لا معلومة.
+# Column order for evm_contract — matches schema.sql. Base only is measured: it is
+# the only network where contracts actually varied (19 full contracts at sizes 135B–14.8KB),
+# while BSC is identical proxies and Robinhood six duplicated templates ⇒ a constant column, no information.
 _EVM_CONTRACT_COLUMNS = (
     "token_address", "network_id", "recorded_at", "watch_first_seen_at",
     "entry_signal_id", "is_control", "code_size", "function_count",
@@ -2781,9 +2782,9 @@ _EVM_CONTRACT_COLUMNS = (
     "has_fee_setter", "has_limit_setter", "has_trading_switch", "raw_json",
 )
 
-# ترتيب أعمدة chain_authority — يطابق schema.sql. الطبقة البطيئة (ساعيّة):
-# صلاحية السكّ/التجميد و`mutable` تتغيّر مرّة في العمر، فلا معنى لسؤالها بإيقاع
-# التركّز.
+# Column order for chain_authority — matches schema.sql. The slow (lazy) layer:
+# mint/freeze authority and `mutable` change once in a lifetime, so there is no point
+# asking for them at the concentration cadence.
 _CHAIN_AUTH_COLUMNS = (
     "token_address", "network_id", "recorded_at", "watch_first_seen_at",
     "entry_signal_id", "is_control", "token_program", "mint_authority",

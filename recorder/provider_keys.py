@@ -1,16 +1,19 @@
 """Read and rotate local provider keys without exposing their values.
 
-ورصدُها كذلك: الحوض يعيش في ذاكرة العمليّة المالكة، واللوحة عمليّةٌ أخرى تقرأ
-القاعدة — فبلا ختمٍ مكتوب لا سبيل لمعرفة «هل هناك مفتاح ثانٍ أصلاً؟» ولا «هل
-واحدٌ منها مرفوض الآن؟» إلّا بقراءة سجلٍّ نصّيّ. ولذلك `KeyPool.stats()`
-و`pool_report()`: **أعدادٌ ومؤشّرات فقط، بلا أي قيمة مفتاح ولا كسرٍ منها**
-(FR-013) — العدد لا يُعاد بناؤه إلى مفتاح، والبصمة تُعاد مطابقتها فلا نصدرها.
+Observability is part of this too: the pool lives in the owning process's memory,
+while the dashboard is another process reading the database — without a written
+stamp there is no way to know "is there even a second key?" or "is one of them
+rejected right now?" except by reading a text log. Hence `KeyPool.stats()` and
+`pool_report()`: **counts and indicators only, no key value and no fragment of
+one** (FR-013) — a count cannot be rebuilt into a key, and a fingerprint can be
+matched back, so we never emit it.
 
-وهذا الحدُّ حدُّ *هذا الطريق*: ما يُكتب في `meta` يُنسخ احتياطيّاً ويُقرأ في
-سجلّات، فلا يحمل شيئاً من السرّ أبداً. وللوحة طريقٌ ثانٍ منفصل (`keystore` يقرأ
-الملفّ مباشرةً) تعرض فيه اسمَ الحساب وآخرَ أربعة أحرف بطلب المستخدم — يُحسب
-لحظةَ الطلب ولا يُكتب في `meta` ولا في سجلّ. فلا يُخلط الطريقان: ما يجوز عرضُه
-على الشاشة ليس بالضرورة ما يجوز تسجيلُه.
+And this limit is a limit of *this route*: whatever is written to `meta` gets
+backed up and read inside logs, so it never carries any part of the secret. The
+dashboard has a separate second route (`keystore` reads the file directly) where
+it shows the account name and the last four characters on request — computed at
+request time, never written to `meta` or to any log. The two routes are therefore
+never mixed: what may be shown on screen is not necessarily what may be logged.
 """
 from __future__ import annotations
 
@@ -25,12 +28,13 @@ import key_file
 
 
 def read_keys(plural: str, singular: str, env_name: str | None = None) -> list[str]:
-    """قيمُ مفاتيح مزوّدٍ واحد للحوض — **المفعّلة منها فقط**.
+    """The values of one provider's keys for the pool — **only the enabled ones**.
 
-    صيغةُ الملفّ نفسها معرّفةٌ في `key_file` وحدَه (تقرأها اللوحة أيضاً وتكتبها،
-    فمصدرُ حقيقةٍ واحد لا اثنان). وما يزيده هذا الموضع شيئان: تقدّمُ متغيّر
-    البيئة، وتصفيةُ `enabled` — فالمفتاح الموقوف مؤقّتاً يبقى في الملفّ لتراه
-    اللوحة وتُعيد تشغيله، ولا يدخل الحوض فلا يُنادى به.
+    The file format itself is defined in `key_file` alone (the dashboard reads and
+    writes it too, so there is one source of truth, not two). This spot adds two
+    things: environment-variable precedence, and the `enabled` filter — a
+    temporarily disabled key stays in the file so the dashboard can see it and
+    re-enable it, but it never enters the pool, so it never gets called.
     """
     if env_name:
         env = os.environ.get(env_name, "").strip()
@@ -70,12 +74,13 @@ class KeyPool:
         self._index = updated.index(current) if current in updated else 0
 
     def rotate(self, *, block_current: bool = False) -> str:
-        """ينتقل إلى أوّل مفتاح غير مبرَّد، ويعدّ الانتقال.
+        """Moves to the first non-cooled key and counts the rotation.
 
-        الملجأ الأخير مقصود: إن كانت **كلّها** مبرَّدة نعيد التاليَ رغم تبريده
-        بدل أن نرفع. المفتاح المبرَّد قد يكون تجاوز حصّته للدقيقة فحسب، ومحاولةٌ
-        بمفتاح مرفوضٍ مؤقّتاً أنفعُ من إسقاط الدورة بيقين — والمنادي عليه مهلةٌ
-        وحدٌّ للمحاولات يمنعان الدوران بلا نهاية.
+        The last-resort fallback is deliberate: if **all** keys are cooled, we
+        still return the next one despite its cooldown rather than raise. A cooled
+        key may simply have exhausted its per-minute quota, and one attempt with a
+        temporarily rejected key is better than dropping the cycle for certain —
+        and the caller's timeout and attempt cap prevent endless rotation.
         """
         current = self.current()
         if block_current:
@@ -91,19 +96,20 @@ class KeyPool:
         return self.current()
 
     def blocked_count(self, *, now: float | None = None) -> int:
-        """عدد المفاتيح المبرَّدة الآن — لا التي بُرِّدت يوماً (التبريد ينتهي)."""
+        """How many keys are cooled right now — not how many ever were (cooldowns expire)."""
         moment = time.monotonic() if now is None else now
         return sum(
             1 for key in self.keys if moment < self._blocked_until.get(key, 0.0)
         )
 
     def blocked_indices(self, *, now: float | None = None) -> list[int]:
-        """مواضعُ المبرَّدة في القائمة — لتلوين مفتاحٍ بعينه في اللوحة.
+        """Positions of the cooled keys in the list — so the dashboard can color a specific key.
 
-        العددُ وحده لا يكفي: «واحدٌ من ثلاثة مبرَّد» لا يقول أيُّها، فتُعرض
-        الثلاثةُ بلونٍ واحد ويُلام السليمُ منها. والموضعُ رقمٌ في قائمة، لا
-        يدلّ على قيمةٍ ولا على طولها (FR-013)، وترتيبُ القائمة هو ترتيبُ
-        المفعّلة في الملفّ — فتتطابق مع ما تعرضه اللوحة سطراً بسطر.
+        The count alone is not enough: "one of three is cooled" does not say which
+        one, so all three would be drawn in one color and the healthy one would be
+        blamed. A position is a number in a list: it reveals neither a value nor
+        the list's length (FR-013), and the list's order is the order of the enabled
+        keys in the file — so it matches what the dashboard shows, line by line.
         """
         moment = time.monotonic() if now is None else now
         return [
@@ -112,10 +118,11 @@ class KeyPool:
         ]
 
     def stats(self, *, now: float | None = None) -> dict[str, Any]:
-        """صورةُ الحوض للكتابة في `meta` — **أعدادٌ ومؤشّرات لا قيم** (FR-013).
+        """A snapshot of the pool for writing to `meta` — **counts and indicators, no values** (FR-013).
 
-        `index` مؤشّرٌ في قائمة، لا يدلّ على قيمةٍ ولا على طولها. و`available`
-        محسوبٌ لا مستقلّ كي لا يتناقض الرقمان في العرض.
+        `index` is an index into a list: it reveals neither a value nor the list's
+        length. And `available` is computed rather than stored separately, so the
+        two numbers can never contradict each other in the display.
         """
         blocked = self.blocked_indices(now=now)
         return {
@@ -132,14 +139,16 @@ class KeyPool:
 def pool_report(
     pools: Mapping[str, Mapping[str, Any]], *, at: str, owner: str,
 ) -> str:
-    """سطر JSON واحد لصفٍّ في `meta`. المالك في القيمة لا في المفتاح وحده.
+    """One JSON line for a row in `meta`. The owner lives in the value, not only in the key.
 
-    يأخذ صوراً محسوبة (`client.key_stats()`) لا أحواضاً: الحوض خاصّيّة داخليّة
-    في العميل، وتمريره خارجاً كان سيفتح طريقاً ثانياً إلى `keys` نفسها.
+    It takes computed snapshots (`client.key_stats()`), not pools: the pool is an
+    internal property of the client, and passing it out would have opened a second
+    route to `keys` itself.
 
-    كل عمليّة تكتب صفَّها الخاصّ (`provider_keys_<owner>`) فلا تسابُقَ على صفٍّ
-    مشترك: مزوّدٌ واحد قد يوجد في `FomoChain` و`FomoEVMReplay` معاً بحالتين
-    مختلفتين، وصفٌّ واحد لهما كان سيُظهر آخرَ كاتبٍ فقط ويسمّيه الحقيقة.
+    Every process writes its own row (`provider_keys_<owner>`), so there is no race
+    over a shared row: one provider may exist in both `FomoChain` and
+    `FomoEVMReplay` in two different states, and a single row for the two would
+    show only the last writer and call it the truth.
     """
     return json.dumps(
         {"at": at, "owner": owner, "pools": {name: dict(s) for name, s in pools.items()}},
@@ -151,15 +160,16 @@ def pool_report(
 def write_pool_report(
     db: Any, owner: str, pools: Mapping[str, Mapping[str, Any]], at: str,
 ) -> bool:
-    """يختم تقرير الأحواض في `meta`. لا يرفع أبداً: تقريرٌ لا قياس.
+    """Stamps the pools report into `meta`. Never raises: this is a report, not a measurement.
 
-    يمرّ عبر `note_error` عن قصد — ليست رسالةَ خطأ، لكنّ دلالتها واحدة: كتابةٌ
-    دفتريّة لا يجوز أن تُسقط مَن يكتبها إن كانت القاعدة هي المورد المتعطّل
-    (انظر `db.note_error`). ولو غاب التابع (قاعدةٌ وهميّة في اختبار) لا نتعثّر.
+    It goes through `note_error` on purpose — it is not an error message, but its
+    meaning is the same: a bookkeeping write must not take down its writer when the
+    database is the resource that is down (see `db.note_error`). And if the method
+    is missing (a fake database in a test), we do not stumble.
     """
     try:
         value = pool_report(pools, at=at, owner=owner)
-    except Exception:  # noqa: BLE001 — تسلسلٌ فاشل لا يُسقط دورة
+    except Exception:  # noqa: BLE001 — a failed serialization must not drop the cycle
         return False
     note = getattr(db, "note_error", None)
     if note is None:

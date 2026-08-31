@@ -1,6 +1,6 @@
-"""صيغةُ ملفّ المفاتيح: ما تقرأه ثلاثُ عمليّاتٍ وتكتبه اللوحة.
+"""The key-file format: read by three processes, written by the dashboard.
 
-الاختبارات هنا لا تلمس مفتاحاً حقيقيّاً ولا الملفَّ الحقيقيّ — `tmp_path` دائماً.
+The tests here never touch a real key or the real file — `tmp_path` always.
 """
 import json
 
@@ -8,20 +8,23 @@ import key_file
 
 
 def test_tail_shows_four_characters_and_nothing_more():
-    """الخفضُ المسموح من FR-013 محدودٌ بأربعة أحرف — لا خامسٍ ولا طول."""
+    """The FR-013 allowed reveal is capped at four characters — no fifth, no
+    length."""
     assert key_file.tail("abcdefghijkl-WXYZ") == "WXYZ"
     assert len(key_file.tail("x" * 64)) == 4
 
 
 def test_tail_refuses_short_keys_because_four_of_twelve_is_a_third_of_the_secret():
-    """مفتاحٌ قصير: التمييزُ يسقط والسرُّ يبقى — لا نصفَ حلٍّ بينهما."""
+    """A short key: the reveal is dropped and the secret stays — no half
+    solution in between."""
     assert key_file.tail("short") == ""
     assert key_file.tail("x" * 11) == ""
     assert key_file.tail("x" * 12) == "xxxx"
 
 
 def test_load_treats_a_missing_or_broken_file_as_empty():
-    """القارئ لا يتعثّر: جهازٌ بلا مفاتيح حالةٌ عاديّة، والعطبُ مسؤوليّة الكاتب."""
+    """The reader does not stumble: a machine without keys is an ordinary
+    state, and corruption is the writer's responsibility."""
     assert key_file.load("no-such-file.json") == {}
 
 
@@ -35,21 +38,23 @@ def test_load_treats_a_corrupt_file_as_empty(tmp_path):
 
 
 def test_entries_reads_all_three_shapes_and_defaults_enabled_to_true():
-    """الملفّ الموجود كُتب بيدٍ قبل التعدّد؛ السطرُ اليدويّ بلا `enabled` عامل."""
+    """The existing file was written by hand before multiplicity existed; a
+    hand-written line without `enabled` counts as enabled."""
     plain = key_file.entries({"helius_api_key": " one "}, "helius_api_keys", "helius_api_key")
     assert plain == [{"key": "one", "label": "", "enabled": True}]
 
     listed = key_file.entries(
-        {"helius_api_keys": ["a", {"key": "b", "label": "حساب ثانٍ"}]},
+        {"helius_api_keys": ["a", {"key": "b", "label": "second account"}]},
         "helius_api_keys", "helius_api_key",
     )
     assert [row["key"] for row in listed] == ["a", "b"]
     assert [row["enabled"] for row in listed] == [True, True]
-    assert listed[1]["label"] == "حساب ثانٍ"
+    assert listed[1]["label"] == "second account"
 
 
 def test_entries_keeps_disabled_rows_for_the_dashboard_to_re_enable():
-    """المعطّل يبقى معروضاً وإلّا لم يكن للإيقاف المؤقّت طريقُ رجعة."""
+    """A disabled row stays visible, otherwise temporary disabling has no way
+    back."""
     rows = key_file.entries(
         {"k": [{"key": "a", "enabled": False}, "b"]}, "k", "k1",
     )
@@ -64,29 +69,32 @@ def test_entries_drops_blanks_and_duplicates():
 
 
 def test_an_empty_plural_list_hides_the_legacy_singular():
-    """حذفُ آخرِ مفتاح يجب أن يبقى محذوفاً — لا يعود المفردُ من قبره."""
+    """Deleting the last key must stay deleted — the singular does not come
+    back from its grave."""
     assert key_file.entries(
         {"k": [], "k1": "old-value"}, "k", "k1",
     ) == []
 
 
 def test_save_entries_round_trips_and_drops_the_legacy_singular(tmp_path):
-    """المفردُ يُحذف عند أوّل كتابة: مصدرُ حقيقةٍ واحد لا اثنان يتباعدان."""
+    """The singular is deleted on the first write: one source of truth, not
+    two that drift apart."""
     path = tmp_path / "keys.json"
     path.write_text(json.dumps({"helius_api_key": "old", "other_setting": 7}), encoding="utf-8")
 
     key_file.save_entries(str(path), "helius_api_keys", "helius_api_key", [
-        {"key": "new-one-123456", "label": "الرئيسي"},
+        {"key": "new-one-123456", "label": "main"},
         {"key": "new-two-123456", "label": "", "enabled": False},
     ])
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "helius_api_key" not in data
-    # ما لا يملكه هذا المزوّد لا يُمَسّ: الملفّ مشتركٌ بين ثلاثة مزوّدين وإعداداتٍ أخرى.
+    # What this provider does not own is not touched: the file is shared by
+    # three providers and other settings.
     assert data["other_setting"] == 7
     rows = key_file.load_entries(str(path), "helius_api_keys", "helius_api_key")
     assert [(row["key"], row["label"], row["enabled"]) for row in rows] == [
-        ("new-one-123456", "الرئيسي", True),
+        ("new-one-123456", "main", True),
         ("new-two-123456", "", False),
     ]
 
@@ -105,7 +113,8 @@ def test_save_entries_leaves_other_providers_untouched(tmp_path):
 
 
 def test_save_entries_replaces_atomically_and_leaves_no_temp_file(tmp_path):
-    """المسجّل يقرأ هذا الملفّ عند **كلّ نداء**؛ ملفٌّ نصفَ مكتوبٍ = عطلٌ كامل."""
+    """The recorder reads this file on **every call**; a half-written file =
+    a full outage."""
     path = tmp_path / "keys.json"
     key_file.save_entries(str(path), "k", "k1", [{"key": "value-123456"}])
     key_file.save_entries(str(path), "k", "k1", [{"key": "value-123456"},
@@ -123,12 +132,14 @@ def _source(name: str) -> str:
 
 
 def test_probe_endpoints_match_the_clients_that_use_the_keys():
-    """فحصُ عنوانٍ آخر يقول «سليم» عن مفتاحٍ لا يعمل حيث يُستعمل فعلاً.
+    """Probing a different endpoint would say "healthy" about a key that does
+    not work where it is actually used.
 
-    نطابق المضيف لا الرابط كاملاً: العميل يبني مساره بنفسه (مفتاحٌ في الاستعلام،
-    أو في المسار، أو في ترويسة) — المضيفُ هو ما يجب ألّا يتباعد. وقراءةُ النصّ
-    مقصودة: العناوين في العملاء نصوصٌ داخل الدوالّ لا ثوابتُ وحدة، وفحصٌ نصّيّ
-    يمسك التباعدَ بلا إعادة هيكلةِ عميلٍ يعمل الآن.
+    We match the host, not the full URL: the client builds its own path (key
+    in the query string, or the path, or a header) — the host is what must
+    not drift. And reading the source as text is deliberate: the URLs in the
+    clients are strings inside functions, not module constants, and a textual
+    check catches drift without restructuring a client that works today.
     """
     import config
 
@@ -144,11 +155,14 @@ def test_probe_endpoints_match_the_clients_that_use_the_keys():
 
 
 def test_provider_field_names_match_what_read_keys_is_actually_called_with():
-    """اسمُ حقلٍ مختلفٌ حرفاً واحداً = لوحةٌ تكتب في مكانٍ لا يقرأه أحد.
+    """A field name differing by one letter = a dashboard writing to a place
+    nobody reads.
 
-    نفحص نداءات `read_keys` في كلّ من يقرأ مفاتيح: كلُّ زوج (جمع، مفرد) يُنادى
-    به فعلاً يجب أن يعرفه `PROVIDERS`، وإلّا فمزوّدٌ يقرؤه المسجّل ولا تراه
-    اللوحة — أو أسوأ: اللوحة تكتب حقلاً لا يقرؤه أحد ويبدو أنّ المفتاح أُضيف.
+    We check the `read_keys` calls in everything that reads keys: every
+    (plural, singular) pair actually called must be known to `PROVIDERS`,
+    otherwise a provider is read by the recorder but unseen by the dashboard —
+    or worse: the dashboard writes a field nobody reads and the key looks
+    added.
     """
     import re
 
@@ -159,17 +173,19 @@ def test_provider_field_names_match_what_read_keys_is_actually_called_with():
                  "run_evm_replay.py", "audit_evm_ledger.py"):
         found |= {tuple(match) for match in pattern.findall(_source(name))}
 
-    assert found, "لم يُعثر على أيّ نداء read_keys — تغيّر شكل النداء فالفحص أعمى"
-    assert found <= known, f"حقولٌ لا تعرفها اللوحة: {found - known}"
+    assert found, "no read_keys calls found — the call shape changed and this check is blind"
+    assert found <= known, f"fields the dashboard does not know: {found - known}"
 
 
 def test_the_audit_tools_field_triplets_are_the_same_ones_the_dashboard_writes():
-    """المدقّق ينادي `read_keys` بمتغيّراتٍ من جدولٍ خاصّ، فالفحصُ النصّيّ أعمى عنه.
+    """The audit tool calls `read_keys` with variables from its own table, so
+    the textual check above is blind to it.
 
-    فحصُ النداءات فوق يقرأ حروفاً بين قوسين، و`audit_evm_ledger` يمرّر أسماءَ
-    حقولٍ من `PROVIDER_FIELDS` — لا يراها ذاك النمط. فيُطابَق الجدولان مباشرةً:
-    حرفٌ واحد يفترق هنا يعني لوحةً تكتب مفتاحاً في حقلٍ لا يقرؤه المدقّق، فيبدو
-    المفتاحُ مُضافاً وهو غيرُ موجود.
+    The call check above reads the letters between parentheses, while
+    `audit_evm_ledger` passes field names from `PROVIDER_FIELDS` — that
+    pattern never sees them. So the two tables are matched directly: one
+    letter off here means a dashboard writing a key into a field the auditor
+    never reads, and the key looks added when it is not there.
     """
     import audit_evm_ledger
 
@@ -179,14 +195,16 @@ def test_the_audit_tools_field_triplets_are_the_same_ones_the_dashboard_writes()
         assert (meta["plural"], meta["singular"], meta["env"]) == (
             plural, singular, env,
         ), name
-    # وكلُّ شبكةٍ في المدقّق مسارُها مزوّدٌ مُسجَّل — لا اسمٌ مخترَعٌ عند التشغيل.
+    # And every network's route in the auditor is a registered provider — no
+    # name invented at runtime.
     for network, routes in audit_evm_ledger.ARCHIVE_ROUTES.items():
         for provider, _ in routes:
             assert provider in key_file.PROVIDERS, (network, provider)
 
 
 def test_every_provider_has_the_five_fields_the_dashboard_reads():
-    """اللوحة تقرأ الخمسةَ بلا حماية، فمزوّدٌ ناقصُ حقلٍ يُسقطها بـKeyError."""
+    """The dashboard reads all five without protection, so a provider missing
+    a field takes it down with a KeyError."""
     for name, meta in key_file.PROVIDERS.items():
         assert set(meta) == {"plural", "singular", "env", "title", "probe"}, name
         assert meta["probe"]["method"] == "POST", name

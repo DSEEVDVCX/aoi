@@ -1,16 +1,19 @@
-"""يدُ الإنقاذ في الحلقات الأربع الطويلة — الانحدارُ الذي كلّف 382 دورة.
+"""The rescue hand in the four long loops — the slide that cost 382 cycles.
 
-`db.recover_connection` موجودةٌ منذ 2026-08-19، لكنّها كانت موصولةً بـ
-`recorder.py` وحدها. فحين عَلِق اتّصالُ `FomoChain` بلقطةِ قراءةٍ سُبقت في WAL
-بقيت كلُّ دورةٍ تنهار عند `set_chain_state` بـ`database is locked` من
-2026-08-22T19:26:58Z إلى 2026-08-23T11:13:47Z — **382 دورةً متتالية** — ولم
-يُفرج عنها إلّا إعادةُ تشغيل المهمّة عند 10:57Z، لا الحلقة. والقفلُ كان حرّاً
-طولَ ذلك: اتّصالٌ جديد أخذ `BEGIN IMMEDIATE` في صفرِ ثانية في 12 من 12 عيّنة،
-فالعالقُ لقطةُ قراءتنا لا القاعدة — وهي الحالة التي **لا تنفع فيها المهلة**
-لأنّ معالجَ الانتظار لا يُنادى لها (`SQLITE_BUSY_SNAPSHOT`).
+`db.recover_connection` has existed since 2026-08-19, but it was wired into
+`recorder.py` alone. So when `FomoChain`'s connection got stuck on a read
+snapshot that had been overtaken in the WAL, every cycle kept crashing at
+`set_chain_state` with `database is locked` from 2026-08-22T19:26:58Z to
+2026-08-23T11:13:47Z — **382 consecutive cycles** — and what released it was
+the task restart at 10:57Z, not the loop. The lock itself was free the whole
+time: a fresh connection took `BEGIN IMMEDIATE` in zero seconds in 12 of 12
+samples — the stuck thing was our read snapshot, not the database. That is
+the case where **the timeout does not help**, because the busy handler is
+never invoked (`SQLITE_BUSY_SNAPSHOT`).
 
-الغيابُ لا يظهر في أيّ اختبارٍ آخر: الحلقاتُ الأربع تسجّل الانهيار وتُكمل،
-فتبدو سليمةً في كلّ فحصٍ إلّا فحصَ السجلّ بعد ساعات. فيُثبَّت النداءُ نفسه.
+The absence does not show up in any other test: the four loops log the crash
+and move on, so they look healthy in every check except reading the log hours
+later. So the call itself is what gets pinned here.
 """
 import asyncio
 import sqlite3
@@ -22,7 +25,7 @@ import pytest
 
 
 class _FakeDB:
-    """أضعفُ ما يكفي: عدّادُ إنقاذٍ وأختامٌ لا ترفع."""
+    """The weakest thing that suffices: a rescue counter and stamps that do not raise."""
 
     def __init__(self) -> None:
         self.recoveries = 0
@@ -65,14 +68,14 @@ async def _locked_async(*_a, **_k):
 
 @pytest.fixture()
 def fake_db(monkeypatch):
-    """قاعدةٌ وهميّة عبر `db.RecorderDB`: الحلقاتُ تستورده **داخل** الدالّة."""
+    """A fake database via `db.RecorderDB`: the loops import it **inside** the function."""
     fake = _FakeDB()
     monkeypatch.setattr(db_module, "RecorderDB", lambda *a, **k: fake)
     return fake
 
 
 def test_chain_loop_rescues_the_connection_after_every_crash(fake_db, monkeypatch):
-    """السلسلةُ بعينها: 382 دورةً انهارت هنا بلا إنقاذٍ واحد."""
+    """The chain loop itself: 382 cycles crashed here without a single rescue."""
     import chain_layer
     import provider_keys
     import run_chain
@@ -86,12 +89,12 @@ def test_chain_loop_rescues_the_connection_after_every_crash(fake_db, monkeypatc
 
     asyncio.run(run_chain.main_loop(cycles=3))
 
-    assert fake_db.recoveries == 3      # إنقاذٌ لكلّ انهيار، لا واحدٌ للحلقة
-    assert fake_db.closed is True       # وخرجت بنظافة لا بانفجار
+    assert fake_db.recoveries == 3      # a rescue per crash, not one per loop
+    assert fake_db.closed is True       # and it exits cleanly, not with a bang
 
 
 def test_evm_replay_loop_rescues_before_it_stamps_the_error(fake_db, monkeypatch):
-    """الترتيبُ مقصود: `note_error` نفسها تفشل على اتّصالٍ عالق."""
+    """The order is deliberate: `note_error` itself fails on a stuck connection."""
     import evm_rpc
     import nodereal_rpc
     import run_evm_replay
@@ -138,7 +141,7 @@ def test_labeler_loop_rescues_the_connection_after_every_crash(fake_db, monkeypa
 
 
 def test_build_rows_loop_rescues_the_connection_after_every_crash(fake_db, monkeypatch):
-    """فترةُ هذه الحلقة ساعة: كلُّ دورةٍ ساقطة بلا إنقاذٍ ساعةُ صفوفٍ لا تُبنى."""
+    """This loop's interval is an hour: every cycle that falls without rescue is an hour of rows not built."""
     import run_build_rows
 
     monkeypatch.setattr(run_build_rows, "_log", lambda msg: None)
@@ -154,7 +157,7 @@ def test_build_rows_loop_rescues_the_connection_after_every_crash(fake_db, monke
 
 
 def test_every_long_lived_loop_wires_the_rescue():
-    """حرسٌ على الطبقة لا على الحالة: حلقةٌ جديدة تنسى النداءَ فيسقط هذا."""
+    """A guard on the layer, not on the state: a new loop forgets the call and this catches it."""
     import os
 
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

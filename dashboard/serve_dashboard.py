@@ -1,7 +1,7 @@
-"""نقطة إطلاق اللوحة (تُشغَّل عبر pythonw كمهمّة مجدولة).
+"""Dashboard launcher (run via pythonw as a scheduled task).
 
-نمط api/serve.py: نثبّت مجلّد العمل ومسار الاستيراد، نكتب سجلّ إقلاع (pythonw
-يُخفي stderr)، ثم نُشغّل uvicorn على 127.0.0.1:8090.
+Following api/serve.py's pattern: pin the working directory and import path,
+write a boot log (pythonw hides stderr), then run uvicorn on 127.0.0.1:8090.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _boot_log(msg: str) -> None:
     try:
         with open(config.BOOT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
-    except Exception:  # noqa: BLE001 — سجلّ الإقلاع لا يُسقط الإقلاع
+    except Exception:  # noqa: BLE001 — the boot log must not crash the boot
         pass
 
 
@@ -30,9 +30,9 @@ def main() -> None:
     try:
         import uvicorn
 
-        # log_config=None: تحت pythonw يكون sys.stdout = None، ومنسّق uvicorn
-        # الافتراضي يستدعي sys.stdout.isatty() فيتعطّل. تعطيله يتجنّب ذلك
-        # (نفس ما يفعله api/serve.py).
+        # log_config=None: under pythonw sys.stdout is None, and uvicorn's
+        # default formatter calls sys.stdout.isatty() and breaks. Disabling it
+        # avoids that (same as api/serve.py does).
         server_config = uvicorn.Config(
             "app:app",
             host=config.DASHBOARD_HOST,
@@ -42,9 +42,10 @@ def main() -> None:
         )
         server = uvicorn.Server(server_config)
 
-        # تسخينُ الذاكرة المؤقّتة قبل الاستماع: أوّلُ زائرٍ لا يدفع ثمن الحساب
-        # البارد (3.4ث للشبكات مقيسةً). الخيطُ خفيٌّ وفشلُه لا يُسقط الإقلاع —
-        # وأصحابُ الطلبات يُجابون بالحساب البارد كما كانوا إن سبقوه.
+        # Warm the cache before listening: the first visitor doesn't pay the
+        # cold-compute cost (3.4s for networks, measured). The thread is
+        # daemonic and its failure never crashes the boot — requests that beat
+        # it just get the cold computation as before.
         import warmup
 
         warmup.start_warmup_thread()

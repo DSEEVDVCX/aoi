@@ -1,11 +1,12 @@
-"""نقطة إطلاق المسجّل للمهمّة المجدولة (pythonw، stderr مخفيّ).
+"""Recorder launcher for the scheduled task (pythonw, stderr hidden).
 
-يعكس نمط serve.py في api/: يثبّت مجلّد العمل، يضيف المسارات، ويسجّل أي خطأ إقلاع
-إلى ملف حتى لا يضيع تحت pythonw. ثمّ يشغّل الحلقة اللانهائية.
+Mirrors the serve.py pattern in api/: pins the working directory, sets up
+import paths, and logs any boot error to a file so it is not lost under
+pythonw. Then runs the infinite loop.
 
-الاستخدام:
-  python run_recorder.py            # حلقة لا نهائية (المهمّة المجدولة)
-  python run_recorder.py 1          # دورة واحدة (تحقّق حيّ)
+Usage:
+  python run_recorder.py            # infinite loop (the scheduled task)
+  python run_recorder.py 1          # single cycle (live check)
 """
 from __future__ import annotations
 
@@ -24,14 +25,14 @@ def _log_boot(msg: str) -> None:
     try:
         with open(_BOOT_LOG, "a", encoding="utf-8") as fh:
             fh.write(msg + "\n")
-    except Exception:  # noqa: BLE001 — سجلّ الإقلاع لا يُسقط الإقلاع
+    except Exception:  # noqa: BLE001 — boot logging must not kill booting
         pass
 
 
 def main() -> None:
     import asyncio
 
-    import config  # يضيف api/src إلى sys.path عند الاستيراد
+    import config  # adds api/src to sys.path on import
     from keep_awake import keep_awake, release
 
     from recorder import main_loop
@@ -40,15 +41,17 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1].isdigit():
         cycles = int(sys.argv[1])
 
-    # قفل الاستيقاظ للحلقة اللانهائية وحدها: تشغيلٌ بعدد دورات محدّد أداةُ تحقّق
-    # يدويّة، وليس من حقّها أن تمنع الجهاز من النوم بعد أن تنتهي.
+    # The wake lock is for the infinite loop only: a run with a fixed cycle
+    # count is a manual verification tool, and it has no right to keep the
+    # machine awake after it finishes.
     awake = keep_awake() if cycles is None else False
     _log_boot(f"boot ok, db={config.DB_PATH}, cycles={cycles}, keep_awake={awake}")
     try:
         asyncio.run(main_loop(cycles=cycles))
     finally:
-        # القفل يسقط مع العملية أصلاً، لكنّ الإسقاط الصريح يجعل التوقّف النظيف
-        # يعيد سلوك النوم فوراً بلا انتظار موت العملية.
+        # The lock dies with the process anyway, but releasing it explicitly
+        # makes a clean stop restore sleep behavior immediately, without
+        # waiting for the process to die.
         if awake:
             release()
 

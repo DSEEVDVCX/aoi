@@ -7,11 +7,11 @@ from fomo_api.clients.fomo_client import FomoClient
 from fomo_api.config import settings
 
 CANDIDATES = ["large_sell", "largeSell", "whale_sell", "sell", "multi_sell",
-              "multi_user_buy"]  # الأخير معروف — شاهد إثبات أن المسبار يعمل
+              "multi_user_buy"]  # the last is known — a witness that the probe works
 
 async def probe(client, ftype):
-    # نوع مجهول وحده → 400 (موثّق في config: all-unknown list 400s).
-    # نوع صالح → 200 حتى لو بلا أحداث حديثة.
+    # an unknown type alone → 400 (documented in config: an all-unknown list 400s).
+    # a valid type → 200 even with no recent events.
     try:
         r = await client._client.get(
             client._url(settings.upstream_feed_path),

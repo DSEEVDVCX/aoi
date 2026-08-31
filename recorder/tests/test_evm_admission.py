@@ -47,7 +47,7 @@ def test_policy_levels_follow_network_rpc_capacity(db, monkeypatch, backlog, per
 
 
 def test_policy_isolated_per_network_and_records_rpc_budget(db, monkeypatch):
-    """شبكة متوقفة لا توقف شبكة أخرى ذات RPC سليم."""
+    """A stalled network must not stall another network with a healthy RPC."""
     monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "143"))
     for index in range(60):
         token = f"0x{index + 100:040x}"
@@ -72,7 +72,7 @@ def test_policy_isolated_per_network_and_records_rpc_budget(db, monkeypatch):
 
 
 def test_healthy_network_can_admit_when_other_network_is_paused(db, monkeypatch):
-    """الحالة السليمة تبقى مستقلة حتى لو توقفت Monad."""
+    """The healthy case stays independent even when Monad is down."""
     monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "143"))
     db.upsert_watch("0x" + "1" * 40, "143", "large_buy", "m-1", 48, NOW)
     db.set_evm_backfill_state(
@@ -230,8 +230,9 @@ async def test_feed_signal_survives_watch_admission_failure(db, monkeypatch):
     policy = recorder.EVMAdmissionPolicy(
         frozenset({"8453"}), 0, 1, 1, False,
     )
-    # عمرٌ معروفٌ وحديث (2026-08-29): بوابة العمر وسقف EVM الأعلى ليسا
-    # موضوع هذا الاختبار، فلا يحجبان المسار عن الإشارة. (عمر ~10 أيام.)
+    # A known, recent age (2026-08-29): the age gate and the higher EVM cap
+    # are not this test's subject, so they must not block the path to the
+    # signal. (Age ~10 days.)
     db.upsert_static({
         "token_address": "0xabc", "network_id": "8453", "recorded_at": NOW,
         "token_created_at": "1786368000", "raw_json": "{}",
@@ -253,8 +254,9 @@ async def test_feed_signal_survives_watch_admission_failure(db, monkeypatch):
 def test_control_sample_throttles_only_evm(db):
     db.upsert_watch("signal-sol", "1399811149", "large_buy", "s1", 48, NOW)
     db.upsert_watch("signal-evm", "8453", "large_buy", "s2", 48, NOW)
-    # عمرٌ معروفٌ وقديم للمرشّحين: موضوعُ الاختبار خنقُ EVM لا بوّابةُ العمر،
-    # وبلا تاريخٍ يرفضهما الضابطُ كمجهولَي العمر فيُقاس الخنق على مجموعةٍ خالية.
+    # A known, old age for the candidates: the test's subject is EVM
+    # throttling, not the age gate — without a date the controller rejects
+    # both as unknown-age and the throttle gets measured on an empty set.
     for addr, net in (("control-sol", "1399811149"), ("control-evm", "8453")):
         db.upsert_static({
             "token_address": addr, "network_id": net, "recorded_at": NOW,

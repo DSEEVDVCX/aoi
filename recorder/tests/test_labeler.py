@@ -1,7 +1,8 @@
-"""اختبارات الموسِّم (بلا شبكة، بلا ساعة نظام).
+"""Labeler tests (no network, no system clock).
 
-تثبت خصائص عدم التسرّب قبل أي شيء: لا توسيم قبل نضج النافذة، سعر الدخول لا
-يسبق الإشارة، القمم من الشموع التالية حصراً، والتقسيم بالعملة لا بالصفّ.
+Leak-proofness properties come first: no labeling before the window matures,
+the entry price never precedes the signal, peaks come from the following bars
+only, and the split is by token, not by row.
 """
 import os
 from datetime import UTC
@@ -13,7 +14,7 @@ from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 
-ENTRY = 1_785_000_000                      # لحظة الدخول (epoch)
+ENTRY = 1_785_000_000                      # the moment of entry (epoch)
 H = 3600
 
 
@@ -29,26 +30,26 @@ def _bar(ts, o=1.0, h=1.0, low=1.0, c=1.0, **flags):
 
 
 def _series(*, entry_px=1.0):
-    """سلسلة معلومة النتائج: دخول 1.0، قمّة 3.0 في الساعة 2، قاع 0.5 في
-    الساعة 30، إغلاق نهائي 2.0."""
-    bars = [_bar(ENTRY, c=entry_px)]                       # شمعة الدخول
-    bars.append(_bar(ENTRY + 30 * 60, h=1.5, c=1.2))       # داخل أوّل ساعة
-    bars.append(_bar(ENTRY + 2 * H, h=3.0, c=2.5))         # القمّة (ساعة 2)
+    """A series with known outcomes: entry 1.0, peak 3.0 at hour 2, trough 0.5
+    at hour 30, final close 2.0."""
+    bars = [_bar(ENTRY, c=entry_px)]                       # the entry bar
+    bars.append(_bar(ENTRY + 30 * 60, h=1.5, c=1.2))       # inside the first hour
+    bars.append(_bar(ENTRY + 2 * H, h=3.0, c=2.5))         # the peak (hour 2)
     bars.append(_bar(ENTRY + 10 * H, h=2.0, c=1.8))
-    bars.append(_bar(ENTRY + 30 * H, h=1.0, low=0.5, c=0.6))  # القاع
-    bars.append(_bar(ENTRY + 48 * H, h=2.2, c=2.0))        # نهاية النافذة
+    bars.append(_bar(ENTRY + 30 * H, h=1.0, low=0.5, c=0.6))  # the trough
+    bars.append(_bar(ENTRY + 48 * H, h=2.2, c=2.0))        # end of the window
     return bars
 
 
-# ---------- compute_labels: دالة خالصة ----------
+# ---------- compute_labels: a pure function ----------
 
 def test_labels_from_a_known_series():
     out = labeler.compute_labels(_series(), ENTRY)
     assert out["status"] == "ok"
     assert out["entry_px"] == 1.0
     assert out["entry_lag_s"] == 0
-    assert out["max_gain_1h"] == pytest.approx(0.5)     # قمّة 1.5 خلال ساعة
-    assert out["max_gain_4h"] == pytest.approx(2.0)     # قمّة 3.0 في الساعة 2
+    assert out["max_gain_1h"] == pytest.approx(0.5)     # peak 1.5 within an hour
+    assert out["max_gain_4h"] == pytest.approx(2.0)     # peak 3.0 at hour 2
     assert out["max_gain_24h"] == pytest.approx(2.0)
     assert out["max_gain_48h"] == pytest.approx(2.0)
     assert out["max_drawdown_48h"] == pytest.approx(-0.5)
@@ -60,18 +61,20 @@ def test_labels_from_a_known_series():
 
 
 def test_entry_bar_never_precedes_the_signal():
-    """تسرّب معكوس: شمعة قبل الإشارة لا تصلح دخولاً ولا تُحسب قممها."""
+    """Reverse leak: a bar before the signal is not a valid entry, and its
+    peaks do not count."""
     bars = [_bar(ENTRY - 300, h=99.0, c=0.1), *_series()]
     out = labeler.compute_labels(bars, ENTRY)
-    assert out["entry_px"] == 1.0                        # لا 0.1 السابقة
-    assert out["max_gain_48h"] == pytest.approx(2.0)     # لا 99 السابقة
+    assert out["entry_px"] == 1.0                        # not the earlier 0.1
+    assert out["max_gain_48h"] == pytest.approx(2.0)     # not the earlier 99
 
 
 def test_entry_bars_own_high_is_not_counted_as_gain():
-    """قمّة شمعة الدخول نفسها قد تسبق تنفيذنا — لا تُحسب مكسباً."""
+    """The entry bar's own high may precede our execution — it does not count
+    as gain."""
     bars = [_bar(ENTRY, h=50.0, c=1.0), _bar(ENTRY + H, h=1.1, c=1.05)]
     out = labeler.compute_labels(bars, ENTRY)
-    assert out["max_gain_48h"] == pytest.approx(0.1)     # لا x50
+    assert out["max_gain_48h"] == pytest.approx(0.1)     # not x50
 
 
 def test_late_entry_bar_means_no_entry():
@@ -99,13 +102,14 @@ def test_admission_price_is_the_symmetric_watch_entry_price():
 
 
 def test_truncated_series_is_flagged_not_dropped():
-    """العملة الميّتة إشارة لا نقص — استبعادها يُدخل انحياز البقاء."""
+    """A dead coin is a signal, not a gap — excluding it introduces survivorship
+    bias."""
     bars = [_bar(ENTRY, c=1.0), _bar(ENTRY + 2 * H, h=1.2, low=0.05, c=0.08)]
     out = labeler.compute_labels(bars, ENTRY)
     assert out["status"] == "ok"
     assert out["bars_truncated"] == 1
     assert out["last_bar_lag_h"] == pytest.approx(46.0)
-    assert out["is_rug"] == 1                            # -92% ≤ عتبة -90%
+    assert out["is_rug"] == 1                            # -92% ≤ the -90% threshold
 
 
 def test_series_without_a_valid_peak_is_incomplete_not_ok():
@@ -134,17 +138,17 @@ def test_non_finite_admission_price_is_rejected(price):
     )["status"] == "no_entry"
 
 
-# ---------- التقسيم ----------
+# ---------- The split ----------
 
 def test_split_is_deterministic_and_by_token():
     a = labeler.assign_split("0xAbCd")
-    assert a == labeler.assign_split("0xabcd")           # حالة الأحرف لا تفرّق
+    assert a == labeler.assign_split("0xabcd")           # letter case does not matter
     assert all(labeler.assign_split("0xAbCd") == a for _ in range(50))
     splits = {labeler.assign_split(f"tok{i}") for i in range(300)}
-    assert splits == {"train", "val", "test"}            # الأقسام الثلاثة تظهر
+    assert splits == {"train", "val", "test"}            # all three splits appear
 
 
-# ---------- label_pending: تزايديّ وناضج فقط ----------
+# ---------- label_pending: incremental, mature only ----------
 
 def _seed_signal(db, sid, token, ts_iso):
     db.insert_signal({
@@ -192,7 +196,7 @@ def _iso(epoch):
 
 def test_only_mature_windows_are_labeled(db):
     _seed_signal(db, "old", "tokA", _iso(ENTRY))
-    _seed_signal(db, "fresh", "tokB", _iso(ENTRY + 40 * H))   # نافذتها لم تكتمل
+    _seed_signal(db, "fresh", "tokB", _iso(ENTRY + 40 * H))   # its window is not complete yet
     _seed_bars(db, "tokA", ENTRY)
 
     now = ENTRY + 48 * H + config.LABEL_MARGIN_SECONDS + 60
@@ -200,7 +204,7 @@ def test_only_mature_windows_are_labeled(db):
 
     assert stats["signals"] == 1
     keys = [r["key"] for r in db._conn.execute("SELECT key FROM outcomes WHERE kind='signal'")]
-    assert keys == ["old"]                               # الطازجة تُركت لدورة لاحقة
+    assert keys == ["old"]                               # the fresh one left for a later cycle
 
 
 def test_labeling_is_idempotent(db):
@@ -208,7 +212,7 @@ def test_labeling_is_idempotent(db):
     _seed_bars(db, "tokA", ENTRY)
     now = ENTRY + 49 * H
     assert labeler.label_pending(db, now_epoch=now)["signals"] == 1
-    assert labeler.label_pending(db, now_epoch=now)["signals"] == 0   # لا إعادة
+    assert labeler.label_pending(db, now_epoch=now)["signals"] == 0   # no re-labeling
 
 
 def test_signal_outcome_carries_labels_split_and_metadata(db):
@@ -227,10 +231,11 @@ def test_signal_outcome_carries_labels_split_and_metadata(db):
 
 
 def test_independence_flag_uses_the_gap_between_signals(db):
-    """69% من الإشارات متباعدة <5 دقائق — تكرار زائف يُعلَّم لا يُحذف."""
+    """69% of signals sit <5 minutes apart — a duplicate burst is labeled, not
+    deleted."""
     _seed_signal(db, "first", "tokA", _iso(ENTRY))
-    _seed_signal(db, "burst", "tokA", _iso(ENTRY + 600))       # بعد 10 دقائق
-    _seed_signal(db, "later", "tokA", _iso(ENTRY + 2 * H))     # بعد ساعتين
+    _seed_signal(db, "burst", "tokA", _iso(ENTRY + 600))       # 10 minutes later
+    _seed_signal(db, "later", "tokA", _iso(ENTRY + 2 * H))     # two hours later
     _seed_bars(db, "tokA", ENTRY)
     labeler.label_pending(db, now_epoch=ENTRY + 60 * H)
 
@@ -243,7 +248,7 @@ def test_watch_entries_including_control_get_labeled(db):
     db.upsert_watch("tokA", "56", "large_buy", "s1", 48, _iso(ENTRY))
     db.admit_control("tokC", "56", 48, _iso(ENTRY))
     _seed_bars(db, "tokA", ENTRY)
-    _seed_bars(db, "tokC", ENTRY, final=0.05)                  # الضابطة انهارت
+    _seed_bars(db, "tokC", ENTRY, final=0.05)                  # the control collapsed
     db.set_bars_state("tokA", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
     db.set_bars_state("tokC", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
 
@@ -255,19 +260,21 @@ def test_watch_entries_including_control_get_labeled(db):
     assert rows["tokA"]["is_control"] == 0
     assert rows["tokC"]["is_control"] == 1
     assert rows["tokC"]["is_rug"] == 1                         # -95%
-    assert rows["tokC"]["is_independent"] is None              # لا يخصّ المراقبة
+    assert rows["tokC"]["is_independent"] is None              # not for watch rows
     assert rows["tokC"]["design_version"] == 2
 
 
 def test_window_labeled_when_bars_stopped_before_watch_end(db):
-    """سلسلةٌ متقطّعة تُوسم `ok` بعلم `bars_truncated` — لا تُركب إلى الأبد.
+    """A gappy series is labeled `ok` with the `bars_truncated` flag — not
+    parked forever.
 
-    قِياس حيّ 2026-08-24: 1900 نافذة ناضجة بلا توسيم لأنّ آخر سحب شموع سبق
-    `watch_until` بساعات، بينما الشموع نفسها تغطي النافذة. بوابةُ «آخر سحب»
-    كانت تحجب ما تملك بياناته أصلاً.
+    Live measurement 2026-08-24: 1,900 mature windows unlabeled because the
+    last bars fetch preceded `watch_until` by hours, while the bars themselves
+    covered the window. The "last fetch" gate was blocking what it already
+    had the data for.
     """
     db.upsert_watch("tokT", "56", "large_buy", "s1", 48, _iso(ENTRY))
-    # سلسلة متقطّعة فعلاً: شمعة الدخول ثم فراغ حتى ما بعد النهاية.
+    # A genuinely gappy series: the entry bar, then a void past the end.
     db.insert_bars([
         {"token_address": "tokT", "network_id": "56", "resolution": "5",
          "ts": ENTRY, "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "fetched_at": "t"},
@@ -275,7 +282,7 @@ def test_window_labeled_when_bars_stopped_before_watch_end(db):
          "ts": ENTRY + 3 * H, "o": 1.0, "h": 1.4, "l": 0.9, "c": 1.2,
          "fetched_at": "t"},
     ])
-    # آخر سحب قبل نهاية النافذة بساعتين — البوابة القديمة تحجب هذه الحالة.
+    # The last fetch is 2h before the window's end — the old gate blocks this case.
     db.set_bars_state("tokT", "56", "ok", 3, _iso(ENTRY + 46 * H))
 
     stats = labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
@@ -499,8 +506,8 @@ def test_v3_window_before_gate_is_not_retroactively_age_filtered(db, monkeypatch
 
 
 def test_signal_without_bars_gets_an_auditable_status_row(db):
-    """بلا شموع لا نُسقط الصفّ بصمت — status=no_entry يبقى قابلاً للجرد
-    ولا يُعاد فحصه كل دورة إلى الأبد."""
+    """Without bars the row is not silently dropped — status=no_entry stays
+    auditable and is not re-examined every cycle forever."""
     _seed_signal(db, "s1", "ghost", _iso(ENTRY))
     stats = labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
     assert stats["no_entry"] == 1
@@ -509,7 +516,7 @@ def test_signal_without_bars_gets_an_auditable_status_row(db):
     assert labeler.label_pending(db, now_epoch=ENTRY + 50 * H)["signals"] == 0
 
 
-# ---------- ترحيل outcomes القديم ----------
+# ---------- Migration of the old outcomes table ----------
 
 def test_old_empty_outcomes_table_is_replaced(tmp_path):
     import sqlite3
@@ -549,7 +556,7 @@ def test_old_outcomes_with_data_is_preserved_as_legacy(tmp_path):
     d = RecorderDB(p, SCHEMA)
     try:
         legacy = d._conn.execute("SELECT COUNT(*) FROM outcomes_legacy").fetchone()[0]
-        assert legacy == 1                                   # البيانات لم تُتلف
+        assert legacy == 1                                   # the data was not destroyed
         cols = {r["name"] for r in d._conn.execute("PRAGMA table_info(outcomes)")}
         assert "kind" in cols
     finally:

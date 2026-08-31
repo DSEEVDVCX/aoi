@@ -1,56 +1,73 @@
-# لوحة المسجّل — Fomo Recorder Dashboard
+# Recorder Dashboard — Fomo Recorder Dashboard
 
-> جزء من مشروع **aoi** — انظر [الوثيقة الرئيسية](../README.md) للمعمارية
-> الكاملة و[خطة ما بعد الجمع](../docs/PLAN.md).
+> Part of the **aoi** project — see the [main document](../README.md) for the
+> full architecture and the [post-collection plan](../docs/PLAN.md).
 
-نافذة حيّة (read-only) على ما يجمعه `FomoRecorder`، وعلى حالة الـ API المحلّي.
-تُقسّم اللوحة إلى عروض مستقلة عبر شريط جانبي: نظرة عامة، الإشارات، المراقبة،
-الأداء، صحة البيانات، والشبكات. مشروع مستقل بجانب `api/` و`recorder/`.
-**لا يعدّل أيّ كود فيهما.**
-قاعدة `recorder.db` تبقى read-only — **قراءة محضة بلا استثناء**.
+A live (read-only) window onto what `FomoRecorder` collects, and onto the
+local API's health. The dashboard is split into independent views through a
+sidebar: overview, signals, watchlist, performance, data health, and networks.
+A standalone project alongside `api/` and `recorder/`.
+**It modifies no code in either of them.**
+The `recorder.db` database stays read-only — **purely read, no exceptions**.
 
-## ماذا يعرض
-- **شريط جانبي**: تنقّل بين مساحات العمل دون صفحة طويلة واحدة؛ الحالة والخيارات تبقى
-  في الشريط العلوي على سطح المكتب، وتتحول إلى شريط قابل للتمرير على الهاتف.
-- **شريط علوي**: هل المسجّل حيّ (آخر دورة خلال 150ث)، وهل الـ API متصل/معطوب/منقطع،
-  مع إيقاف مؤقّت للتحديث وتبديل السمة (داكن/فاتح/تلقائي).
-- **رقم رئيسي واحد**: عدد الإشارات المسجّلة + خطّ تراكمها في آخر 24 ساعة.
-- **بطاقات**: المراقَب النشط، تغطية الشموع، شموع OHLCV، لقطات السوق، حجم الأرشيف
-  ومعدّل نموّه، وزمن الـ API.
-- **أداء الإشارات منذ الدخول** ← اللوحة الأهمّ: لكل عملة مراقَبة، كم ارتفع سعرها
-  بعد إشارتها (`peak_pct`)، وأين هي الآن، وكم انخفضت عن قمّتها، مع sparkline.
-  أعمدتها **قابلة للترتيب** (ضغطة على العنوان تقلب الاتجاه) وحدّ العرض قابل للتغيير.
-- **حصيلة الأرباح والخسائر** فوق الجدول: عدد الرابح/الخاسر، نسبة الرابح، متوسّط
-  العائد **والوسيط** معاً، مجموع الأرباح ومجموع الخسائر والصافي، والأفضل والأسوأ.
-- **تدفّق الإشارات**: أعمدة مكدّسة، الإشارات لكل ساعة حسب النوع (آخر 24 ساعة).
-- **صحّة الجمع**: تغطية الشموع + آخر دورة + حجم/مدى الأرشيف + مساحة القرص وطزاجة النسخة الاحتياطية.
-- **قائمة المراقبة**: مقياس المتبقّي من 48 ساعة لكل عملة.
-- **أحدث الإشارات**: مع إبراز "متصدّر اشترى" (top_trader_match_count>0 أو رتبة ≤50).
-- **الأخطاء حسب المصدر**: النشِط بالأحمر، والمتعافى (أقدم من آخر دورة ناجحة) خافتاً.
-- **الشبكات**: عدد العملات المراقبة ولقطات السوق وقياسات `Top 1/5/10/20` وعدد
-  الحائزين حسب الشبكة، مع إظهار مصدر القياس وآخر تحديث فعلي.
+## What it shows
+- **Sidebar**: navigate between workspaces instead of one long page; status and
+  options stay in the top bar on desktop, and turn into a scrollable bar on mobile.
+- **Top bar**: is the recorder alive (last cycle within 150s), is the API
+  connected/degraded/disconnected, plus a pause for refresh and a theme toggle
+  (dark/light/auto).
+- **One headline number**: the count of recorded signals + its accumulation
+  line over the last 24 hours.
+- **Cards**: active watches, candle coverage, OHLCV candles, market snapshots,
+  archive size and growth rate, and API latency.
+- **Signal performance since entry** ← the most important panel: for every
+  watched coin, how much its price rose after its signal (`peak_pct`), where
+  it is now, and how far it has fallen from its peak, with a sparkline.
+  Its columns are **sortable** (a click on the header flips the direction) and
+  the display limit is changeable.
+- **The profit-and-loss tally** above the table: winner/loser count, win rate,
+  mean return **and median** together, gross gains and gross losses and net,
+  and the best and worst.
+- **Signal flow**: stacked columns, signals per hour by type (last 24 hours).
+- **Collection health**: candle coverage + last cycle + archive size/span +
+  disk space and backup freshness.
+- **Watchlist**: the 48-hour remaining gauge for each coin.
+- **Latest signals**: with a "top trader bought" highlight
+  (top_trader_match_count>0 or rank ≤50).
+- **Errors by source**: the active one in red, the recovered one (older than
+  the last successful cycle) dimmed.
+- **Networks**: the number of watched coins, market snapshots, `Top 1/5/10/20`
+  measurements, and holder counts per network, showing the measurement source
+  and the last actual update.
 
-الصفحة تُحدّث نفسها كل 10 ثوانٍ عبر fetch للـ JSON endpoints.
+The page refreshes itself every 10 seconds via fetch to the JSON endpoints.
 
-## ملاحظات التصميم (لمن يعدّلها لاحقاً)
+## Design notes (for whoever edits it later)
 
-- **الألوان مُتحقَّق منها آلياً، لا مُختارة بالذوق.** الألوان الفئوية الثلاث
-  (نوع الإشارة) تجتاز بوابات فصل عمى الألوان والتباين على السطحين الداكن
-  والفاتح. لا تُبدّل لوناً بالحدس — أعِد تشغيل مدقّق اللوحة أوّلاً.
-- **اللون يتبع نوع الإشارة لا رتبتها** (`TYPE_META`): وإلّا أعادت الفلترة طلاء
-  السلاسل الباقية فيضلّ من تعلّم "الأزرق = شراء متعدّد".
-- **الترتيب يجري على الخادم، لا في المتصفّح.** الخادم يرتّب المجموعة كاملة ثمّ
-  يقتطع. لو رُتِّبت في المتصفّح بعد الاقتطاع لأعطى العكسُ «أفضل N مقلوبة» لا
-  الأسوأ فعلاً — خطأ صامت يبدو صحيحاً تماماً. مفاتيح الترتيب في قائمة بيضاء
-  (`_SORT_KEYS`)، والقيمة الغائبة تبقى في الذيل في الاتجاهين.
-- **الحصيلة تُحسب على كل العملات لا على الشريحة المعروضة** — وإلّا تغيّرت الأرقام
-  كلّما غيّر المستخدم حدّ العرض. وهي مبنيّة على `change_pct` لا `peak_pct`: القمّة
-  لا تُحقَّق إلّا ببيع في لحظتها. **والوسيط معروض بجانب المتوسّط** لأنّ رابحاً
-  واحداً شاذّاً يسحب المتوسّط وحده (حالياً: متوسّط +4.9% مقابل وسيط −4.7%).
-- **الروابط إلى fomo.family** مبنيّة من جدول مسارات الموقع نفسه لا بالتخمين:
-  صفحة العملة `/tokens/:chain/:tokenAddress` وصفحة المتداول `/u/:handle`.
-  و`:chain` **اسم مختصر لا معرّف رقميّ** — كود الموقع يقرؤه كمفتاح في خريطة،
-  فالخريطة منسوخة حرفياً من حزمته (`chains-*.js`) إلى `CHAIN_SLUG`:
+- **The colors are verified automatically, not chosen by taste.** The three
+  categorical colors (signal type) pass color-blindness separation and contrast
+  gates on both the dark and light surfaces. Don't swap a color on intuition —
+  run the dashboard's color checker first.
+- **The color follows the signal type, not its rank** (`TYPE_META`): otherwise
+  filtering would repaint the remaining series and confuse whoever learned
+  "blue = multi-buy".
+- **Sorting happens on the server, not in the browser.** The server sorts the
+  full set, then truncates. If it were sorted in the browser after truncation,
+  descending order would have given "the top N inverted" instead of the actual
+  worst — a silent mistake that looks completely correct. The sort keys are
+  whitelisted (`_SORT_KEYS`), and a missing value stays at the tail in both
+  directions.
+- **The tally is computed over all coins, not the displayed slice** —
+  otherwise the numbers would change whenever the user changed the display
+  limit. And it's built on `change_pct`, not `peak_pct`: a peak is only
+  realized by selling at that exact moment. **And the median is shown next to
+  the mean** because a single outlier winner drags the mean by itself
+  (currently: mean +4.9% versus median −4.7%).
+- **The links to fomo.family** are built from the site's own route table, not
+  by guessing: the coin page `/tokens/:chain/:tokenAddress` and the trader
+  page `/u/:handle`. And `:chain` is a **short slug, not a numeric id** — the
+  site's code reads it as a key in a map, so the map is copied verbatim from
+  its bundle (`chains-*.js`) into `CHAIN_SLUG`:
 
   | networkId | slug | | networkId | slug |
   |---|---|---|---|---|
@@ -59,68 +76,75 @@
   | 143 | `monad` | | 4663 | `robinhood` |
   | 56 | `bnb` | | | |
 
-  شبكة غير مذكورة في الجدول ⇒ **لا رابط** (نصّ عاديّ) بدل رابط مُخمَّن يقود إلى
-  صفحة معطوبة. إن أضافت fomo شبكة جديدة، أضِفها هنا. كل الروابط
-  `target="_blank" rel="noopener noreferrer"`.
-- **لكل رسم مكافئ جدوليّ** (زرّ «عرض كجدول»): القيمة لا تُحجب خلف تلميح.
-- **وسيلة إيضاح حاضرة دائماً** لسلسلتين فأكثر؛ الاتجاه (صعود/هبوط) يُشفَع
-  بعلامة `+/-` ونصّ فلا يحمل اللون المعنى وحده.
-- **كل لوحة تُرسم معزولة** عبر `paint()`: عطبٌ في واحدة يُفرغ تلك وحدها.
-  (بلا هذا العزل أفرغ خطأ واحد أربع لوحات دفعةً واحدة.)
-- **الصفحة تُخدَّم بـ `Cache-Control: no-cache`**: بدونها يبقى المتصفّح على
-  نسخة قديمة من اللوحة إلى الأبد بعد أي تحديث — بما في ذلك بعد إصلاح عطب.
-- الجداول العريضة تُمرَّر داخل `.tablewrap` وحدها؛ جسم الصفحة لا يُمرَّر أفقياً.
-- بلا أي مكتبة خارجية: الرسوم SVG مكتوبة يدوياً (تعمل بلا إنترنت).
+  A network not in the table ⇒ **no link** (plain text) instead of a guessed
+  link leading to a broken page. If fomo adds a new network, add it here. All
+  links are `target="_blank" rel="noopener noreferrer"`.
+- **Every chart has a table equivalent** (a "show as table" button): the value
+  isn't hidden behind a tooltip.
+- **A legend is always present** for two or more series; the direction
+  (up/down) is paired with a `+/-` sign and text, so color never carries the
+  meaning alone.
+- **Every panel renders in isolation** via `paint()`: a failure in one empties
+  that one alone. (Without this isolation one error emptied four panels at once.)
+- **The page is served with `Cache-Control: no-cache`**: without it the browser
+  stays on an old version of the dashboard forever after any update — including
+  after a bug fix.
+- Wide tables scroll inside `.tablewrap` alone; the page body never scrolls
+  horizontally.
+- No external libraries: the charts are hand-written SVG (they work offline).
 
-## الأمان
-- تُفتح `recorder.db` عبر URI بـ **`mode=ro`** — لا كتابة إطلاقاً، فلا تعطّل كتابات المسجّل (WAL).
-- الاستماع على **127.0.0.1** فقط (محلّي، غير مكشوف).
-- **الحارسان يبقيان رغم أنّ اللوحة صارت قراءةً محضة**: حارس `Host` يمنع DNS
-  rebinding عن كل المسارات، وحارس CSRF (رمز جلسة عشوائي + تطابق `Origin/Referer`)
-  يرفض أي طلب يغيّر الحالة. أرخص من تذكّر إعادتهما عند أوّل مسار كتابة يُضاف.
+## Security
+- `recorder.db` is opened via a URI with **`mode=ro`** — no writes at all, so
+  it never blocks the recorder's writes (WAL).
+- Listening on **127.0.0.1** only (localhost, not exposed).
+- **Both guards stay even though the dashboard is now purely read-only**: the
+  `Host` guard blocks DNS rebinding on every route, and the CSRF guard (a
+  random session token + `Origin/Referer` matching) rejects any
+  state-changing request. Cheaper than remembering to add them back when the
+  first write route appears.
 
-## الملفات
-- `config.py` — المسارات والمنافذ (recorder.db، API health، منفذ 8090).
-- `dao.py` — دوال قراءة خالصة (read-only) قابلة للاختبار.
-- `app.py` — FastAPI: JSON endpoints + خدمة الصفحة.
-- `static/index.html` — الصفحة (RTL عربي، HTML+CSS+JS مضمّن).
-- `serve_dashboard.py` — نقطة الإطلاق (chdir + boot log + uvicorn).
-- `tests/test_dao.py` — اختبارات dao على قاعدة مؤقّتة.
-- `tests/test_app_guards.py` — اختبارات حارسَي `Host` وCSRF.
+## Files
+- `config.py` — paths and ports (recorder.db, API health, port 8090).
+- `dao.py` — pure read-only query functions, testable.
+- `app.py` — FastAPI: JSON endpoints + serving the page.
+- `static/index.html` — the page (inline HTML+CSS+JS, English/LTR).
+- `serve_dashboard.py` — the launch point (chdir + boot log + uvicorn).
+- `tests/test_dao.py` — dao tests against a temporary database.
+- `tests/test_app_guards.py` — tests for the `Host` and CSRF guards.
 
 ## endpoints
-| المسار | الوصف |
+| Route | Description |
 |---|---|
-| `GET /` | الصفحة |
-| `GET /api/status` | حالة المسجّل (حيّ، عدّ الدورات، آخر دورة…) **وحالة الموسِّم** — الشريط العلويّ يعرضهما منفصلين لأنّ موت الموسِّم صامت (لا أخطاء ولا انهيار دورات) |
-| `GET /api/api-health` | فحص `http://127.0.0.1:8080/health` |
-| `GET /api/signals?limit=50` | أحدث الإشارات |
-| `GET /api/watchlist` | العملات المراقَبة النشطة |
-| `GET /api/ticks-summary` | ملخّص لقطات السوق |
-| `GET /api/counts` | أعداد صفوف كل جدول |
-| `GET /api/errors` | آخر خطأ لكل مصدر |
-| `GET /api/bars` | تغطية الشموع (كم عملة مراقَبة لها سلسلة سعرية) |
-| `GET /api/storage` | حجم الأرشيف ونموّه ومساحة القرص وطزاجة النسخة الاحتياطية |
-| `GET /api/performance?limit=12` | أداء كل عملة منذ إشارتها + sparkline |
-| `GET /api/signal-timeline?hours=24` | الإشارات لكل ساعة حسب النوع |
-| `GET /api/networks` | تغطية السوق والتركيز والحائزين حسب الشبكة |
+| `GET /` | The page |
+| `GET /api/status` | Recorder status (alive, cycle count, last cycle…) **and labeler status** — the top bar shows them separately because the labeler's death is silent (no errors, no cycle crashes) |
+| `GET /api/api-health` | Checks `http://127.0.0.1:8080/health` |
+| `GET /api/signals?limit=50` | Latest signals |
+| `GET /api/watchlist` | Active watched coins |
+| `GET /api/ticks-summary` | Market snapshot summary |
+| `GET /api/counts` | Row counts for every table |
+| `GET /api/errors` | Last error per source |
+| `GET /api/bars` | Candle coverage (how many watched coins have a price series) |
+| `GET /api/storage` | Archive size and growth, disk space, and backup freshness |
+| `GET /api/performance?limit=12` | Every coin's performance since its signal + sparkline |
+| `GET /api/signal-timeline?hours=24` | Signals per hour by type |
+| `GET /api/networks` | Market, concentration, and holder coverage per network |
 
-## التشغيل يدوياً
+## Running manually
 ```powershell
 & "C:\Users\rr\AppData\Local\Programs\Python\Python311\python.exe" `
   "c:\Users\rr\Desktop\aoi\dashboard\serve_dashboard.py"
-# ثم افتح: http://127.0.0.1:8090/
+# then open: http://127.0.0.1:8090/
 ```
 
-## الاختبارات
+## Tests
 ```powershell
 cd c:\Users\rr\Desktop\aoi\dashboard
 & "C:\Users\rr\AppData\Local\Programs\Python\Python311\python.exe" -m pytest tests -q
 ```
 
-## المهمّة المجدولة
-تُثبَّت `FomoDashboard` (نمط `FomoRecorder`): `pythonw serve_dashboard.py`،
-تبدأ عند تسجيل الدخول، تنجو من إعادة التشغيل. إدارتها:
+## Scheduled task
+`FomoDashboard` is installed (the `FomoRecorder` pattern):
+`pythonw serve_dashboard.py`, starts at logon, survives a reboot. Manage it:
 ```powershell
 Start-ScheduledTask -TaskName FomoDashboard
 Stop-ScheduledTask  -TaskName FomoDashboard

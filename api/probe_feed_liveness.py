@@ -1,11 +1,13 @@
-"""هل مِجَسُّ الحياة يصدُق حين يُفتح الطريق؟
+"""Does the liveness probe tell the truth once the road opens?
 
-`_upstream_alive` يضرب `GET /feed?limit=1` بلا `feedTypes`، و`/feed` يشترطها
-شرطاً لازماً، و`_get` يترجم كلَّ ≥400 إلى «غير متاح». فالمِجَسُّ — نظرياً —
-يقرأ الطريقَ ميتاً وهو حيّ، فلا يُعاد فتحُ القاطع أبداً بعد رفع الحجب.
+`_upstream_alive` hits `GET /feed?limit=1` without `feedTypes`, and `/feed`
+requires it, and `_get` translates every ≥400 into "unavailable". So the
+probe — in theory — reads the road as dead while it's alive, and the breaker
+never reopens after the block is lifted.
 
-هذا يقيسه بحسابٍ عاملٍ من الملفّ الدائم: نداءُ المِجَسّ حرفيّاً، ثمّ النداءُ
-نفسه مع `feedTypes` — والفرقُ بينهما هو الحكم.
+This measures it with a working account from the persistent profile: the
+probe's call literally, then the same call with `feedTypes` — and the
+difference between them is the verdict.
 
     py probe_feed_liveness.py
 """
@@ -33,7 +35,7 @@ FEED_TYPES = ("multi_user_buy", "large_buy", "multi_user_sell", "large_sell")
 
 
 async def _token() -> str | None:
-    """يقرأ توكن الجلسة المحفوظة — لا دخولَ بشريّاً، الملفُّ دائم."""
+    """Reads the saved session token — no human sign-in, the profile is persistent."""
     from playwright.async_api import async_playwright
 
     async with async_playwright() as pw:
@@ -45,7 +47,7 @@ async def _token() -> str | None:
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await page.goto(APP, wait_until="domcontentloaded")
         tok = None
-        for _ in range(30):          # Privy يكتب التوكن بعد إقلاع الـSDK لا قبله
+        for _ in range(30):          # Privy writes the token after the SDK boots, not before
             with contextlib.suppress(Exception):
                 tok = await page.evaluate("() => localStorage.getItem('privy:token')")
             if tok:
@@ -59,7 +61,7 @@ async def _token() -> str | None:
 async def main() -> None:
     tok = await _token()
     if not tok:
-        print(">>> لا جلسة محفوظة في .chk_profile — شغّل check_account_block.py أوّلاً.")
+        print(">>> No saved session in .chk_profile — run check_account_block.py first.")
         return
 
     from curl_cffi.requests import AsyncSession
@@ -73,11 +75,11 @@ async def main() -> None:
         "origin": APP,
         "referer": f"{APP}/",
     }
-    # نداءُ المِجَسّ حرفيّاً، ثمّ نداءُ المسجّل الحقيقيّ — والثالثُ حَكَمٌ محايد
+    # the probe's call literally, then the recorder's real call — and the third is a neutral judge
     cases = (
-        ("مِجَسُّ الحياة كما هو", {"limit": 1}),
-        ("مِجَسٌّ + feedTypes", {"feedTypes": list(FEED_TYPES), "limit": 1}),
-        ("نداءُ المسجّل", {"feedTypes": list(FEED_TYPES), "limit": 50}),
+        ("liveness probe as-is", {"limit": 1}),
+        ("probe + feedTypes", {"feedTypes": list(FEED_TYPES), "limit": 1}),
+        ("recorder's call", {"feedTypes": list(FEED_TYPES), "limit": 50}),
     )
     async with AsyncSession(impersonate="chrome124", headers=headers, timeout=20) as s:
         for label, params in cases:
@@ -86,8 +88,8 @@ async def main() -> None:
             print(f"  {label:24s} {json.dumps(params, ensure_ascii=False)[:52]:54s} -> {r.status_code}")
             if r.status_code != 200:
                 print(f"    {body}")
-    print("\nالحكم: إن ردَّ الأوّلُ 400 والثاني 200، فالمِجَسُّ كاذبٌ بذاته —")
-    print("       يقرأ الطريقَ ميتاً وهو حيّ، فلا يُرفع القاطعُ بعد رفع الحجب.")
+    print("\nVerdict: if the first answers 400 and the second 200, the probe is false on its own —")
+    print("       it reads the road as dead while it's alive, so the breaker never lifts after the block is lifted.")
 
 
 if __name__ == "__main__":

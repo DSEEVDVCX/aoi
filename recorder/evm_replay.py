@@ -1,39 +1,47 @@
 # -*- coding: utf-8 -*-
-"""إعادة رجعيّة لتركّز حائزي EVM: صفوف تركّز لماضٍ لم تكن الطبقة تعمل فيه.
+"""Retroactive replay of EVM holder concentration: concentration rows for a past when the layer was not running.
 
-**لماذا هذه مسموحة وتعبئة الإشارات الرجعيّة ممنوعة؟** الفرق ليس في الزمن بل في
-مصدر المعلومة. تلك تختلق نافذة مراقبة لعملة لم يرها البوت أصلاً — فتُدخِل إلى
-التدريب اختياراً لم يكن ليقع. وهذه لا تُنشئ صفّاً ولا نافذة: تأخذ صفّ تدريب
-**موجوداً** وتُكمِل أعمدةً كانت NULL فيه، بمعلومة كانت **متاحة فعلاً** في لحظته.
+**Why is this allowed while retroactive signal backfilling is forbidden?** The difference
+is not in time but in the source of the information. That one fabricates a monitoring
+window for a token the bot never saw at all — importing into training a selection that
+would never have occurred. This one creates no row and no window: it takes an
+**existing** training row and completes columns that were NULL in it, with information
+that was **actually available** at its moment.
 
-والسلسلة هي ما يجعل ذلك ممكناً وحدها بين مصادرنا: سجلّ لا يُغيَّر ومؤرَّخ
-بالكتل. فإعادة تشغيل تحويلات عملة حتى الكتلة التي كانت رأساً عند اللحظة القديمة
-تعطي **ما كان معلوماً في تلك اللحظة بالضبط** — لا شيء من مستقبلها. أمّا الأسعار
-والسيولة والحائزون من FOMO فحالةٌ لحظيّة لا سجلّ، فلا يمكن إعادتها ولا تُحاوَل.
+And the chain is the only one of our sources that makes this possible: an immutable
+ledger dated by blocks. Replaying a token's transfers up to the block that was head at
+the old moment yields **exactly what was known at that moment** — nothing from its
+future. Prices, liquidity, and holders from FOMO, by contrast, are a momentary state
+with no history, so they cannot be replayed and are not attempted.
 
-وثلاثة حرّاس تجعل الصفّ المُعاد إمّا صحيحاً أو غائباً، ولا شيء بينهما:
+And three guards make every replayed row either correct or absent — nothing in between:
 
-1. **`is_replay = 1`** على كل صفّ. الرقم صادق لكنّ طريقه مختلف (الحيّ بتأخير
-   تأكيد وإيقاع دورة، والمُعاد عند الكتلة بالضبط) ⇒ الفصل عمودٌ حقيقيّ لا حقل
-   في `raw_json`، ليبقى ممكناً تدريبٌ على المقيس حيّاً وحده.
-2. **فحص الأرصدة السالبة.** الرصيد تراكم لا معدّل: من بدأ القراءة بعد أوّل تحويل
-   يرى إرسالاً بلا استلام فيصير الرصيد سالباً — أي أنّ الأرقام **كاذبة لا
-   ناقصة**. الطبقة الحيّة تُثبّت السالب عند صفر (عمودها نصّ سِتّينيّ لا يحمل
-   إشارة)، وهنا لا يُثبَّت بل يُكشَف: عملة واحد من عناوينها سالب لا تُكتب أصلاً.
-3. **الهامش الزمنيّ يُضاف لا يُطرح.** حيث لا طابع في السجلّ (روبن‑هود) يُستقرَأ
-   الوقت بين مرساتين، والاستقراء يخطئ ثوانٍ. فالهامش يُبعِد السجلّ الحدوديّ إلى
-   ما **بعد** اللقطة: أسوأ ما يقع تأخيرُ قياس (كما تفعل تأكيدات الكتل في الطبقة
-   الحيّة) لا استباقُه — وهو الاتّجاه الوحيد المقبول.
+1. **`is_replay = 1`** on every row. The number is honest, but its path differs (live:
+   confirmation delay and cycle cadence; replay: exactly at the block) => the split is a
+   real column, not a field in `raw_json`, so training on live measurements alone stays
+   possible.
+2. **The negative-balance check.** A balance is an accumulation, not a rate: whoever
+   starts reading after the first transfer sees sends without receives, so the balance
+   goes negative — meaning the numbers are **false, not incomplete**. The live layer
+   clamps negatives to zero (its column is a hexadecimal string that carries no sign);
+   here it is not clamped but exposed: a token with even one negative address is not
+   written at all.
+3. **The time margin is added, never subtracted.** Where the log carries no timestamp
+   (Robinhood), time is interpolated between anchors, and interpolation errs by
+   seconds. The margin pushes a boundary log to **after** the snapshot: the worst that
+   can happen is a late measurement (as block confirmations do in the live layer), never
+   an early one — the only acceptable direction.
 
-والإيقاع 5 دقائق لا لقطة واحدة لكل صفّ تدريب: عائلة `onchain_*` تقرأ لقطةً
-عند/قبل t0 **ولقطةً قبلها بـ240–900ث** لتحسب فروق الخمس دقائق (`features.py`)،
-فلقطةٌ واحدة تعطي الفروق كلّها NULL — وهي أنفس ما في الطبقة.
+And the cadence is 5 minutes, not a single snapshot per training row: the `onchain_*`
+family reads a snapshot at/before t0 **and one 240-900s earlier** to compute the
+five-minute deltas (`features.py`), so a single snapshot leaves all the deltas NULL —
+and they are the most valuable part of the layer.
 
-الاستخدام:
-  python evm_replay.py --check          # ما هو المتاح وما كلفته، بلا نداء كتابة
-  python evm_replay.py --limit 1        # عملة واحدة (تحقّق يدويّ)
+Usage:
+  python evm_replay.py --check          # what is available and what it costs, with no write calls
+  python evm_replay.py --limit 1        # one token (manual verification)
   python evm_replay.py --token 0x… --dry-run
-  python evm_replay.py                  # كل المتاح على شبكات الإعادة
+  python evm_replay.py                  # everything available on the replay networks
 """
 from __future__ import annotations
 
@@ -51,7 +59,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import config  # noqa: E402 — تشغيل الملف مباشرة يتطلب إضافة HERE أولاً
+import config  # noqa: E402 — running this file directly requires adding HERE first
 import evm_rpc  # noqa: E402
 from db import RecorderDB, StaleEVMState, decode_raw, utcnow_iso  # noqa: E402
 from evm_layer import build_evm_concentration_row  # noqa: E402
@@ -62,11 +70,12 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):  # pragma: no cover - depends on host terminal
         pass
 
-# عناوين لا تُحسب حائزاً — نفس مجموعة الطبقة الحيّة، وإلّا اختلف عمود عن عمود.
+# Addresses that do not count as holders — the same set as the live layer, otherwise the columns would disagree.
 _BURN = {a.lower() for a in evm_rpc.BURN_ADDRESSES}
 _TOP_N = 20
-# كم لقطة قبل لحظة الدخول: فرق الخمس دقائق عند t0 يحتاج سلفاً قبله، فبلا هذه
-# السابقة يبقى `onchain_*_delta_5m` فارغاً في أوّل صفّ — وهو أهمّ صفوف النافذة.
+# How many snapshots before the entry moment: the five-minute delta at t0 needs a
+# predecessor before it; without one, `onchain_*_delta_5m` stays empty in the first
+# row — and that is the most important row of the window.
 _LEAD_STEPS = 2
 
 
@@ -75,17 +84,17 @@ def _epoch(iso: str) -> int:
 
 
 def _iso(ts: int) -> str:
-    """نفس صيغة `utcnow_iso` بالضبط: القراءة في `features.py` عبر
-    `strftime('%s', recorded_at)` وSQLite يفهم الإزاحة `+00:00` لا حرف Z."""
+    """Exactly the same format as `utcnow_iso`: reading in `features.py` goes through
+    `strftime('%s', recorded_at)` and SQLite understands the `+00:00` offset, not the Z letter."""
     return datetime.fromtimestamp(int(ts), UTC).isoformat()
 
 
 def grid_points(start_ts: int, end_ts: int, step: int) -> list[int]:
-    """لحظات اللقطات: من البداية إلى النهاية بخطوة ثابتة، والنهاية داخلة.
+    """Snapshot moments: from start to end at a fixed step, end inclusive.
 
-    الشبكة تُحاذى على مضاعفات الخطوة (`ts // step * step`) لا على لحظة الدخول:
-    عملتان دخلتا بفارق ثلاث دقائق تصيران على نفس الشبكة، فلو أُضيفت لقطات حيّة
-    لاحقاً لم تتشابك سلسلتان بإيقاعين.
+    The grid is aligned to multiples of the step (`ts // step * step`), not to the entry
+    moment: two tokens that entered three minutes apart land on the same grid, so if
+    live snapshots are added later, two series with two cadences never tangle.
     """
     step = max(1, int(step))
     first = (int(start_ts) // step) * step
@@ -96,7 +105,7 @@ def watch_grid(
     watch: dict[str, Any], start_ts: int, end_ts: int, step: int,
     live_coverage: dict[str, str] | None = None,
 ) -> list[int]:
-    """اتحاد نقاط نوافذ العملة الفعلية؛ لا يملأ الفجوات بين إعادة التنشيط."""
+    """Union of the token's actual window points; gaps between re-activations are not filled."""
     windows = watch.get("replay_windows")
     if not isinstance(windows, list) or not windows:
         windows = [{
@@ -119,14 +128,14 @@ def watch_grid(
 
 
 class BlockClock:
-    """جدول تحويل وقت↔كتلة لشبكة واحدة، مخزَّن في `evm_block_time`.
+    """A time↔block conversion table for one network, stored in `evm_block_time`.
 
-    مشترك بين العملات بحكم التصميم: المرساة صفة كتلة لا صفة عملة، ونوافذ الـ48
-    ساعة متراكبة بكثافة ⇒ العملة العاشرة على الشبكة تكاد لا تنادي شيئاً. ولذلك
-    تُحاذى المراسي على شبكة ثابتة (مضاعفات `EVM_REPLAY_ANCHOR_BLOCKS`): أرقام
-    عشوائية لكل عملة تعني صفراً من إعادة الاستخدام.
+    Shared across tokens by design: an anchor is a property of a block, not of a token,
+    and the 48-hour windows overlap heavily => the tenth token on a network makes almost
+    no calls of its own. That is why anchors are aligned on a fixed grid (multiples of
+    `EVM_REPLAY_ANCHOR_BLOCKS`): random numbers per token would mean zero reuse.
 
-    والمرساة لا تُبطل أبداً — طابع الكتلة لا يتغيّر — فهي أرخص ذاكرة في المشروع.
+    And an anchor is never invalidated — a block's timestamp does not change — so it is the cheapest memory in the project.
     """
 
     def __init__(self, db: RecorderDB, network_id: str) -> None:
@@ -150,13 +159,14 @@ class BlockClock:
         self.db.add_block_anchor(self.net, block, ts, now_iso)
 
     def time_at(self, block: int) -> int | None:
-        """وقت كتلة بالاستقراء الخطّيّ بين أقرب مرساتين.
+        """A block's time by linear interpolation between the nearest anchors.
 
-        الخطّيّة مشروعة بقياس: زمن كتلة روبن‑هود 0.1002ث على 100 ألف كتلة
-        و0.1003ث على 300 ألف (2026-08-13) ⇒ الانحراف داخل قوس واحد (18 ألف كتلة
-        = نصف ساعة) ثوانٍ لا دقائق. وخارج القوسين يُمَدّ الميل من أقرب زوج بدل
-        `None`: العملة الجديدة كل تحويلاتها فوق آخر مرساة، ورفضُها يعني ألّا
-        نقيس شيئاً.
+        Linearity is justified by measurement: Robinhood block time is 0.1002s over 100k
+        blocks and 0.1003s over 300k (2026-08-13) => the deviation within one span
+        (18k blocks = half an hour) is seconds, not minutes. Outside both spans the
+        slope is extrapolated from the nearest pair instead of returning `None`: a new
+        token has all its transfers above the last anchor, and refusing it would mean
+        measuring nothing.
         """
         block = int(block)
         n = len(self.blocks)
@@ -167,7 +177,7 @@ class BlockClock:
         i = bisect.bisect_left(self.blocks, block)
         if i < n and self.blocks[i] == block:
             return self.times[i]
-        lo = min(max(i - 1, 0), n - 2)   # قوس داخليّ، أو أقرب زوج عند الطرفين
+        lo = min(max(i - 1, 0), n - 2)   # interior span, or the nearest pair at the ends
         b0, b1 = self.blocks[lo], self.blocks[lo + 1]
         t0, t1 = self.times[lo], self.times[lo + 1]
         if b1 == b0:
@@ -182,14 +192,16 @@ class BlockClock:
         self, rpc: Any, block: int, now_iso: str, sleep=asyncio.sleep,
         retries: int | None = None,
     ) -> int | None:
-        """يجلب طابع كتلة ويحفظه مرساةً. الكتلة المعروفة لا تُنادى.
+        """Fetches a block timestamp and saves it as an anchor. A known block is not called.
 
-        والكتم (429) يُنتظَر ويُعاد **هنا** لا يُرفَع: عقدة روبن‑هود العامّة تكتم
-        بعد تسعة نداءات (مقيس 2026-08-13 على تباعد 0.4ث و1.0ث سواءً — فهي حصّة
-        لا تباعد)، وأوّل تشغيل حيّ مات عند العملة الأولى بـ`EVMRateLimit` من
-        `eth_getBlockByNumber`. ورفعُه يُسقط العملة كلّها بسبب ثانية مزدحمة،
-        بينما مسار السجلّات ينتظر ويعيد نفس المدى — فالمرساة تستحقّ نفس المعاملة.
-        وكل محاولة تُحسب نداءً ولو رُدّت: الحصّة تُستهلك بالطلب لا بالجواب.
+        Throttling (429) is waited out and retried **here**, not raised: the public
+        Robinhood node throttles after nine calls (measured 2026-08-13, identically at
+        0.4s and 1.0s spacing — it is a quota, not a spacing issue), and the first live
+        run died on the first token with `EVMRateLimit` from `eth_getBlockByNumber`.
+        Raising it would drop the whole token because of one crowded second, while the
+        logs path waits and retries the same range — so the anchor deserves the same
+        treatment. And every attempt counts as a call even when rejected: the quota is
+        consumed by the request, not by the reply.
         """
         block = int(block)
         if block < 0:
@@ -218,10 +230,10 @@ class BlockClock:
         self, rpc: Any, blocks: Iterable[int], now_iso: str, sleep,
         max_calls: int, head: int | None = None,
     ) -> int:
-        """يضمن قوساً حول كل كتلة مطلوبة، على الشبكة الثابتة.
+        """Ensures a span around every required block, on the fixed grid.
 
-        يعيد عدد الكتل التي بقيت بلا قوس (نفدت الميزانية) — والمنادي يعدّها
-        سجلّات لا وقت لها فيُهملها ولا يخمّنها.
+        Returns the number of blocks left without a span (the budget ran out) — the
+        caller counts them as logs without a time and drops them rather than guessing.
         """
         step = max(1, int(config.EVM_REPLAY_ANCHOR_BLOCKS))
         wanted: set[int] = set()
@@ -243,7 +255,7 @@ class BlockClock:
         return left
 
     def _guess_block(self, target_ts: int, head: int) -> int:
-        """تقدير أوّليّ لرقم الكتلة عند وقت، بعكس الاستقراء."""
+        """A first estimate of the block number at a time, the inverse of interpolation."""
         n = len(self.times)
         if n == 0:
             return max(0, head // 2)
@@ -262,14 +274,16 @@ class BlockClock:
         self, rpc: Any, target_ts: int, head: int, now_iso: str, sleep,
         max_calls: int, tolerance: int = 300,
     ) -> int:
-        """أعلى كتلة طابعها ≤ الوقت المطلوب — بحثاً بالاستقراء لا بالتنصيف.
+        """The highest block whose timestamp is ≤ the requested time — by interpolation, not binary search.
 
-        التنصيف يكلّف ~25 نداءً على شبكة بـ30 مليون كتلة، والاستقراء يكلّف 3–4:
-        زمن الكتلة شبه ثابت فالتقدير الأوّل يقع داخل دقائق، ونداء واحد يصحّحه.
+        Binary search costs ~25 calls on a network of 30 million blocks, interpolation
+        costs 3–4: block time is nearly constant, so the first estimate lands within
+        minutes and a single call corrects it.
 
-        والخطأ **مقصود في اتّجاه القِدَم**: أيّ كتلة أقدم من المطلوب تكلّف نداءات
-        سجلّات زائدة وتنتهي، أمّا كتلة أحدث فتُفقِد تحويلات ⇒ أرصدة سالبة وصفوف
-        لا تُكتب. فالجواب أدنى مرساة تحقّق الشرط، لا أقربها.
+        And the error is **deliberately in the old direction**: a block older than
+        requested costs extra log calls and then finishes, whereas a newer block misses
+        transfers => negative balances and rows that are never written. So the answer is
+        the lowest anchor that satisfies the condition, not the nearest one.
         """
         target = int(target_ts)
         if len(self.blocks) < 2:
@@ -294,15 +308,16 @@ class BlockClock:
 def resolve_log_times(
     logs: Sequence[dict[str, Any]], clock: BlockClock, margin: int,
 ) -> tuple[dict[int, int], int]:
-    """{رقم كتلة: وقتها} لكل كتلة ظهرت في السجلّات، وعدد الكتل بلا وقت.
+    """{block number: its time} for every block that appears in the logs, plus the count of blocks with no time.
 
-    الطابع من السجلّ نفسه إن أعطته العقدة (Base وBSC تعطيانه) — لا استقراء ولا
-    هامش حينها، فهو الحقيقة. وروبن‑هود تعيد `blockTimestamp: '0x0'` (مقيس) ⇒
-    استقراءٌ **زائد هامش**: الزيادة تُخرِج السجلّ الحدوديّ من اللقطة، والنقص
-    يُدخِل تحويلاً من مستقبلها.
+    The timestamp comes from the log itself when the node provides one (Base and BSC
+    do) — no interpolation and no margin then; it is the truth. Robinhood returns
+    `blockTimestamp: '0x0'` (measured) => interpolation **plus a margin**: too much
+    pushes a boundary log out of the snapshot, and too little lets in a transfer from
+    its future.
 
-    و`'0x0'` تُعامَل غياباً لا وقتاً: كتلة عام 1970 كانت ستُدخِل كل التحويلات في
-    كل اللقطات — أي عكس ما نريد بالضبط.
+    And `'0x0'` is treated as an absence, not as a time: a 1970 block would have let
+    every transfer into every snapshot — exactly the opposite of what we want.
     """
     out: dict[int, int] = {}
     unknown = 0
@@ -330,11 +345,12 @@ def replay_rows(
     network_id: str,
     watch: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """سجلّات عملة + شبكة لحظات ⇒ صفوف `chain_concentration` بتواريخها.
+    """A token's logs + a grid of moments => `chain_concentration` rows with their dates.
 
-    دالّة خالصة بلا شبكة ولا قاعدة: هي قلب الصحّة هنا فيجب أن تكون قابلة
-    للاختبار بلا أيّ منهما. والمرور واحد: التحويلات تُرتَّب زمنيّاً مرّة، ثمّ
-    يمشي مؤشّر واحد مع الشبكة — فالتكلفة خطّيّة لا (لحظات × تحويلات).
+    A pure function with no network and no database: it is the heart of correctness
+    here, so it must be testable without either. And it is a single pass: transfers are
+    sorted by time once, then one pointer walks with the grid — so the cost is linear,
+    not (moments × transfers).
     """
     token = token_address.lower()
     events: list[tuple[int, int, str, str, int]] = []
@@ -365,9 +381,9 @@ def replay_rows(
                     continue
                 new = balances.get(holder, 0) + delta
                 balances[holder] = new
-                # لا تثبيت عند صفر كما تفعل الطبقة الحيّة: السالب هنا **دليل**
-                # على أنّ القراءة بدأت متأخّرة، وطمسُه يحوّل الدليل إلى رقم
-                # يبدو سليماً وهو كاذب.
+                # No clamping at zero as the live layer does: a negative here is
+                # **evidence** that the reading started late, and erasing it turns the
+                # evidence into a number that looks sound but is false.
                 if new < 0 and holder not in _BURN:
                     negatives.add(holder)
         live = {h: v for h, v in balances.items() if v > 0 and h not in _BURN}
@@ -391,8 +407,9 @@ def replay_rows(
         "events": len(events), "skipped": skipped, "empty": empty,
         "negatives": len(negatives), "applied": idx,
     }
-    # عملة واحد من عناوينها سالب ⇒ لا صفّ واحد. الجزئيّة هنا ليست «أقلّ دقّة» بل
-    # نِسبٌ محسوبة على معروض ناقص: عملة فاتنا سكّها تظهر بتركّز 90% وهو 9%.
+    # One negative address in a token => not a single row. Partiality here is not "less
+    # precision" but ratios computed over a missing supply: a token whose mint we missed
+    # shows 90% concentration when the truth is 9%.
     if negatives:
         return [], meta
     return rows, meta
@@ -403,7 +420,7 @@ def _replay_segment(
     token_address: str, network_id: str, watch: dict[str, Any],
     initial_balances: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int]]:
-    """نسخة تراكميّة من قلب الإعادة، تعيد الرصيد checkpoint للجزء التالي."""
+    """A cumulative version of the replay core; returns the balance checkpoint for the next segment."""
     token = token_address.lower()
     events: list[tuple[int, int, str, str, int]] = []
     skipped = 0
@@ -450,8 +467,9 @@ def _replay_segment(
             row["is_replay"] = 1
             rows.append(row)
 
-    # طبّق ما يقع بعد آخر نقطة أيضاً كي يمثل checkpoint نهاية المدى المقروء، لا
-    # آخر لقطة فقط. هذه الأحداث ستؤثر في أول لقطة من الجزء التالي.
+    # Apply what falls after the last point too, so the checkpoint represents the end of
+    # the range read, not just the last snapshot. These events affect the first
+    # snapshot of the next segment.
     while idx < len(events):
         _, _, src, dst, value = events[idx]
         idx += 1
@@ -475,12 +493,13 @@ def _replay_segment(
 def _window(
     db: RecorderDB, watch: dict[str, Any], step: int,
 ) -> tuple[int, int, dict[str, str]]:
-    """حدود الشبكة الزمنيّة لعملة: من قبيل الدخول إلى منتهى النافذة.
+    """The token's time-grid bounds: from before the entry to the end of the window.
 
-    والحدّ الأعلى يتوقّف حيث **تبدأ التغطية الحيّة**: قياسان لنفس اللحظة من
-    طريقين (الحيّ بتأخير تأكيد وإيقاع دورة، والمُعاد عند الكتلة بالضبط) يتفاوتان
-    قليلاً، وتشابكهما في سلسلة واحدة يخلق فروق خمس‑دقائق وهميّة — وهي أنفس ما
-    تقرؤه الميزات. فالإعادة تملأ ما قبل أوّل صفّ حيّ ولا تلمس ما بعده.
+    The upper bound stops where **live coverage begins**: two measurements of the same
+    moment by two routes (live with confirmation delay and cycle cadence, replay exactly
+    at the block) differ slightly, and interleaving them in one series creates phantom
+    five-minute deltas — the very thing the features read. So replay fills up to the
+    first live row and never touches what comes after it.
     """
     token = str(watch["token_address"]).lower()
     net = str(watch["network_id"])
@@ -494,7 +513,7 @@ async def replay_token(
     head: int, now_iso: str, sleep=asyncio.sleep, write: bool = True,
     replace_existing: bool = False, deadline: float | None = None,
 ) -> dict[str, Any]:
-    """إعادة عملة واحدة كاملة: مدًى واحد من السجلّات ثمّ مرور واحد على الشبكة."""
+    """Replays one whole token: one range of logs, then one pass over the grid."""
     net = str(watch["network_id"])
     token = str(watch["token_address"]).lower()
     generation = db.evm_ledger_generation()
@@ -513,7 +532,7 @@ async def replay_token(
     start_ts, end_ts, live_coverage = _window(db, watch, step)
     full_grid = watch_grid(watch, start_ts, end_ts, step, live_coverage)
     if end_ts <= start_ts or not full_grid:
-        out["note"] = "التغطية الحيّة تسبق النافذة" if live_coverage else "نافذة فارغة"
+        out["note"] = "live coverage precedes the window" if live_coverage else "empty window"
         out["status"] = "skip"
         if write:
             with db.batch():
@@ -534,8 +553,8 @@ async def replay_token(
                 )
         return out
 
-    # ميزانيّتان منفصلتان: المراسي والسجلّات. سقفٌ واحد مشترك يجعل عملةً
-    # صاخبة تأكل ميزانية المراسي فتبقى سجلّاتها بلا وقت — أي نداءات بلا صفوف.
+    # Two separate budgets: anchors and logs. One shared cap lets a noisy token eat the
+    # anchor budget, leaving its logs without times — calls that produce no rows.
     base_calls = clock.calls
     anchor_ceiling = base_calls + max(4, int(config.EVM_REPLAY_ANCHOR_MAX_CALLS))
     log_budget = max(1, int(config.EVM_REPLAY_MAX_CALLS))
@@ -551,23 +570,25 @@ async def replay_token(
         to_block = min(to_block, window_block)
 
     checkpoint: dict[str, Any] | None = None
-    # `window` معها: حكمُها أُبطل بنافذةٍ جديدة (`db.stale_evm_replay_verdict`)
-    # ومشيُها قائم. إخراجُها من هنا يجعل الصفَّ يُقرأ ثمّ يُهمَل مشيُه فتبدأ من
-    # النشأة — وهو العطبُ الذي أُبقي الصفُّ لأجله.
+    # `window` is included with them: its verdict was invalidated by a new window
+    # (`db.stale_evm_replay_verdict`) but its walk still stands. Leaving it out here
+    # means the row is read and then its walk is discarded, restarting from genesis —
+    # the very breakage this row was kept to avoid.
     if (watch.get("replay_status") or "") in ("partial", "budget", "error", "window"):
         raw_checkpoint = watch.get("replay_checkpoint_json")
         if raw_checkpoint is not None:
             try:
                 decoded = decode_raw(raw_checkpoint)
                 checkpoint = decoded if isinstance(decoded, dict) else None
-            except Exception:  # noqa: BLE001 — checkpoint تالف يعاد بأمان من البداية
+            except Exception:  # noqa: BLE001 — a corrupt checkpoint restarts safely from the beginning
                 checkpoint = None
     if checkpoint is not None and watch.get("replay_from_block") is not None:
         from_block = int(watch["replay_from_block"])
     else:
-        # الرصيد حالة تراكميّة منذ إنشاء العقد. نافذة زمنية أو غياب أرصدة سالبة
-        # لا يثبتان الاكتمال: حائز استلم قبل النافذة ولم يتحرك بعدها يختفي بصمت.
-        # نبدأ من genesis ونستأنف عبر checkpoint؛ أبطأ لكنه الدليل الوحيد الكامل.
+        # A balance is cumulative since the contract's creation. A time window or the
+        # absence of negative balances proves nothing about completeness: a holder who
+        # received before the window and never moved afterwards disappears silently.
+        # We start from genesis and resume via checkpoint; slower, but the only complete proof.
         from_block = 0
     checkpoint_balances = (checkpoint or {}).get("balances", {})
     resettable_status = (watch.get("replay_status") or "") in (
@@ -579,10 +600,11 @@ async def replay_token(
         and not checkpoint_balances
         and (int(watch.get("replay_transfers") or 0) == 0 or resettable_status)
     ):
-        # طريقان لسؤال «متى نشأت؟» بحسب ما تحفظه العقدة، والشبكة في أحدهما لا
-        # كليهما: الأرشيف يسمح ببحث ثنائيّ على `eth_getCode`، وحيث لا أرشيف
-        # (روبن‑هود ~128 كتلة) يجيب مرشّح السكّ في نداء واحد. والوفر هنا أكبر من
-        # الطبقة الحيّة: الإعادة تمشي كل عملة من نشأتها في كل دورة استئناف.
+        # Two ways to ask "when was it born?", depending on what the node keeps, and a
+        # network has one of them, not both: an archive allows binary search on
+        # `eth_getCode`, and where there is no archive (Robinhood ~128 blocks) the mint
+        # filter answers in a single call. The saving here is larger than in the live
+        # layer: replay walks every token from its birth on every resume cycle.
         origin_calls = 1
         if net in config.EVM_MINT_SCAN_NETWORKS:
             minted = await rpc.first_mint_block(net, token, to_block)
@@ -655,51 +677,54 @@ async def replay_token(
         "to_block": covered_to, "rows": len(rows),
     })
 
-    # ثلاثة أسباب لعدم الكتابة، ولكلٍّ حالته: أرصدة سالبة (أرقام كاذبة)، وسجلّ
-    # بلا وقت (لا نعرف في أيّ لقطة يدخل فيخمَّن)، ولا تحويل أصلاً (عملة لم
-    # تتحرّك — غياب لا صفر، FR-007).
+    # Three reasons not to write, each with its own status: negative balances (false
+    # numbers), logs without a time (we cannot tell which snapshot a transfer enters, so
+    # it would be guessed), and no transfer at all (a token that never moved — an
+    # absence, not a zero, FR-007).
     prior_transfers = int(watch.get("replay_transfers") or 0) if checkpoint else 0
     prior_calls = int(watch.get("replay_calls") or 0) if checkpoint else 0
     has_negative = bool(meta["negatives"] or checkpoint_negative)
     if has_negative and not window_complete:
         status, check = "partial", "ok"
-        out["note"] = "السجل الجزئي يحتوي أرصدة سالبة؛ سيُعاد التحقق بعد اكتماله"
+        out["note"] = "partial ledger contains negative balances; will re-verify once complete"
     elif has_negative:
         status, check = "negative", "negative"
-        out["note"] = "أرصدة سالبة بعد اكتمال السجل ⇒ لا صفّ"
+        out["note"] = "negative balances after ledger completion => no row"
     elif unknown:
         status, check = "no_time", "ok"
-        out["note"] = f"{unknown} كتلة بلا وقت ⇒ لا صفّ"
+        out["note"] = f"{unknown} blocks without timestamps => no row"
     elif not window_complete:
         status, check = "partial", "ok"
         if not rows:
-            out["note"] = "المدى جزئيّ ولم يبلغ أول لقطة بعد"
+            out["note"] = "range is partial and has not reached the first snapshot yet"
     elif not rows:
         status, check = "empty", "ok"
-        out["note"] = "لا تحويل في المدى"
+        out["note"] = "no transfer in range"
     else:
         status, check = "done", "ok"
 
-    # سقفٌ **لكل عملة**، وهو ما لا يفعله `EVM_REPLAY_MAX_CALLS` (سقف الدورة):
-    # عملة تعود `partial` كل دورة تستأنف إلى الأبد وتأكل الميزانيّة من العملات
-    # التي تُنجَز. مقيس على Base: عملتان أنفقتا 15,270 و11,665 نداءً بصفر صفّ،
-    # مقابل ~4,960 نداءً لأثقل مشيٍ مشروع. فالتجاوز ليس بطأً بل عطبٌ صامت.
-    # ويُسجَّل باسمه: `budget` نهائيّة فلا تُعاد، لكنّ الـcheckpoint يبقى محفوظاً
-    # فيُستأنف من حيث توقّف يوم يُرفع السقف أو يُطلَب `--redo`.
+    # A cap **per token** — the thing `EVM_REPLAY_MAX_CALLS` (the per-cycle cap) does not
+    # do: a token that returns `partial` every cycle resumes forever and eats the budget
+    # away from tokens that finish. Measured on Base: two tokens spent 15,270 and
+    # 11,665 calls for zero rows, against ~4,960 calls for the heaviest legitimate walk.
+    # Exceeding it is therefore not slowness but a silent failure. And it is recorded
+    # under its own name: `budget` is final so it is not retried, but the checkpoint
+    # stays saved and resumes from where it stopped the day the cap is raised or
+    # `--redo` is passed.
     if status == "partial" and prior_calls + calls_used >= int(
         config.EVM_REPLAY_TOKEN_CALL_CAP
     ):
         status, check = "budget", "ok"
         out["note"] = (
-            f"{prior_calls + calls_used} نداءً بلغ سقف العملة "
-            f"({config.EVM_REPLAY_TOKEN_CALL_CAP}) ⇒ توقّف مع نقطة استئناف"
+            f"{prior_calls + calls_used} calls reached the token call cap "
+            f"({config.EVM_REPLAY_TOKEN_CALL_CAP}) => stopping with a resume checkpoint"
         )
 
     written = 0
     if write:
-        # الصفوف والـcheckpoint معاملة واحدة. سقوط العملية بينهما كان يعيد
-        # الجزء نفسه من checkpoint قديم؛ INSERT OR IGNORE يمنع التكرار المرئي
-        # لكنه يترك عدادات وحالة تقدم غير متسقة.
+        # Rows and checkpoint are one transaction. A process dying between them used to
+        # replay the same segment from a stale checkpoint; INSERT OR IGNORE prevents the
+        # visible duplication but leaves counters and progress state inconsistent.
         with db.batch():
             db.assert_evm_ledger_generation(generation)
             db.assert_chain_live_coverage(token, net, live_coverage)
@@ -715,15 +740,16 @@ async def replay_token(
                 if db.insert_chain_concentration(row):
                     written += 1
             if status in ("negative", "no_time"):
-                # checkpoint سابق قد كتب صفوفاً قبل اكتشاف فساد لاحق؛ بقاء بعضها
-                # يجعل العملة تبدو مكتملة جزئياً وهي مرفوضة كلياً.
+                # An earlier checkpoint may have written rows before a later corruption
+                # was discovered; keeping some of them makes the token look partially
+                # complete while it is wholly rejected.
                 db.delete_evm_replay_rows(token, net)
                 written = 0
             prior_snapshots = int(watch.get("replay_snapshots") or 0) if checkpoint else 0
             if status in ("negative", "no_time"):
                 prior_snapshots = 0
-            # في الحالة المكتملة يبقى `from_block` تاريخياً: بداية المدى الذي
-            # فُحص. أما `partial` فيحمل نقطة الاستئناف الفعلية.
+            # In the completed state `from_block` stays historical: the start of the
+            # range that was examined. In `partial` it carries the actual resume point.
             state_from_block = (
                 from_block if window_complete else
                 (covered_to + 1 if complete else int(resume))
@@ -734,8 +760,9 @@ async def replay_token(
                  "next_grid": next_point}
                 if status in ("partial", "budget") else None
             )
-            # **لا `set_chain_state`**: ذاك جدول إيقاع الطبقة الحيّة، وكتابته هنا
-            # تُخبر الحيّة أنّ العملة قيست الآن فتؤجّل لقطتها الحقيقيّة.
+            # **No `set_chain_state`**: that is the live layer's cadence table, and
+            # writing to it here would tell the live layer the token was just measured,
+            # so it would postpone its real snapshot.
             db.set_evm_replay_state(
                 token, net, status, now_iso, from_block=state_from_block,
                 to_block=covered_to, transfers=prior_transfers + meta["applied"],
@@ -748,13 +775,14 @@ async def replay_token(
     return out
 
 
-# حالات نهائيّة لا تُعاد إلّا بـ`--redo`: أُنجزت، أو تبيّن أنّها لا تُنجَز، أو
-# أنفقت سقف نداءاتها (`budget`). و`partial`/`error` **ليست** نهائيّة: الأولى نفد
-# سقف *الدورة* والثانية عطبٌ قد يكون عابراً (كتم، مهلة) — ودمجُهما مع النهائيّة
-# يعني هجر عملة بسبب ثانية سيّئة.
-# والقائمة **واحدة** لأنّها كانت ثلاثاً: هنا وفي `repair_evm_ledger` وفي
-# `run_evm_replay`. ونسخةٌ تنسى حالةً جديدة تعني عدّاً معلّقاً لا ينزل أبداً في
-# تقرير، أو عملةً «مستحقّة» في تقرير وغير مستحقّة في التنفيذ.
+# Final statuses, not retried except with `--redo`: completed, or proven unachievable,
+# or out of its call budget (`budget`). `partial`/`error` are **not** final: the former
+# ran out of the *cycle* cap, the latter is a failure that may be transient (throttle,
+# timeout) — folding either into the final set means abandoning a token over one bad
+# second.
+# And the list is **one** because it used to be three: here, in `repair_evm_ledger`,
+# and in `run_evm_replay`. A copy that forgets a new status means a stuck counter that
+# never lands in a report, or a token "due" in the report and not due in execution.
 FINAL_STATUSES = ("done", "negative", "empty", "no_time", "skip", "budget")
 
 
@@ -764,11 +792,11 @@ async def run_replay(
     sleep=asyncio.sleep, write: bool = True, redo: bool = False,
     log=None, budget_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """المهمّة كاملة: كل عملة مستحقّة على كل شبكة إعادة مسموحة.
+    """The whole task: every due token on every allowed replay network.
 
-    خطأ عملة واحدة لا يُسقط شبكتها ولا يُسقط الشبكة التالية — نفس حرس الطبقة
-    الحيّة. والحالة محفوظة لكل عملة فالقطع في أيّ لحظة لا يفقد إلّا العملة
-    الجارية، وتُستأنف بتشغيل آخر.
+    One token's failure does not sink its network or the next network — the same guard
+    as the live layer. State is kept per token, so cutting the run at any moment loses
+    only the token in flight, and a later run resumes it.
     """
     emit = log or (lambda _m: None)
     allowed = {str(n) for n in config.EVM_REPLAY_NETWORKS}
@@ -800,17 +828,17 @@ async def run_replay(
         if token:
             targets = [w for w in targets if w["token_address"].lower() == token.lower()]
         if not targets:
-            emit(f"[{net}] لا عملة مستحقّة")
+            emit(f"[{net}] no due tokens")
             continue
         head = await rpc.block_number(net)
         clock = BlockClock(db, net)
-        emit(f"[{net}] رأس {head} · مستحقّ {len(targets)} · مراسٍ محفوظة {len(clock)}")
+        emit(f"[{net}] head {head} · due {len(targets)} · saved anchors {len(clock)}")
         anchors_before = clock.calls
         for watch in targets:
             if remaining is not None and remaining <= 0:
                 break
             if deadline is not None and time.monotonic() >= deadline:
-                emit(f"[{net}] انتهت الميزانية الزمنيّة — تُستأنف لاحقاً")
+                emit(f"[{net}] time budget exhausted — will resume later")
                 break
             now_iso = utcnow_iso()
             generation = db.evm_ledger_generation()
@@ -820,9 +848,9 @@ async def run_replay(
                     replace_existing=redo, deadline=deadline,
                 )
             except StaleEVMState:
-                # عامل آخر أو reset سبقنا؛ لا نخفض حالته الناجحة إلى error.
+                # Another worker or a reset got there first; do not downgrade its successful state to error.
                 continue
-            except Exception as exc:  # noqa: BLE001 — عملة لا تُسقط شبكة
+            except Exception as exc:  # noqa: BLE001 — one token does not sink a network
                 stats["errors"] += 1
                 msg = f"{type(exc).__name__}: {exc}"[:300]
                 emit(f"  ✗ {watch['token_address'][:12]}… {msg}")
@@ -851,9 +879,9 @@ async def run_replay(
                 remaining -= 1
             emit(
                 f"  {res['status']:<8} {res['token'][:12]}… "
-                f"صفوف {res['written']}/{res['rows']} · تحويلات {res['events']} "
-                f"· نداءات {res['calls']}+{res['anchor_calls']} "
-                f"· كتل {res['from_block']}→{res['to_block']}"
+                f"rows {res['written']}/{res['rows']} · transfers {res['events']} "
+                f"· calls {res['calls']}+{res['anchor_calls']} "
+                f"· blocks {res['from_block']}→{res['to_block']}"
                 + (f" · {res['note']}" if res["note"] else "")
             )
         stats["anchor_calls"] += clock.calls - anchors_before
@@ -870,12 +898,12 @@ def _log_line(msg: str) -> None:
 
 
 def _check(db: RecorderDB) -> int:
-    """ما هو المستحقّ وما كلفته — بلا نداء شبكة واحد."""
+    """What is due and what it costs — without a single network call."""
     print(
-        "شبكات الإعادة: "
+        "Replay networks: "
         + (", ".join(str(n) for n in config.EVM_REPLAY_NETWORKS) or "—")
-        + f" · خطوة {config.EVM_REPLAY_STEP_SECONDS}ث"
-        f" · سقف {config.EVM_REPLAY_MAX_CALLS} نداءً/عملة"
+        + f" · step {config.EVM_REPLAY_STEP_SECONDS}s"
+        f" · cap {config.EVM_REPLAY_MAX_CALLS} calls/token"
     )
     total_rows = 0
     for net in (str(n) for n in config.EVM_REPLAY_NETWORKS):
@@ -889,28 +917,28 @@ def _check(db: RecorderDB) -> int:
             if (w.get("replay_status") or None) not in FINAL_STATUSES
         ]
         active = sum(1 for w in targets if int(w.get("active") or 0))
-        # 48 ساعة ÷ 5 دقائق = 576 لقطة للنافذة الكاملة، والمنتهية نافذتها كاملة.
+        # 48 hours ÷ 5 minutes = 576 snapshots for a full window; a token whose window has ended has the full window.
         est = len(due) * (48 * 3600 // int(config.EVM_REPLAY_STEP_SECONDS))
         total_rows += est
         print(
-            f"[{net}] مراقَبات {len(targets)} (نشطة {active}) · مستحقّ {len(due)}"
-            f" · مراسٍ محفوظة {len(db.block_anchors(net))}"
-            f" · حالات: {by_status or '—'} ⇒ حتّى ~{est:,} صفّاً"
+            f"[{net}] watches {len(targets)} (active {active}) · due {len(due)}"
+            f" · saved anchors {len(db.block_anchors(net))}"
+            f" · statuses: {by_status or '—'} => up to ~{est:,} rows"
         )
-    print(f"المجموع الأقصى: ~{total_rows:,} صفّ تركّز مُعاد (is_replay=1)")
+    print(f"Total ceiling: ~{total_rows:,} replayed concentration rows (is_replay=1)")
     return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="إعادة رجعيّة لتركّز حائزي EVM")
+    ap = argparse.ArgumentParser(description="Retroactive replay of EVM holder concentration")
     ap.add_argument("--networks", nargs="*", default=None)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--token", default=None)
     ap.add_argument("--dry-run", action="store_true",
-                    help="يحسب ولا يكتب صفّاً ولا حالة")
+                    help="computes without writing a single row or state")
     ap.add_argument("--redo", action="store_true",
-                    help="يعيد العملات المنتهية حالتها أيضاً")
-    ap.add_argument("--check", action="store_true", help="تقرير بلا نداء شبكة")
+                    help="also replays tokens whose status is final")
+    ap.add_argument("--check", action="store_true", help="a report without a single network call")
     args = ap.parse_args()
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)

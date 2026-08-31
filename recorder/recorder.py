@@ -1,11 +1,15 @@
-"""الحلقة الرئيسية لمسجّل البيانات التاريخي.
+"""Main loop of the historical data recorder.
 
-يقرأ الخام من fomo عبر FomoClient._get/_post مباشرة (قبل أي تعيين، لأن التعيين
-يُسقط أثمن الحقول)، ويكتب إلى recorder.db. كل نداء upstream داخل try/except:
-الفشل (502...) يُسجَّل في meta ويُتخطّى — الحلقة لا تموت أبداً.
 
-read-only (FR-012): كل النداءات GET/POST قراءة فقط (feed، trending، verified،
-leaderboard). لا نداء يكتب حالة حساب أو تداول.
+Reads raw data from fomo via FomoClient._get/_post directly (before any mapping,
+since mapping drops the most valuable fields) and writes to recorder.db. Every
+upstream call sits inside try/except: failure (502...) is logged in meta and
+skipped — the loop never dies.
+
+
+read-only (FR-012): every GET/POST call is read-only (feed, trending, verified,
+leaderboard). No call writes account state or trades.
+
 """
 from __future__ import annotations
 
@@ -60,7 +64,8 @@ def _fail_closed_evm_admission(networks: frozenset[str]) -> EVMAdmissionPolicy:
 
 @dataclass(frozen=True)
 class EVMAdmissionPolicy:
-    """قرار قبول حتميّ للعملات الجديدة؛ شبكات غير EVM لا تتأثر."""
+    """Deterministic admission decision for new tokens; non-EVM networks are unaffected."""
+
 
     networks: frozenset[str]
     backlog: int
@@ -170,11 +175,12 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
         ]
         backlog = len(pending_rows)
         retry_count = sum(str(row["status"] or "") == "retry" for row in pending_rows)
-        # وحدة العمل = نداء تعبئة واحد، والنداء يقطع المدى المقيس في
-        # `EVM_BACKFILL_BLOCKS_PER_CALL` لا سقف المدى (range_hint). التقدير
-        # القديم بالسقف ضخّم العمل ×25 على روبن‑هود (سقف مدى غير معمول به
-        # هناك أصلًا) فأبقى البوابة موقوفة أبدًا — قياس 2026-08-29: عملة
-        # كاملة بـ79,894 تحويلًا اكتملت في 33 نداءً.
+        # One work unit = one backfill call, and a call covers the measured range
+        # in `EVM_BACKFILL_BLOCKS_PER_CALL`, not the range cap (range_hint). The old
+        # cap-based estimate inflated the work ×25 on Robinhood (a range cap not in
+        # effect there anyway), keeping the gate paused forever — measurement
+        # 2026-08-29: a full token with 79,894 transfers completed in 33 calls.
+
         blocks_per_call = max(
             1, int(config.EVM_BACKFILL_BLOCKS_PER_CALL.get(network, range_hint))
         )
@@ -272,50 +278,61 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
 
 
 def _load_access_token() -> str:
-    """يقرأ session_token (access_token) من CredentialStore على القرص.
+    """Reads the session_token (access_token) from the CredentialStore on disk.
 
-    لا يطبع قيمة التوكن إطلاقاً (FR-013). يرفع خطأً واضحاً إن غاب الاعتماد.
-    القرص هو مصدر الحقيقة: خادم الـ api (TokenRefresher) يكتب توكناً طازجاً هنا
-    قبل انتهائه، فيلتقطه المسجّل كل دورة بلا أي تسجيل دخول يدوي.
+
+    Never prints the token value (FR-013). Raises a clear error if the credential is missing.
+    The disk is the source of truth: the api server (TokenRefresher) writes a fresh
+    token here before it expires, and the recorder picks it up every cycle with no manual login.
+
     """
     from fomo_api.auth.credential_store import CredentialStore
 
     creds = CredentialStore(config.credential_state_path()).load()
     if creds is None or not creds.access_token:
         raise RuntimeError(
-            "لا يوجد اعتماد صالح في ملف الحالة — شغّل خدمة الـ api أولاً لتوليده."
+            "No valid credential in the state file — run the api service first to generate one."
+
         )
     return creds.access_token
 
 
 def _build_client(access_token: str) -> Any:
-    """يُنشئ FomoClient من توكن معطى (لا يقرأ القرص، لا يطبع التوكن)."""
+    """Builds a FomoClient from a given token (no disk read, no token printing)."""
+
     from fomo_api.clients.fomo_client import FomoClient
 
     return FomoClient(session_token=access_token)
 
 
 def _load_client() -> Any:
-    """يحمّل session_token من القرص ويُنشئ FomoClient.
+    """Loads the session_token from disk and builds a FomoClient.
 
-    لا يطبع قيمة التوكن إطلاقاً (FR-013). يرفع خطأً واضحاً إن غاب الاعتماد.
+
+    Never prints the token value (FR-013). Raises a clear error if the credential is missing.
+
     """
     return _build_client(_load_access_token())
 
 
 def _exc_note(exc: Exception) -> str:
-    """اسمُ الخطأ ورسالتُه **ورمزُ حالته** — فالرسالة وحدها تكذب أحياناً.
+    """The exception's name and message **plus its status code** — the message alone sometimes lies.
 
-    قِيس 2026-08-19T14:54Z: حجبت المنصّة الحساب بـ403 على كلّ مسارٍ من اثني
-    عشر، فكتب المسجّل «UpstreamUnavailableError: fomo.family is currently
-    unreachable» — وهي رسالةُ الصنف الافتراضيّة نفسها التي يكتبها الانقطاعُ
-    الشبكيّ الحقيقيّ. فذهب التشخيصُ إلى DNS وping وTLS والمصدرُ يردّ في 20ms،
-    والرمزُ 403 كان في `ApiError.details` طوال الوقت ولم يُطبَع لأنّ التنسيق
-    يأخذ `str(exc)` وحدها. وطبقةُ EVM تُدرج الرمزَ أصلاً — يشهد عليها اختبارٌ
-    يطلب `"503" in last_error_evm` — فهذا توحيدُ عُرفٍ قائم لا اختراعُ آخر.
 
-    والقصُّ مقصود: `details["reason"]` تحمل نصَّ استثناءِ النقل كاملاً، وهذه
-    الملاحظةُ تسكن صفّاً في `meta` يُقرأ في اللوحة لا سجلَّ تنقيبٍ مفتوحَ الطول.
+    Measured 2026-08-19T14:54Z: the platform blocked the account with 403 on all
+    twelve paths, yet the recorder wrote "UpstreamUnavailableError: fomo.family is
+    currently unreachable" — the very same default class message a real network
+    outage writes. So the diagnosis chased DNS and ping and TLS while the origin
+    replied in 20ms; the 403 code sat in `ApiError.details` the whole time and was
+    never printed because the formatter takes `str(exc)` alone. The EVM layer
+    already includes the code — a test asking for `"503" in last_error_evm`
+    attests to it — so this unifies an existing convention, not invents a new one.
+
+
+    The truncation is deliberate: `details["reason"]` carries the full transport
+    exception text, and this note lives in a `meta` row read on the dashboard, not
+    an open-ended debug log.
+
     """
     text = f"{type(exc).__name__}: {exc}"
     details = getattr(exc, "details", None)
@@ -328,23 +345,31 @@ def _exc_note(exc: Exception) -> str:
 def _note_shutout(
     db: RecorderDB, block: str, recorded_at: str, asked: int, produced: int
 ) -> int:
-    """يرفع صوتَ الحصار: كتلةٌ تسأل ولا تُنتج شيئاً، دورةً بعد دورة.
+    """Makes the shutout audible: a block that asks and produces nothing, cycle after cycle.
 
-    الدرسُ من 2026-08-19: مات `/v2/users/{id}` فردَّ 404 لكلّ معرّف، و404 و«حسابٌ
-    محذوف» مسارٌ واحد — فكُتب `empty` لكلّ متداول، و`traders_rows: 0` في كلّ سطر
-    سجلّ، و`errors: 0` كذلك. 21 ساعةً ولا كلمةَ خطأ واحدة، لأنّ «لا بيانات لهذا
-    العنصر» جوابٌ **مشروع** لعنصرٍ واحد. الصفرُ الفرديُّ عاديّ؛ الصفرُ الجماعيُّ
-    المتكرّرُ لا يكون إلّا عطلاً.
 
-    فالعدّادُ في `meta` لا في الذاكرة: لو أُعيد تشغيلُ المسجّل كلَّ ساعة (وقد
-    حدث) لبدأت الذاكرةُ من الصفر فبقي الحصارُ صامتاً كما كان. ويُصفَّر عند أوّل
-    صفٍّ ينزل — فالتشخيصُ عن «الآن» لا عن الأمس.
+    The lesson of 2026-08-19: `/v2/users/{id}` died and returned 404 for every id,
+    and 404 and "account deleted" are one and the same path — so `empty` was
+    written for every trader, `traders_rows: 0` on every log line, and `errors: 0`
+    as well. 21 hours without a single error word, because "no data for this item"
+    is a **legitimate** answer for a single item. An individual zero is normal; a
+    repeated collective zero can only be an outage.
 
-    يُنادى فقط حيث يكون صفرُ الكتلة **مستحيلاً** لا نادراً: 50 متداولاً كلُّهم
-    محذوفون ليس حدثاً (قِيس: 7 غيابات حقيقيّة من 500). أمّا الشموعُ فتغيب
-    مشروعةً، والإشاراتُ تخلو في دقيقةٍ هادئة — فلا تُوصَل هذه بها.
 
-    يعيد طولَ السلسلة بعد التحديث.
+    Hence the counter lives in `meta`, not in memory: were the recorder restarted
+    every hour (it happened), memory would start from zero and the shutout would
+    stay as silent as before. It resets at the first row that lands — the
+    diagnosis is about "now", not about yesterday.
+
+
+    It is called only where a block-wide zero is **impossible**, not merely rare:
+    50 traders all deleted is not an event (measured: 7 real absences out of 500).
+    Candles can be legitimately missing, and signals sit empty in a quiet minute —
+    those blocks are not wired to this one.
+
+
+    Returns the streak length after the update.
+
     """
     key = f"shutout_{block}"
     if produced > 0 or asked <= 0:
@@ -357,15 +382,17 @@ def _note_shutout(
     if streak >= config.SHUTOUT_STREAK_ALERT:
         db.note_error(
             f"last_error_{block}",
-            f"{recorded_at}: ShutoutSuspected: سُئل {asked} ولم ينزل صفٌّ واحد "
-            f"في {streak} دورةً متتالية — الأرجحُ أنّ المسار نفسه تعطّل، "
-            f"لا أنّ كلَّ العناصر خالية",
+            f"{recorded_at}: ShutoutSuspected: asked {asked} and not a single row landed "
+            f"across {streak} consecutive cycles — most likely the path itself broke, "
+            f"not that every item is empty",
+
         )
     return streak
 
 
 async def _fetch_feed_raw(client: Any) -> Any:
-    """خام GET /feed — نتجاوز get_feed (تُعيّن وتُسقط topTraders/body الكامل)."""
+    """Raw GET /feed — we bypass get_feed (it maps and drops topTraders/the full body)."""
+
     from fomo_api.config import settings
 
     params = {"feedTypes": list(config.FEED_TYPES), "limit": config.FEED_LIMIT}
@@ -385,11 +412,14 @@ async def _fetch_verified_raw(client: Any) -> Any:
 
 
 async def _fetch_most_held_raw(client: Any) -> Any:
-    """خام POST /proxy/mostHeld — قائمة اكتشاف ثالثة.
+    """Raw POST /proxy/mostHeld — a third discovery list.
 
-    مقيس حيّاً: `[200]`، 25 عنصراً، يتقاطع مع مستخرِج trending في 18 مفتاحاً
-    ⇒ `extract_market_tick` يكفي بلا تعديل. 19 من 25 كانت مراقَبة عندنا و**6
-    جديدة تماماً** — أي أنّه يرى عملات لا تراها القائمتان الأخريان.
+
+    Measured live: `[200]`, 25 items, intersecting the trending extractor in 18
+    keys => `extract_market_tick` suffices unchanged. 19 of the 25 were already
+    watched here and **6 brand new** — that is, it sees tokens the other two lists
+    do not.
+
     """
     from fomo_api.config import settings
 
@@ -397,11 +427,13 @@ async def _fetch_most_held_raw(client: Any) -> Any:
 
 
 async def _fetch_filter_tokens_raw(client: Any, symbols: list[str]) -> Any:
-    """خام POST /proxy/filterTokens — الجسم **مصفوفة** `"address:networkId"`.
+    """Raw POST /proxy/filterTokens — the body is an **array** of `"address:networkId"`.
 
-    مقيس حيّاً: 150 عنواناً في نداء واحد ترجع 150/150 (326 KB)، والعنوان
-    الميّت **يُحذف بصمت والدفعة تنجو** (5 من 6 رجعت، `[200]`) — فعملة تُشطب
-    أثناء النافذة لا تُعمي بقيّة الدفعة.
+
+    Measured live: 150 addresses in one call return 150/150 (326 KB), and a dead
+    address is **silently dropped while the batch survives** (5 of 6 came back,
+    `[200]`) — so a token delisted mid-window does not blind the rest of the batch.
+
     """
     from fomo_api.config import settings
 
@@ -414,18 +446,23 @@ _UUID_RE = re.compile(
 
 
 async def _fetch_traders_raw(client: Any, trader_ids: list[str]) -> Any:
-    """خام GET /v2/users?userIds=…&userIds=… — رزمةُ ملفّات متداولين.
+    """Raw GET /v2/users?userIds=…&userIds=… — a batch of trader profiles.
 
-    نتجاوز `get_trader_profiles` لأنّها تُعيّن وتُسقط حقولاً؛ نريد المغلّف
-    كاملاً للأرشيف. مقيس حيّاً: 26 مفتاحاً لكلّ مستخدم.
 
-    والرزمةُ ليست تحسيناً اختياريّاً: `/v2/users/{id}` يردّ 404 «User not found»
-    لكلّ معرّفٍ صحيحِ الشكل منذ 2026-08-19T14:53Z — ومعرّفاتٌ خرجت لحظتَها من
-    200 على `/v2/leaderboard` تردّ 404 هي أيضاً، فلا هي معرّفاتُنا ولا حسابُنا.
-    وهذه أوّلُ مرّةٍ يُجلَب فيها متداولٌ منذ ذلك الوقت (3,775 صفّاً آخرُها
-    14:53:51Z، ثمّ 21 ساعةً من `empty` صامت).
+    We bypass `get_trader_profiles` because it maps and drops fields; we want the
+    full envelope for the archive. Measured live: 26 keys per user.
 
-    والحدُّ 100 لكلّ نداء يُصرّح به المصدرُ نفسه في خطأ التحقّق.
+
+    And the batch is not an optional nicety: `/v2/users/{id}` has answered 404
+    "User not found" to every well-formed id since 2026-08-19T14:53Z — and ids
+    that that very moment came out of a 200 on `/v2/leaderboard` also get 404, so
+    it is neither our ids nor our account. This is the first time a trader has
+    been fetched since then (3,775 rows, the last at 14:53:51Z, then 21 hours of
+    silent `empty`).
+
+
+    The 100-per-call limit is declared by the source itself in the validation error.
+
     """
     from fomo_api.config import settings
 
@@ -438,11 +475,13 @@ async def _fetch_bars_raw(
     client: Any, token_address: str, network_id: str, from_ts: int, to_ts: int,
     resolution: str | None = None,
 ) -> Any:
-    """خام POST /proxy/getBarsNew.
+    """Raw POST /proxy/getBarsNew.
 
-    نتجاوز get_token_bars لأنّها تُعيّن؛ نريد المغلّف الخام لنستخرجه بأنفسنا.
-    symbol = "address:networkId" و from/to إلزاميان — كلاهما مؤكَّد حيّاً
-    (العنوان المجرّد → 502، وغياب from/to → 400).
+
+    We bypass get_token_bars because it maps; we want the raw envelope to extract
+    ourselves. symbol = "address:networkId" and from/to are both mandatory — each
+    confirmed live (bare address → 502, missing from/to → 400).
+
     """
     from fomo_api.config import settings
 
@@ -459,11 +498,14 @@ async def _fetch_bars_raw(
 async def run_bars_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """يسحب شموع شريحة من العملات المراقَبة (جدولة دوّارة).
+    """Pulls candles for a slice of the watched tokens (round-robin scheduling).
 
-    كل عملة على حدة داخل try: فشل واحدة لا يمنع البقيّة ولا يُسقط الدورة.
-    نطلب دائماً النافذة الكاملة منذ (أول ظهور - سياق) لا منذ آخر شمعة: الشمعة
-    الأخيرة تكون قيد التكوّن فتُراجَع، والسحب الكامل يشفي أي ثغرة سابقة.
+
+    Each token on its own inside try: one failure does not block the rest or sink
+    the cycle. We always request the full window from (first seen - context), not
+    from the last candle: the latest candle is still forming and gets re-reviewed,
+    and the full pull heals any earlier gap.
+
     """
     stats = {"bars_tokens": 0, "bars_rows": 0, "bars_no_data": 0, "bars_errors": 0}
     now_dt = datetime.fromisoformat(recorded_at)
@@ -481,7 +523,8 @@ async def run_bars_cycle(
         try:
             first_seen = datetime.fromisoformat(w["first_seen_at"])
             from_dt = first_seen - timedelta(hours=config.BARS_PRE_SIGNAL_HOURS)
-            # لا نتجاوز سقف النافذة (تفادي طلب مدى أوسع ممّا يعيده fomo أصلاً).
+            # Never exceed the window cap (avoid requesting a wider range than fomo returns anyway).
+
             earliest = now_dt - timedelta(hours=config.BARS_MAX_SPAN_HOURS)
             from_ts = int(max(from_dt, earliest).timestamp())
 
@@ -492,18 +535,21 @@ async def run_bars_cycle(
             )
             if rows:
                 stats["bars_rows"] += db.insert_bars(rows)
-                # حكم التشوّه يحتاج جار الشمعة الأخيرة — يُعاد بعد كل إدراج.
+                # The distortion verdict needs the neighbor of the last candle — recomputed after every insert.
+
                 db.recompute_bar_flags(addr, net, config.BARS_RESOLUTION)
                 stats["bars_tokens"] += 1
             else:
                 stats["bars_no_data"] += 1
             db.set_bars_state(addr, net, status if rows else "no_data", len(rows), recorded_at)
-        except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الشريحة
+        except Exception as exc:  # noqa: BLE001 — one token must not sink the slice
+
             stats["bars_errors"] += 1
             try:
                 db.set_bars_state(addr, net, "error", 0, recorded_at)
-            except Exception:  # noqa: BLE001 — جدولةُ إعادة لا قياس؛ ولو رمت هي
-                pass                        # لَما بُلِغ الختمُ أدناه أصلاً
+            except Exception:  # noqa: BLE001 — rescheduling, not measuring; and if it threw
+                pass                        # the seal below would never be reached anyway
+
             db.note_error("last_error_bars", f"{recorded_at}: {_exc_note(exc)}")
         if i + 1 < len(due):
             await sleep(config.BARS_PACING_SECONDS)
@@ -519,23 +565,31 @@ def admit_control_sample(
     stats: dict[str, int] | None = None,
     static_items: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> int:
-    """يُدخل عملات ضابطة مختارة **عشوائياً** من نفس كون العملات. يعيد كم أُدخلت.
+    """Admits control tokens chosen **at random** from the same token universe. Returns how many were admitted.
 
-    شروط سلامة المقارنة (كلّها مقصودة):
-    - **عشوائيّ لا حسب الترتيب**: الأخذ من رأس قائمة الرواج يختار الأعلى حجماً
-      فيصير الفرق عن المُشار إليها فرقَ حجمٍ لا فرقَ إشارة.
-    - **بلا نظر إلى المستقبل**: الاختيار يعتمد على ما هو معروف الآن فقط؛ لا
-      يُستشار أداء لاحق (وإلّا كان تسرّباً صريحاً).
-    - **يُستبعد كل ما أُشير إليه** ولو لم يدخل المراقبة — وإلّا لم يعد ضابطاً.
-    - **بالتقسيط** (`CONTROL_PER_CYCLE`): أخذ الأربعين دفعةً واحدة يجعلها كلّها
-      عيّنة من لحظة سوقية واحدة، فيختلط أثر الإشارة بأثر تلك اللحظة.
-    - **نفس بوّابة العمر** المطبَّقة على المُشار إليها (أُضيفت 2026-08-22): وإلّا
-      اختلف الذراعان في المتغيّر الأقوى أثراً. مقيسٌ يومَ أُضيفت البوّابة أنّ
-      1.5% من نوافذ الإشارة كانت لعملةٍ دون يومين مقابل **50%** من نوافذ الضابط
-      — فرقُ 48 نقطة في متغيّرٍ نسبةُ الانهيار فيه 29 ضعفاً ووسيطُ المردود
-      −46.2% مقابل −5.1%. وأيُّ «أثرٍ للإشارة» يُقاس على ذراعين كهذين هو أثرُ
-      عمرٍ مقنّعٌ في زيّ إشارة. ومجهولُ العمر يُرفض هنا كما يُرفض هناك — نفس
-      القاعدة لا قاعدةٌ ألطف — وثمنُه 12 عملة من 1,212 (0.99%).
+
+    Comparison-soundness conditions (all deliberate):
+
+    - **Random, not rank-ordered**: taking from the head of the trending list picks
+      the highest volume, so the gap versus the signalled ones becomes a volume gap, not a signal gap.
+
+    - **No peeking at the future**: selection depends only on what is known now; no
+      later performance is consulted (otherwise it is outright leakage).
+
+    - **Everything signalled is excluded**, even if it never entered the watch — otherwise it is no longer a control.
+
+    - **In installments** (`CONTROL_PER_CYCLE`): taking all forty at once makes them
+      a sample of a single market moment, mixing the signal effect with that moment's effect.
+
+    - **The same age gate** applied to the signalled ones (added 2026-08-22):
+      otherwise the two arms differ in the strongest variable. Measured on the day
+      the gate was added: 1.5% of signal windows were for a token under two days
+      old versus **50%** of control windows — a 48-point gap in a variable whose
+      rug rate is 29x higher and whose median return is −46.2% versus −5.1%. Any
+      "signal effect" measured on arms like these is an age effect dressed up as a
+      signal. Unknown age is rejected here exactly as it is rejected there — the
+      same rule, not a gentler one — and its price is 12 tokens out of 1,212 (0.99%).
+
     """
     need = config.CONTROL_GROUP_SIZE - db.active_watch_count(is_control=1)
     if need <= 0 or not candidates:
@@ -576,9 +630,11 @@ def admit_control_sample(
                 continue
         normalized[(addr, net)] = (price_usd, admission_source, created_at)
 
-    # البوّابة **قبل** الترجيح لا بعده: الأوزان تطابق مزيجَ شبكات الضابط بمزيج
-    # شبكات الإشارة، فلو أُسقطت الصغيرةُ بعد الاختيار نقص نصيبُ شبكتها بلا أن
-    # يُعاد الترجيح — فيصير الذراعان مختلفَين في الشبكة بدل العمر.
+    # The gate **before** weighting, not after: the weights match the control
+    # group's network mix to the signal network mix, so if the small ones were
+    # dropped after selection their network's share would shrink with no
+    # re-weighting — and the two arms would differ in network instead of age.
+
     age_rejected = 0
 
     def _age_ok(key: tuple[str, str]) -> bool:
@@ -734,7 +790,7 @@ def admit_signal_comparison_windows(
     stats: dict[str, int] | None = None,
     static_items: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> int:
-    """يدخل إشارات v3 فقط عندما تظهر في نفس قائمة المرشحين المستخدمة للضابطة."""
+    """Admits v3 signals only when they appear in the same candidate list used for the control group."""
     candidate_prices: dict[tuple[str, str], tuple[float, str, Any]] = {}
     for candidate in candidates:
         addr, net, price, admission_source = candidate[:4]
@@ -805,13 +861,18 @@ AGE_UNKNOWN = "unknown"
 
 
 def token_age_days(created_at: Any, now_iso: str) -> float | None:
-    """عمرُ العملة بالأيّام لحظةَ `now_iso`، أو None إن تعذّر.
+    """Token age in days as of `now_iso`, or None if it cannot be determined.
 
-    `token_created_at` **ثوانٍ منذ المبدأ مخزَّنةً نصّاً** لا تاريخاً مقروءاً،
-    فـ`julianday()` عليه يعيد NULL بصمت — ولهذا يُحسب هنا في بايثون لا في SQL.
 
-    العمرُ السالب (تاريخُ إنشاءٍ في المستقبل) ليس عمراً: يعود None فيُعامَل
-    معاملةَ المجهول لا معاملةَ القديم، وإلّا لصار انحرافُ ساعةٍ بوّابةً مفتوحة.
+    `token_created_at` is **seconds-since-epoch stored as text**, not a readable
+    date, so `julianday()` on it silently returns NULL — which is why it is
+    computed here in Python, not in SQL.
+
+
+    A negative age (creation date in the future) is not an age: it returns None
+    and is treated as unknown, not as old — otherwise a clock skew becomes an
+    open gate.
+
     """
     created = _created_epoch(created_at)
     if created is None:
@@ -837,7 +898,8 @@ def _created_epoch(value: Any) -> float | None:
 def age_verdict(
     created_at: Any, now_iso: str, observed_at: Any = None,
 ) -> str:
-    """حكم بوابة العمر مع ختم اختياري لوقت معرفة التاريخ."""
+    """Age-gate verdict with an optional stamp for when the date became known."""
+
     if not config.MIN_TOKEN_AGE_DAYS:
         return AGE_OK
     if observed_at is not None:
@@ -930,23 +992,30 @@ async def resolve_ages(
     stats: dict[str, int],
     gecko_fallback: Any | None = None,
 ) -> None:
-    """يجلب تاريخَ إنشاءِ المرشّحين المجهولين ويثبّته في `token_static`.
+    """Fetches the creation date of unknown candidates and pins it in `token_static`.
 
-    الإشارةُ نفسها **لا تحمل عمرَ العملة**: حدثُ الـfeed فيه `tokenAddress` و
-    `networkId` و`createdAt` الخاصّ بالمنشور وحده — لا كائنَ عملةٍ فيه إطلاقاً.
-    فبوّابةُ العمر تحتاج مصدراً، و`filterTokens` يسأل عن عنوانٍ بالاسم بلا شرط
-    شعبيّة ويحمل `token.createdAt`.
 
-    الكلفةُ نداءٌ واحد في الدورة على الأكثر: المرشّحون الجدد **1.11 عملة في
-    الدورة** (أقصى ما رُصد 4) والدفعة تحمل 150 — مقابل تسعة نداءات شموع تُجرى
-    في الدورة نفسها. والنتيجةُ تُخزَّن فلا يُسأل عن العملة نفسها ثانيةً: إشارةٌ
-    لاحقة على عملةٍ رُفضت تُحكَم من التاريخ المخزَّن بلا شبكة.
+    The signal itself **carries no token age**: the feed event holds
+    `tokenAddress` and `networkId` and the post's own `createdAt` — no token
+    object at all. So the age gate needs a source, and `filterTokens` asks for an
+    address by name with no popularity requirement and carries `token.createdAt`.
 
-    `gecko_fallback` (2026-08-27): عندما لا يجد filterTokens العملة إطلاقاً
-    («مفقود» لا «خطأ») نسأل GeckoTerminal عن أقدم `pool_created_at`. مقيس:
-    يحلّ 17/18 من مجهولي fomo. المصدران مستقلّان فلو حُجب أحدهما كمُلأ الآخر.
-    فشل GT صامت بلا عدّاد فشل: هو fallback لا مساراً أساسيّاً — نجاحُه فقط
-    يُعدّ (`age_gecko_resolved`)، وعطبُه الأقصى أن تبقى الحالة كما كانت.
+
+    The cost is at most one call per cycle: new candidates are **1.11 tokens per
+    cycle** (4 at the observed maximum) and the batch carries 150 — against nine
+    candle calls made in the same cycle. And the result is stored, so the same
+    token is never asked again: a later signal on a rejected token is judged from
+    the stored date with no network.
+
+
+    `gecko_fallback` (2026-08-27): when filterTokens cannot find the token at all
+    ("missing", not "error") we ask GeckoTerminal for the earliest
+    `pool_created_at`. Measured: it resolves 17/18 of fomo's unknowns. The two
+    sources are independent, so if one is blocked the other fills in. GT failure
+    is silent with no failure counter: it is a fallback, not a primary path — only
+    its success is counted (`age_gecko_resolved`), and its worst outage leaves the
+    state as it was.
+
     """
     if not keys:
         return
@@ -963,7 +1032,8 @@ async def resolve_ages(
     symbols = [f"{addr}:{net}" for addr, net in due_keys]
     try:
         raw = await _fetch_filter_tokens_raw(client, symbols)
-    except Exception as exc:  # noqa: BLE001 — الإشارة محفوظة أصلاً
+    except Exception as exc:  # noqa: BLE001 — the signal is already durable
+
         stats["age_lookup_failed"] += len(due_keys)
         db.note_error("last_error_age_lookup", f"{recorded_at}: {_exc_note(exc)}")
         db.bump_counter("age_lookup_failed_streak")
@@ -1043,20 +1113,25 @@ async def resolve_ages(
 async def _gecko_resolve_age(
     gecko: Any, db: RecorderDB, addr: str, net: str, recorded_at: str,
 ) -> str | None:
-    """يسأل GeckoTerminal عن العمر ويكتبه إن صحّ. يعيد القيمة أو None.
+    """Asks GeckoTerminal for the age and writes it if valid. Returns the value or None.
 
-    نفس قاعدة الصلاحية التي تطبّق على fomo (`_age_value_is_valid`): مستقبلٌ
-    أو صيغةٌ فاسدة تُرفض — لا نكتب عمراً فاسداً من مصدر بديل. الكتابة عبر
-    `set_static_created_at` بختمِ ملاحظةٍ صريح، فالبوابة تُفرِّق بين عمرٍ
-    موثَّق وآخر بلا provenance.
+
+    The same validity rule applied to fomo (`_age_value_is_valid`): a future or
+    malformed value is rejected — we do not write a corrupt age from an alternate
+    source. The write goes through `set_static_created_at` with an explicit
+    observation stamp, so the gate can tell a documented age from one with no
+    provenance.
+
     """
     canonical = extract.canonical_token_address(addr)
     current, _observed = stored_age(db, canonical, str(net or ""))
     if current not in (None, ""):
-        return None                      # عمرٌ موجود أصلاً — لا شأن لنا
+        return None                      # an age already exists — not our business
+
     try:
         created = await gecko.pool_created_at(addr, str(net or ""))
-    except Exception:  # noqa: BLE001 — fallback لا يرفع أبدًا
+    except Exception:  # noqa: BLE001 — the fallback never raises
+
         return None
     if created in (None, "") or not _age_value_is_valid(created, recorded_at):
         return None
@@ -1065,11 +1140,14 @@ async def _gecko_resolve_age(
 
 
 def _opens_window(existing: Any) -> bool:
-    """هل ستفتح `upsert_watch` نافذةً جديدة لهذا الصفّ؟
+    """Will `upsert_watch` open a new window for this row?
 
-    شرطُ التحديث فيه `WHERE watchlist.active=0 OR watchlist.is_control=1`، فثلاثُ
-    حالات تفتح نافذة: لا صفَّ أصلاً، صفٌّ منتهي، صفٌّ ضابط يُحوَّل إلى مُشار
-    إليه. والنشطُ غيرُ الضابط وحده لا تُفتَح له نافذة — نافذتُه تجري بالفعل.
+
+    Its update clause is `WHERE watchlist.active=0 OR watchlist.is_control=1`, so
+    three cases open a window: no row at all, an expired row, or a control row
+    being converted to a signalled one. Only the active non-control row gets no
+    window — its window is already running.
+
     """
     if existing is None:
         return True
@@ -1079,12 +1157,15 @@ def _opens_window(existing: Any) -> bool:
 def _evm_age_exceeds_cap(
     db: RecorderDB, token: str, network: str, recorded_at: str,
 ) -> bool:
-    """هل عمر عملة EVM يتجاوز السقف الأعلى للإدخال؟
+    """Does an EVM token's age exceed the upper admission cap?
 
-    يقرأ التاريخ المخزَّن وحده (لا نداء شبكة): السقف يعمل لحظة فتح النافذة
-    والتاريخ المخزَّن حُكِم به في بوابة العمر الدنيا قبل قليل، فمجهوله رُفض
-    هناك أصلًا. يعيد False عند غياب السقف أو المعمّر — الحكم «ليس فوق السقف»
-    هنا لا يفتح بابًا: بوابة الدنيا ترفض المجهول.
+
+    It reads only the stored date (no network call): the cap acts at the moment
+    the window opens, and the stored date was just judged by the minimum age gate,
+    whose unknowns were already rejected there. Returns False when the cap or the
+    date is missing — a "not above the cap" verdict here opens no door: the
+    minimum gate rejects the unknown.
+
     """
     cap = float(config.EVM_MAX_TOKEN_AGE_DAYS or 0)
     if cap <= 0:
@@ -1097,10 +1178,13 @@ def _evm_age_exceeds_cap(
 
 
 def _evm_admission_networks() -> frozenset[str]:
-    """الشبكات التي تخضع لسقف العمر الأعلى: شبكات EVM المفعَّلة.
+    """Networks subject to the upper age cap: the enabled EVM networks.
 
-    تُقرأ من الإعدادات لا من كائن السياسة: السقف حكمُ قبولٍ ثابت لا يتغير
-    بحالة الاكتظاظ، وبوابةٌ تتوقف على «هل هناك سياسة أصلًا» بوابةٌ مثقوبة.
+
+    Read from settings, not from the policy object: the cap is a fixed admission
+    rule that does not change with congestion, and a gate that depends on "is
+    there even a policy" is a hole.
+
     """
     return frozenset(str(net) for net in config.EVM_NETWORKS)
 
@@ -1115,7 +1199,8 @@ async def record_feed(
     stats: dict[str, int],
     client: Any = None,
 ) -> set[str]:
-    """يحفظ الإشارات أولاً، ثم يحاول المراقبة بلا أن يربط مصير الاثنين."""
+    """Saves the signals first, then attempts the watch without tying the two fates together."""
+
     events = extract.unwrap_feed(raw_feed)
     rows = []
     inserted: set[str] = set()
@@ -1139,7 +1224,8 @@ async def record_feed(
                 stats["signals"] += 1
 
     triggers = [r for r in rows if r["signal_type"] in config.TRIGGER_SIGNAL_TYPES]
-    # حالةُ القائمة لكلّ مُشغّل مرّةً واحدة: يقرأها فرزُ المرشّحين وحلقةُ القبول.
+    # List state per trigger fetched once: read by candidate sorting and the admission loop.
+
     watch_state: dict[tuple[str, str], Any] = {}
     for row in triggers:
         key = (str(row["token_address"]), str(row["network_id"] or ""))
@@ -1150,8 +1236,10 @@ async def record_feed(
                 key,
             ).fetchone()
 
-    # عمرُ المرشّحين الذين ستُفتَح لهم نافذة، قبل الحكم. المخزَّن يكفي غالباً
-    # فلا نداءَ له؛ المجهول وحده يخرج للشبكة، ونداءٌ واحدٌ يحمل 150.
+    # Age of the candidates that will get a window opened, before the verdict.
+    # The stored value usually suffices, so no call for it; only the unknown goes
+    # to the network, and one call carries 150.
+
     if client is not None and config.MIN_TOKEN_AGE_DAYS:
         unknown = [
             key for key, existing in watch_state.items()
@@ -1160,12 +1248,14 @@ async def record_feed(
         ]
         gecko = None
         if config.AGE_GECKO_FALLBACK:
-            # زبون لكل دورة لا زبونٌ مشترك: الجلسة ترتبط بحلقة asyncio،
-            # والمسجّل يعمل حلقةً واحدة طويلة العمر فلا مشكلة، لكن الاختبارات
-            # تجرِي كلَّ اختبارٍ في حلقةٍ جديدة — فزبونٌ مشترك يوقظ مؤقّت
-            # curl_cffi من حلقةٍ ميتة (قِيس: PytestUnraisableExceptionWarning
-            # عبر filterwarnings=error). كلفة الإنشاء صفر: جلسة تُبنى أول
-            # نداء فعلي، والدورات بلا مجهولٍ لا تلمس الشبكة إطلاقاً.
+            # A client per cycle, not a shared one: the session is tied to the
+            # asyncio loop, and the recorder runs one long-lived loop so there is
+            # no problem, but the tests run each test in a fresh loop — a shared
+            # client then wakes the curl_cffi timer from a dead loop (measured:
+            # PytestUnraisableExceptionWarning via filterwarnings=error). The
+            # creation cost is zero: the session is built on the first real call,
+            # and cycles with no unknowns touch the network not at all.
+
             from gecko_terminal import GeckoTerminalClient
 
             gecko = GeckoTerminalClient()
@@ -1178,9 +1268,11 @@ async def record_feed(
         token = str(row["token_address"])
         network = str(row["network_id"] or "")
         existing = watch_state[(token, network)]
-        # البوّابةُ تحكم كلَّ نافذةٍ تُفتَح — الجديدةَ **وإعادةَ التنشيط**:
-        # `upsert_watch` يُحيي صفّاً منتهياً (active=0) أو ضابطاً بنافذةٍ جديدة،
-        # فلو حُصِرت في الجديد لدخلت الصغيرةُ من باب الإحياء.
+        # The gate rules every window that opens — the new ones **and
+        # reactivations**: `upsert_watch` revives an expired row (active=0) or a
+        # control row with a new window, so had it been confined to the new, the
+        # young ones would slip in through revival.
+
         if _opens_window(existing):
             verdict = stored_age_verdict(db, token, network, recorded_at)
             if verdict != AGE_OK:
@@ -1188,10 +1280,12 @@ async def record_feed(
                 if verdict == AGE_UNKNOWN:
                     stats["age_unknown"] += 1
                 continue
-            # سقف العمر الأعلى لإدخال EVM (2026-08-29): بوابة العمر الدنيا
-            # وحدها تُدخل عملات عمرها سنتين فتُسقط الشبكة في إيقاف الإدخال
-            # (قياس 08-29: 26 إدخالًا فوق سنة على 8453). لا يُطبَّق على
-            # سولانا ولا على مجهول العمر (بوابة الدنيا تتكفل به).
+            # Upper age cap for EVM admission (2026-08-29): the minimum age gate
+            # alone admits two-year-old tokens and drops the network into
+            # admission pause (measured 08-29: 26 admissions over a year old out
+            # of 8453). Not applied to Solana nor to unknown age (the minimum
+            # gate handles that).
+
             if (
                 config.EVM_MAX_TOKEN_AGE_DAYS
                 and network in _evm_admission_networks()
@@ -1201,9 +1295,11 @@ async def record_feed(
                     stats.get("evm_max_age_rejected", 0) + 1
                 )
                 continue
-            # بوابة الصعود المسبق: تُطبَّق على النافذة الجديدة/المعاد تنشيطها
-            # مثل بوابة العمر نفسها. الإشارة نفسها محفوظة أعلاه دائمًا؛
-            # المرفوض هنا فتحُ المراقبة فقط (وإلا عادت من باب الإحياء).
+            # Pre-signal runup gate: applied to the new/reactivated window just
+            # like the age gate itself. The signal itself is always saved above;
+            # what is rejected here is only opening the watch (otherwise it
+            # returns through revival).
+
             row_ts = row.get("ts")
             t0 = int(row_ts) if str(row_ts or "").isdigit() else None
             if t0 is not None and runup_verdict(db, token, network, t0) == RUNUP_LATE:
@@ -1211,9 +1307,11 @@ async def record_feed(
                     stats.get("runup_rejected", 0) + 1
                 )
                 continue
-        # بوابة إدخال EVM تُطبَّق على كل نافذةٍ ستُفتَح — الجديدة وإعادة
-        # التنشيط سواء (2026-08-29): فحصُها كان محصورًا في الجديد فكانت
-        # إعادةُ التنشيط تتجاوز الإيقاف كليًا وتُغذّي الطابور من باب خلفيّ.
+        # The EVM admission gate applies to every window about to open — new ones
+        # and reactivations alike (2026-08-29): its check used to be confined to
+        # the new, so reactivation bypassed the pause entirely and fed the queue
+        # through a back door.
+
         if (
             _opens_window(existing)
             and network in policy_networks
@@ -1241,14 +1339,18 @@ async def record_feed(
             if added:
                 stats["watch_added"] += 1
                 watch_state[(token, network)] = {"active": 1, "is_control": 0}
-                # (fv16) socials من DEX Screener لعملة تُقبل للتو — نداء واحد
-                # في عمر العملة عندنا: يُخزّن في token_static (تُكتب مرة)،
-                # فلا تُسأل ثانيةً مهما تكررت إشاراتها. الفشل صامت كليًا:
-                # الطبقة مساندة، وغيابها يترك العمودين NULL (لم يُقس).
+                # (fv16) socials from DEX Screener for a token just admitted —
+                # one call per token in its lifetime with us: stored in
+                # token_static (written once), never asked again no matter how
+                # many signals repeat. Failure is fully silent: the layer is
+                # supporting, and its absence leaves the two columns NULL (not
+                # measured).
+
                 if config.DEX_SCREENER_SOCIALS:
                     try:
                         await _enrich_dex_socials(db, token, network)
-                    except Exception:  # noqa: BLE001 — إثراء لا يُسقط القبول
+                    except Exception:  # noqa: BLE001 — enrichment must not sink the admission
+
                         pass
         except Exception as exc:  # noqa: BLE001 - signal is already durable
             stats["errors"] += 1
@@ -1266,13 +1368,16 @@ async def record_feed(
 
 
 async def _enrich_dex_socials(db: RecorderDB, token: str, network: str) -> None:
-    """يسأل DEX Screener عن قنوات التواصل ويخزنها في token_static.
+    """Asks DEX Screener for the social channels and stores them in token_static.
 
-    نداء واحد لكل عملة في عمرها عندنا — إن كان العمود قد كُتب سابقًا
-    (ولو NULL صريحًا من محاولة فاشلة) لا يُسأل ثانية: الإثراء فرصة لا
-    التزام. `social_match_fomo_dex` يقارن رؤية المصدرين: كلاهما يرى
-    socials أو كلاهما لا يرى = 1 (توافق)؛ واحد فقط = 0 (تعارض — نمط
-    ملف مزوّر). فشل النداء لا يكتب شيئًا (NULL = لم يُقس).
+
+    One call per token in its lifetime with us — once the column has been written
+    (even an explicit NULL from a failed attempt) it is never asked again:
+    enrichment is an opportunity, not an obligation. `social_match_fomo_dex`
+    compares the two sources' visibility: both see socials or neither does = 1
+    (agreement); exactly one does = 0 (conflict — a forged-profile pattern). A
+    failed call writes nothing (NULL = not measured).
+
     """
     from dex_screener import DexScreenerClient
 
@@ -1285,16 +1390,18 @@ async def _enrich_dex_socials(db: RecorderDB, token: str, network: str) -> None:
         (token, net),
     ).fetchone()
     if row is None or row["social_channels_dex"] is not None:
-        return                       # سُئلت سابقًا (نجاحًا أو فشلًا موثقًا)
+        return                       # asked before (successfully or with a documented failure)
+
     client = DexScreenerClient()
     try:
         channels = await client.social_channels(token, net)
     finally:
         await client.aclose()
     if channels is None:
-        return                       # غير مفهرسة/عطب — تبقى NULL، تُسأل لاحقًا؟
-                                     # لا: العمود يبقى NULL لكن لا نعوّد السؤال
-                                     # كل دورة — الإخفاق المشوّش يحرق نداءات.
+        return                       # not indexed / broken — stays NULL, ask again later?
+                                     # No: the column stays NULL but we do not make a
+                                     # habit of asking every cycle — a fuzzy failure burns calls.
+
     fomo_has = 1 if (row["twitter"] or row["telegram"] or row["discord"]) else 0
     dex_has = 1 if channels > 0 else 0
     match = 1 if fomo_has == dex_has else 0
@@ -1308,7 +1415,8 @@ async def _enrich_dex_socials(db: RecorderDB, token: str, network: str) -> None:
 
 
 async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) -> Any:
-    """خام GET /feed/token/thesis — نتجاوز get_token_thesis_feed لأنّها تُعيّن."""
+    """Raw GET /feed/token/thesis — we bypass get_token_thesis_feed because it maps."""
+
     from fomo_api.config import settings
 
     params = {
@@ -1320,10 +1428,12 @@ async def _fetch_thesis_raw(client: Any, token_address: str, network_id: str) ->
 
 
 async def _fetch_token_details_raw(client: Any, token_address: str, network_id: str) -> Any:
-    """خام POST /proxy/tokenDetails — يحمل top10HoldersPercent وعدد الحائزين.
+    """Raw POST /proxy/tokenDetails — carries top10HoldersPercent and the holder count.
 
-    `tokenId` **يجب** أن يكون "address:networkId" كـgetBarsNew؛ العنوان المجرّد
-    يجعل الخادم يرمي 502 من Cloudflare (يبدو عطلاً وهو طلب مشوّه).
+
+    `tokenId` **must** be "address:networkId" as in getBarsNew; the bare address
+    makes the server throw a 502 from Cloudflare (looks like an outage, is a malformed request).
+
     """
     from fomo_api.config import settings
 
@@ -1332,9 +1442,11 @@ async def _fetch_token_details_raw(client: Any, token_address: str, network_id: 
 
 
 async def _fetch_hodlers_raw(client: Any, token_address: str, network_id: str) -> Any:
-    """خام GET /hodlers/top — تفصيل كبار الحائزين (يعطي top1 أيضاً).
+    """Raw GET /hodlers/top — top-holders detail (also yields top1).
 
-    المعامل `tokens` سلسلة JSON لقائمة كائنات، وهو شكل المصدر لا عنوان مفرد.
+
+    The `tokens` parameter is a JSON string of a list of objects, the source's shape, not a single address.
+
     """
     from fomo_api.config import settings
 
@@ -1346,18 +1458,24 @@ async def _fetch_hodlers_raw(client: Any, token_address: str, network_id: str) -
 async def refresh_leaderboard(
     lb: LeaderboardCache, db: RecorderDB, now_mono: float, recorded_at: str
 ) -> None:
-    """يحدّث الصدارة عند الاستحقاق، يؤرشف الخام، ويسجّل الفشل صراحةً.
+    """Refreshes the leaderboard when due, archives the raw, and logs failure explicitly.
 
-    بلا الأرشفة يضيع مسار كل متصدّر عبر الزمن إلى الأبد — الرتبة كانت تُقرأ
-    وتُرمى كل ساعة. وبلا تسجيل الفشل يبقى ركود الخريطة (تحديث فاشل أو مغلّف
-    فارغ ⇒ الخريطة القديمة) صامتاً إلى الأبد: `last_error_leaderboard` معروض
-    في اللوحة كبقيّة المصادر.
 
-    **خام كل مدّة في مصدر مستقلّ** (`leaderboard` / `leaderboard_24h` …): دمجها
-    في مصدر واحد يخلط أربع قوائم مختلفة في أرشيف لا يُفكّ. `raw_by_period`
-    تعيد المدد الطازجة (آخر محاولة) فحسب — أرشفة مغلّف قديم بتوقيت جديد تضع في
-    الأرشيف صدارةً لم نجلبها قطّ. ومدّة فشلت وأخواتها نجحت لا تُفشل الدورة،
-    لكنّها تُسجَّل كي لا يصمت العطل الجزئيّ.
+    Without archiving, every leader's trajectory is lost forever — the rank used
+    to be read and thrown away every hour. And without failure logging, a stale
+    map (failed refresh or empty envelope ⇒ the previous map) stays silent
+    forever: `last_error_leaderboard` is shown on the dashboard like the other
+    sources.
+
+
+    **Raw per period in an independent source** (`leaderboard` /
+    `leaderboard_24h` …): merging them into one source mixes four different lists
+    into an archive that cannot be untangled. `raw_by_period` returns only the
+    fresh periods (the last attempt) — archiving an old envelope under a new
+    timestamp would put in the archive a leaderboard we never fetched. A period
+    that failed while its sisters succeeded does not fail the cycle, but it is
+    logged so the partial outage is not silent.
+
     """
     was_stale = lb.is_stale(now_mono)
     refreshed = await lb.maybe_refresh(now_mono)
@@ -1383,13 +1501,17 @@ async def refresh_leaderboard(
 async def run_macro_bars_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """يسحب شموع السوق الكلّي (SOL/WETH/WBTC) مرّة كل ساعة.
+    """Pulls whole-market candles (SOL/WETH/WBTC) once an hour.
 
-    مرجع النظام السوقي: عائد أي عملة يُقرأ بمعزل عن السوق فيبدو أثر الإشارة
-    أثرَ يومٍ صاعد. لا تقودها watchlist — أصول ثابتة في config.MACRO_BARS.
-    التخزين في token_bars بدقّة ساعية فلا يتصادم مع شموع المراقبة (5 دقائق)،
-    والموسِّم لا يلمسها (لا إشارة ولا watch لها). الختم في meta يقود الإيقاع؛
-    دورة ضمن الساعة تخرج فوراً بلا نداء شبكة.
+
+    The market-regime reference: any token's return read in isolation from the
+    market makes the signal effect look like an up-day effect. Not driven by the
+    watchlist — fixed assets in config.MACRO_BARS. Stored in token_bars at hourly
+    resolution so it never collides with the watch candles (5 minutes), and the
+    labeler never touches it (no signal, no watch on them). The stamp in meta
+    drives the cadence; a cycle within the hour exits immediately with no network
+    call.
+
     """
     stats = {"macro_rows": 0, "macro_errors": 0, "macro_no_data": 0}
     now_dt = datetime.fromisoformat(recorded_at)
@@ -1409,21 +1531,26 @@ async def run_macro_bars_cycle(
             rows = extract.extract_bars(
                 raw, addr, net, config.MACRO_BARS_RESOLUTION, recorded_at
             )
-            # «نجاح بلا شموع» ليس نجاحاً: لو كان دائماً (تهيئة خاطئة) صار صمتاً
-            # أبدياً — نفس طراد no_data الموثّق في دورة الشموع.
+            # "Success with no candles" is not success: were it permanent (bad
+            # configuration) it would become eternal silence — the same documented
+            # no_data patrol as in the candle cycle.
+
             if not rows:
                 stats["macro_no_data"] += 1
             stats["macro_rows"] += db.insert_bars(rows)
             if rows:
                 db.recompute_bar_flags(addr, net, config.MACRO_BARS_RESOLUTION)
-        except Exception as exc:  # noqa: BLE001 — أصل واحد لا يُسقط البقيّة
+        except Exception as exc:  # noqa: BLE001 — one asset must not sink the rest
+
             stats["macro_errors"] += 1
             db.note_error("last_error_macro", f"{recorded_at}: {label}: {_exc_note(exc)}")
         if i + 1 < len(config.MACRO_BARS):
             await sleep(config.BARS_PACING_SECONDS)
-    # الختم بصفوف مكتوبة فعلاً فقط: فشل كامل (انقطاع fomo) أو فراغ كامل
-    # (ردود بلا شموع) يُعاد في الدورة القادمة كبقيّة المصادر — لا نُرجئه
-    # ساعة كاملة، والفراغ الكليّ يُسجَّل خطأً لئلا يمرّ صامتاً.
+    # Stamp only with rows actually written: a total failure (fomo outage) or
+    # total emptiness (responses with no candles) is retried next cycle like the
+    # other sources — not postponed a full hour, and total emptiness is logged as
+    # an error so it does not pass silently.
+
     if stats["macro_rows"] == 0:
         if stats["macro_errors"] == 0:
             db.set_meta(
@@ -1438,10 +1565,12 @@ async def run_macro_bars_cycle(
 async def run_social_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """يلتقط الطبقة الاجتماعية لشريحة من المراقَبات (جدولة دوّارة كالشموع).
+    """Captures the social layer for a slice of the watches (round-robin like the candles).
 
-    العملة بلا نقاش تُسجَّل بأصفار لا تُتخطّى: **الصمت إشارة**، وسلسلة الأصفار
-    ثمّ الارتفاع المفاجئ هي بالضبط ما نريد التقاطه.
+
+    A token with no discussion is recorded with zeros, not skipped: **silence is
+    a signal**, and the run of zeros followed by a sudden spike is exactly what we want to capture.
+
     """
     stats = {"social_tokens": 0, "social_items": 0, "thesis_rows": 0, "social_errors": 0}
     now_dt = datetime.fromisoformat(recorded_at)
@@ -1470,11 +1599,13 @@ async def run_social_cycle(
                 addr, net, "ok" if row["thesis_sampled"] else "empty",
                 row["thesis_total"], recorded_at,
             )
-        except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الشريحة
+        except Exception as exc:  # noqa: BLE001 — one token must not sink the slice
+
             stats["social_errors"] += 1
             try:
                 db.set_social_state(addr, net, "error", 0, recorded_at)
-            except Exception:  # noqa: BLE001 — كما في bars: لا تحجب الختمَ أدناه
+            except Exception:  # noqa: BLE001 — as in bars: do not block the seal below
+
                 pass
             db.note_error("last_error_social", f"{recorded_at}: {_exc_note(exc)}")
         if i + 1 < len(due):
@@ -1482,9 +1613,11 @@ async def run_social_cycle(
     return stats
 
 
-# مصدرا الحائزين ثابتاً وحدَه لا مضمَّناً في الحلقة، ليُعرَف طولهما فيُحرَس النوم
-# بعد آخر نداء: التمهّل فاصل **بين** النداءات، ونوم بعد آخرها يقتطع من فسحة
-# الدورة بلا مقابل (نفس حرس `if i + 1 < len(due)` في دورتَي الشموع والسوشيال).
+# The two holder sources are a module constant, not inline in the loop, so their
+# length is known and the sleep after the last call is guarded: pacing is a gap
+# **between** calls, and a sleep after the last one cuts cycle time for nothing
+# (same guard as `if i + 1 < len(due)` in the candle and social cycles).
+
 _HOLDERS_SOURCES: tuple[tuple[str, Any, Any], ...] = (
     ("token_details", _fetch_token_details_raw, extract.extract_token_details_holders),
     ("hodlers_top", _fetch_hodlers_raw, extract.extract_platform_holders),
@@ -1494,31 +1627,41 @@ _HOLDERS_SOURCES: tuple[tuple[str, Any, Any], ...] = (
 async def run_holders_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """يقيس تركيز الملكية وتموضع الحشد زمنياً من مصدرين متكاملين.
+    """Measures ownership concentration and crowd positioning over time from two complementary sources.
 
-    `market_ticks.top10_holders_pct` ميت (صفر من 1,430,475): قوائم
-    trending/verified لا تحمل المفتاح أصلاً. وفحص السلسلة يغطّي Solana وحدها
-    (2,929 من 3,044) وصامت تماماً عن EVM (صفر من 2,378) — فالتركيز مجهول
-    لكل عملة إيثيريوم عندنا. المصدران هنا يعملان على الشبكتين ويقيسان شيئين
-    مختلفين (مؤكَّد حيّاً 2026-08-09 لا مفترَضاً):
 
-    - `tokenDetails`: تركّز السلسلة — `top10HoldersPercent` + `holders` على
-      السلسلة كلّها (شوهد 83.6% و90.1% و21.9%). يعمل على EVM وSolana معاً
-      — وهو الإصلاح المباشر للعمود الميّت.
-    - `hodlers/top`: تموضع الحشد — مستخدمو fomo الحائزون (276 من 947؛ 118 من
-      14,371) بلا أي نسبة من المعروض، لكن مع تكلفة كل مركز وربحه غير المحقّق
-      ومدّة حمله وعلَم `isDev`. «هل حاملو المنصّة تحت الماء؟» سؤال مختلف عن
-      «هل الملكية مركَّزة؟». قياس أوّليّ: 50 من 50 حائزاً خاسراً في عملة،
-      مقابل 12 من 49 في أخرى.
+    `market_ticks.top10_holders_pct` is dead (zero of 1,430,475): the
+    trending/verified lists do not carry the key at all. And the on-chain check
+    covers Solana only (2,929 of 3,044) and is completely silent on EVM (zero of
+    2,378) — so concentration is unknown for every Ethereum token we have. The
+    two sources here work on both networks and measure two different things
+    (confirmed live 2026-08-09, not assumed):
 
-    كلٌّ يُخزَّن بصفّه (`source` داخل المفتاح الأساسي) فلا يطمس أحدهما قياس
-    الآخر، ولا نفبرك قيمة غائبة (FR-007). فشل مصدر لا يُسقط الثاني.
 
-    وردّ `tokenDetails` يُستخرَج **مرّتين**: تركّز الملكية إلى `token_holders`،
-    وتدفّق الشراء/البيع إلى `token_flow` — **جلب واحد، مستخرِجان، جدولان**.
-    الردّ يحمل (100% في 300 ردّ مؤرشف) انقسام الشراء/البيع وطبقة 5 دقائق
-    كاملة، وكنّا نرميها كلّها. صفر نداء إضافي. فشل أحد المستخرِجَين لا يُسقط
-    الآخر: التدفّق في `try` خاصّ به.
+    - `tokenDetails`: on-chain concentration — `top10HoldersPercent` + `holders`
+      across the whole chain (83.6%, 90.1%, and 21.9% observed). Works on both
+      EVM and Solana — the direct fix for the dead column.
+
+    - `hodlers/top`: crowd positioning — fomo users who hold (276 of 947; 118 of
+      14,371) with no share of supply at all, but with each position's cost,
+      unrealized profit, holding duration, and the `isDev` flag. "Are the
+      platform's holders underwater?" is a different question from "is ownership
+      concentrated?". A first measurement: 50 of 50 holders losing on one token,
+      versus 12 of 49 on another.
+
+
+    Each is stored in its own row (`source` inside the primary key) so neither
+    blinds the other's measurement, and we fabricate no absent value (FR-007).
+    One source failing does not sink the second.
+
+
+    And the `tokenDetails` response is extracted **twice**: ownership
+    concentration into `token_holders`, and buy/sell flow into `token_flow` —
+    **one fetch, two extractors, two tables**. The response carries (100% across
+    300 archived responses) the buy/sell split and a full 5-minute layer, and we
+    used to throw it all away. Zero extra calls. One extractor failing does not
+    sink the other: the flow sits in its own `try`.
+
     """
     stats = {
         "holders_tokens": 0, "holders_details": 0,
@@ -1545,7 +1688,8 @@ async def run_holders_cycle(
         got = 0
 
         for j, (source, fetch_fn, extract_fn) in enumerate(_HOLDERS_SOURCES):
-            raw: Any = None  # يبقى None لو رمى الجلب — يُقرأ في فرع التدفّق أدناه
+            raw: Any = None  # stays None if the fetch raised — read in the flow branch below
+
             try:
                 raw = await fetch_fn(client, addr, net)
                 row = extract_fn(raw, addr, net, recorded_at, first_seen, sig, is_control)
@@ -1558,16 +1702,21 @@ async def run_holders_cycle(
                         stats["holders_top"] += 1
                     if top10 is None:
                         top10 = row["top10_pct"]
-            except Exception as exc:  # noqa: BLE001 — مصدر واحد لا يُسقط الباقي
+            except Exception as exc:  # noqa: BLE001 — one source must not sink the rest
+
                 stats["holders_errors"] += 1
                 db.note_error(
                     "last_error_holders",
                     f"{recorded_at}: {source}: {_exc_note(exc)}",
                 )
-            # التدفّق من **نفس** الردّ: مستخرِج ثانٍ على مغلّف بين أيدينا، بلا
-            # نداء إضافي. `try` مستقلّ حتى لا يُسقط أحد الجدولين الآخر، و**خارج**
-            # فرع الحيازة عمداً: مستخرِج الحيازة يعيد None حين تغيب نسب الملكية،
-            # فلو عُلِّق التدفّق عليه لابتُلع معها — وهو حاضر 100% بينما هي لا.
+            # The flow from the **same** response: a second extractor on an
+            # envelope already in hand, with no extra call. An independent `try`
+            # so neither table sinks the other, and deliberately **outside** the
+            # holders branch: the holders extractor returns None when ownership
+            # shares are absent, so had the flow hung off it, it would have been
+            # swallowed with them — it is present 100% of the time while they are
+            # not.
+
             if source == "token_details" and raw is not None:
                 try:
                     frow = extract.extract_token_flow(
@@ -1582,7 +1731,8 @@ async def run_holders_cycle(
                         "last_error_holders",
                         f"{recorded_at}: flow: {_exc_note(exc)}",
                     )
-            # فاصل **بين** النداءات لا بعد آخرها.
+            # A gap **between** calls, not after the last one.
+
             if i + 1 < len(due) or j + 1 < len(_HOLDERS_SOURCES):
                 await sleep(config.HOLDERS_PACING_SECONDS)
 
@@ -1596,20 +1746,25 @@ def _write_filter_static(
     db: RecorderDB, item: Any, addr: str, net: str, recorded_at: str,
     *, replace_invalid: bool = False,
 ) -> bool:
-    """يسدّ ثقب العمر من عنصر filterTokens. يعيد True إن كتب شيئاً.
+    """Fills the age hole from a filterTokens item. Returns True if it wrote something.
 
-    كان تاريخ الإنشاء يأتي من القوائم العامّة وحدها، والقائمة العامّة شرطها
-    **الشعبيّة لا العمر**: 406 عملةً ظهرت في trending/verified/most_held فلها
-    صفّ ثوابت، و177 لم تظهر ولا مرّة فلا صفَّ لها إطلاقاً — فصلٌ تامّ 100%
-    مقيس. أي أنّ «العمر المجهول» لم يكن فئة عملاتٍ حديثةٍ بل فئة عملاتٍ غير
-    رائجة (39.8% منها كانت < يومين لحظة أوّل استرجاع، مقابل 42.4% في
-    معروفات العمر — بلا فرق).
 
-    والحلّ لا يكلّف نداءً واحداً: filterTokens يُسأل عن **مراقَباتنا بالذات**
-    كلَّ دورة، وشكل عنصره **مطابقٌ** لشكل عنصر trending (المفاتيح العليا
-    والمفاتيح داخل `token` متطابقة) فيحمل `token.createdAt` — تغطية مقيسة
-    215 من 216 مراقَبة نشطة، وصفر لم يُعَد. كان العنصر بين أيدينا في هذه
-    الحلقة نفسها ونحن نطرحه.
+    The creation date used to come from the public lists alone, and a public
+    list's condition is **popularity, not age**: 406 tokens appeared in
+    trending/verified/most_held and so have a statics row, while 177 never
+    appeared and have no row at all — a perfect 100% split, measured. So
+    "unknown age" was not a class of new tokens but a class of unpopular ones
+    (39.8% of them were < two days old at first retrieval, versus 42.4% among
+    the knowns — no difference).
+
+
+    And the fix costs not a single call: filterTokens is asked about **our own
+    watches** every cycle, and its item shape **matches** the trending item shape
+    (the top-level keys and the keys inside `token` are identical) so it carries
+    `token.createdAt` — measured coverage 215 of 216 active watches, with zero
+    retries. The item was in our hands in this very loop and we were discarding
+    it.
+
     """
     net = str(net or "")
     if not db.static_exists(addr, net):
@@ -1621,7 +1776,7 @@ def _write_filter_static(
             st["token_created_at_observed_at"] = None
         db.upsert_static(st)
         return True
-    # الصفّ قائم والعمر مفقود (المنبع أغفله): أوّل إجابةٍ تحمله تسدّه.
+    # The row exists and the age is missing (the source omitted it): the first answer carrying it fills the hole.
     tok = item.get("token") if isinstance(item.get("token"), Mapping) else {}
     created = tok.get("createdAt") or item.get("createdAt")
     if created in (None, "") or not _age_value_is_valid(created, recorded_at):
@@ -1647,32 +1802,38 @@ def _write_filter_static(
     return db.set_static_created_at(addr, net, str(created), recorded_at)
 
 
-# عدّاد شرائح filterTokens: يبدأ من -1 فأول دورة تأخذ الشريحة 0. يُصفَّر في
-# الاختبارات (fixture) لضمان الحتمية.
+# The filterTokens slice counter: starts at -1 so the first cycle takes slice 0.
+# Tests reset it (fixture) to guarantee determinism.
+
 _FILTER_STRIDE_TURN = -1
 
 # ----------------------------------------------------------------------------
-# بوابة الصعود المسبق (2026-08-27): إشارة على عملة صعدت كثيرًا قبلها = واصلون
-# متأخرون، لا بداية صعود. القياس على 2,968 إشارة موسومة: الذروة الوسطية بعد
-# الإشارة متقاربة بين كل المراحل (~28%)، لكن النهائي بعد 48س ينقلب سالبًا
-# كلما تأخرت الإشارة: -2.1% للمبكرة، -14.4% للمتأخرة، -36.0% للمتأخرة جدًا
-# (>150% صعود سابق) وrug يقفز 0.0%→7.1%. أي أن الإشارة المتأخرة فخُّ سيولة
-# لا فرصة: من اشترى «وسط الصعود» هو وقود خروج الحيتان.
+# Pre-signal runup gate (2026-08-27): a signal on a token that already ran up a
+# lot before it = latecomers, not the start of a run. Measured on 2,968 labelled
+# signals: the median peak after the signal is similar across all stages (~28%),
+# but the 48h final flips more negative the later the signal: -2.1% for the
+# early, -14.4% for the late, -36.0% for the very late (>150% prior runup), and
+# rug jumps 0.0%→7.1%. A late signal is a liquidity trap, not an opportunity:
+# whoever bought "mid-run" is the whales' exit fuel.
+
 # ----------------------------------------------------------------------------
 RUNUP_OK = "ok"
 RUNUP_LATE = "late"
 
-# كاش أحكام «متأخر» (2026-08-28): العملة الصاعدة تتلقى 5-10 إشارات يوميًا
-# وكل واحدة كانت تعيد استعلام الشموع. الحكم الرافض يُخزَّن في الذاكرة
-# `RUNUP_RETRY_SECONDS` — نمط `token_age_lookup_state` نفسه: نتيجة سلبية
-# تُعاد قراءتها لا حسابها، وتُنسخ عند انقضاء المهلة (قد يهدأ الصعود فتصبح
-# الإشارة اللاحقة مبكرة بحق). حكم «مقبول» لا يُخزَّن أبدًا: الصعود متغير
-# سريع وكل صف يستحق قياسًا طازجًا.
+# Cache of "late" verdicts (2026-08-28): a running token receives 5-10 signals a
+# day and each one was re-querying the candles. The rejecting verdict is kept in
+# memory for `RUNUP_RETRY_SECONDS` — the same pattern as
+# `token_age_lookup_state`: a negative result is re-read, not recomputed, and
+# expires when the window does (the run may calm down and a later signal may
+# then be genuinely early). An "accepted" verdict is never stored: runup is
+# fast-moving and every row deserves a fresh measurement.
+
 _RUNUP_STATE: dict[tuple[str, str], tuple[int, str]] = {}
 
-# نافذة قياس الصعود السابق: 24 ساعة شموع 5 دقائق (نفس نافذة السياق التي
-# يستعملها السوق؛ 12 شمعة كحد أدنى لرفض الضجيج، وأقل من ذلك = عملة جديدة
-# لا تاريخ لها = إشارة مبكرة بالتعريف).
+# Prior-runup measurement window: 24 hours of 5-minute candles (the same context
+# window the market uses); 12 candles minimum to reject noise, and anything less
+# = a new token with no history = an early signal by definition.
+
 _RUNUP_WINDOW_BARS = 288
 _RUNUP_MIN_BARS = 12
 
@@ -1680,11 +1841,14 @@ _RUNUP_MIN_BARS = 12
 def pre_signal_runup(
     db: RecorderDB, token: str, network: str, t0: int,
 ) -> float | None:
-    """log(سعر الإشارة / أقدم سعر في نافذة 24س قبلها) — صعود ما قبل t0.
+    """log(signal price / oldest price in the 24h window before it) — runup before t0.
 
-    قانون النقطة الزمنية محفوظ بنيويًا: الاستعلام يشترط `ts <= t0` فلا
-    شمعة بعد الإشارة تدخل أبدًا. يعيد None حين لا تاريخ كافيًا (عملة
-    جديدة) — الغياب ليس صعودًا ولا هبوطًا.
+
+    The point-in-time law is preserved structurally: the query requires
+    `ts <= t0` so no candle after the signal ever enters. Returns None when
+    there is not enough history (a new token) — absence is neither runup nor
+    decline.
+
     """
     rows = db._conn.execute(
         """SELECT c FROM token_bars
@@ -1700,42 +1864,51 @@ def pre_signal_runup(
         return None
     import math
 
-    return math.log(closes[0] / closes[-1])   # rows تنازلي: [0]=الأحدث
+    return math.log(closes[0] / closes[-1])   # rows descending: [0]=newest
+
 
 
 def runup_verdict(
     db: RecorderDB, token: str, network: str, t0: int,
 ) -> str:
-    """حكم بوابة الصعود: RUNUP_OK أو RUNUP_LATE (أو OK إن عُطّل الفلتر).
+    """Runup gate verdict: RUNUP_OK or RUNUP_LATE (or OK if the filter is disabled).
 
-    الأحكام الرافضة تُقرأ من الكاش داخل نافذة `RUNUP_RETRY_SECONDS` —
-    نفس فلسفة backoff بوابة العمر، ومفتاحها العنوان+الشبكة.
+
+    Rejecting verdicts are read from the cache inside the `RUNUP_RETRY_SECONDS`
+    window — the same backoff philosophy as the age gate, keyed by address+network.
+
     """
     limit = float(getattr(config, "MAX_PRE_SIGNAL_RUNUP", 0) or 0)
     if limit <= 0:
-        return RUNUP_OK                       # معطّل — سلوك ما قبل الفلتر
+        return RUNUP_OK                       # disabled — pre-filter behavior
+
     key = (token, str(network or ""))
     cached = _RUNUP_STATE.get(key)
     if cached is not None and t0 - cached[0] < int(
         getattr(config, "RUNUP_RETRY_SECONDS", 3600) or 3600
     ):
-        return cached[1]                      # داخل نافذة الهدنة: من الذاكرة
+        return cached[1]                      # inside the truce window: from memory
+
     runup = pre_signal_runup(db, token, network, t0)
     if runup is None:
-        return RUNUP_OK                       # بلا تاريخ = مبكرة بالتعريف
+        return RUNUP_OK                       # no history = early by definition
+
     verdict = RUNUP_LATE if runup > limit else RUNUP_OK
     if verdict == RUNUP_LATE:
-        # لا نخزّن إلا الرفض: القبول متغير سريع ويستحق قياسًا طازجًا كل مرة.
+        # Only the rejection is stored: acceptance is fast-moving and deserves a fresh measurement every time.
+
         _RUNUP_STATE[key] = (t0, verdict)
     return verdict
 
 
 def _persist_runup_rejection(db: RecorderDB, stats: dict[str, int]) -> None:
-    """يثبّت رفضَ بوابة الصعود تراكميًا في meta — البوابة الصامتة عمياء.
+    """Persists the runup gate's rejections cumulatively in meta — a silent gate is blind.
 
-    اكتُشف 2026-08-28: البوابة كانت تعمل (المرفوض لا يدخل) لكن العدّاد
-    لم يُكتب أبدًا، فلا سبيل لمعرفة أثرها أو تعطلها. صفر رفضٍ لا يكتب
-    شيئًا — لا ضجيج كتابة في meta.
+
+    Discovered 2026-08-28: the gate was working (the rejected did not enter) but
+    the counter was never written, so there was no way to know its effect or its
+    failure. Zero rejections write nothing — no write noise in meta.
+
     """
     n = int(stats.get("runup_rejected", 0) or 0)
     if n:
@@ -1750,22 +1923,31 @@ async def run_filter_tokens_cycle(
     captured: set[tuple[str, str]],
     sleep=asyncio.sleep,
 ) -> dict[str, int]:
-    """يقيس المراقَبات التي **لم تلتقطها** trending/verified في هذه الدورة.
+    """Measures the watches that trending/verified **did not capture** in this cycle.
 
-    القائمتان العامّتان تقيسان ما هو رائج، ونحن نراقب ما أشارت إليه الإشارة —
-    والمجموعتان تفترقان بسرعة. مقيس على القاعدة الحيّة: 53 من 189 مراقَبة نشطة
-    بلا لقطة منذ ساعتين، و35 لم تُقَس ولا مرّة. `filterTokens` يطلب عناويننا
-    بالاسم فيرجعها بلا اعتماد على شعبيّتها.
 
-    قيود مقيسة حيّاً لا مفترضة:
-    - الربط **بالعنوان لا بالترتيب**: كل عنصر يحمل `token.address`، والمصدر
-      **يحذف الميّت بصمت** (5 من 6 رجعت) — فالفهرس ينزلق والترتيب يكذب.
-    - **بلا `insert_snapshot`**: طلبنا مراقَباتنا بالذات فكل عنصر يصير صفّاً
-      يحمل `raw_json` الخاص به؛ اللقطة تكرار محض (~94 MB/يوم بلا فائدة).
-      بخلاف trending/verified حيث اللقطة تحفظ غير المراقَب أيضاً.
-    - أعمدة العدّ/الفريد الـ18 تبقى `NULL` من هذا المصدر — هذا هو الصواب
-      (FR-007)، ودمج المصادر في `features.market_features` هو ما يمنع هذا
-      النقص من طمس قياس أغنى جاء من trending.
+    The two public lists measure what is trending, while we watch what the
+    signal pointed at — and the two sets drift apart quickly. Measured on the
+    live database: 53 of 189 active watches with no tick for two hours, and 35
+    never measured at all. `filterTokens` asks for our addresses by name and
+    returns them regardless of their popularity.
+
+
+    Constraints measured live, not assumed:
+
+    - **Join by address, not by order**: every item carries `token.address`, and
+      the source **silently drops the dead** (5 of 6 came back) — so the index slides and the order lies.
+
+    - **No `insert_snapshot`**: we asked for our own watches, so every item
+      becomes a row carrying its own `raw_json`; the snapshot is pure duplication
+      (~94 MB/day for nothing). Unlike trending/verified, where the snapshot
+      also preserves the unwatched.
+
+    - The 18 count/unique columns stay `NULL` from this source — which is the
+      correct thing (FR-007), and merging sources in
+      `features.market_features` is what keeps this gap from masking a richer
+      measurement that came from trending.
+
     """
     stats = {"filter_requested": 0, "filter_ticks": 0, "filter_errors": 0,
              "filter_static": 0}
@@ -1773,15 +1955,19 @@ async def run_filter_tokens_cycle(
     if not missing:
         return stats
 
-    # شرائح بالتناوب (2026-08-27): العنوان نفسه يحفظ موضعه في `missing` عبر
-    # الدورات لأنّ الترتيب `sorted` ثابت، فاختيار `idx % stride == turn`
-    # يقيس كلَّ عملة كلَّ N دورات. N=1 يُعيد السلوك القديم حرفيّاً. الشريحة
-    # الفارغة (لا شيء في دورتها) لا تكلّف نداءً أصلاً.
+    # Alternating slices (2026-08-27): the same address keeps its position in
+    # `missing` across cycles because the `sorted` order is stable, so picking
+    # `idx % stride == turn` measures every token every N cycles. N=1 restores
+    # the old behavior literally. An empty slice (nothing in its turn) costs no
+    # call at all.
+
     stride = max(1, int(config.FILTER_TOKENS_STRIDE))
     if stride > 1:
-        # عدّاد دورة معلَق في وحدة recorder نفسها (bump_counter لا يعيد قيمة).
-        # `sorted(missing)` ثابت الترتيب عبر الدورات، فموضعُ العنوان فيه مستقرّ
-        # والشريحة `idx % stride == turn` تجعل كلَّ عملة تُقاس كلَّ N دورات.
+        # A cycle counter pinned in the recorder module itself (bump_counter
+        # returns no value). `sorted(missing)` is order-stable across cycles,
+        # so an address's position in it is stable, and the `idx % stride ==
+        # turn` slice makes every token measured every N cycles.
+
         global _FILTER_STRIDE_TURN
         _FILTER_STRIDE_TURN += 1
         cycle_turn = _FILTER_STRIDE_TURN % stride
@@ -1797,8 +1983,9 @@ async def run_filter_tokens_cycle(
         try:
             raw = await _fetch_filter_tokens_raw(client, symbols)
             items = extract.unwrap_token_list(raw)
-            # العنوان وحده لا يكفي: نفس العنوان قد يوجد على شبكتين. حالة أحرف
-            # EVM قد تختلف، لذلك نصغّر العنوان ونُبقي network_id في المفتاح.
+            # The address alone is not enough: the same address can exist on
+            # two networks. EVM casing may differ, so we lowercase the address and keep network_id in the key.
+
             by_key: dict[tuple[str, str], Any] = {}
             for item in items:
                 a = extract.token_list_address(item)
@@ -1808,14 +1995,16 @@ async def run_filter_tokens_cycle(
                 for addr, _net in batch:
                     item = by_key.get((addr.lower(), str(_net or "")))
                     if item is None:
-                        continue  # حُذف بصمت (عملة مشطوبة) — لا يكسر الدفعة
+                        continue  # silently dropped (a delisted token) — does not break the batch
+
                     tick = extract.extract_market_tick(item, recorded_at, "filter")
                     if tick is None:
                         continue
                     if db.insert_tick(tick):
                         stats["filter_ticks"] += 1
-                    # `dex_protocol` غائب تماماً من خام trending (0 من 3,000)
-                    # وهذا مصدره الوحيد — نملأه حين يكون العمود فارغاً فقط.
+                    # `dex_protocol` is entirely absent from trending raw (0 of
+                    # 3,000) and this is its only source — we fill it only when the column is empty.
+
                     proto = extract.filter_item_protocol(item)
                     if proto:
                         db.set_static_protocol(
@@ -1832,14 +2021,16 @@ async def run_filter_tokens_cycle(
                         replace_invalid=True,
                     ):
                         stats["filter_static"] += 1
-        except Exception as exc:  # noqa: BLE001 — دفعة واحدة لا تُسقط الباقي
+        except Exception as exc:  # noqa: BLE001 — one batch must not sink the rest
+
             stats["filter_errors"] += 1
             db.note_error(
                 "last_error_filter",
                 f"{recorded_at}: {_exc_note(exc)}",
             )
-        # فاصل **بين** الدفعات لا بعد آخرها. وفي الحالة الغالبة (≈53 عنواناً ⇒
-        # دفعة واحدة) كان هذا النوم كلّه ضائعاً بلا نداء بعده.
+        # A gap **between** batches, not after the last one. And in the common
+        # case (≈53 addresses ⇒ one batch) this whole sleep was wasted with no call after it.
+
         if start + config.FILTER_TOKENS_BATCH < len(missing):
             await sleep(config.FILTER_TOKENS_PACING_SECONDS)
     return stats
@@ -1848,15 +2039,20 @@ async def run_filter_tokens_cycle(
 async def run_traders_cycle(
     client: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """يبني ملفّات المشترين الذين تتكرّر أسماؤهم في إشاراتنا.
+    """Builds profiles of the buyers whose names recur in our signals.
 
-    `signal_events.buyer_id` مخزَّن منذ اليوم الأوّل ولا جدول تجّار في القاعدة:
-    5,572 معرّفاً مميّزاً، **3,202 منهم بـ≥3 أحداث**. فالسؤال «هل هذا المشتري
-    ماهر أم يشتري كل شيء؟» بقي بلا جواب رغم أنّ الجواب على بُعد نداء واحد.
 
-    الجدولة دوّارة كدورة الحائزين: غير المجلوب قطّ أوّلاً، ثم الأقدم جلباً،
-    ثم الأكثر أحداثاً. `INSERT OR REPLACE` عمداً (بخلاف كل الجداول الأخرى):
-    الملفّ **يتغيّر** — المتابعون ومدّة الحمل ليست ثوابت.
+    `signal_events.buyer_id` has been stored since day one and there is no
+    traders table in the database: 5,572 distinct ids, **3,202 of them with ≥3
+    events**. So the question "is this buyer skilled or does he buy everything?"
+    stayed unanswered even though the answer was one call away.
+
+
+    The scheduling is round-robin like the holders cycle: never-fetched first,
+    then the longest since fetched, then the most events. `INSERT OR REPLACE`
+    on purpose (unlike every other table): the profile **changes** — followers
+    and holding duration are not constants.
+
     """
     stats = {
         "traders_fetched": 0, "traders_rows": 0, "traders_errors": 0,
@@ -1877,17 +2073,23 @@ async def run_traders_cycle(
     )
 
     def _seal() -> dict[str, int]:
-        """ختمُ آخرِ الدورة: حرسُ الحصار ثمّ ختمُ النجاح. مخرجان يشتركان فيه.
+        """The end-of-cycle seal: the shutout guard, then the success stamp. Two exits share it.
 
-        سُئل عددٌ ولم ينزل صفٌّ: مقبولٌ مرّةً، عطلٌ إن تكرّر — `_note_shutout`.
-        ولا يُحاسب هذا على الأخطاء: الخطأُ يكتب سطرَه بنفسه، والحصارُ صامتٌ بطبعه.
 
-        وختمُ النجاح شرطُه **نزولُ صفٍّ** (أو ألّا يُسأل أحد)، بخلاف قاعدة
-        `chain_last_ok_at` «صفرُ أخطاءٍ ⇒ ختم». لأنّ الحصار هو بالضبط صفرُ أخطاءٍ
-        مع صفرِ صفوف: ختمٌ هنا كان سيُعلن خطأَ الحصار «متعافياً» بعد دقيقة، فيموت
-        الحرسُ بنفس الصحّةِ الكاذبة التي أوجدته. و«لم يُسأل أحد» نجاحٌ حقيقيّ لا
-        خمود — لا شيء استحقّ الجلب فلا شيء فشل — وبلا ختمٍ له يبقى طابورٌ هادئ
-        أحمرَ إلى الأبد على خطأٍ قد شُفي.
+        Some were asked and no row came down: acceptable once, an outage if it
+        repeats — `_note_shutout`. And this is not charged against errors: an
+        error writes its own line, while a shutout is silent by nature.
+
+
+        And the success stamp requires **a row to land** (or that nobody was
+        asked), unlike the `chain_last_ok_at` rule "zero errors ⇒ stamp".
+        Because a shutout is precisely zero errors with zero rows: stamping here
+        would declare the shutout error "recovered" a minute later, killing the
+        guard with the same false health that created it. And "nobody was
+        asked" is a genuine success, not idleness — nothing deserved fetching so
+        nothing failed — and without a stamp for it a quiet queue would stay red
+        forever over an error long since healed.
+
         """
         if not stats["traders_errors"]:
             streak = _note_shutout(
@@ -1898,9 +2100,11 @@ async def run_traders_cycle(
                 db.set_meta("traders_last_ok_at", recorded_at)
         return stats
 
-    # معرّفٌ فاسدُ الشكل يُسقط الرزمةَ كلَّها (400 على العنصر الفاسد وحده)، فلا
-    # يجوز أن يكلّف معرّفٌ واحدٌ رديء التسعةَ والتسعين الباقين. و`unsupported`
-    # لا `error` لأنّه لن يصلح بإعادة المحاولة: استعلامُ الاستحقاق يستبعده نهائيّاً.
+    # One malformed id kills the whole batch (400 on that one bad item alone),
+    # so a single rotten id must not cost the remaining ninety-nine. And
+    # `unsupported` not `error`, because retrying cannot fix it: the due-query
+    # excludes it for good.
+
     wanted, malformed = [], []
     for w in due:
         (wanted if _UUID_RE.match(str(w["trader_id"] or "")) else malformed).append(
@@ -1922,19 +2126,23 @@ async def run_traders_cycle(
             for tid in chunk:
                 row = rows.get(tid)
                 if row is None:
-                    # غائبٌ عن الردّ = لا مستخدمَ بهذا المعرّف. المصدرُ يحذف
-                    # المجهولَ بصمتٍ ولا يخطئ به، فهذا جوابٌ لا فشل.
+                    # Absent from the response = no user with this id. The
+                    # source deletes the unknown silently and does not error on it, so this is an answer, not a failure.
+
                     db.set_trader_state(tid, "empty", recorded_at)
                     stats["traders_missing"] += 1
                     continue
                 db.upsert_trader(row)
                 stats["traders_rows"] += 1
                 db.set_trader_state(tid, "ok", recorded_at)
-        except Exception as exc:  # noqa: BLE001 — رزمةٌ واحدة لا تُسقط الدورة
+        except Exception as exc:  # noqa: BLE001 — one batch must not sink the cycle
+
             stats["traders_errors"] += 1
             db.note_error("last_error_traders", f"{recorded_at}: {_exc_note(exc)}")
-            # ولا حالةَ تُكتب لمن سقطت رزمتُه: الحالةُ تعني «سألنا وهذا الجواب»،
-            # وكتابة `error` هنا تدفعه إلى مهلة الانتظار الطويلة على ذنبِ الشبكة.
+            # And no state is written for those whose batch fell: state means
+            # "we asked and this is the answer", and writing `error` here would
+            # push them into the long wait timeout for the network's sins.
+
         if start + cap < len(wanted):
             await sleep(config.TRADERS_PACING_SECONDS)
     return _seal()
@@ -1946,7 +2154,8 @@ async def run_cycle(
     lb: LeaderboardCache,
     now_mono: float | None = None,
 ) -> dict[str, int]:
-    """دورة واحدة. يعيد عدّادات ملخّصة. يبتلع أخطاء كل مصدر على حدة."""
+    """One cycle. Returns summarized counters. Swallows each source's errors separately."""
+
     now_mono = now_mono if now_mono is not None else time.monotonic()
     recorded_at = utcnow_iso()
     stats = {
@@ -1970,26 +2179,35 @@ async def run_cycle(
 
     def _fail(where: str, exc: Exception) -> None:
         stats["errors"] += 1
-        # **معالج الخطأ يحتاج القاعدة التي هي المورد المتعطّل.** قِيس
-        # 2026-08-17: `database is locked` في `insert_holders` رفع الاستثناء
-        # هنا أيضاً، فأسقط `_fail` ثم أسقط درع الحلقة، فخرجت العمليّة بالرمز 1
-        # وبقيت المهمّة `Ready` ثلاث ساعات صامتة. العدّ في الذاكرة يكفي لتُكمل
-        # الدورة وتُبلّغ؛ فقدُ سطرٍ في `meta` أرخص من فقد المسجّل ساعات.
+        # **The error handler needs the database that is the failing
+        # resource.** Measured 2026-08-17: `database is locked` in
+        # `insert_holders` raised here too, taking down `_fail`, then the
+        # loop's shield, so the process exited with code 1 and the task sat
+        # `Ready` for three silent hours. Counting in memory is enough to
+        # finish and report the cycle; losing a line in `meta` is cheaper than
+        # losing the recorder for hours.
+
         try:
             db.bump_counter("errors_total")
-        except Exception:  # noqa: BLE001 — عدّادٌ لا قياس
+        except Exception:  # noqa: BLE001 — a counter, not a measurement
+
             pass
         note = f"{recorded_at}: {_exc_note(exc)}"
         if not db.note_error(f"last_error_{where}", note):
-            # لا نصمت تماماً: السجلّ آخرُ ما يبقى حين تُقفل القاعدة، و`_log`
-            # نفسها محميّة فلا تُسقط الدورة.
-            _log(f"note_error failed for {where}: القاعدة لا تستجيب للكتابة")
+            # Not fully silent either: the log is the last thing standing when
+            # the database is locked, and `_log` itself is guarded so it cannot sink the cycle.
 
-    # أوقف أولاً أي مراقبة دخلت بعد تفعيل البوابة بعمر صغير/مجهول. النافذة
-    # التاريخية تبقى، لكن الصف لا يدخل حساب admission ولا طلبات الجمع المكلفة.
+            _log(f"note_error failed for {where}: the database is not responding to writes")
+
+
+    # First stop any watch admitted after the gate was enabled with a
+    # young/unknown age. The historical window stays, but the row leaves the
+    # admission count and the costly collection requests.
+
     try:
         quarantine_active_age_violations(db, recorded_at, stats)
-    except Exception as exc:  # noqa: BLE001 — التنظيف لا يُسقط المسجّل
+    except Exception as exc:  # noqa: BLE001 — cleanup must not sink the recorder
+
         _fail("age_cleanup", exc)
 
     try:
@@ -2022,13 +2240,16 @@ async def run_cycle(
         }, sort_keys=True)
         db.note_error("last_error_evm_admission", f"{recorded_at}: {_exc_note(exc)}")
 
-    # 0) تحديث صدارة المتصدّرين (كل ساعة) + أرشفة الخام + تسجيل الفشل.
+    # 0) Refresh the leaderboard (hourly) + archive the raw + log the failure.
+
     try:
         await refresh_leaderboard(lb, db, now_mono, recorded_at)
-    except Exception as exc:  # noqa: BLE001 — لا نُفشل الدورة
+    except Exception as exc:  # noqa: BLE001 — do not fail the cycle
+
         _fail("leaderboard", exc)
 
-    # 1) الـ feed الخام → signal_events + watchlist للمُشغّلات.
+    # 1) Raw feed → signal_events + watchlist for the triggers.
+
     admitted_signals: set[str] = set()
     try:
         raw_feed = await _fetch_feed_raw(client)
@@ -2040,15 +2261,19 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("feed", exc)
 
-    # 2) trending + verified + mostHeld الخام → snapshots + market_ticks + token_static.
-    # `mostHeld` قائمة اكتشاف ثالثة: مقيس أنّها تعطي 25 عنصراً منها **6 لم نكن
-    # نراها** في القائمتين الأخريين، وتتقاطع معهما في 18 مفتاحاً ⇒ نفس المستخرِج
-    # يكفي، وتدخل تلقائياً في المرشّحين والضابطة وthe token_static بلا كود جديد.
+    # 2) Raw trending + verified + mostHeld → snapshots + market_ticks + token_static.
+    # `mostHeld` is a third discovery list: measured to give 25 items of which
+    # **6 we never saw** in the other two lists, and it intersects them in 18
+    # keys ⇒ the same extractor suffices, and it enters candidates, control,
+    # and token_static automatically with no new code.
+
     watched = {(w["token_address"], str(w["network_id"] or "")) for w in db.active_watches()}
-    # المفاتيح الملقوطة في هذه الدورة — ما يتبقّى منها تسدّه دورة filterTokens.
+    # Keys captured in this cycle — whatever remains of them is covered by the filterTokens cycle.
+
     captured: set[tuple[str, str]] = set()
-    # مرشّحو المجموعة الضابطة: كل عملة نراها في هذه الدورة ولم تدخل من قبل.
-    # نجمعها هنا مجّاناً — البيانات في اليد أصلاً، فلا نداء شبكة إضافيّ.
+    # Control-group candidates: every token we see in this cycle that has not
+    # been admitted before. Collected here for free — the data is already in hand, so no extra network call.
+
     control_candidates: list[tuple[str, str, float | None, str]] = []
     static_items: dict[tuple[str, str], Mapping[str, Any]] = {}
     for source, fetch in (
@@ -2060,7 +2285,8 @@ async def run_cycle(
             raw = await fetch(client)
             if raw is None:
                 continue
-            with db.batch():  # ~65 tick في الدورة → تثبيت واحد بدل 65
+            with db.batch():  # ~65 ticks per cycle → one commit instead of 65
+
                 db.insert_snapshot(source, raw, recorded_at)
                 items = extract.unwrap_token_list(raw)
                 for item in items:
@@ -2073,8 +2299,10 @@ async def run_cycle(
                         (key[0], key[1], tick.get("price_usd"), source,
                          extract.token_list_created_at(item))
                     )
-                    # نسجّل tick لكل عملة مراقَبة (المصدر الأساسي للسلسلة الزمنية).
-                    # نسجّل أيضاً الثوابت لكل عملة نراها لأول مرّة إن كانت مراقَبة.
+                    # We record a tick for every watched token (the primary
+                    # source of the time series). We also record statics for
+                    # every first-seen token when it is watched.
+
                     if key in watched:
                         captured.add(key)
                         if db.insert_tick(tick):
@@ -2089,9 +2317,11 @@ async def run_cycle(
         except Exception as exc:  # noqa: BLE001
             _fail(source, exc)
 
-    # 2.3) سدّ فجوة القياس: المراقَبات التي لم تلتقطها أي قائمة في هذه الدورة.
-    # بلا هذه الخطوة تتوقّف العملة عن القياس لحظة سقوطها من القوائم العامّة —
-    # وهي لا تزال داخل نافذة الـ48 ساعة التي نزعم أنّنا نقيسها (53 من 189).
+    # 2.3) Close the measurement gap: the watches no list captured in this
+    # cycle. Without this step a token stops being measured the moment it falls
+    # off the public lists — while still inside the 48-hour window we claim to
+    # measure (53 of 189).
+
     try:
         filt = await run_filter_tokens_cycle(client, db, recorded_at, watched, captured)
         stats["filter_requested"] = filt["filter_requested"]
@@ -2102,7 +2332,8 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("filter", exc)
 
-    # 2.2) نوافذ إشارة من الكون نفسه وسعر السوق نفسه المستخدم للضابطة.
+    # 2.2) Signal windows from the same universe and the same market price used for the control group.
+
     try:
         stats["comparison_signal_added"] = admit_signal_comparison_windows(
             db, control_candidates, recorded_at, policy=admission_policy,
@@ -2112,19 +2343,23 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("comparison_signal", exc)
 
-    # 2.25) الضابطة تُقبل في الدورة نفسها التي قبلت إشارة مقارنة فقط. السماح
-    # بملء 40 ضابطة بعد إشارة قديمة واحدة يعيد اختلال الزمن الذي نريد منعه.
+    # 2.25) The control group is admitted only in the same cycle that admitted
+    # a comparison signal. Allowing 40 controls to be filled after one old
+    # signal reintroduces the timing imbalance we are trying to prevent.
+
     if stats["comparison_signal_added"]:
         try:
             stats["control_added"] = admit_control_sample(
                 db, control_candidates, recorded_at, policy=admission_policy,
                 stats=stats, static_items=static_items,
             )
-        except Exception as exc:  # noqa: BLE001 — الضابطة إضافة، لا تُسقط الدورة
+        except Exception as exc:  # noqa: BLE001 — the control group is an addition, it must not sink the cycle
+
             _fail("control", exc)
 
-    # 2.42) تركيز الملكية من المصدرين — تركيز عالٍ = خطر تصريف، وهو مجهول اليوم
-    # لكل عملة EVM عندنا.
+    # 2.42) Ownership concentration from the two sources — high concentration =
+    # dump risk, and it is unknown today for every EVM token we have.
+
     try:
         hold = await run_holders_cycle(client, db, recorded_at)
         for key in ("holders_tokens", "holders_details", "holders_top", "flow_rows"):
@@ -2134,8 +2369,9 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("holders", exc)
 
-    # 2.45) ملفّات المشترين المتكرّرين — «من اشترى؟» كان سؤالاً بلا جواب رغم أنّ
-    # buyer_id مخزَّن في كل حدث منذ اليوم الأوّل.
+    # 2.45) Profiles of repeat buyers — "who bought?" was a question without
+    # an answer even though buyer_id has been stored in every event since day one.
+
     try:
         trd = await run_traders_cycle(client, db, recorded_at)
         stats["traders_rows"] = trd["traders_rows"]
@@ -2144,7 +2380,8 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("traders", exc)
 
-    # 2.5) شموع OHLCV لشريحة من المراقَبات (مصدر الحقيقة السعرية للتوسيم).
+    # 2.5) OHLCV candles for a slice of the watches (the price source of truth for labelling).
+
     try:
         bars = await run_bars_cycle(client, db, recorded_at)
         stats["bars_tokens"] = bars["bars_tokens"]
@@ -2154,7 +2391,8 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("bars", exc)
 
-    # 2.75) الطبقة الاجتماعية لشريحة من المراقَبات.
+    # 2.75) The social layer for a slice of the watches.
+
     try:
         soc = await run_social_cycle(client, db, recorded_at)
         stats["social_tokens"] = soc["social_tokens"]
@@ -2165,7 +2403,8 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("social", exc)
 
-    # 2.9) شموع السوق الكلّي (مرجع النظام السوقي — مرّة كل ساعة).
+    # 2.9) Whole-market candles (the market-regime reference — once an hour).
+
     try:
         mac = await run_macro_bars_cycle(client, db, recorded_at)
         stats["macro_rows"] = mac["macro_rows"]
@@ -2175,10 +2414,12 @@ async def run_cycle(
     except Exception as exc:  # noqa: BLE001
         _fail("macro", exc)
 
-    # 3) تنظيف watchlist: تعطيل ما تجاوز 48 ساعة.
+    # 3) Watchlist cleanup: deactivate what passed 48 hours.
+
     try:
         db.deactivate_expired(recorded_at)
-        # حذف اللقطات القديمة — معطّل افتراضياً (0 = احتفاظ أبديّ).
+        # Delete old snapshots — disabled by default (0 = keep forever).
+
         if config.SNAPSHOT_RETENTION_DAYS > 0:
             cutoff = (
                 datetime.fromisoformat(recorded_at)
@@ -2200,7 +2441,8 @@ async def run_cycle(
         "networks": json.loads(stats["evm_admission_network_state"]),
     }, sort_keys=True))
     db.set_meta("last_cycle_stats", str(stats))
-    # دورة نجحت كلياً (بلا أي خطأ مصدر) → ختم يُبطل أخطاء meta الأقدم منه في اللوحة.
+    # A fully successful cycle (no source errors at all) → a stamp that invalidates older meta errors on the dashboard.
+
     if stats["errors"] == 0:
         db.set_meta("last_ok_cycle_at", recorded_at)
     db.bump_counter("cycles_total")
@@ -2210,40 +2452,51 @@ async def run_cycle(
 async def _maybe_rotate_client(
     client: Any, current_token: str, lb: LeaderboardCache, db: RecorderDB
 ) -> tuple[Any, str]:
-    """يلتقط التوكن المتجدّد من القرص كل دورة.
+    """Picks up the renewed token from disk every cycle.
 
-    توكن fomo عمره 60 دقيقة؛ خادم الـ api يكتب توكناً طازجاً إلى القرص قبل انتهائه.
-    نقرأ القرص، فإن تغيّر التوكن أعدنا بناء FomoClient (وأغلقنا القديم) ووجّهنا
-    الكاش إلى العميل الجديد. فشل القراءة لا يُسقط الدورة — نُكمل بالعميل الحالي.
-    لا يُطبع أي قيمة توكن إطلاقاً (FR-013).
 
-    يعيد (client, token) المستعملَين للدورة القادمة.
+    A fomo token lives 60 minutes; the api server writes a fresh token to disk
+    before it expires. We read the disk, and if the token changed we rebuild
+    the FomoClient (closing the old one) and point the cache at the new client.
+    A read failure does not sink the cycle — we continue with the current
+    client. No token value is ever printed (FR-013).
+
+
+    Returns the (client, token) pair to use for the next cycle.
+
     """
     try:
         disk_token = _load_access_token()
-    except Exception as exc:  # noqa: BLE001 — قراءة القرص فشلت؛ نكمل بالحالي
+    except Exception as exc:  # noqa: BLE001 — disk read failed; continue with the current one
+
         db.note_error("last_error_token_reload", f"{utcnow_iso()}: {type(exc).__name__}")
         return client, current_token
     if disk_token == current_token:
         return client, current_token
-    # تدوّر التوكن: أنشئ عميلاً جديداً وأغلق القديم بنظافة.
+    # Rotate the token: build a new client and close the old one cleanly.
+
     new_client = _build_client(disk_token)
     try:
         await client.aclose()
-    except Exception:  # noqa: BLE001 — إغلاق العميل القديم لا يُسقط المسجّل
+    except Exception:  # noqa: BLE001 — closing the old client must not sink the recorder
+
         pass
     lb.set_client(new_client)
     try:
         db.set_meta("last_token_refresh_at", utcnow_iso())
-    except Exception:  # noqa: BLE001 — التدوير نجح فعلاً، لا نهدره لأجل ختم
+    except Exception:  # noqa: BLE001 — the rotation already succeeded; don't waste it for a stamp
+
         pass
-    _log("token rotated → client rebuilt")  # بلا أي قيمة سرّية
+    _log("token rotated → client rebuilt")  # no secret value whatsoever
+
     return new_client, disk_token
 
 
-# مفاتيحُ الثمرة: صفوفٌ كُتبت فعلاً. و`filter_requested` ليست منها — هي عدُّ
-# محاولاتٍ يرتفع 108→190 وقتَ الحجب بالضبط (مقيس 2026-08-19T14:55)، فلو حُسبت
-# ثمرةً لأعمَت القاطعَ عن الحجب الذي وُضع له.
+# The productive keys: rows actually written. `filter_requested` is not one of
+# them — it counts attempts and rises 108→190 exactly during the block
+# (measured 2026-08-19T14:55); counted as produce it would blind the breaker to
+# the very block it was built for.
+
 _PRODUCTIVE_KEYS = (
     "signals", "ticks", "filter_ticks", "bars_rows", "social_items",
     "holders_details", "holders_top", "flow_rows", "traders_rows", "macro_rows",
@@ -2251,10 +2504,13 @@ _PRODUCTIVE_KEYS = (
 
 
 def _cycle_is_dead(stats: dict[str, int]) -> bool:
-    """دورةٌ أخطأت ولم تكتب صفّاً واحداً — لا «دورةٌ ضعيفة» ولا «دورةٌ بأخطاء».
+    """A cycle that errored and wrote not a single row — not a "weak cycle" and not a "cycle with errors".
 
-    الشرطان معاً مقصودان: أخطاءٌ بلا ثمرة تعني أنّ المصدرَ لم يُعطِ شيئاً، أمّا
-    ثمرةٌ مع أخطاء فهي حالةُ 274 دورةٍ من 375 السويّة ولا يجوز أن تُبطئ الجمع.
+
+    Both conditions together are deliberate: errors with no produce means the
+    source gave nothing, while produce alongside errors is the state of 274 of
+    375 healthy cycles and must not be allowed to slow collection.
+
     """
     return stats.get("errors", 0) > 0 and not any(
         stats.get(key, 0) for key in _PRODUCTIVE_KEYS
@@ -2262,11 +2518,14 @@ def _cycle_is_dead(stats: dict[str, int]) -> bool:
 
 
 def _breaker_wait(dead_streak: int) -> float:
-    """انتظارُ ما بين مِجَسّين: يتضاعف من دورةٍ واحدة إلى السقف.
+    """The wait between probes: doubles from a single cycle up to the cap.
 
-    مسقوفٌ مرّتين — بالثواني وبالأُسِّ نفسه: `2.0 ** 1024` يرفع OverflowError،
-    وحجبٌ يطول أسبوعاً يبلغ ذلك الأُسّ، فينهار الدرعُ كلَّ دورةٍ إلى الأبد.
-    ومقياسُ الأساس `CYCLE_SECONDS`، فاختبارٌ يصفّره يُلغي الانتظار من نفسه.
+
+    Capped twice — by seconds and by the exponent itself: `2.0 ** 1024` raises
+    OverflowError, and a week-long block reaches that exponent, so the shield
+    would crash every cycle forever. And the base is scaled by
+    `CYCLE_SECONDS`, so a test that zeroes it cancels the wait on its own.
+
     """
     return min(
         float(config.UPSTREAM_BREAKER_MAX_SECONDS),
@@ -2276,25 +2535,34 @@ def _breaker_wait(dead_streak: int) -> float:
 
 
 async def _upstream_alive(client: Any, reason: list[str] | None = None) -> bool:
-    """مِجَسٌّ واحد: هل يردّ المصدر أصلاً؟ لا يرفع، ولا يكتب، ولا يُحصى.
+    """A single probe: does the origin answer at all? It never raises, never writes, never counts.
 
-    `limit=1` لأنّ المطلوب حالةُ الطريق لا حمولتُه — أمّا `feedTypes` فشرطٌ
-    لازم: قِيس 2026-08-20T00:24Z بحسابٍ سليم أنّ `/feed?limit=1` وحده يردّ
-    **400** «Invalid input: query.feedTypes - Required»، و`_get` يترجم كلَّ
-    ≥400 إلى «غير متاح». فكان المِجَسُّ يقرأ الطريقَ ميتاً وهو حيّ، أي أنّ
-    القاطعَ يُغلق ولا يُفتح أبداً ولو رُفع الحجبُ عن الحساب — وشهد السجلُّ:
-    أحدَ عشرَ إغلاقاً ولا استئنافَ واحداً إلّا بإعادة تشغيل.
 
-    ولذلك حُكمان لا واحد: النداءُ يحمل شرطَه، ثمّ **جوابُ التطبيق بذاته حياة**
-    — فرمزٌ في 4xx غيرُ 403 و401 يعني أنّ الطلبَ وصل وفُحص، وذلك كلُّ ما
-    يسأل عنه القاطع. فلو أضاف المصدرُ شرطاً آخر غداً لم يَقتُل الدرعُ الجمعَ
-    مرّةً ثانية. و403 وحده حجبُ هويّة، و401 توكنٌ باطل، وكلاهما لا يُصلحه
-    تشغيلُ الدورة.
+    `limit=1` because what is wanted is the road's condition, not its payload —
+    while `feedTypes` is a mandatory condition: measured 2026-08-20T00:24Z with
+    a sound account that `/feed?limit=1` alone returns **400** "Invalid input:
+    query.feedTypes - Required", and `_get` translates every ≥400 into
+    "unavailable". So the probe was reading the road as dead while it was
+    alive, meaning the breaker closed and never reopened even after the account
+    was unblocked — and the log witnessed it: eleven closures and not one
+    resumption except by restart.
 
-    و`reason` مَخرَجٌ اختياريّ لا قيمةُ رجوع: «محجوب» و«منقطع» يتساويان في قرار
-    الانتظار ويختلفان كلَّ الاختلاف في العلاج — 403 على الهويّة يُحَلّ بحساب،
-    والانقطاع يُحَلّ بالصبر. فمن ردَّ الاستثناءَ نصّاً هنا كتبته الحلقةُ في
-    `meta` فقرأته اللوحة، ومن جعله قيمةَ رجوعٍ كسر `is False` في الاختبار.
+
+    Hence two verdicts, not one: the call carries its condition, and then
+    **the application's answer is itself life** — a 4xx code other than 403 and
+    401 means the request arrived and was examined, which is all the breaker
+    asks. So if the source adds another condition tomorrow, the shield will not
+    kill collection a second time. And 403 alone is an identity block, 401 a
+    bad token, and neither is fixed by running the cycle.
+
+
+    And `reason` is an optional output, not a return value: "blocked" and
+    "disconnected" are equal in the wait decision and utterly different in the
+    remedy — a 403 on identity is solved with an account, an outage with
+    patience. Whoever returns the exception as text here has the loop write it
+    to `meta` for the dashboard to read, and whoever makes it a return value
+    breaks `is False` in the test.
+
     """
     from fomo_api.config import settings
 
@@ -2302,18 +2570,21 @@ async def _upstream_alive(client: Any, reason: list[str] | None = None) -> bool:
     try:
         await client._get(settings.upstream_feed_path, params)
         return True
-    except Exception as exc:  # noqa: BLE001 — الفشلُ **هو** الجواب المطلوب
+    except Exception as exc:  # noqa: BLE001 — the failure **is** the requested answer
+
         details = getattr(exc, "details", None)
         status = details.get("upstream_status") if isinstance(details, dict) else None
         if isinstance(status, int) and 400 <= status < 500 and status not in (401, 403):
-            return True                    # جوابُ التطبيق حياةٌ لا موت
+            return True                    # the application's answer is life, not death
+
         if reason is not None:
             reason.append(_exc_note(exc))
         return False
 
 
 async def main_loop(cycles: int | None = None) -> None:
-    """يشغّل الحلقة إلى ما لا نهاية (cycles=None) أو عدداً محدّداً (للتحقّق)."""
+    """Runs the loop forever (cycles=None) or a set number of cycles (for verification)."""
+
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     current_token = _load_access_token()
     client = _build_client(current_token)
@@ -2325,7 +2596,8 @@ async def main_loop(cycles: int | None = None) -> None:
         pacing_seconds=config.LEADERBOARD_PACING_SECONDS,
     )
     db.set_meta("schema_version", "1")
-    # يوثّق أنّ raw_json يُكتب مضغوطاً — أي قارئ لاحق يمرّ عبر db.decode_raw.
+    # Documents that raw_json is written compressed — any later reader goes through db.decode_raw.
+
     db.set_meta("raw_encoding", "zlib")
     db.set_meta("started_at", utcnow_iso())
     n = 0
@@ -2334,16 +2606,21 @@ async def main_loop(cycles: int | None = None) -> None:
         while cycles is None or n < cycles:
             started = time.monotonic()
             try:
-                # التقط التوكن المتجدّد على القرص قبل الدورة (يمنع 401 بعد
-                # الساعة). **داخل** الدرع: كان خارجه وهو يكتب في القاعدة، فقفلٌ
-                # هناك يخرج من الحلقة كلها بلا أي معالجة.
+                # Pick up the renewed token on disk before the cycle (prevents
+                # a 401 after the hour). **Inside** the shield: it used to sit
+                # outside it while writing to the database, so a lock there
+                # escaped the whole loop with no handling at all.
+
                 client, current_token = await _maybe_rotate_client(
                     client, current_token, lb, db
                 )
-                # قاطعُ الحجب — **بعد** التدوير: التوكن يبقى طازجاً وإن لم
-                # نَدُر دورةً واحدة، فحجبٌ طويل لا يورّث 401 عند انتهائه.
-                # مِجَسٌّ واحد بدل دورةٍ كاملة، وانتظارٌ يتضاعف؛ وأوّلُ نجاحٍ
-                # يُعيد كلَّ شيء في الحال فيبقى انقطاعُ الدقيقة دقيقةً واحدة.
+                # The block breaker — **after** rotation: the token stays
+                # fresh even if we skip a single cycle, so a long block does
+                # not bequeath a 401 when it ends. One probe instead of a full
+                # cycle, and a wait that doubles; the first success puts
+                # everything back at once, so a one-minute outage stays a
+                # one-minute outage.
+
                 if dead_streak >= config.UPSTREAM_BREAKER_AFTER:
                     why: list[str] = []
                     if await _upstream_alive(client, why):
@@ -2351,39 +2628,48 @@ async def main_loop(cycles: int | None = None) -> None:
                         dead_streak = 0
                     else:
                         wait = _breaker_wait(dead_streak)
-                        # سببُ الرفض في السطر نفسه: هذا السطرُ هو ما يُقرأ طولَ
-                        # الحجب، وحجبُ 403 لا يُشبه انقطاعاً في شيءٍ إلا الانتظار.
-                        cause = why[0] if why else "لا جواب"
+                        # The rejection reason on the same line: this line is
+                        # what gets read for the whole block, and a 403 block resembles an outage in nothing but the wait.
+
+                        cause = why[0] if why else "no answer"
+
                         _log(
                             f"upstream blocked ({dead_streak} dead cycles) — "
                             f"{cause} — skipping cycle, next probe in {wait:.0f}s"
                         )
                         db.note_error(
                             "last_error_upstream_blocked",
-                            f"{utcnow_iso()}: مِجَسّ /feed رفض — {cause} — "
-                            f"{dead_streak} دورة ميتة، انتظار {wait:.0f}ث",
+                            f"{utcnow_iso()}: /feed probe rejected — {cause} — "
+                            f"{dead_streak} dead cycles, waiting {wait:.0f}s",
+
                         )
                         dead_streak += 1
                         n += 1
                         await asyncio.sleep(wait)
                         continue
                 stats = await run_cycle(client, db, lb, now_mono=started)
-                # الجفافُ يُعَدّ هنا لا في الدرع: دورةٌ انهارت كلّياً يعالجها
-                # الدرع، وهذه دورةٌ **نجحت** في الجريان وفشلت في الجمع.
+                # The drought is counted here, not in the shield: a cycle that
+                # collapsed entirely is the shield's business, and this one **succeeded** in running and failed in collecting.
+
                 dead_streak = dead_streak + 1 if _cycle_is_dead(stats) else 0
                 _log(f"cycle {n}: {stats}")
-            except Exception:  # noqa: BLE001 — درع أخير حول الدورة كلها
+            except Exception:  # noqa: BLE001 — a final shield around the whole cycle
+
                 _log("cycle crashed:\n" + traceback.format_exc())
-                # اتصالٌ واحد عمره عمر العملية: إن عَلِق بمعاملةٍ مفتوحة أو
-                # بلقطة قراءةٍ سُبقت، بقيت كلّ دورةٍ تالية تنهار كما انهارت هذه
-                # — 22 دقيقة و40 ثانية صامتة في 2026-08-19 حتى إعادةٍ يدويّة.
-                # فالإنقاذ هنا: بعد الانهيار، وقبل عدّاده وقبل الدورة القادمة.
+                # One connection for the process's lifetime: if it sticks on
+                # an open transaction or a superseded read snapshot, every
+                # following cycle would crash just as this one did — 22 minutes
+                # and 40 seconds of silence on 2026-08-19 until a manual
+                # restart. So the rescue goes here: after the crash, before
+                # its counter and before the next cycle.
+
                 try:
                     _log(f"connection recovery: {db.recover_connection()}")
                 except Exception as rec_exc:  # noqa: BLE001
                     _log(f"connection recovery failed: {type(rec_exc).__name__}")
-                # والدرع لا يجوز أن يموت بيده: هذا السطر بعينه أخرج العمليّة
-                # بالرمز 1 عند 2026-08-17T16:27 لأنّ القاعدة كانت مقفلة.
+                # And the shield must not die by its own hand: this very line
+                # exited the process with code 1 at 2026-08-17T16:27 because the database was locked.
+
                 try:
                     db.bump_counter("cycle_crashes")
                 except Exception as meta_exc:  # noqa: BLE001
@@ -2399,10 +2685,13 @@ async def main_loop(cycles: int | None = None) -> None:
 
 
 def _log(msg: str) -> None:
-    """يكتب سطراً للسجلّ مع ختم زمني. الفشل في الكتابة لا يُسقط المسجّل.
+    """Writes a line to the log with a timestamp. A write failure does not sink the recorder.
 
-    يُدوّر الملف عند تجاوز LOG_MAX_BYTES (سطر/دقيقة يعني نموّاً أبدياً بلا ذلك)؛
-    نحتفظ بنسخة واحدة `.1` فقط — السجلّ تشخيصيّ لا أرشيفيّ.
+
+    It rotates the file past LOG_MAX_BYTES (a line a minute means eternal
+    growth without it); we keep a single `.1` copy — the log is diagnostic,
+    not an archive.
+
     """
     line = f"{utcnow_iso()} {msg}\n"
     try:
@@ -2411,11 +2700,12 @@ def _log(msg: str) -> None:
         if config.LOG_MAX_BYTES > 0 and os.path.getsize(config.LOG_PATH) > config.LOG_MAX_BYTES:
             os.replace(config.LOG_PATH, config.LOG_PATH + ".1")
     except OSError:
-        pass  # الملف غير موجود بعد أو مقفل — الكتابة أدناه تتكفّل
+        pass  # file not there yet or locked — the write below handles it
+
     try:
         with open(config.LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line)
-    except Exception:  # noqa: BLE001 — الكتابةُ في السجلّ لا تُسقط ما تُسجّله
+    except Exception:  # noqa: BLE001 — writing to the log must not sink what it logs
         pass
 
 

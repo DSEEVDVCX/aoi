@@ -1,17 +1,18 @@
-"""تعبئة رجعية للليبلين الجديدين (fv15) عبر خدمة — لا SQL يدوي.
+"""Backfills the two new labels (fv15) through the service layer — no hand-written SQL.
 
-الليبلان `is_explosive` و`time_to_plus20_min` أُضيفا 2026-08-28 والتوسيم
-idempotent (INSERT OR IGNORE) فالنتائج الموسومة سابقًا لا يلمسها التوسيم
-العادي. لكن `is_explosive` قابل للاشتقاق الكامل من أعمدة مخزنة أصلًا
-(`max_gain_48h`/`max_gain_24h`) — فالتعبئة هنا قراءة ثم كتابة عبر نفس
-طبقة db، والسجل محفوظ.
+The labels `is_explosive` and `time_to_plus20_min` were added 2026-08-28 and
+labeling is idempotent (INSERT OR IGNORE), so normal labeling never touches
+already-labeled results. But `is_explosive` is fully derivable from columns
+that are already stored (`max_gain_48h`/`max_gain_24h`) — so the backfill here
+reads and then writes through the same db layer, and the log is preserved.
 
-`time_to_plus20_min` يحتاج الشموع (أول إغلاق ≥ +20%) فتُحسب من token_bars
-المخزنة — بلا شبكة، والحساب من نفس مصدر التوسيم الأصلي.
+`time_to_plus20_min` needs bars (first close >= +20%), so it is computed from
+stored token_bars — no network, and the computation comes from the same source
+as the original labeling.
 
-الاستعمال:
-    python backfill_explosive_labels.py            # تشخيص فقط
-    python backfill_explosive_labels.py --apply    # تنفيذ
+Usage:
+    python backfill_explosive_labels.py            # diagnosis only
+    python backfill_explosive_labels.py --apply    # execute
 """
 from __future__ import annotations
 
@@ -44,7 +45,7 @@ def main() -> int:
                   AND is_explosive IS NULL
                 ORDER BY entry_ts""",
         ).fetchall()
-        print(f"نتائج ok قابلة للتعبئة: {len(rows):,}")
+        print(f"Fillable ok outcomes: {len(rows):,}")
 
         explosive = 0
         done = 0
@@ -57,8 +58,9 @@ def main() -> int:
             done += 1
             if not args.apply:
                 continue
-            # الكتابة عبر نفس طبقة db: تحديث مشروط بأن الليبل ما زال فارغًا
-            # (idempotent وآمن للإعادة — لا يلمس ما عُبّئ).
+            # Writing through the same db layer: an update conditioned on the
+            # label still being empty (idempotent and safe to re-run — never
+            # touches what was already filled).
             db._conn.execute(
                 """UPDATE outcomes SET is_explosive=?
                     WHERE kind=? AND key=? AND is_explosive IS NULL""",
@@ -70,19 +72,19 @@ def main() -> int:
         if args.apply:
             db._commit()
 
-        print(f"is_explosive: {explosive:,} من {len(rows):,} "
+        print(f"is_explosive: {explosive:,} of {len(rows):,} "
               f"({explosive / max(len(rows), 1):.1%})")
 
-        # time_to_plus20: يحتاج الشموع — نفس مصدر التوسيم
+        # time_to_plus20: needs bars — same source as labeling
         need_hook = db._conn.execute(
             """SELECT COUNT(*) FROM outcomes
                 WHERE status='ok' AND time_to_plus20_min IS NULL
                   AND kind='watch'""",
         ).fetchone()[0]
-        print(f"(time_to_plus20 للنوافذ يحتاج الشموع: {need_hook:,} — "
-              f"يُعبّأ في توسيم مستقبلي عبر compute_labels الجديد)")
+        print(f"(time_to_plus20 for windows needs bars: {need_hook:,} — "
+              f"filled by future labeling through the new compute_labels)")
         if not args.apply:
-            print("\nتشخيص فقط — مرّر --apply للتنفيذ.")
+            print("\nDiagnosis only — pass --apply to execute.")
         return 0
     finally:
         db.close()

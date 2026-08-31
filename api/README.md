@@ -58,7 +58,7 @@ All under `/v1`, all read-only, all requiring `Authorization: Bearer <consumer_k
 
 | Route | Upstream |
 |---|---|
-| `GET /health` | — (liveness + Redis + جاهزية اعتماد Privy للتجديد؛ بلا كشف أي سر، no auth) |
+| `GET /health` | — (liveness + Redis + Privy token readiness for renewal, with no secret exposed, no auth) |
 | `POST /v1/auth/login` · `/logout` · `/dev-token` | Privy |
 | `GET /v1/leaderboard?period=all\|24h\|7d\|30d` | `/v2/leaderboard[/{period}]` |
 | `GET /v1/traders/{id}` | `/v2/users?userIds={id}` (repeated query parameter) |

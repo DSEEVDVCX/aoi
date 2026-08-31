@@ -1,4 +1,4 @@
-"""اختبارات طبقة DEX Screener socials (fv16)."""
+"""Tests of the DEX Screener socials layer (fv16)."""
 
 import dex_screener
 import pytest
@@ -43,7 +43,7 @@ def _with_fake(monkeypatch, fake):
 
 
 async def test_enrich_stores_channels_and_match(db, monkeypatch):
-    """fomo يرى تويتر وDEX يرى قناتين ⇒ قنوات=2 وتوافق=1."""
+    """fomo sees a twitter and DEX sees two channels ⇒ channels=2 and match=1."""
     _static(db, "BOTHA", twitter="https://x.com/a")
     fake = _FakeDex(2)
     _with_fake(monkeypatch, fake)
@@ -56,7 +56,7 @@ async def test_enrich_stores_channels_and_match(db, monkeypatch):
 
 
 async def test_enrich_conflict_detected(db, monkeypatch):
-    """fomo يرى تويتر وDEX يرى صفرًا ⇒ تعارض=0 (نمط ملف مزور)."""
+    """fomo sees a twitter and DEX sees zero ⇒ mismatch=0 (the forged-profile pattern)."""
     _static(db, "FAKEx", twitter="https://x.com/fake")
     fake = _FakeDex(0)
     _with_fake(monkeypatch, fake)
@@ -65,24 +65,24 @@ async def test_enrich_conflict_detected(db, monkeypatch):
         "SELECT social_channels_dex, social_match_fomo_dex FROM token_static "
         "WHERE token_address='FAKEx'").fetchone()
     assert row["social_channels_dex"] == 0
-    assert row["social_match_fomo_dex"] == 0       # تعارض — الإشارة الخطرة
+    assert row["social_match_fomo_dex"] == 0       # conflict — the dangerous signal
 
 
 async def test_enrich_asked_once_only(db, monkeypatch):
-    """العملة المسؤول عنها سابقًا لا تُسأل ثانية (نداء واحد في عمرها)."""
-    _static(db, "ONCEx", dex_channels=3)           # سُئلت سابقًا
+    """A token already enriched is never asked again (one call in its lifetime)."""
+    _static(db, "ONCEx", dex_channels=3)           # asked previously
     fake = _FakeDex(9)
     _with_fake(monkeypatch, fake)
     await recorder._enrich_dex_socials(db, "ONCEx", "1399811149")
-    assert fake.asked == []                        # لم تُسأل أبدًا
+    assert fake.asked == []                        # never asked
     row = db._conn.execute(
         "SELECT social_channels_dex FROM token_static "
         "WHERE token_address='ONCEx'").fetchone()
-    assert row["social_channels_dex"] == 3         # القيمة الأصلية لم تُمسّ
+    assert row["social_channels_dex"] == 3         # the original value untouched
 
 
 async def test_enrich_failure_leaves_null(db, monkeypatch):
-    """DEX لا يجيب (None) ⇒ العمودان يبقيان NULL — لم يُقس، لا صفر."""
+    """DEX does not answer (None) ⇒ both columns stay NULL — unmeasured, not zero."""
     _static(db, "NOANx", twitter=None)
     fake = _FakeDex(None)
     _with_fake(monkeypatch, fake)
@@ -95,7 +95,7 @@ async def test_enrich_failure_leaves_null(db, monkeypatch):
 
 
 async def test_enrich_both_absent_is_match(db, monkeypatch):
-    """كلا المصدرين لا يرى socials ⇒ توافق=1 (صدق متبادل على الفراغ)."""
+    """Neither source sees socials ⇒ match=1 (mutual honesty about the empty set)."""
     _static(db, "EMPTYx", twitter=None)
     fake = _FakeDex(0)
     _with_fake(monkeypatch, fake)

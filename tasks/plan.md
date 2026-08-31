@@ -1,239 +1,242 @@
-# خطة تنفيذ متكاملة: إكمال جمع بيانات FOMO والبلوك تشين
+# Integrated implementation plan: completing FOMO and blockchain data collection
 
-## 1. الهدف
+## 1. Objective
 
-تهدف هذه الخطة إلى تحويل نظام التسجيل الحالي من أرشيف واسع للبيانات إلى منصة
-بيانات قابلة لبناء واختبار نموذج تداول واقعي، مع المحافظة على ثلاثة شروط لا
-يجوز التنازل عنها:
+This plan aims to transform the current recording system from a broad data archive into a data
+platform capable of building and testing a realistic trading model, while preserving three conditions
+that may not be traded away:
 
-1. كل ميزة دخول يجب أن تكون معلومة عند لحظة القرار `t0` أو قبلها.
-2. البيانات الغائبة تبقى `NULL` ولا تتحول إلى صفر مفبرك.
-3. نجاح الجمع أو ارتفاع `AUC` لا يعني وجود نموذج رابح؛ الاعتماد يحتاج اختباراً
-   زمنياً على عملات جديدة وربحاً صافياً بعد تكلفة تنفيذ واقعية.
+1. Every entry feature must be known at or before the decision moment `t0`.
+2. Missing data stays `NULL` and does not become a fabricated zero.
+3. Collection success or a high `AUC` does not mean a winning model exists; approval requires a
+   time-based test on new tokens and a net profit after a realistic execution cost.
 
-هذه الوثيقة ملحق تنفيذي لـ `docs/PLAN.md`. لا تلغي بوابة الضابطة `v3` ولا قرار
-التدريب على البيانات الحية فقط، ولا تفتح التداول الحقيقي تلقائياً.
+This document is an execution annex to `docs/PLAN.md`. It does not cancel the `v3` control-group gate or the
+live-data-only training decision, and it does not automatically open real trading.
 
-## 2. الحالة المرجعية عند بدء الخطة
+## 2. Reference state at the start of the plan
 
-الحالة المقيسة في 2026-08-19:
+State measured on 2026-08-19:
 
-| البند | الحالة التقريبية |
+| Item | Approximate state |
 |---|---:|
-| حجم `recorder/recorder.db` | 16.8 GB |
-| `signal_events` | 97 ألفاً |
-| `token_bars` | 2.05 مليون شمعة |
-| `market_ticks` | 3.25 مليون لقطة |
-| `training_rows` | 94 ألفاً |
-| صفوف النموذج الحية المستقلة النظيفة | 11.2 ألفاً |
-| العملات المميزة في صفوف النموذج | 611 |
-| `traders` | 4,588 ملفاً |
-| `token_flow` | 77 ألف لقطة تقريباً |
-| `token_holders` | 173 ألف لقطة تقريباً |
-| `chain_concentration` | 283 ألف لقطة تقريباً |
-| `evm_balances` | 2.05 مليون رصيد تقريباً |
-| `activity_events` | 190 فقط، وهي فجوة واضحة |
+| `recorder/recorder.db` size | 16.8 GB |
+| `signal_events` | 97 thousand |
+| `token_bars` | 2.05 million candles |
+| `market_ticks` | 3.25 million snapshots |
+| `training_rows` | 94 thousand |
+| Clean independent live model rows | 11.2 thousand |
+| Distinct tokens in model rows | 611 |
+| `traders` | 4,588 profiles |
+| `token_flow` | ~77 thousand snapshots |
+| `token_holders` | ~173 thousand snapshots |
+| `chain_concentration` | ~283 thousand snapshots |
+| `evm_balances` | ~2.05 million balances |
+| `activity_events` | only 190, a clear gap |
 
-الوضع المنهجي المرجعي:
+Reference methodological state:
 
-- التقييم السابق أعطى `AUC` للعملات الجديدة قريباً من 0.555، بلا دليل كاف على
-  ربح قابل للتعميم.
-- بيانات ملفات المتداولين تُجمع، لكنها لا تدخل `FEATURE_COLUMNS` أو
-  `training_rows` حتى الآن.
-- جمع `flow_*` و`onchain_*` موجود، لكن جزءاً كبيراً منه حديث زمنياً أو ما زال
-  استرجاع EVM الخاص به جزئياً.
-- `evm_training_rebuild_started=0`؛ لا يجوز اعتبار صفوف EVM النهائية مكتملة قبل
-  إنهاء إعادة السجل ثم إعادة البناء.
-- بيانات التنفيذ الواقعي، خصوصاً احتياطيات DEX والانزلاق وإضافة وسحب السيولة،
-  ليست طبقة كاملة حالياً.
+- The previous evaluation gave an `AUC` for new tokens near 0.555, with no sufficient evidence of a
+  generalizable profit.
+- Trader-profile data is collected, but it does not yet enter `FEATURE_COLUMNS` or
+  `training_rows`.
+- `flow_*` and `onchain_*` collection exists, but a large part of it is recent in time or its EVM
+  backfill is still partial.
+- `evm_training_rebuild_started=0`; the final EVM rows must not be considered complete before
+  the ledger repair is finished and then rebuilt.
+- Realistic execution data, especially DEX reserves and slippage and liquidity add/remove,
+  is not a complete layer yet.
 
-## 3. نطاق الخطة
+## 3. Plan scope
 
-### داخل النطاق
+### In scope
 
-- تدقيق جودة وتغطية كل مصدر قائم.
-- إنهاء صحة دفتر EVM وإعادة بناء صفوفه.
-- استغلال ملفات المتداولين الموجودة دون تسرب زمني.
-- بناء ميزات عناقيد الإشارات ومسار ظهور العملة في قوائم FOMO.
-- إكمال `tradingActivity` بوصفه كوناً تحليلياً منفصلاً.
-- الاحتفاظ بتاريخ ملفات المتداولين بدلاً من آخر نسخة فقط.
-- إضافة طبقة أحداث DEX والسيولة والتنفيذ على نحو تدريجي لكل بروتوكول.
-- إضافة قياسات محافظ وحيتان ومطورين من التحويلات التاريخية.
-- تحديث التصدير، التقارير، المراقبة، واختبارات النقطة الزمنية.
-- تشغيل دراسة استئصال `ablation` واختبار زمني وتداول ورقي بعد نضج البيانات.
+- Quality and coverage audit of every existing source.
+- Finishing EVM ledger integrity and rebuilding its rows.
+- Exploiting the existing trader profiles without time leakage.
+- Building signal-cluster and FOMO-list-appearance-path features.
+- Completing `tradingActivity` as a separate analytical universe.
+- Keeping trader-profile history instead of only the latest copy.
+- Adding a DEX event, liquidity, and execution layer incrementally per protocol.
+- Adding wallet, whale, and developer measurements from historical transfers.
+- Updating export, reports, monitoring, and point-in-time tests.
+- Running an `ablation` study and time-based test and paper trading after the data matures.
 
-### خارج النطاق في هذه الدورة
+### Out of scope in this cycle
 
-- تنفيذ تداول حقيقي أو حفظ مفاتيح محفظة تداول.
-- استخدام بيانات خاصة أو تجاوز شروط المصادر.
-- تحليل نصوص الأطروحات بنموذج لغوي قبل تثبيت صحة المجاميع والهوية والزمن.
-- إضافة شبكة عصبية لمجرد زيادة التعقيد.
-- اعتبار بيانات رجعية ناقصة بديلاً عن القياسات الحية.
-- فتح مجموعة `test` الحالية مراراً لاختيار الميزات.
+- Executing real trading or storing trading wallet keys.
+- Using private data or bypassing source terms.
+- Analyzing thesis texts with a language model before aggregate, identity, and time integrity is established.
+- Adding a neural network merely to increase complexity.
+- Treating incomplete retro data as a substitute for live measurements.
+- Opening the current `test` set repeatedly for feature selection.
 
-## 4. مبادئ المعمارية
+## 4. Architecture principles
 
-### 4.1 الخام غير قابل للاستبدال
+### 4.1 Raw data is irreplaceable
 
-- يبقى `raw_json` محفوظاً لكل مصدر متاح.
-- الأعمدة المستخرجة قابلة لإعادة البناء، أما الخام فلا يُعدّل.
-- أي ترحيل مشتق يعمل بدفعات، قابل للاستئناف، وله وضع `--dry-run`.
-- أي عملية حذف لمشتقات EVM تمر عبر `repair_evm_ledger.py` فقط وبعد نسخة احتياطية
-  متحققة؛ لا أوامر SQL يدوية مدمرة.
+- `raw_json` stays stored for every available source.
+- Extracted columns are rebuildable; raw is never edited.
+- Any derived migration runs in batches, is resumable, and has a `--dry-run` mode.
+- Any deletion of EVM derivatives goes through `repair_evm_ledger.py` only and after a verified
+  backup; no destructive manual SQL commands.
 
-### 4.2 فصل القياس عن الاشتقاق
+### 4.2 Separating measurement from derivation
 
-تتبع كل عائلة هذا المسار:
+Every family follows this path:
 
 ```text
-مصدر خارجي
-  -> صف خام مؤرخ ومحدد المصدر
-  -> أعمدة مستخرجة مباشرة
-  -> ميزات point-in-time
-  -> صف تدريب بإصدار feature_version
-  -> تقييم زمني وتداول ورقي
+External source
+  -> a dated, source-stamped raw row
+  -> directly extracted columns
+  -> point-in-time features
+  -> a training row with a feature_version
+  -> time-based evaluation and paper trading
 ```
 
-لا يجوز أن تحسب عملية الجمع `label`، ولا يجوز أن يقرأ مستخرج ميزات الدخول صفاً
-بعد `t0`.
+The collection process must not compute a `label`, and the entry-feature extractor must not read a row
+after `t0`.
 
-### 4.3 فصل السكان والمصادر
+### 4.3 Separating populations and sources
 
-- حائزو السلسلة لا يساوون حائزي FOMO.
-- صفقة FOMO لا تساوي حدث `Swap` على السلسلة دون ربط موثق.
-- لقطة حية لا تساوي لقطة أعيد بناؤها تاريخياً، حتى لو كان الرقم صحيحاً.
-- بيانات `signal_events` الحية لا تدمج مع `activity_events` الرجعية في تدريب
-  الاعتماد إلا بعد تقرير تحيز مستقل.
-- يجب أن يحمل كل صف `source`, `recorded_at`, ومؤشر طريقة القياس عند الحاجة مثل
+- On-chain holders are not equal to FOMO holders.
+- A FOMO trade is not equal to an on-chain `Swap` event without a documented join.
+- A live snapshot is not equal to a historically reconstructed snapshot, even if the number is correct.
+- Live `signal_events` data is not merged with retro `activity_events` in approval training
+  without an independent bias report.
+- Every row must carry `source`, `recorded_at`, and a measurement-method indicator where needed, such as
   `is_replay`.
 
-### 4.4 الإصدارات والحقب
+### 4.4 Versions and eras
 
-- كل تغيير في معنى ميزة يرفع `FEATURE_VERSION`.
-- إضافة مصدر حديث لا تبيح تدريب النموذج عليه فوراً؛ يجب أن يغطي Train وVal/Test
-  زمنياً كي لا يتعلم تاريخ تشغيل المصدر.
-- أي عائلة جديدة تحمل تقرير تغطية حسب اليوم والشبكة ونوع الإشارة.
-- إذا كان الحضور نفسه يكشف تاريخ الصف، تُستبعد العائلة مؤقتاً من نموذج الاعتماد.
+- Every change in a feature's meaning bumps `FEATURE_VERSION`.
+- Adding a recent source does not permit training the model on it immediately; Train and Val/Test must be
+  covered in time so the model does not learn the source's operating history.
+- Every new family carries a coverage report by day, network, and signal type.
+- If presence alone reveals a row's date, the family is temporarily excluded from the approval model.
 
-## 5. مخطط الاعتماديات
+## 5. Dependency map
 
 ```text
-P0 خط أساس وتدقيق
+P0 baseline and audit
   |
-  +--> P1 صحة EVM وإعادة البناء
+  +--> P1 EVM integrity and rebuild
   |
-  +--> P2 حفظ تاريخ المتداولين
+  +--> P2 trader history preservation
   |      |
-  |      +--> P3 ميزات جودة المتداول
+  |      +--> P3 trader quality features
   |
-  +--> P4 عناقيد الإشارات ومسار قوائم FOMO
+  +--> P4 signal clusters and FOMO list path
   |
-  +--> P5 إكمال tradingActivity
+  +--> P5 tradingActivity completion
   |
-  +--> P6 عقد بيانات DEX واكتشاف الأحواض
+  +--> P6 DEX contracts and pool discovery
          |
-         +--> P7 أحداث Swap والسيولة
+         +--> P7 Swap and liquidity events
                 |
-                +--> P8 ميزات التنفيذ والمحافظ
+                +--> P8 execution and wallet features
 
 P1 + P3 + P4 + P5 + P8
-  -> P9 إعادة بناء وتصدير وتدقيق تسرب
-  -> P10 تقييم زمني واستئصال ميزات
-  -> P11 تداول ورقي وبوابة اعتماد
+  -> P9 rebuild, export, and leakage audit
+  -> P10 time-based evaluation and feature ablation
+  -> P11 paper trading and the approval gate
 ```
 
-يمكن تنفيذ P2 وP4 وP5 بالتوازي بعد P0. يجب أن تبقى P1 متسلسلة بسبب حالة دفتر
-EVM المشتركة. لا تبدأ P7 قبل تثبيت عقد P6 كي لا نعيد كتابة الجداول لكل بروتوكول.
+P2, P4, and P5 can run in parallel after P0. P1 must stay sequential because of the shared EVM
+ledger state. Do not start P7 before P6's contracts are established, so we do not rewrite tables for every
+protocol.
 
-## 6. مراحل التنفيذ
+## 6. Implementation phases
 
-## P0 - تجميد خط الأساس وبناء تدقيق آلي
+## P0 - Freeze the baseline and build an automated audit
 
-### الغرض
+### Purpose
 
-إنشاء رقم مرجعي يمكن مقارنة كل تغيير به ومنع تحسين جمعٍ بينما تتدهور طبقة أخرى
-بصمت.
+Create a reference number that every change can be compared against, and prevent collection improving
+while another layer silently degrades.
 
-### العمل
+### Work
 
-- إنشاء أداة قراءة فقط `recorder/data_readiness.py` تنتج JSON قابل للمقارنة.
-- قياس عدد الصفوف، أحدث ختم، نسبة الأخطاء، التغطية عند `t0`، التغطية حسب اليوم
-  والشبكة، القيم المميزة، ونسبة `NULL` لكل عائلة.
-- تسجيل حالات العمليات المجدولة والـ meta المهمة دون أسرار.
-- إضافة فحوص سلامة:
-  - `PRAGMA quick_check` على نسخة احتياطية لا على الكاتب الحي.
-  - لا أرصدة EVM سالبة في إعادة ناجحة.
-  - لا شموع مستقبلية تدخل ميزات `t0`.
-  - لا صفوف مكررة في `model_training_rows`.
-  - لا انتقال للعملة بين الأجزاء الزمنية المستخدمة في التقييم.
-- كتابة أول تقرير مرجعي مؤرخ في `docs/data-readiness-YYYY-MM-DD.md` بواسطة الأداة
-  فقط، لا أرقام يدوية.
+- Create a read-only tool `recorder/data_readiness.py` that produces comparable JSON.
+- Measure row counts, latest stamp, error ratio, coverage at `t0`, coverage by day
+  and network, distinct values, and the `NULL` ratio per family.
+- Log scheduled-task states and important meta without secrets.
+- Add safety checks:
+  - `PRAGMA quick_check` on a backup, not on the live writer.
+  - No negative EVM balances in a successful replay.
+  - No future candles entering `t0` features.
+  - No duplicate rows in `model_training_rows`.
+  - No token crossing between the time parts used in evaluation.
+- Write the first dated reference report at `docs/data-readiness-YYYY-MM-DD.md` by the tool
+  only, no manual numbers.
 
-### بوابة القبول
+### Acceptance gate
 
-- الأداة تنتهي في زمن معقول على قاعدة التشغيل دون كتابة.
-- المخرجات تشمل كل مصدر قائم وتفرق بين `missing`, `empty`, `error`, و`stale`.
-- تشغيلان متتاليان بلا تغيير بنيوي ينتجان مخطط JSON متوافقاً.
-- توجد اختبارات على قاعدة مصغرة لكل عداد وحالة.
+- The tool finishes in reasonable time on the operating database without writing.
+- The outputs cover every existing source and distinguish `missing`, `empty`, `error`, and `stale`.
+- Two consecutive runs without a structural change produce compatible JSON schemas.
+- There are tests on a miniaturized database for every counter and state.
 
-## P1 - إنهاء صحة EVM وإعادة بناء مشتقاته
+## P1 - Finish EVM integrity and rebuild its derivatives
 
-### الغرض
+### Purpose
 
-منع تدريب النموذج على تركيز حائزين ناقص أو رصيد بدأ بعد أول تحويل.
+Prevent the model from training on incomplete holder concentration or a balance that started after the
+first transfer.
 
-### العمل
+### Work
 
-1. أخذ نسخة احتياطية متسقة بواسطة `backup_db.py` والتحقق من `quick_check`.
-2. تشغيل `repair_evm_ledger.py` في وضع الفحص فقط وتخزين تقرير الحالة.
-3. إنهاء backfill الحي للشبكات المفعلة.
-4. إنهاء replay للنوافذ الناضجة على `4663` و`8453`.
-5. تصنيف الحالات النهائية صراحة: `done`, `empty`, `negative`, `budget`, `error`.
-6. تدقيق عينة من كل شبكة ضد `totalSupply` و`balanceOf` بواسطة
+1. Take a consistent backup via `backup_db.py` and verify it with `quick_check`.
+2. Run `repair_evm_ledger.py` in inspect-only mode and store the status report.
+3. Finish the live backfill for enabled networks.
+4. Finish replay for mature windows on `4663` and `8453`.
+5. Classify final states explicitly: `done`, `empty`, `negative`, `budget`, `error`.
+6. Audit a sample from each network against `totalSupply` and `balanceOf` via
    `audit_evm_ledger.py`.
-7. عدم إعادة إدخال الشبكات أو العملات ذات `negative` في ميزات الملكية.
-8. بعد وصول `active_pending=0` و`replay_pending=0` فقط، تشغيل
-   `--finalize-training` ثم السماح للباني بإعادة صفوف EVM.
-9. مقارنة عدد الصفوف والتغطية والقيم قبل الإصلاح وبعده.
+7. Do not re-admit networks or tokens marked `negative` into ownership features.
+8. Only after `active_pending=0` and `replay_pending=0`, run
+   `--finalize-training` and then let the builder rebuild the EVM rows.
+9. Compare row counts, coverage, and values before and after the repair.
 
-### قرار BSC
+### BSC decision
 
-- القياس اللحظي عبر NodeReal يبقى مصدراً منفصلاً وموثوقاً للحالة الحالية.
-- التاريخ لا يُفبرك من RPC غير أرشيفي.
-- إذا لم يتوفر مزود أرشيفي موثق ضمن ميزانية واضحة، تبقى ميزات replay التاريخية
-  لـBSC `NULL` ويضاف علم تغطية، ولا يعد ذلك فشلاً.
+- Instantaneous measurement via NodeReal remains a separate, trusted source for the current state.
+- History is not fabricated from a non-archive RPC.
+- If no documented archive provider is available within a clear budget, BSC's historical replay features
+  stay `NULL` with a coverage flag added, and that is not a failure.
 
-### ملكية الكاتب
+### Writer ownership
 
-- `run_evm_replay.py` هو الكاتب الوحيد لكل طبقات EVM: التطبيق الحي، backfill،
-  snapshots، BSC، فحص العقود، ثم replay التاريخي.
-- `run_chain.py` يملك Solana وSolana authority فقط؛ لا يشغل EVM أو BSC.
-- السبب تشغيلي لا تحليلي: SQLite يسمح بقراء متزامنة لكنه يسلسل الكتابات، ودورتا
-  EVM الطويلتان كانتا تتنافسان على `evm_balances` و`chain_concentration` وتسببان
+- `run_evm_replay.py` is the sole writer of all EVM layers: live application, backfill,
+  snapshots, BSC, contract checks, then historical replay.
+- `run_chain.py` owns Solana and Solana authority only; it does not run EVM or BSC.
+- The reason is operational, not analytical: SQLite allows concurrent readers but serializes writes, and the
+  two long EVM cycles were contending on `evm_balances` and `chain_concentration` and causing
   `database is locked`.
-- لا يجوز إعادة فصل هذه الطبقات إلى مهمتين كاتبتين إلا بعد نقل الحالة إلى كاتب
-  واحد أو طابور كتابة مستقل واختباره تحت حمل فعلي.
+- These layers must not be split back into two writer tasks unless the state is moved to a single
+  writer or a standalone write queue and tested under real load.
 
-### بوابة القبول
+### Acceptance gate
 
-- `repair_evm_ledger.inspect()` يعيد `active_pending=0` و`replay_pending=0` للشبكات
-  المطلوبة قبل finalize.
-- جميع الصفوف الموسومة `done` تنجح في فحص عدم السالب.
-- تدقيق أكبر خمسة حائزين في العينة يطابق السلسلة أو يوثق فرقاً تحت العتبة.
-- لا تبقى صفوف تدريب EVM بالإصدار السابق بعد إعادة البناء.
-- اختبارات `test_repair_evm_ledger.py`, `test_evm_replay.py`, و`test_evm_layer.py`
-  تمر كاملة.
+- `repair_evm_ledger.inspect()` returns `active_pending=0` and `replay_pending=0` for the required
+  networks before finalize.
+- All rows labeled `done` pass the non-negative check.
+- An audit of the top five holders in the sample matches the chain or documents a difference under the
+  threshold.
+- No EVM training rows remain on the previous version after the rebuild.
+- The tests `test_repair_evm_ledger.py`, `test_evm_replay.py`, and `test_evm_layer.py`
+  pass in full.
 
-## P2 - تحويل ملفات المتداولين إلى سجل زمني
+## P2 - Turn trader profiles into a time-series record
 
-### الغرض
+### Purpose
 
-الجدول الحالي `traders` يكتب آخر لقطة فوق السابقة. هذا يمنع معرفة ما كان معلوماً
-عن المتداول عند إشارة قديمة.
+The current `traders` table overwrites the previous snapshot with the latest. This prevents knowing what was known
+about a trader at an old signal.
 
-### التصميم
+### Design
 
-إضافة جدول append-only:
+Add an append-only table:
 
 ```sql
 CREATE TABLE trader_snapshots (
@@ -254,36 +257,38 @@ CREATE TABLE trader_snapshots (
 );
 ```
 
-- يبقى `traders` كجدول latest-state للوحة والتشغيل السريع.
-- يكتب كل جلب صالح في `trader_snapshots` ثم يحدث `traders` في معاملة واحدة.
-- يمنع التكرار بوساطة المفتاح، ولا يسجل لقطة جديدة إذا لم يتغير المحتوى إلا بعد
-  heartbeat يومي موثق، لتقليل الحجم.
-- لا تعبئة رجعية زائفة: النسخة الحالية يمكن إدراجها بتاريخ القياس الحالي فقط.
-- إضافة `trader_fetch_method` أو إصدار للمصدر إذا تغير شكل endpoint.
+- `traders` remains the latest-state table for the dashboard and fast operations.
+- Every valid fetch writes to `trader_snapshots` and then updates `traders` in a single transaction.
+- Duplication is prevented via the key, and a new snapshot is not recorded if the content is unchanged except
+  after a documented daily heartbeat, to reduce size.
+- No fake retroactive filling: the current version can only be inserted with the current measurement date.
+- Add `trader_fetch_method` or a source version if the endpoint's shape changes.
 
-### تحسين الجدولة
+### Scheduling improvements
 
-- الأولوية للمشترين المرتبطين بإشارة جديدة.
-- يليهم المتكررون الأكثر ظهوراً.
-- يطلب ملف المتداول قبل أو مباشرة بعد معالجة الإشارة، مع حفظ `recorded_at` الحقيقي.
-- يظل حد السرعة قابلاً للضبط وتظهر تغطية `buyer_id -> trader_snapshot <= t0`.
+- Buyers linked to a new signal get priority.
+- Then the most frequent repeaters.
+- The trader profile is requested before or immediately after processing the signal, with the real
+  `recorded_at` preserved.
+- The rate limit stays tunable, and `buyer_id -> trader_snapshot <= t0` coverage is displayed.
 
-### بوابة القبول
+### Acceptance gate
 
-- كل جلب ناجح يكتب لقطة تاريخية ولا يمحو القديمة.
-- اختبار يثبت أن ميزة إشارة قديمة تقرأ لقطة ما قبل `t0` لا أحدث لقطة.
-- لا يزداد حجم الجدول يومياً بسبب نسخ متطابقة غير محدودة.
-- تغطية المشترين الجدد تقاس وتظهر في تقرير الجاهزية.
+- Every successful fetch writes a historical snapshot and never erases an old one.
+- A test proves that an old signal's feature reads a snapshot from before `t0`, not the latest snapshot.
+- The table does not grow daily from unlimited identical copies.
+- New-buyer coverage is measured and shown in the readiness report.
 
-## P3 - بناء ميزات جودة المتداول دون تسرب
+## P3 - Build trader-quality features without leakage
 
-### الغرض
+### Purpose
 
-استغلال 4,588 ملف متداول وسجل الإشارات السابق بدلاً من الاكتفاء برتبة الصدارة.
+Exploit the 4,588 trader profiles and the existing signal archive instead of settling for the leaderboard
+rank.
 
-### عائلات الميزات
+### Feature families
 
-#### أ. لقطة الملف عند `t0`
+#### A. Profile snapshot at `t0`
 
 - `buyer_followers`
 - `buyer_following`
@@ -299,7 +304,7 @@ CREATE TABLE trader_snapshots (
 - `buyer_is_restricted`
 - `buyer_profile_age_min`
 
-#### ب. السلوك السابق داخل أرشيفنا
+#### B. Prior behavior inside our archive
 
 - `buyer_prior_signals`
 - `buyer_prior_tokens`
@@ -313,44 +318,45 @@ CREATE TABLE trader_snapshots (
 - `buyer_prior_up20_rate`
 - `buyer_history_complete_rows`
 
-لا تدخل نتيجة إلا إذا كان `watch_until` أو أفق الصفقة السابقة منتهياً قبل `t0`.
-وجود صف سابق دخل قبل `t0` لكنه لم ينضج بعد لا يسمح باستخدام نتيجته.
+An outcome enters only if the prior trade's `watch_until` or horizon ended before `t0`.
+The existence of a prior row that entered before `t0` but has not matured yet does not permit using its
+outcome.
 
-#### ج. المتداولون المتعددون
+#### C. Multiple traders
 
-لـ`multi_user_buy` تحسب مجاميع قائمة `top_trader_ids_json`:
+For `multi_user_buy`, aggregates over the `top_trader_ids_json` list are computed:
 
-- عدد ملفات المتداولين المتاحة.
-- أفضل ووسيط حجم تاريخي.
-- أفضل ووسيط نسبة نجاح سابقة.
-- عدد المتداولين ذوي تاريخ كاف.
-- تشتت الجودة، كي لا يخفي متداول قوي مجموعة ضعيفة.
+- Number of trader profiles available.
+- Best and median historical volume.
+- Best and median prior success rate.
+- Number of traders with sufficient history.
+- Quality dispersion, so one strong trader cannot hide a weak group.
 
-### الحماية من فرط التخصيص
+### Overfitting protection
 
-- لا يدخل `buyer_id`, handle, wallet، أو أي معرف عالي الكاردينالية كميزة مباشرة.
-- حد أدنى لعدد النتائج السابقة قبل حساب rate؛ دون الحد تبقى النسبة `NULL` ويظهر
-  `buyer_history_complete_rows`.
-- تستعمل smoothing محددة مسبقاً، لا تضبط بعد رؤية `test`.
-- تكتب اختبارات خصيصاً لمنع نتيجة الصف الحالي من دخول تاريخ المشتري.
+- No `buyer_id`, handle, wallet, or any high-cardinality identifier enters as a direct feature.
+- A minimum count of prior outcomes before computing a rate; below the threshold the ratio stays `NULL` and
+  `buyer_history_complete_rows` is shown.
+- Pre-specified smoothing is used, not tuned after seeing `test`.
+- Tests are written specifically to keep the current row's outcome out of the buyer's history.
 
-### بوابة القبول
+### Acceptance gate
 
-- كل ميزة لها تعريف SQL أو Python موثق واختبار point-in-time.
-- تقرير التغطية يظهر تغطية Train وVal والفترة الجديدة منفصلة.
-- تجربة استئصال على Val تقارن baseline و`+trader`, دون فتح Test.
-- لا يعتمد القبول على معرف شخص بعينه.
+- Every feature has a documented SQL or Python definition and a point-in-time test.
+- The coverage report shows Train, Val, and new-period coverage separately.
+- An ablation trial on Val compares baseline versus `+trader`, without opening Test.
+- Acceptance does not rest on any single individual's identity.
 
-## P4 - عناقيد الإشارات ومسار اكتشاف العملة في FOMO
+## P4 - Signal clusters and the token discovery path in FOMO
 
-### الغرض
+### Purpose
 
-تحويل الأرشيف الدوري لـ`feed`, `trending`, `verified`, و`most_held` إلى سياق زمني
-بدلاً من مجرد صفوف سوق منفصلة.
+Turn the periodic archive of `feed`, `trending`, `verified`, and `most_held` into time context
+instead of merely separate market rows.
 
-### التصميم
+### Design
 
-إضافة جدول مشتق قابل لإعادة البناء من `snapshots`:
+Add a derived table, rebuildable from `snapshots`:
 
 ```sql
 CREATE TABLE token_source_presence (
@@ -366,12 +372,12 @@ CREATE TABLE token_source_presence (
 );
 ```
 
-- يستخرج ترتيب العنصر من موضعه في القائمة، إن كان الترتيب ذا معنى ثابتاً.
-- إذا لم يثبت أن ترتيب قائمة ما دلالة، يبقى `source_rank=NULL`.
-- `filterTokens` لا يدخل كقائمة شعبية؛ يستخدم فقط كعلم استمرار القياس.
-- يعاد البناء من اللقطات الخام القديمة بلا شبكة.
+- The item's rank is extracted from its position in the list, if the rank has a stable meaning.
+- If a list's ordering is not proven meaningful, `source_rank` stays NULL.
+- `filterTokens` does not enter as a popularity list; it is used only as a measurement-continuity flag.
+- It is rebuilt from old raw snapshots without any network.
 
-### ميزات مسار المصدر
+### Source-path features
 
 - `first_seen_age_min`
 - `first_seen_source`
@@ -383,9 +389,9 @@ CREATE TABLE token_source_presence (
 - `most_held_appearances_1h`
 - `source_transition_count_24h`
 - `minutes_since_last_trending`
-- `rank_change_15m` فقط إن ثبت معنى الرتبة.
+- `rank_change_15m` only if the rank's meaning is proven.
 
-### ميزات عناقيد الإشارات
+### Signal-cluster features
 
 - `token_signals_5m`, `15m`, `30m`, `1h`
 - `token_unique_buyers_15m`
@@ -396,56 +402,57 @@ CREATE TABLE token_source_presence (
 - `signal_cluster_size`
 - `same_trade_duplicate_count`
 
-يستخدم `tradeId`, `swapId`, `transferId` للربط وإزالة التكرار فقط بعد إثبات
-معنى كل معرف على عينات الخام. لا تعامل معرفات مفقودة كأنها متساوية.
+`tradeId`, `swapId`, and `transferId` are used for joining and deduplication only after the meaning of each
+identifier is proven on raw samples. Missing identifiers are not treated as equal.
 
-### بوابة القبول
+### Acceptance gate
 
-- إعادة البناء من اللقطات idempotent.
-- اختبار يثبت عدم دخول ظهور أو إشارة بعد `t0`.
-- تقرير يبين نسبة الأحداث المزالة كتكرار وسبب الإزالة.
-- لا تنفجر قاعدة البيانات بسبب نسخ raw متكررة؛ الجدول المشتق لا يعيد حفظ المغلف.
+- Rebuilding from the snapshots is idempotent.
+- A test proves that no appearance or signal after `t0` enters.
+- A report shows the share of events removed as duplicates and the removal reason.
+- The database does not blow up from repeated raw copies; the derived table does not re-save the envelope.
 
-## P5 - إكمال `tradingActivity` ككون منفصل
+## P5 - Complete `tradingActivity` as a separate universe
 
-### الغرض
+### Purpose
 
-الحصول على `swap_buy` و`swap_sell` والأحداث التي لا يعرضها `/feed`، دون تلويث
-التدريب الحي ببيانات رجعية ناقصة لحظياً.
+Obtain `swap_buy`, `swap_sell`, and events that `/feed` does not show, without polluting
+live training with instantaneously incomplete retro data.
 
-### العمل
+### Work
 
-- تشخيص سبب بقاء `activity_events` عند 190 صفاً: توقف pagination، اعتماد، endpoint،
-  حد زمني، أو حالة مهمة غير عاملة.
-- إضافة checkpoint واضح: آخر `id`, أقدم `createdAt`, عدد الصفحات، سبب التوقف.
-- منع اعتبار صفحة فارغة عابرة نهاية تاريخ دون إعادة متحكم بها.
-- تسجيل أنواع الأحداث الجديدة قبل كتابة مستخرج تخميني.
-- إكمال backfill تدريجياً مع حد وقت ونداءات وحالة قابلة للاستئناف.
-- سحب الشموع للصفوف الجديدة وتوسيمها في مسار مستقل.
-- إنتاج تقرير تحيز يقارن الحي والرجعي في الشبكة، النوع، القيمة السوقية، الحقول
-  المفقودة، وتغطية ميزات `t0`.
+- Diagnose why `activity_events` is stuck at 190 rows: pagination stopping, authorization, endpoint,
+  time limit, or a non-running task state.
+- Add a clear checkpoint: last `id`, oldest `createdAt`, page count, stop reason.
+- Prevent a transient empty page from being treated as the end of history without a controlled retry.
+- Log new event types before writing a guessing extractor.
+- Complete the backfill gradually with a time and call budget and a resumable state.
+- Pull candles for the new rows and label them in a separate path.
+- Produce a bias report comparing live versus retro across network, type, market cap, missing
+  fields, and `t0` feature coverage.
 
-### قاعدة الاستخدام
+### Usage rule
 
-- `activity_events` تستخدم أولاً لتحليل سلوك المشترين والبائعين وحجم الكون.
-- لا تدخل نموذج الاعتماد الحالي لأن `is_live=0` والعائلات اللحظية ناقصة.
-- يمكن بناء نموذج رجعي منفصل للمقارنة، باسم وإصدار ونتائج منفصلة تماماً.
+- `activity_events` is used first for buyer/seller behavior analysis and universe size.
+- It does not enter the current approval model because `is_live=0` and the instantaneous families are
+  incomplete.
+- A separate retro model can be built for comparison, with a completely separate name, version, and results.
 
-### بوابة القبول
+### Acceptance gate
 
-- التقدم يظهر عبر أقدم ختم وليس عدد الصفوف فقط.
-- إعادة التشغيل لا تكرر الأحداث.
-- كل حالة توقف لها سبب مسجل.
-- تقرير التحيز يقرر صراحة إن كان المصدر صالحاً لأي تدريب، ولا يفترض ذلك.
+- Progress shows via the oldest stamp, not just row count.
+- Restarting does not duplicate events.
+- Every stop state has a recorded reason.
+- The bias report explicitly decides whether the source is valid for any training; it does not assume it.
 
-## P6 - عقد بيانات DEX واكتشاف الأحواض
+## P6 - DEX contracts and pool discovery
 
-### الغرض
+### Purpose
 
-تثبيت هوية الحوض والبروتوكول والأصول قبل جمع `Swap` أو السيولة، لأن الحدث بلا
-هوية حوض موثقة قد يُفسر باتجاه خاطئ.
+Establish the pool, protocol, and asset identity before collecting `Swap` or liquidity, because an event
+without a documented pool identity can be interpreted in the wrong direction.
 
-### نموذج البيانات
+### Data model
 
 ```sql
 CREATE TABLE dex_pools (
@@ -465,33 +472,33 @@ CREATE TABLE dex_pools (
 );
 ```
 
-### ترتيب البروتوكولات
+### Protocol order
 
-1. جرد `dex_protocol` و`pair` الموجودين في FOMO حسب الشبكة والتكرار.
-2. اختيار بروتوكول واحد وشبكة واحدة تمثل أكبر نسبة قابلة للقياس.
-3. بناء adapter مستقل له واختبارات بعينات خام حقيقية من دون أسرار.
-4. إضافة بروتوكول ثان فقط بعد اجتياز الأول بوابة التطابق.
+1. Inventory the `dex_protocol` and `pair` values already in FOMO by network and frequency.
+2. Choose one protocol and one network representing the largest measurable share.
+3. Build a standalone adapter for it, with tests on real raw samples and no secrets.
+4. Add a second protocol only after the first passes the match gate.
 
-### التحقق
+### Verification
 
-- تطابق `token0/token1` أو mint A/B مع العملة المتوقعة.
-- تحديد quote asset وعدم افتراض USDC دائماً.
-- التحقق من decimals والعنوان والشبكة.
-- عدم قبول حوض فقط لأن FOMO ذكر اسمه؛ يلزم تحقق من السلسلة.
+- `token0/token1` or mint A/B matches the expected token.
+- Identify the quote asset and do not always assume USDC.
+- Verify decimals, address, and network.
+- Do not accept a pool just because FOMO mentioned its name; on-chain verification is required.
 
-### بوابة القبول
+### Acceptance gate
 
-- ≥95% من الأحواض المقبولة تتطابق عناوين أصولها مع العملة والشبكة.
-- كل حوض يحمل مصدر اكتشاف وطريقة تحقق.
-- الحالات غير المدعومة تبقى `unsupported` لا `error` متكرر إلى الأبد.
+- ≥95% of accepted pools have asset addresses matching the token and network.
+- Every pool carries a discovery source and a verification method.
+- Unsupported cases stay `unsupported`, not an `error` repeating forever.
 
-## P7 - جمع أحداث Swap والسيولة
+## P7 - Collecting Swap and liquidity events
 
-### الغرض
+### Purpose
 
-الحصول على سعر وتنفيذ وتدفق حقيقيين من السلسلة بدلاً من ملخصات FOMO فقط.
+Obtain real on-chain price, execution, and flow instead of FOMO summaries only.
 
-### جداول مقترحة
+### Proposed tables
 
 ```sql
 CREATE TABLE dex_swaps (
@@ -545,26 +552,26 @@ CREATE TABLE dex_pool_snapshots (
 );
 ```
 
-### استراتيجية التنفيذ
+### Execution strategy
 
-- البدء بعملية مستقلة عن `run_recorder.py` حتى لا تؤخر دورة FOMO.
-- استخدام cursor لكل شبكة وبروتوكول وتأخيرات تأكيد مناسبة.
-- تخزين الأحداث الخام مرة واحدة وإعادة اشتقاق السعر والاتجاه محلياً.
-- بناء backfill من كتلة إنشاء الحوض إلى نهاية نوافذ المراقبة فقط، لا مسح الشبكة
-  كلها بلا حاجة.
-- مقارنة حجم `Swap` المجمع مع `token_flow` وOHLCV؛ الاختلاف الكبير يفعل إنذاراً.
+- Start with a process independent of `run_recorder.py` so it does not delay the FOMO cycle.
+- Use a cursor per network and protocol, with appropriate confirmation delays.
+- Store raw events once and re-derive price and direction locally.
+- Build the backfill from the pool's creation block to the end of the watch windows only, not an
+  unnecessary sweep of the whole network.
+- Compare aggregated `Swap` volume against `token_flow` and OHLCV; a large difference triggers an alert.
 
-### بوابة القبول
+### Acceptance gate
 
-- اتجاه buy/sell مثبت بمعاملات معروفة يدوياً لكل بروتوكول.
-- السعر المستخرج يقع ضمن نطاق شمعة FOMO في غالبية عينة التطابق، مع تفسير الرسوم
-  والفروق الزمنية.
-- لا ثغرات cursor ولا تطبيق مكرر بعد إعادة التشغيل.
-- `Swap` وTransfer لا يخلطان؛ التحويل ليس صفقة إلا ضمن decoder البروتوكول.
+- The buy/sell direction is proven with manually known transactions for each protocol.
+- The extracted price falls within a FOMO candle's range in most of the match sample, with fees and
+  timing differences explained.
+- No cursor gaps and no duplicate application after restart.
+- `Swap` and Transfer are not mixed; a transfer is not a trade except within the protocol's decoder.
 
-## P8 - ميزات التنفيذ والمحافظ والحيتان
+## P8 - Execution, wallet, and whale features
 
-### أ. ميزات التنفيذ والسيولة
+### A. Execution and liquidity features
 
 - `pool_liquidity_usd_t0`
 - `pool_count`
@@ -579,272 +586,273 @@ CREATE TABLE dex_pool_snapshots (
 - `pool_age_h`
 - `fee_bps`
 
-### ب. تدفق DEX
+### B. DEX flow
 
-- حجم شراء وبيع 5 و15 و60 دقيقة.
-- عدد المشترين والبائعين الفريدين.
-- وسيط ومتوسط حجم الصفقة.
-- نسبة أكبر صفقة إلى الحجم.
-- نسبة حجم أفضل خمسة متداولين.
-- عدد الصفقات في نفس الكتلة.
-- اتساع الطلب: فريدون إلى عدد الصفقات.
+- Buy and sell volume over 5, 15, and 60 minutes.
+- Unique buyer and seller counts.
+- Median and mean trade size.
+- Largest trade's share of volume.
+- Top five traders' volume share.
+- Number of trades in the same block.
+- Demand breadth: uniques over trade count.
 
-### ج. المحافظ والحيتان
+### C. Wallets and whales
 
-- حائزون جدد وخارجون في 5 و15 و60 دقيقة.
-- حركة أكبر حائز وأكبر عشرة.
-- تحويلات المطور قبل الإشارة.
-- نسبة المعروض التي تحركت حديثاً.
-- محافظ ممولة من عنوان واحد، عند توفر مسار موثق.
-- تركيز أول المشترين.
+- New and exiting holders over 5, 15, and 60 minutes.
+- Movement of the largest holder and the largest ten.
+- Developer transfers before the signal.
+- Share of supply recently moved.
+- Wallets funded from a single address, where a documented path exists.
+- Early-buyer concentration.
 
-### د. أخطار الإدارة
+### D. Governance hazards
 
-- تغير الملكية أو السلطة.
-- أحداث mint وburn بعد بدء التداول.
-- تغير الرسوم أو حدود التداول.
-- سحب السيولة بواسطة المطور أو عنوان مرتبط به.
+- Ownership or authority changes.
+- mint and burn events after trading started.
+- Fee or trading-limit changes.
+- Liquidity withdrawal by the developer or an address linked to them.
 
-### قانون النقطة الزمنية
+### Point-in-time law
 
-- كل نافذة تنتهي عند `t0` حصراً لنموذج الدخول.
-- ميزات التأكيد عند `t0+Delta` تبنى في صف قرار منفصل مع `decision_ts` مختلف.
-- بيانات الخروج المستقبلية لا تدخل نموذج الدخول، لكنها قد تغذي نموذج خروج مستقل.
+- Every window ends strictly at `t0` for the entry model.
+- Confirmation features at `t0+Delta` are built in a separate decision row with a different `decision_ts`.
+- Future exit data does not enter the entry model, but it may feed a separate exit model.
 
-### بوابة القبول
+### Acceptance gate
 
-- اختبارات future-row لكل دالة ميزات.
-- تغطية ≥70% داخل شبكة/بروتوكول مدعوم قبل إدخال العائلة في نموذج تلك الشريحة.
-- لا تعمم ميزة بروتوكول واحد على شبكات أخرى؛ الغياب يبقى `NULL`.
-- محاكي التنفيذ يستخدم احتياطي الحوض لا `liquidity` الملخص وحده.
+- Future-row tests for every feature function.
+- Coverage ≥70% within a supported network/protocol before the family enters that segment's model.
+- A single protocol's feature is not generalized to other networks; absence stays `NULL`.
+- The execution simulator uses pool reserves, not the summarized `liquidity` alone.
 
-## P9 - إعادة البناء والتصدير وجودة مجموعة البيانات
+## P9 - Rebuild, export, and dataset quality
 
-### العمل
+### Work
 
-- رفع `FEATURE_VERSION` مرة واحدة لكل حزمة متماسكة، لا لكل عمود منفرد.
-- تحديث `schema.sql`, migrations, `db.py`, `features.py`, واختبارات التغطية.
-- بناء صفوف التدريب على دفعات مع قفل جيل EVM الحالي.
-- تحديث `model_training_rows` ليبقى واجهة وحيدة للتدريب المعتمد.
-- تحديث `export_dataset.py` ليصدر:
-  - ميزات المتداولين.
-  - حضور المصادر.
-  - ملخص DEX point-in-time.
-  - ملف تغطية حسب العائلة واليوم والشبكة.
-  - ملف provenance يربط كل ميزة بجدولها وقانون زمنها.
-- إضافة فحص forbidden columns آلياً بالاسم والدور، لا قائمة يدوية فقط.
-- قياس زمن بناء الصفوف وإزالة نمط N+1 في `train_pipeline.py` قبل إعادة التقييم.
+- Bump `FEATURE_VERSION` once per coherent bundle, not per individual column.
+- Update `schema.sql`, migrations, `db.py`, `features.py`, and coverage tests.
+- Build training rows in batches with the current EVM generation locked.
+- Update `model_training_rows` so it remains the single interface for approved training.
+- Update `export_dataset.py` to export:
+  - trader features.
+  - source presence.
+  - point-in-time DEX summaries.
+  - a coverage file by family, day, and network.
+  - a provenance file linking every feature to its table and time law.
+- Add an automated forbidden-columns check by name and role, not just a manual list.
+- Measure row-build time and remove the N+1 pattern in `train_pipeline.py` before re-evaluation.
 
-### بوابة القبول
+### Acceptance gate
 
-- إعادة بناء كاملة قابلة للاستئناف دون صفوف بإصدارات مختلطة في واجهة النموذج.
-- `feature_coverage.csv` يوضح القيم الممتلئة والحقب والشبكات.
-- اختبار توليدي يزرع صفوفاً بعد `t0` في كل جدول جديد ويتأكد أنها لا تغير الصف.
-- التصدير قابل لإعادة بناء الهدف من الشموع والأحداث دون الوصول للقاعدة الحية.
+- A full, resumable rebuild with no mixed-version rows in the model view.
+- `feature_coverage.csv` shows filled values, eras, and networks.
+- A generative test plants rows after `t0` in every new table and confirms they do not change the row.
+- The export can rebuild the target from candles and events without accessing the live database.
 
-## P10 - التقييم الزمني ودراسة الاستئصال
+## P10 - Time-based evaluation and the ablation study
 
-### مجموعات المقارنة
+### Comparison groups
 
-تدرب النماذج التالية بنفس التقسيم والهدف والتكلفة:
+The following models are trained with the same split, target, and cost:
 
-1. Baseline: القيمة السوقية والسيولة والزخم السعري فقط.
-2. Current: جميع الميزات الحالية قبل هذه الخطة.
+1. Baseline: market cap, liquidity, and price momentum only.
+2. Current: all features as of before this plan.
 3. Current + trader.
 4. Current + source path/clusters.
 5. Current + on-chain ownership.
 6. Current + DEX/execution.
 7. All accepted families.
 
-### البروتوكول
+### Protocol
 
-- Walk-forward زمني.
-- تقييم منفصل على عملات لم تظهر في التدريب.
-- Bootstrap بالعملة لا بالصف.
-- مقاييس تصنيف: ROC-AUC, PR-AUC, calibration, Brier.
-- مقاييس تداول: صافي العائد، الوسيط، نسبة الفوز، max drawdown، turnover، وعدد
-  الصفقات غير القابلة للتنفيذ.
-- تكاليف 2%, 3%, و5%، إضافة إلى نموذج انزلاق الحوض.
-- تقرير حسب اليوم والشبكة والبروتوكول والقيمة السوقية والسيولة.
-- لا اختيار ميزات أو عتبة على Test.
+- Time-based walk-forward.
+- Separate evaluation on tokens never seen in training.
+- Bootstrap by token, not by row.
+- Classification metrics: ROC-AUC, PR-AUC, calibration, Brier.
+- Trading metrics: net return, median, win rate, max drawdown, turnover, and the count of
+  unexecutable trades.
+- Costs of 2%, 3%, and 5%, plus a pool slippage model.
+- A report by day, network, protocol, market cap, and liquidity.
+- No feature or threshold selection on Test.
 
-### بوابة قبول عائلة ميزات
+### Feature-family acceptance gate
 
-العائلة مقبولة فقط إذا:
+A family is accepted only if:
 
-- تحسن Val زمنياً لا random split.
-- لا يعتمد التحسن على يوم واحد أو شبكة واحدة غير مقصودة.
-- لا يختفي عند العملات الجديدة.
-- لا ينقلب الربح إلى سالب بعد تكاليف التنفيذ.
-- فاصل الثقة وتحليل الحساسية لا يثبتان أن الأثر من عملة شاذة واحدة.
+- It improves Val over time, not on a random split.
+- The improvement does not depend on one day or one unintended network.
+- It does not vanish on new tokens.
+- Profit does not flip negative after execution costs.
+- The confidence interval and sensitivity analysis do not reveal the effect comes from one anomalous
+  token.
 
-### بوابة اعتماد النموذج
+### Model approval gate
 
-- بوابة الضابطة `v3` في `docs/PLAN.md` مستوفاة: 500 ضابطة ناضجة و14 يوماً على
-  الأقل، أو يوصف النموذج بالاستكشافي فقط.
-- صافي أعلى شريحة موجب بعد التكلفة والانزلاق.
-- يتفوق على كل baseline مجمد مسبقاً.
-- `AUC` العملات الجديدة وفاصل الثقة يدعمان أفضلية فعلية.
-- المعايرة مقبولة؛ احتمال 0.7 لا يعني 0.4 فعلياً.
+- The `v3` control-group gate in `docs/PLAN.md` is met: 500 mature controls and at least 14 days, or
+  the model is described as exploratory only.
+- The top segment's net is positive after cost and slippage.
+- It beats every pre-frozen baseline.
+- New-token `AUC` and the confidence interval support a real edge.
+- Calibration is acceptable; a 0.7 probability must not actually mean 0.4.
 
-## P11 - التداول الورقي والمراقبة
+## P11 - Paper trading and monitoring
 
-### سجل القرار
+### Decision record
 
-كل قرار، بما فيه الرفض، يسجل:
+Every decision, including rejections, logs:
 
 - `decision_id`, `model_version`, `feature_version`.
 - `signal_id`, token, network, `decision_ts`.
-- احتمال النموذج والعتبة.
-- الميزات أو hash صف الميزات.
-- أسباب الرفض: سيولة، انزلاق، تغطية، خطر عقد، أو احتمال.
-- السعر النظري وسعر التنفيذ الورقي.
-- حجم الصفقة المقترح والمحدود بالسيولة.
-- مصدر السعر والحوض والكتلة.
-- نتيجة التنفيذ والخروج والتكلفة الفعلية المحاكاة.
+- Model probability and threshold.
+- The features or the feature-row hash.
+- Rejection reasons: liquidity, slippage, coverage, contract risk, or probability.
+- Theoretical price and paper execution price.
+- Proposed trade size, capped by liquidity.
+- Price source and pool and block.
+- Execution, exit, and actual simulated cost outcome.
 
-### قواعد التشغيل
+### Operating rules
 
-- نموذج مجمد طوال الجولة.
-- لا تعديل للعتبة بعد رؤية الربح اليومي.
-- مدة لا تقل عن 14 يوماً، ويفضل 30 يوماً ونظامان سوقيان.
-- محفظة جديدة لكل إصدار، دون حذف سجل الإصدار السابق.
-- إن كانت البيانات الأساسية stale أو ناقصة، القرار `no_trade` لا تخمين.
+- A frozen model for the whole round.
+- No threshold adjustments after seeing daily profit.
+- A duration of at least 14 days, preferably 30 days and two market regimes.
+- A new wallet per version, without deleting the previous version's record.
+- If the underlying data is stale or incomplete, the decision is `no_trade`, not a guess.
 
-### بوابة الانتقال خارج الورق
+### Gate for leaving paper
 
-هذه الخطة لا تجيز التداول الحقيقي تلقائياً. يلزم قرار منفصل بعد:
+This plan does not permit real trading automatically. A separate decision is required after:
 
-- ربح ورقي صاف مستقر.
-- تراجع أقصى ضمن حد محدد مسبقاً.
-- عدد صفقات كاف وفترة كافية.
-- عدم اعتماد النتيجة على عملة أو يوم واحد.
-- تدقيق أمان مستقل لمسار التنفيذ وإدارة المفاتيح والمخاطر.
+- Stable net paper profit.
+- Max drawdown within a pre-set limit.
+- Sufficient trades and a sufficient period.
+- The result not depending on one token or one day.
+- An independent security audit of the execution path and key management and risks.
 
-## 7. الرصد والتشغيل
+## 7. Monitoring and operations
 
-### أسئلة يجب أن تجيب عنها المراقبة
+### Questions the monitoring must answer
 
-1. هل كل مصدر يتقدم أم يعيد نفس الصفوف؟
-2. ما نسبة الإشارات التي تملك لقطة صالحة لكل عائلة عند `t0`؟
-3. هل cursor لأي شبكة متأخر أو متجمد؟
-4. هل تغير شكل upstream وأصبحت أعمدة مهمة فارغة؟
-5. هل زمن الدورة يتجاوز ميزانيته ويؤخر مصادر أخرى؟
+1. Is every source advancing, or returning the same rows?
+2. What share of signals has a valid snapshot for every family at `t0`?
+3. Is any network's cursor lagging or frozen?
+4. Has upstream's shape changed so important columns became empty?
+5. Is the cycle time exceeding its budget and delaying other sources?
 
-### مقاييس إلزامية
+### Mandatory metrics
 
-- `collector_cycle_duration_seconds` لكل عملية.
-- نجاح وفشل ومدة كل upstream.
-- عمر آخر صف ناجح لكل مصدر وشبكة.
-- صفوف مكتوبة، مكررة، فارغة، وغير مدعومة.
-- backlog لكل حالة backfill/replay.
-- تغطية كل عائلة عند `t0` حسب اليوم.
-- معدل نمو القاعدة والـ WAL.
-- فشل البناء وعدد الصفوف المعلقة لكل feature version.
+- `collector_cycle_duration_seconds` per process.
+- Success, failure, and duration of every upstream.
+- Age of the last successful row per source and network.
+- Rows written, duplicated, empty, and unsupported.
+- backlog per backfill/replay state.
+- Every family's coverage at `t0` by day.
+- Database and WAL growth rate.
+- Build failures and pending row count per feature version.
 
-### إنذارات عملية
+### Practical alerts
 
-- feed أو signals بلا تقدم أكثر من 5 دقائق.
-- bars/social/holders تتجاوز ضعف إيقاعها المستهدف.
-- cursor شبكة لا يتقدم دورتين مع نجاح الرأس.
-- ارتفاع error rate لمصدر فوق 10% خلال 15 دقيقة.
-- هبوط حقل كان يغطي >80% إلى <20% في يوم جديد.
-- نمو قاعدة غير متوقع بأكثر من ضعفي المتوسط.
+- feed or signals with no progress for more than 5 minutes.
+- bars/social/holders exceeding twice their target cadence.
+- A network's cursor not advancing for two cycles while the head succeeds.
+- A source's error rate rising above 10% over 15 minutes.
+- A field that covered >80% dropping to <20% on a new day.
+- Unexpected database growth beyond twice the average.
 
-لا توضع token address أو trader id كـmetric labels؛ تستخدم في السجل المنظم فقط.
+No token address or trader id is placed as metric labels; they are used in structured logs only.
 
-## 8. الاختبارات المطلوبة
+## 8. Required tests
 
-### اختبارات الوحدة
+### Unit tests
 
-- مستخرج كل شكل خام حقيقي.
-- اتجاه Swap وحساب السعر والاحتياطي.
-- حساب ميزات المتداول والعناقيد.
-- `NULL` مقابل الصفر.
-- dedup باستخدام مفاتيح الحدث.
+- An extractor for every real raw shape.
+- Swap direction, price computation, and reserves.
+- Trader and cluster feature computation.
+- `NULL` versus zero.
+- dedup using event keys.
 
-### اختبارات النقطة الزمنية
+### Point-in-time tests
 
-لكل جدول جديد:
+For every new table:
 
-1. ابن صفاً عند `t0`.
-2. أضف قياساً أقوى بعد `t0`.
-3. أعد البناء.
-4. يجب أن يبقى الصف مطابقاً بايتياً في أعمدة العائلة.
+1. Build a row at `t0`.
+2. Add a stronger measurement after `t0`.
+3. Rebuild.
+4. The row must remain byte-identical in the family's columns.
 
-### اختبارات التكامل
+### Integration tests
 
-- دورة جمع مصغرة من raw fixture إلى الجداول.
-- إعادة تشغيل الدورة لا تكرر الأحداث.
-- cursor يستأنف بعد فشل وسط دفعة.
-- build rows يقرأ الإصدار الصحيح.
-- export يعيد هدفاً مطابقاً للمحاكاة المحلية.
+- A miniature collection cycle from a raw fixture to the tables.
+- Restarting the cycle does not duplicate events.
+- The cursor resumes after a mid-batch failure.
+- build rows reads the correct version.
+- export reproduces a target matching the local simulation.
 
-### اختبارات البيانات
+### Data tests
 
-- uniqueness وforeign linkage المنطقي.
-- timestamps غير مستقبلية بالنسبة إلى `recorded_at` ضمن حدود المصدر.
-- نسب التركيز بين 0 و100 مع توثيق الاستثناء.
-- الاحتياطي والحجوم غير سالبة.
-- كل `side` له token/quote amounts متسقة.
-- لا feature identifier عالي الكاردينالية.
+- Uniqueness and logical foreign linkage.
+- Timestamps not in the future relative to `recorded_at` within the source's bounds.
+- Concentration ratios between 0 and 100, with exceptions documented.
+- Reserves and volumes non-negative.
+- Every `side` has consistent token/quote amounts.
+- No high-cardinality feature identifiers.
 
-## 9. الترحيل والعودة الآمنة
+## 9. Migration and safe rollback
 
-- كل جدول جديد يضاف دون تعديل الخام القائم.
-- migrations قابلة لإعادة التشغيل.
-- الكتابة المزدوجة تبدأ قبل تحويل القراءة.
-- تظل القراءة القديمة متاحة حتى نجاح تقرير التطابق.
-- إذا فشل مصدر جديد، يعطل بعلم config وتستمر العمليات القديمة.
-- rollback يعني إيقاف القراءة من العائلة الجديدة، لا حذف بياناتها.
-- لا `git reset`, لا حذف قاعدة، ولا `DELETE` يدوي واسع أثناء التنفيذ.
+- Every new table is added without modifying existing raw data.
+- Migrations are re-runnable.
+- Dual writing starts before the read switchover.
+- The old read path stays available until the match report succeeds.
+- If a new source fails, it is disabled with a config flag and the old operations continue.
+- Rollback means stopping reads from the new family, not deleting its data.
+- No `git reset`, no database deletion, and no broad manual `DELETE` during execution.
 
-## 10. نقاط التوقف لتجنب تضخم المشروع
+## 10. Stopping points to avoid project bloat
 
-- لا يضاف endpoint جديد قبل قياس عينة خام وتباين حقوله.
-- لا يضاف عمود ثبت أنه ثابت أو تغطيته شبه صفر بلا خطة تحسن واضحة.
-- لا يدعم بروتوكول DEX ثان قبل نجاح الأول end-to-end.
-- لا يبنى تحليل sybil وتمويل محافظ قبل وجود جودة كافية في swaps/transfers.
-- لا تدخل بيانات نص الأطروحات قبل إثبات أن المجاميع والهوية والزمن أضافت قيمة.
-- إذا لم تحسن عائلة Val أو التنفيذ، تبقى مؤرشفة وتخرج من النموذج؛ لا نحاول إنقاذها
-  بضبط معاملات متكرر.
+- No new endpoint before measuring a raw sample and its field variance.
+- No column proven constant or with near-zero coverage enters without a clear improvement plan.
+- No second DEX protocol is supported before the first succeeds end-to-end.
+- No sybil and wallet-funding analysis is built before swaps/transfers quality is sufficient.
+- No thesis-text data enters before proving that aggregates, identity, and time added value.
+- If a family does not improve Val or execution, it stays archived and out of the model; we do not try to
+  rescue it with repeated parameter tuning.
 
-## 11. ترتيب التسليم المقترح
+## 11. Suggested delivery order
 
-### الإصدار A - صحة واستغلال الموجود
+### Release A - Integrity and exploiting what exists
 
 - P0, P1, P2, P3, P4.
-- قيمة مباشرة دون مزود خارجي جديد.
-- ينتج أول مقارنة صادقة لأثر المتداول ومسار المصدر.
+- Direct value without a new external provider.
+- Produces the first honest comparison of the trader and source-path effects.
 
-### الإصدار B - إكمال الكون التاريخي
+### Release B - Completing the historical universe
 
-- P5 وتغطية `tradingActivity` وتقارير التحيز.
-- لا يغير نموذج الاعتماد تلقائياً.
+- P5 and `tradingActivity` coverage and bias reports.
+- Does not change the approval model automatically.
 
-### الإصدار C - تنفيذ DEX تجريبي
+### Release C - Experimental DEX execution
 
-- P6 وP7 لبروتوكول واحد على شبكة واحدة.
-- يثبت قدرة حساب السعر والسيولة والانزلاق من السلسلة.
+- P6 and P7 for one protocol on one network.
+- Proves the ability to compute price, liquidity, and slippage from the chain.
 
-### الإصدار D - ميزات التنفيذ والنموذج
+### Release D - Execution features and the model
 
 - P8, P9, P10.
-- لا يعتمد إلا العائلات التي اجتازت التغطية والتقييم.
+- Only families that passed coverage and evaluation are adopted.
 
-### الإصدار E - تداول ورقي
+### Release E - Paper trading
 
-- P11 بعد بوابات البيانات والضابطة.
+- P11 after the data and control-group gates.
 
-## 12. تعريف الإنجاز الكامل
+## 12. Definition of full completion
 
-تعد الخطة منفذة عندما:
+The plan counts as executed when:
 
-- تكون حالة EVM النهائية مدققة وصفوف التدريب معاد بناؤها.
-- تدخل ميزات المتداول التاريخية وعناقيد المصدر دون تسرب.
-- يكون `tradingActivity` إما مكتملاً إلى حد موثق أو متوقفاً بسبب نهائي موثق.
-- يعمل adapter DEX واحد على الأقل end-to-end مع سيولة وانزلاق.
-- يصدر dataset provenance وتغطية كاملة.
-- يمر التقييم الزمني والاستئصال دون فتح Test للتطوير.
-- تعمل جولة تداول ورقي مجمدة بتسجيل قرارات وتنفيذ كامل.
-- تظل النتيجة المسموح بها واحدة من ثلاث: أفضلية مثبتة، لا أفضلية، أو غير حاسم.
+- The final EVM state is audited and the training rows are rebuilt.
+- Historical trader features and source clusters enter without leakage.
+- `tradingActivity` is either complete to a documented point or stopped for a documented final reason.
+- At least one DEX adapter works end-to-end with liquidity and slippage.
+- Dataset provenance and full coverage are exported.
+- The time-based evaluation and ablation pass without opening Test for development.
+- A frozen paper-trading round runs with full decision and execution logging.
+- The permitted outcome remains one of three: a proven edge, no edge, or inconclusive.

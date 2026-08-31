@@ -1,23 +1,26 @@
-"""إعادة ضبط عملات backfill العالقة إلى نقطة انضمامها.
+"""Reset stuck backfill tokens to their join point.
 
-التشخيص (مقيس 2026-08-27): 145 عملة `partial` في `evm_backfill_state`، 63 منها
-على مراقبات نشطة، ومداها المتبقي 13–77 **مليون** كتلة. بميزانية الدورة
-(12 نداءً × ~2000 كتلة) تحتاج العملة الواحدة ~20,000 دورة — أي أنّ الدورة
-تستهلك نداءات **لن تكتمل أبدًا** بلا صفوف مقابلها، والعملة في الأثناء محرومة
-من لقطات التركيز لأنّ `partial` مستثناة من التطبيق الحي.
+Diagnosis (measured 2026-08-27): 145 `partial` tokens in `evm_backfill_state`,
+63 of them on active watches, with remaining ranges of 13–77 **million**
+blocks. At the cycle budget (12 calls × ~2000 blocks) a single token needs
+~20,000 cycles — meaning the cycle burns calls on a range that will **never
+complete** with no rows to show for it, while the token is meanwhile denied
+concentration snapshots because `partial` is excluded from the live layer.
 
-الحل: البدء من **كتلة لحظة الانضمام** (`first_seen_at`) لا من فجر السلسلة.
-هذا آمن رياضيّاً لأي صفٍّ مستقبليّ: كل `t0` ممكن للعملة ≥ لحظة انضمامها،
-فالتاريخ قبلها لا تدخله أي ميزة. صفوف التدريب القائمة لا تُمسّ أصلاً —
-قاعدة الدفتر تراكميّة والصفوف الجديدة تُبنى فوق الحاضر.
+The fix: start from the **join-time block** (`first_seen_at`), not the dawn of
+the chain. This is mathematically safe for any future row: every possible `t0`
+for a token is ≥ its join moment, so no feature ever reads the history before
+it. Existing training rows are untouched — the ledger is cumulative and new
+rows are built on top of the present.
 
-الأرصدة الناقصة قبل نقطة البداية مقصودة وموثّقة: الدفتر يقيس «التوزيع منذ
-راقبنا» لا «التوزيع منذ الولادة» — نفس دلالة لقطات سولانا التي لا تعرف
-غير 20 حساباً أصلاً.
+Balances missing before the starting point are deliberate and documented: the
+ledger measures "distribution since we watched", not "distribution since
+birth" — the same semantics as Solana snapshots, which only ever know 20
+accounts anyway.
 
-الاستعمال:
-    python reset_stuck_backfills.py            # تشخيص فقط (قراءة)
-    python reset_stuck_backfills.py --apply    # إعادة الضبط فعلياً
+Usage:
+    python reset_stuck_backfills.py            # diagnosis only (read-only)
+    python reset_stuck_backfills.py --apply    # actually reset
 """
 from __future__ import annotations
 
@@ -32,20 +35,21 @@ if str(HERE) not in sys.path:
 import config  # noqa: E402
 from db import RecorderDB  # noqa: E402
 
-# حدّ الواقعية: مدى أقصر من هذا يُترك يكتمل بالطريقة العادية.
-# (عملة انضمت حديثاً ومداها المتاح أصلاً قصير — لا داعي لتدخّلنا.)
+# Reality threshold: a remaining range shorter than this is left to complete
+# the normal way. (A token that joined recently whose available range is short
+# anyway — no reason for us to intervene.)
 REMAINING_BLOCK_THRESHOLD = 2_000_000
 
 
 def _block_clock_secs(network_id: str) -> int:
-    """متوسط زمن الكتلة بالثواني حسب الشبكة (قيم مقيسة معروفة)."""
+    """Average block time in seconds per network (known measured values)."""
     return {"4663": 12, "8453": 2, "143": 12, "56": 3}.get(str(network_id), 12)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true",
-                    help="نفّذ إعادة الضبط؛ بدونه تشخيص قراءة فقط")
+                    help="perform the reset; without it, a read-only diagnosis")
     args = ap.parse_args()
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
@@ -73,17 +77,19 @@ def main() -> int:
                 continue
             join_epoch = int(ts.timestamp())
             clock = _block_clock_secs(net)
-            # كتلة تقريبية للانضمام: نحسبها من الرأس الحالي المعلوم في الحالة
-            # نفسها (to_block هو أعلى كتلة رأتها التعبئة) ناقص عمر الانضمام.
+            # Approximate join block: computed from the current head known in
+            # the state itself (to_block is the highest block the fill has
+            # seen) minus the age since joining.
             age_secs = max(0, int(datetime.now().timestamp()) - join_epoch)
             join_block = max(0, int(tb) - age_secs // clock)
-            # لو نقطة الانضمام لا توفّر شيئاً (العملة قديمة على المنصة لكن
-            # انضمتنا قديمة أيضاً) فهذا هو أفضل ما نستطيع — المهم أنّ المدى
-            # الجديد قابل للإنجاز.
+            # If the join point buys nothing (the token is old on the platform
+            # but we also joined long ago) then that is the best we can do —
+            # what matters is that the new range is achievable.
             remaining = int(tb) - join_block
             if remaining > REMAINING_BLOCK_THRESHOLD:
-                # حتى نقطة الانضمام بعيدة (نافذة مراقبة قديمة جداً) — نبدأ
-                # من حدّ الواقعية قبل الرأس مباشرة: القصّ الأقصى الموثّق.
+                # Even the join point is far away (a very old watch window) —
+                # start from the reality threshold just below the head: the
+                # documented maximum cutoff.
                 join_block = max(0, int(tb) - REMAINING_BLOCK_THRESHOLD)
             resettable.append((net, token, fb, tb, join_block, active))
         print(f"stuck partial tokens (>{REMAINING_BLOCK_THRESHOLD:,} blocks "
@@ -91,7 +97,7 @@ def main() -> int:
         active_n = sum(1 for r in resettable if r[5])
         print(f"resettable: {len(resettable)} (still-active watches: {active_n})")
         if not resettable:
-            print("لا شيء يستدعي إعادة ضبط.")
+            print("nothing needs a reset.")
             return 0
 
         for net, token, fb, tb, join_block, _active in resettable[:10]:
@@ -99,7 +105,7 @@ def main() -> int:
                   f"({int(tb)-int(fb):,} blk) => new from {join_block:,}")
 
         if not args.apply:
-            print("\nتشخيص فقط — مرّر --apply للتنفيذ.")
+            print("\ndiagnosis only — pass --apply to execute.")
             return 0
 
         from db import utcnow_iso
@@ -108,7 +114,7 @@ def main() -> int:
         with db.batch():
             for net, token, _fb, _tb, join_block, _active in resettable:
                 db.restart_evm_backfill_from(token, net, int(join_block), now)
-        print(f"تمت إعادة ضبط {len(resettable)} عملة إلى نقطة انضمامها.")
+        print(f"reset {len(resettable)} tokens to their join point.")
         return 0
     finally:
         db.close()

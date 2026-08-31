@@ -1,18 +1,24 @@
-"""تسخينُ الذاكرة المؤقّتة عند الإقلاع — أولُ زائرٍ لا يدفع ثمن البرودة.
+"""Warming the cache at boot — the first visitor doesn't pay the cold price.
 
-المشكلة المقيسة (2026-08-29): إقلاعُ اللوحة يبدأ بذاكرةٍ فارغة، فأوّلُ من يفتح
-الصفحة ينتظر المسارات الثقيلة الثلاثة بالتوازي — 3.4 ثانية للشبكات، 1.7 للتوسيم،
-1.0 للأعداد — لأنّ `Promise.all` في الصفحة ينتظر أبطأها قبل رسم أيّ شيء.
+The measured problem (2026-08-29): the dashboard boots with an empty cache,
+so the first one to open the page waits for the three heavy routes in
+parallel — 3.4 seconds for networks, 1.7 for labeling, 1.0 for counts —
+because `Promise.all` in the page waits for the slowest of them before
+painting anything.
 
-والحلُّ جاهزٌ في `cache.py` منذ البداية: دالةُ `warm()` موثّقةٌ «للاستدعاء من خيطٍ
-خلفيّ عند الإقلاع» لكن لا أحد يستدعيها. هذا الملف يثبّت العقد:
+And the fix has been ready in `cache.py` from the start: the `warm()`
+function is documented as "for calling from a background thread at boot" but
+nobody calls it. This file pins the contract:
 
-1. **الإقلاعُ يسخّن.** `serve_dashboard.py` يُشعل خيطًا واحدًا بعد الاستماع،
-   يسخّن المفاتيح الثقيلة بالترتيب. الفشلُ يُسجَّل ولا يُسقط الإقلاع.
-2. **التسخينُ يخدم.** بعد انتهائه لا يُنفَّذ الحساب البارد في الطلب الأوّل —
-   `cache.MEMO.get` يجد القيمة فيُعيدها فورًا (تُختبر عبر `TTLMemo` حرفيًا).
-3. **الصمتُ التشغيليّ.** التسخينُ لا يطبع ولا يكتب في سجلٍّ إلا عند الفشل، لأنّه
-   يُشغَّل مع كل إقلاعٍ للمهمّة المجدولة (والخادمُ يعيد إطلاقها بعد كل إقلاع).
+1. **Boot warms.** `serve_dashboard.py` starts a single thread after
+   listening, warming the heavy keys in order. A failure is logged and
+   doesn't take the boot down.
+2. **Warming serves.** After it finishes, no cold computation runs on the
+   first request — `cache.MEMO.get` finds the value and returns it
+   immediately (tested through `TTLMemo` literally).
+3. **Operational silence.** The warmup prints nothing and writes no log
+   except on failure, because it runs on every boot of the scheduled task
+   (and the server relaunches it after every boot).
 """
 import threading
 
@@ -22,11 +28,11 @@ import warmup
 
 
 def test_warmup_heats_all_heavy_keys():
-    """الخيطُ يسخّن المفاتيح الثقيلة الثلاثة — بالتوازي، فلا ينتظر أحدها الآخر.
+    """The thread warms the three heavy keys — in parallel, so none waits for another.
 
-    المقيس: التسخينُ التتابعيّ كان يجعل `labeling` يُجاب بعد **مجموع** أزمنة
-    الشبكات والتوسيم (3.4+1.5 ثانية) لمن سبق خيطَ التسخين. التوازيُّ يجعل كلَّ
-    مفتاحٍ جاهزًا خلال زمنه الخاص.
+    Measured: sequential warming made `labeling` answer after the **sum** of
+    the networks and labeling times (3.4+1.5 seconds) for whoever beat the
+    warmup thread. Parallelism has every key ready within its own time.
     """
     computed: set[str] = set()
 
@@ -45,11 +51,11 @@ def test_warmup_heats_all_heavy_keys():
 
 
 def test_warmup_survives_a_failing_key_and_continues():
-    """مفتاحٌ فاشل لا يُوقف البقيّة — التسخينُ مساعاةٌ لا شرطَ إقلاع.
+    """A failing key doesn't stop the rest — warming is a courtesy, not a boot condition.
 
-    القاعدةُ قد تكون مشغولةٌ بالمسجّل لحظة الإقلاع؛ فشلُ مفتاحٍ واحدٍ (استثناءٌ
-    يُرفع من `compute`) يجب أن يُسجَّل ويمرّ، لا أن يقتل خيط التسخين كلَّه قبل
-    المفاتيح الباقية.
+    The database may be busy with the recorder at boot; one key's failure (an
+    exception raised from `compute`) must be logged and passed by, not kill
+    the whole warmup thread before the remaining keys.
     """
     calls: list[str] = []
 
@@ -70,10 +76,11 @@ def test_warmup_survives_a_failing_key_and_continues():
 
 
 def test_a_warmed_cache_answers_the_first_request_without_cold_compute():
-    """العقدُ كلُّه هنا: بعد التسخين لا يُنفَّذ حسابٌ باردٌ في الطلب الأوّل.
+    """The whole contract is here: after warming, no cold computation runs on the first request.
 
-    `warm()` نفسُها استدعت `get()`: القيمةُ موجودةٌ داخلَ مدّتها، فأوّلُ طلبٍ حقيقيّ
-    يُجاب من الذاكرة، وأيُّ `compute` يُمرَّر له بعد التسخين لا يُنفَّذ أصلًا.
+    `warm()` itself called `get()`: the value exists within its lifetime, so
+    the first real request is answered from memory, and any `compute` passed
+    to it after the warming never runs at all.
     """
     memo = cache.TTLMemo()
 
@@ -82,7 +89,7 @@ def test_a_warmed_cache_answers_the_first_request_without_cold_compute():
     memo.warm("labeling", ttl=300.0, compute=compute)
 
     def never():
-        raise AssertionError("لا يجب أن يُنفَّذ — القيمة مسخَّنة")
+        raise AssertionError("must not run — the value is warmed")
 
     value, meta = memo.get("labeling", 300.0, never)
     assert value == {"value": 41}
@@ -91,7 +98,7 @@ def test_a_warmed_cache_answers_the_first_request_without_cold_compute():
 
 
 def test_warmup_thread_is_daemon_and_runs_after_start():
-    """الخيطُ خفيٌّ (daemon) لا يمنع انطفاء العمليّة — عقدُّ الخيوط الخلفيّة هنا."""
+    """The thread is a daemon and doesn't prevent the process from exiting — the contract for background threads here."""
     started = threading.Event()
     probe = {"spawned": False}
 
@@ -114,10 +121,11 @@ def test_warmup_thread_is_daemon_and_runs_after_start():
 
 
 def test_warmup_uses_the_live_memo_and_config_ttls():
-    """يستعملُ ذاكرةَ العمليّة الحقيقيّة وأعمارَ config — لا ذاكرة اختبار.
+    """It uses the real process cache and config's lifetimes — not a test cache.
 
-    بلا هذا الحرس قد يُبنى التسخينُ على نسخةٍ من `TTLMemo` لا تصلها الطلبات،
-    فيخضرّ الاختبارُ والخادمُ باردٌ كما كان.
+    Without this guard the warmup could be built against a copy of `TTLMemo`
+    that requests never reach, and the test would go green while the server
+    stayed as cold as before.
     """
     seen: dict[str, float] = {}
 
@@ -151,7 +159,7 @@ def config_ttls():
 
 @pytest.mark.parametrize("missing", ["network_summary", "labeling", "table_counts"])
 def test_every_heavy_key_is_covered_by_warmup(missing):
-    """الحرسُ من الانحراف: مفتاحٌ ثقيلٌ جديدٌ بلا تسخينٍ يُكشف فورًا."""
+    """The guard against drift: a new heavy key without warming is caught immediately."""
     keys = {key for key, _ttl in warmup.HEAVY_KEYS}
 
     assert missing in keys

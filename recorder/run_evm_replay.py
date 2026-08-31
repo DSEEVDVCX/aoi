@@ -1,7 +1,9 @@
-"""عامل الإعادة التاريخية المجدول لقياسات تركّز حائزي EVM.
+"""The scheduled worker for historical replay of EVM holder-concentration
+measurements.
 
-يعمل منفصلاً عن `FomoChain`: الالتقاط الحي لا ينتظر الأرشيف القديم، والإعادة
-تلتقط عملة واحدة في الدورة وتستأنف من `evm_replay_state` بعد أي توقف.
+It runs separately from `FomoChain`: live capture does not wait for the old
+archive, and the replay captures one token per cycle and resumes from
+`evm_replay_state` after any stop.
 """
 from __future__ import annotations
 
@@ -33,7 +35,8 @@ def _log(message: str) -> None:
 
 
 def _next_network(db, networks: tuple[str, ...]) -> tuple[str, str]:
-    """يعيد الشبكة الحالية والتالية، مع استرداد آمن من إعداد قديم."""
+    """Returns the current and next network, with safe recovery from a
+    stale setting."""
     saved = str(db.get_meta("evm_replay_next_network") or "")
     current_index = networks.index(saved) if saved in networks else 0
     current = networks[current_index]
@@ -42,28 +45,35 @@ def _next_network(db, networks: tuple[str, ...]) -> tuple[str, str]:
 
 
 def _stamp(db, pairs: dict) -> None:
-    """أختامٌ دفتريّة تُكتب إن أمكن ولا تُسقط دورةً نجحت.
+    """Bookkeeping stamps that write when they can and never fail a cycle
+    that succeeded.
 
-    `set_meta` عاريةً هنا كانت تجعل قفلَ القاعدة يُسجَّل «cycle crashed» عن دورةٍ
-    تمّت وكُتبت صفوفُها فعلاً. أسوأُ ما تفقده هذه الطريقة هو موضعُ الدوران بين
-    الشبكات، فتُعاد نفس الشبكة مرّةً — وهو أرخص من كذبةٍ في السجلّ واللوحة.
+    A bare `set_meta` here used to make a database lock log "cycle crashed"
+    for a cycle that completed and whose rows were actually written. The
+    worst this method can lose is the rotation position between networks, so
+    the same network is replayed once more — cheaper than a lie in the log
+    and on the dashboard.
     """
     for key, value in pairs.items():
         db.note_error(key, value)
 
 
-# ما ليس عدّاد عمل: اسمُ الشبكة، عددُ الشبكات المطلوبة، المرفوضة منها، والزمن.
+# Not a work counter: the network's name, the number of requested networks,
+# the refused ones, and the time.
 _NOT_WORK = frozenset({"network", "networks", "refused_networks", "seconds"})
 
 
 def _worked(stats: dict) -> bool:
-    """هل جرى عملٌ أو خطأ في هذه الدورة؟ **بالاستثناء لا بالتعداد**.
+    """Did this cycle do any work or hit an error? **By exclusion, not
+    enumeration**.
 
-    كان الشرط `stats["tokens"] or stats["errors"]`، وفرعُ المساعدة الحيّة يعيد
-    مفاتيح أخرى تماماً (`evm_backfill_*`) ويرجع قبل أن يصل إلى تلك — فبقي السجلّ
-    صامتاً أربع ساعات والعامل يعمل سليماً، واحتاج التشخيص قراءة `meta` بدلاً منه.
-    قائمةُ مفاتيحٍ مسموحة كانت ستُكرّر العطب عند أوّل مفتاح جديد، فنستثني ما ليس
-    عدّاداً ونعدّ الباقي: المفتاح الجديد يُحسب تلقائياً.
+    The condition used to be `stats["tokens"] or stats["errors"]`, but the
+    live-assist branch returns entirely different keys (`evm_backfill_*`)
+    and returns before reaching those — so the log stayed silent for four
+    hours while the worker ran fine, and diagnosis required reading `meta`
+    instead of it. An allow-list of keys would have repeated the failure at
+    the first new key, so we exclude what is not a counter and count the
+    rest: a new key is counted automatically.
     """
     for key, value in stats.items():
         if key in _NOT_WORK or isinstance(value, bool):
@@ -132,13 +142,13 @@ def _check_config() -> int:
         "EVM_REPLAY_HEAD_GRACE_SECONDS",
     ):
         if not hasattr(config, name):
-            print(f"config.{name} مفقود", file=sys.stderr)
+            print(f"config.{name} is missing", file=sys.stderr)
             return 1
     if not config.EVM_REPLAY_NETWORKS:
-        print("لا توجد شبكات إعادة EVM مفعَّلة", file=sys.stderr)
+        print("no EVM replay networks enabled", file=sys.stderr)
         return 1
     if not os.path.exists(config.DB_PATH):
-        print(f"قاعدة البيانات غير موجودة: {config.DB_PATH}", file=sys.stderr)
+        print(f"database not found: {config.DB_PATH}", file=sys.stderr)
         return 1
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
@@ -149,14 +159,15 @@ def _check_config() -> int:
         )
     finally:
         db.close()
-    # لا سطرَ مفاتيح هنا: المسارُ كلّه على العقد الرسميّة بلا مفتاح (انظر
-    # `GOLDRUSH_REPLAY_CHAINS` المحذوف في config والمصيدة #29). فإن أُضيف
-    # مزوّدٌ بمفتاح يوماً فليُضَف عدُّه هنا — **عدداً لا قيمة** (FR-013).
+    # No key line here: the whole path runs on official nodes without a key
+    # (see the deleted `GOLDRUSH_REPLAY_CHAINS` in config and trap #29). If a
+    # keyed provider is ever added, add its count here — **a count, not a
+    # value** (FR-013).
     print(
-        f"ok · شبكات: {','.join(map(str, config.EVM_REPLAY_NETWORKS))}"
-        f" · عملة/دورة: {config.EVM_REPLAY_TOKENS_PER_CYCLE}"
-        f" · معلّق: {pending}"
-        f" · نبضة السجلّ: {config.EVM_REPLAY_HEARTBEAT_SECONDS}ث"
+        f"ok · networks: {','.join(map(str, config.EVM_REPLAY_NETWORKS))}"
+        f" · tokens/cycle: {config.EVM_REPLAY_TOKENS_PER_CYCLE}"
+        f" · pending: {pending}"
+        f" · log heartbeat: {config.EVM_REPLAY_HEARTBEAT_SECONDS}s"
     )
     return 0
 
@@ -171,8 +182,9 @@ async def _main(cycles: int | None = None) -> None:
     rpc = evm_rpc.EVMRPC()
     nodereal = NodeRealRPC()
     count = 0
-    # `None` لا `monotonic()`: أوّل دورة تسجّل دائماً مهما كانت خاملة، فسطرُ
-    # الإقلاع هو الدليل الوحيد على أنّ العامل نهض بعد إعادة التشغيل.
+    # `None`, not `monotonic()`: the first cycle always logs no matter how
+    # idle it is, because the startup line is the only proof that the worker
+    # came up after a restart.
     last_logged: float | None = None
     try:
         while cycles is None or count < cycles:
@@ -185,35 +197,43 @@ async def _main(cycles: int | None = None) -> None:
                 elif last_logged is None or (
                     started - last_logged >= config.EVM_REPLAY_HEARTBEAT_SECONDS
                 ):
-                    # نبضة: «حيٌّ ولا عمل مستحقّ». الصمت التامّ يشبه الموت تماماً.
+                    # A heartbeat: "alive, with no work due". Total silence
+                    # looks exactly like death.
                     _log(f"idle: {stats}")
                     last_logged = started
             except Exception as exc:  # noqa: BLE001 - one cycle must not kill the worker
                 import traceback
 
                 _log("cycle crashed:\n" + traceback.format_exc())
-                # الإنقاذُ **قبل** الختم: لقطةُ قراءةٍ سُبقت في WAL تردّ كلَّ
-                # كتابةٍ من هذا الاتّصال بـ`database is locked` بلا أن تنفع
-                # المهلة، فلو كُتب `note_error` أوّلاً سقط هو أيضاً وضاع السطر
-                # الوحيد الذي تعرضه اللوحة. وهذا العامل أخطرُ الأربعة على هذا
-                # الباب: `run_cycle` كلُّها اتّصالٌ واحد بأربع طبقاتٍ كاتبة.
-                # التفصيل والحادثة المقيسة في `db.recover_connection`.
+                # Recovery **before** the stamp: a read snapshot overtaken in
+                # WAL rejects every write from this connection with
+                # `database is locked`, and no timeout helps — so if
+                # `note_error` were written first, it would fail too, and the
+                # one line the dashboard shows would be lost. And this worker
+                # is the most dangerous of the four on this front: all of
+                # `run_cycle` is one connection with four writing layers. The
+                # detail and the measured incident are in
+                # `db.recover_connection`.
                 try:
                     _log(f"connection recovery: {db.recover_connection()}")
-                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                except Exception as rec_exc:  # noqa: BLE001 — a rescue hand that must not kill the loop
                     _log(f"connection recovery failed: {type(rec_exc).__name__}")
-                # وفي `meta` أيضاً: السجلُّ ملفٌّ على القرص لا يقرأه أحد، واللوحة
-                # كانت تعرض كل طابور إلّا هذا — فتعثّرٌ دائم هنا كان صامتاً
-                # مرّتين. سطرٌ واحد بالنوع والرسالة، والأثر الكامل في السجلّ.
+                # And in `meta` as well: the log is a file on disk that
+                # nobody reads, and the dashboard used to show every queue
+                # but this one — so a persistent failure here was silent
+                # twice. One line with the type and the message; the full
+                # trace in the log.
                 db.note_error(
                     "last_error_evm_replay",
                     f"{utcnow_iso()}: {type(exc).__name__}: {exc}"[:400],
                 )
-                # التعثّر سطرٌ أيضاً ⇒ يؤجّل النبضة: أثرُ الانهيار أبلغ منها.
+                # A failure is a line too ⇒ it postpones the heartbeat: a
+                # crash says more than a heartbeat does.
                 last_logged = started
-            # ولا تقريرَ أحواضٍ لهذا المالك: لا مفتاح على مسار الإعادة، وصفٌّ
-            # فارغ في اللوحة أسوأ من غيابه. (كان `provider_keys_replay` يحمل
-            # حوض GoldRush وحده، فحُذف الصفُّ مع المزوّد.)
+            # And no pool report for this owner: there is no key on the
+            # replay path, and an empty queue on the dashboard is worse than
+            # its absence. (`provider_keys_replay` used to hold the GoldRush
+            # pool alone, and the row was deleted with the provider.)
             count += 1
             if cycles is not None and count >= cycles:
                 break

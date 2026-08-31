@@ -1,4 +1,4 @@
-"""اختبارات فلتر الإشارة المتأخرة (MAX_PRE_SIGNAL_RUNUP)."""
+"""Tests for the late-signal filter (MAX_PRE_SIGNAL_RUNUP)."""
 import pytest
 from db import RecorderDB
 
@@ -14,7 +14,7 @@ def db(tmp_path):
 
 def _bars(db: RecorderDB, token: str, *, start_px: float, end_px: float,
           n: int = 24, end_ts: int = 1_787_600_000) -> None:
-    """n شمعة مكتملة قبل end_ts، سعر خطّي من start_px إلى end_px."""
+    """n completed bars before end_ts, a linear price from start_px to end_px."""
     rows = []
     for i in range(n):
         px = start_px + (end_px - start_px) * i / max(n - 1, 1)
@@ -29,10 +29,10 @@ def _bars(db: RecorderDB, token: str, *, start_px: float, end_px: float,
 
 
 def test_late_signal_rejected(db, monkeypatch):
-    """صعود 200% قبل الإشارة ⇒ رفض المراقبة (فخ سيولة متأخر)."""
+    """A 200% runup before the signal ⇒ watch rejected (a late liquidity trap)."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
-    _bars(db, "LATEx", start_px=1.0, end_px=3.0)   # log(3.0/1.0)=1.10 > 1.5? لا
-    _bars(db, "LATE2x", start_px=1.0, end_px=6.0)  # log(6)=1.79 > 1.5 ⇒ رفض
+    _bars(db, "LATEx", start_px=1.0, end_px=3.0)   # log(3.0/1.0)=1.10 > 1.5? no
+    _bars(db, "LATE2x", start_px=1.0, end_px=6.0)  # log(6)=1.79 > 1.5 ⇒ reject
     t0 = 1_787_600_000
     runup = recorder.pre_signal_runup(db, "LATE2x", "1399811149", t0)
     assert runup is not None and runup > 1.5
@@ -41,7 +41,7 @@ def test_late_signal_rejected(db, monkeypatch):
 
 
 def test_early_signal_allowed(db, monkeypatch):
-    """بلا صعود سابق ⇒ الإشارة مبكرة وتُقبل."""
+    """No prior runup ⇒ the signal is early and accepted."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     _bars(db, "EARLYx", start_px=1.0, end_px=1.1)
     t0 = 1_787_600_000
@@ -50,9 +50,9 @@ def test_early_signal_allowed(db, monkeypatch):
 
 
 def test_no_history_is_allowed(db, monkeypatch):
-    """بلا شموع قبل الإشارة (عملة جديدة تمامًا) ⇒ مجهول الصعود، يُقبل:
-    البوابة تحكم بالمتأخر الموثَّق لا بالجاهل — والصاعد حديثًا بلا تاريخ
-    هو بالضبط الإشارة المبكرة التي نريدها."""
+    """No bars before the signal (a brand-new coin) ⇒ runup unknown, accepted:
+    the gate rules on documented lateness, not on ignorance — and a recently
+    pumping coin with no history is precisely the early signal we want."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     t0 = 1_787_600_000
     verdict = recorder.runup_verdict(db, "NOBARx", "1399811149", t0)
@@ -60,7 +60,7 @@ def test_no_history_is_allowed(db, monkeypatch):
 
 
 def test_filter_disabled_when_zero(db, monkeypatch):
-    """MAX_PRE_SIGNAL_RUNUP=0 يعطّل الفلتر تمامًا (سلوك ما قبل 2026-08-27)."""
+    """MAX_PRE_SIGNAL_RUNUP=0 disables the filter entirely (pre-2026-08-27 behavior)."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 0)
     _bars(db, "ANYLATE", start_px=1.0, end_px=10.0)
     t0 = 1_787_600_000
@@ -69,7 +69,8 @@ def test_filter_disabled_when_zero(db, monkeypatch):
 
 
 async def test_record_feed_rejects_late(db, monkeypatch, policy):
-    """تكامل: إشارة على عملة صعدت 3x قبلها لا تفتح مراقبة، وتُعدّ في العدّاد."""
+    """Integration: a signal on a coin that ran up 3x before it opens no watch,
+    and is counted in the counter."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     monkeypatch.setattr(recorder.config, "MIN_TOKEN_AGE_DAYS", 0)
     _bars(db, "VERYLATE", start_px=1.0, end_px=8.0)   # log(8)=2.08
@@ -88,8 +89,8 @@ async def test_record_feed_rejects_late(db, monkeypatch, policy):
     admitted = await recorder.record_feed(
         db, raw, now_iso, lambda _id: None, {}, policy, stats,
     )
-    assert stats["signals"] == 1            # الإشارة محفوظة دائمًا
-    assert stats["watch_added"] == 0        # لكن المراقبة مرفوضة
+    assert stats["signals"] == 1            # the signal is always kept
+    assert stats["watch_added"] == 0        # but the watch is rejected
     assert stats["runup_rejected"] == 1
     assert admitted == set()
 

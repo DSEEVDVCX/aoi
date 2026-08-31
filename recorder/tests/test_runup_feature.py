@@ -1,4 +1,4 @@
-"""اختبارات ميزة pre_signal_runup (fv13) — موضع الصعود كقياس مستمر."""
+"""Tests for the pre_signal_runup feature (fv13) — runup position as a continuous measurement."""
 import features
 import pytest
 from db import RecorderDB
@@ -13,7 +13,7 @@ def db(tmp_path):
 
 def _bars(db: RecorderDB, token: str, closes: list[float], *,
           end_ts: int = 1_787_600_000) -> None:
-    """شموع مكتملة قبل end_ts، إغلاقها closes بالترتيب الزمني."""
+    """Completed bars before end_ts, with `closes` as their closes in chronological order."""
     n = len(closes)
     rows = []
     for i, px in enumerate(closes):
@@ -31,8 +31,8 @@ T0 = 1_787_600_000
 
 
 def test_runup_matches_window_start(db):
-    """صعود من أول شمعة في نافذة 24س إلى الإغلاق الأخير قبل t0."""
-    # 24 شمعة من 1.0 إلى 2.0: runup = log(2.0/1.0)
+    """Runup from the first bar in a 24h window to the last close before t0."""
+    # 24 bars from 1.0 to 2.0: runup = log(2.0/1.0)
     closes = [1.0 + i / 23 for i in range(24)]
     _bars(db, "RUNx", closes)
     out = features.price_history_features(db, "RUNx", "1399811149", T0)
@@ -42,42 +42,42 @@ def test_runup_matches_window_start(db):
 
 
 def test_runup_uses_only_last_24h(db):
-    """شموع أقدم من 24 ساعة لا تدخل البسط — النافذة 288 شمعة لا كل التاريخ."""
-    # 300 شمعة (25 ساعة): القديمة جداً يجب أن تُستبعد من نافذة 24س
+    """Bars older than 24 hours do not enter the numerator — the window is 288 bars, not all of history."""
+    # 300 bars (25 hours): the very old ones must be excluded from the 24h window
     closes = [10.0] * 12 + [1.0 + i / 275 for i in range(276)]
     _bars(db, "WINx", closes)
     out = features.price_history_features(db, "WINx", "1399811149", T0)
     import math
 
-    # النافذة = آخر 288 شمعة: تبدأ من ~1.5 وليس 10.0
+    # The window = the last 288 bars: starts from ~1.5, not 10.0
     window_first = closes[-288]
     expected = math.log(closes[-1] / window_first)
     assert out["pre_signal_runup"] == pytest.approx(expected, rel=1e-6)
 
 
 def test_runup_null_when_insufficient_history(db):
-    """أقل من 12 شمعة ⇒ NULL (غياب مقيس لا صفر)."""
+    """Fewer than 12 bars ⇒ NULL (a measured absence, not zero)."""
     _bars(db, "NEWx", [1.0, 1.1, 1.2])
     out = features.price_history_features(db, "NEWx", "1399811149", T0)
     assert out["pre_signal_runup"] is None
 
 
 def test_runup_zero_for_flat_history(db):
-    """تاريخ كامل بلا حركة ⇒ 0.0 بالضبط (قياس لا غياب)."""
+    """A full history with no movement ⇒ exactly 0.0 (a measurement, not an absence)."""
     _bars(db, "FLATx", [1.0] * 24)
     out = features.price_history_features(db, "FLATx", "1399811149", T0)
     assert out["pre_signal_runup"] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_feature_declared_in_columns():
-    """العمود مواطن من الدرجة الأولى في FEATURE_COLUMNS وfv13."""
+    """The column is a first-class citizen in FEATURE_COLUMNS and fv13."""
     assert "pre_signal_runup" in features.FEATURE_COLUMNS
     assert features.FEATURE_VERSION >= 13
 
 
 def test_runup_never_uses_post_t0_bars(db):
-    """قانون النقطة الزمنية: شموع بعد t0 لا تدخل الحساب إطلاقًا."""
-    # 24 شمعة هادئة قبل t0 ثم 12 شمعة صاروخية بعده
+    """The point-in-time law: bars after t0 never enter the calculation."""
+    # 24 quiet bars before t0, then 12 rocket bars after it
     before = [1.0 + i / 23 * 0.1 for i in range(24)]
     _bars(db, "LEAKx", before, end_ts=T0)
     rows = [{

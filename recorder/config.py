@@ -1,43 +1,43 @@
-"""إعدادات مسجّل البيانات التاريخي.
+"""Configuration for the historical data recorder.
 
-المسجّل مشروع منفصل بجانب `api/` لكنه يعيد استخدام كود `api` (FomoClient،
-CredentialStore، config) عبر إضافة `api/src` إلى sys.path. لا يكرّر أي منطق
-وصول موجود بالفعل.
+The recorder is a separate project beside `api/` but reuses the `api` code
+(FomoClient, CredentialStore, config) by adding `api/src` to sys.path. It does not
+duplicate any access logic that already exists.
 
-كل المسارات مطلقة ومشتقّة من موقع هذا الملف، حتى يعمل المسجّل بصرف النظر عن
-مجلّد العمل الحالي (مهمّ للمهمّة المجدولة).
+All paths are absolute and derived from this file's location, so the recorder works
+regardless of the current working directory (important for the scheduled task).
 """
 from __future__ import annotations
 
 import os
 import sys
 
-# --- المسارات ---
+# --- Paths ---
 HERE = os.path.dirname(os.path.abspath(__file__))          # .../aoi/recorder
 ROOT = os.path.dirname(HERE)                               # .../aoi
 API_DIR = os.path.join(ROOT, "api")                        # .../aoi/api
 API_SRC = os.path.join(API_DIR, "src")                     # .../aoi/api/src
 
-# نضيف api/src حتى نستورد fomo_api. يُنفّذ عند الاستيراد لأن config/db يحتاجانه.
+# We add api/src so we can import fomo_api. Executed at import because config/db need it.
 if API_SRC not in sys.path:
     sys.path.insert(0, API_SRC)
 
-# قاعدة البيانات بجانب هذا الملف.
+# The database sits beside this file.
 DB_PATH = os.path.join(HERE, "recorder.db")
 SCHEMA_PATH = os.path.join(HERE, "schema.sql")
 
-# ملف السجلّ (المهمّة المجدولة تُخفي stderr).
+# The log file (the scheduled task hides stderr).
 LOG_PATH = os.path.join(HERE, "recorder.log")
 
-# جامع tradingActivity من الرأس. منفصل عن دورة /feed لأنّ هذا المسار يملك
-# ترقيمه الخاص، ويمشي حتى أول تداخل مع الأحداث المحفوظة بلا لمس مؤشر التاريخ.
+# tradingActivity head collector. Separate from the /feed cycle because this path has
+# its own pagination, and it walks up to the first overlap with stored events without touching the history pointer.
 ACTIVITY_HEAD_INTERVAL_SECONDS = 300
 ACTIVITY_HEAD_MAX_PAGES = 3
 
-# ملف حالة الاعتماد (session_token). افتراضي fomo_api نسبيّ (.privy_state.json)،
-# وهو يقع داخل api/، فنحلّه بالنسبة إلى api/ ما لم يكن مطلقاً بالفعل.
+# Credential state file (session_token). The fomo_api default is relative
+# (.privy_state.json) and it lives inside api/, so resolve it against api/ unless already absolute.
 def credential_state_path() -> str:
-    from fomo_api.config import settings  # noqa: E402  (بعد إضافة sys.path)
+    from fomo_api.config import settings  # noqa: E402  (after the sys.path insert)
 
     raw = settings.credential_state_file
     if os.path.isabs(raw):
@@ -45,419 +45,459 @@ def credential_state_path() -> str:
     return os.path.join(API_DIR, raw)
 
 
-# --- حدّ الحِقبة: الأماميّ (حيّ) مقابل الرجعيّ (مبعثر) ---
-# النموذج يُدرَّب على الحيّ وحده (قرار المشروع): الصفوف الرجعية تفتقر بنيوياً
-# إلى العائلات اللحظية (market_ticks، لقطات token_social، رتبة المتصدّر، الماكرو)
-# فتخلق نمط غياب يطابق الحِقبة تماماً — يتعلّمه النموذج بدل الإشارة (تسريب حِقبة).
-# القيمة = طابع أوّل إشارة حيّة (signal_events)؛ مؤكَّدة بنيوياً: صفر من 861 صفّاً
-# رجعياً يملك market_tick قرب t0، مقابل 89% من الصفوف الحيّة. `entry_ts` أكبر
-# أو يساوي هذا الحدّ ⇒ `is_live=1`. لا نحذف الرجعيّ — يبقى مخزَّناً وموسوماً
-# للتحليل، لكنّه يُستبعَد من مجموعة التدريب بفلتر `is_live=1`.
-LIVE_START_TS = 1785018927         # 2026-07-25T22:35:27Z (أوّل إشارة حيّة)
+# --- Epoch boundary: forward (live) vs retroactive (scattered) ---
+# The model is trained on the live set alone (project decision): retroactive rows
+# structurally lack the instantaneous families (market_ticks, token_social snapshots,
+# leader rank, macro), so they create an absence pattern that matches the epoch
+# exactly — the model learns it instead of the signal (epoch leakage).
+# The value = the timestamp of the first live signal (signal_events); structurally
+# confirmed: zero of 861 retroactive rows has a market_tick near t0, vs 89% of live
+# rows. An `entry_ts` at or above this boundary => `is_live=1`. We do not delete the
+# retroactive set — it stays stored and labeled for analysis, but it is excluded
+# from the training set by the `is_live=1` filter.
+LIVE_START_TS = 1785018927         # 2026-07-25T22:35:27Z (first live signal)
 
-# --- تواترات ومحدّدات (بالثواني/الساعات) ---
-CYCLE_SECONDS = 60                 # دورة كل دقيقة
-# ميزانية الدورة — القيد الحقيقيّ على الجمع ليس حدود المصدر بل زمن الدورة.
-# المصدر لا يحدّ النداءات: صفر ردّ 429 في تاريخ المشروع كلّه، و`errors: 0` في
-# 274 دورة من آخر 375. لكنّ التمهّل «لُطفاً بالمصدر» كان يأكل **27.5ث من 60**
-# (46%) والعمل الحقيقيّ ~31.5ث — فوسيط الدورة 59ث و**32% منها تتجاوز 61ث** أي
-# بلا فسحة. وحلقة `run_forever` تنام `CYCLE_SECONDS - elapsed`، فدورة تتجاوز
-# الميزانية تُمدّد المدّة نفسها: رفع السقوف بلا تقليل التمهّل يُبطئ المسح بدل
-# أن يُسرعه. فقُلِّص التمهّل إلى ~11ث وأُنفق الموفَّر على السقوف.
-# --- قاطعُ الدورة عند حجب المصدر ---
-# دورةٌ «ميتة» = أخطاءٌ ولا صفَّ مثمرٍ واحد. ثلاثٌ متتاليةٌ تفتح القاطع، فتصير
-# الدورةُ مِجَسّاً واحداً (`GET /feed` بحدّ 1) بدل ~190 طلباً، والانتظار يتضاعف
-# 60→120→240→480→900ث. والسببُ مقيس 2026-08-19: مسارات البيانات كلُّها ردّت 403
-# (`/feed` و`/proxy` و`/v2` و`/hodlers` و`/trades`) فبقي المسجّل يرمي ~52 طلباً
-# في الدقيقة على حائطٍ ويكتب صفراً، 67 دورةً متّصلة. وسابقةُ سبعة أيام: عشرةُ
-# انقطاعات كلّها ≤ دورتين، فعتبةُ الثلاث لا تمسّ واحداً منها.
+# --- Cadences and limits (in seconds/hours) ---
+CYCLE_SECONDS = 60                 # one cycle per minute
+# The cycle budget — the real constraint on collection is not the source's limits
+# but the cycle time. The source does not rate-limit calls: zero 429 responses in the
+# project's entire history, and `errors: 0` in 274 of the last 375 cycles. But the
+# "be kind to the source" pacing was eating **27.5s of every 60** (46%) with real
+# work at ~31.5s — so the median cycle was 59s and **32% of cycles exceeded 61s**,
+# i.e. with no headroom. And the `run_forever` loop sleeps
+# `CYCLE_SECONDS - elapsed`, so a cycle that exceeds the budget stretches the same
+# duration: raising caps without cutting pacing slows the sweep down instead of
+# speeding it up. So pacing was cut to ~11s and the savings were spent on the caps.
+# --- The cycle breaker when the source blocks us ---
+# A "dead" cycle = errors and not one productive row. Three in a row open the
+# breaker, so the cycle becomes a single probe (`GET /feed` with limit 1) instead of
+# ~190 requests, and the wait doubles 60->120->240->480->900s. The reason is measured
+# 2026-08-19: every data path returned 403 (`/feed`, `/proxy`, `/v2`, `/hodlers`,
+# `/trades`), so the recorder kept throwing ~52 requests a minute at a wall and
+# writing nothing, for 67 consecutive cycles. And the seven-day precedent: ten
+# outages, all <= two cycles, so a threshold of three touches none of them.
 #
-# **وكان أوّلُ تشخيصٍ خاطئاً وسُجّل هنا خطأً**: قيل «لعنواننا لا لبصمتنا» لأنّ
-# ثماني بصماتٍ من chrome124 إلى safari260 ردّت 403 كلُّها. والصحيحُ (مقيس
-# 2026-08-20): الحجبُ **على الهويّة** — حسابٌ آخر من نفس العنوان ونفس البصمة
-# ردّ 200 على المسارات الثلاثة. تغييرُ البصمة لا يُجدي لأنّ المحجوبَ ليس البصمة،
-# وتغييرُ الشبكة لا يُجدي لأنّه ليس العنوان. والفارقُ يُعرَف بنداءين: توكنٌ
-# فاسدٌ يردّ **401** وتوكنُنا يردّ **403** ⇒ الطلبُ وصل والهويّةُ رُفضت، فلا
-# تُطارَد الشبكةُ ساعةً وهي سليمة. (زرّ «افحص» في اللوحة يفعل هذا، والتبديلُ
-# من `صحّة البيانات` أو `py api/switch_recorder_account.py`.)
-# --- سقفُ الحجم: ما خُفِّض بعد حجب 2026-08-19 وبأيّ ثمن ---
-# لا يُعرَف يقيناً ما فتح الحجب — لا 429 في تاريخ المشروع كلّه ولا رسالةَ سببٍ
-# من المصدر — لكنّ الحجمَ المستمرّ أرجحُ الفروض: ~52 نداءً/دقيقة = 3,150/ساعة =
-# 75 ألفاً/يوم من هويّةٍ واحدة، أسبوعاً بعد أسبوع. فخُفِّض الحجمُ ثُلثاً تحوّطاً،
-# والثمنُ **كلُّه في تواتر السماتِ البطيئة لا في نواة البيانات**: `market_ticks`
-# كلَّ دقيقة، والإشاراتُ لحظةَ ورودها، والشموعُ (مصدرُ التوسيم) بلا مساس.
+# **And the first diagnosis was wrong, and it is recorded here as wrong**: it was
+# said "our address, not our fingerprint" because eight fingerprints from chrome124
+# to safari260 all returned 403. The truth (measured 2026-08-20): the block is **on
+# the identity** — another account from the same address and the same fingerprint
+# returned 200 on all three paths. Changing the fingerprint does not help because
+# the fingerprint is not what is blocked, and changing the network does not help
+# because it is not the address. And the difference is known with two calls: a
+# garbage token returns **401** while our token returns **403** => the request
+# arrived and the identity was rejected, so do not chase the network for an hour
+# when it is healthy. (The dashboard's "check" button does this, and the switch is
+# from `data health` or `py api/switch_recorder_account.py`.)
+# --- The volume cap: what was cut after the 2026-08-19 block, and at what cost ---
+# What exactly opened the block is not known for certain — no 429 in the project's
+# entire history and no reason message from the source — but sustained volume is the
+# most likely explanation: ~52 calls/minute = 3,150/hour = 75k/day from a single
+# identity, week after week. So volume was cut by two-thirds as a precaution, and
+# the cost is **entirely in the cadence of the slow features, not in the data
+# core**: `market_ticks` stays every minute, signals are recorded the moment they
+# arrive, and candles (the labeling source) are untouched.
 #
-# القياسُ الذي بُني عليه الخفض (2026-08-20، 189 مراقَبةً نشطة):
+# The measurement the cut was built on (2026-08-20, 189 active watches):
 #
-#     الكتلة    نداء/عملة   قبل            بعد           الوفر
+#     Block        calls/coin  before          after           saved
 #     ─────────────────────────────────────────────────────────
-#     الحائزون      2      13 ⇒ 26 نداءً   8 ⇒ 16 نداءً   -10
-#     السوشيال      1       7              5              -2
-#     المتداولون    1       4              1              -3   ← رزمةٌ لا إفراد
-#     الشموع        1       9              9               0   ← لا تُمسّ
-#     القوائم+السدّ  -       ~6             ~6              0
+#     Holders          2      13 => 26 calls  8 => 16 calls   -10
+#     Social           1      7               5               -2
+#     Traders          1      4               1               -3   <- one batch, not per-id
+#     Candles          1      9               9                0   <- untouched
+#     Lists+gap-fill   -      ~6              ~6               0
 #     ─────────────────────────────────────────────────────────
-#     الإجمالي            ~52/دقيقة       ~37/دقيقة      -29%
+#     Total                   ~52/minute      ~37/minute      -29%
 #
-# وسطرُ المتداولين رُوجِع في نفس اليوم بعد كشفِ موتِ `/v2/users/{id}`: صار نداءً
-# واحداً يحمل خمسين متداولاً بدل نداءين يحملان اثنين — أقلُّ طلباً وأوسعُ تغطيةً
-# في الوقت نفسه، وهو الفرقُ بين خفضِ الحجم وخفضِ الجَمع. التفصيلُ عند الثابت.
+# And the traders row was revised the same day after the death of `/v2/users/{id}`
+# was discovered: it became a single call carrying fifty traders instead of two calls
+# carrying two — fewer requests and wider coverage at the same time, which is the
+# difference between cutting volume and cutting collection. The details sit at the constant.
 #
-# ومع كلّ سقفٍ خُفِّض رُفع تواترُه بنفس النسبة، وإلّا صار الطلبُ أكبرَ من السقف
-# فتراكم عجزٌ دائم: المسحُ يبقى **تحت** نافذة التحديث لا فوقها (الحساب عند كلّ
-# ثابت). والرجوعُ سطران: أعِد الأرقامَ ولا شيءَ آخر يحتاج تغييراً.
-UPSTREAM_BREAKER_AFTER = 3         # دورات ميتة متتالية قبل فتح القاطع
-UPSTREAM_BREAKER_MAX_SECONDS = 900 # سقف الانتظار بين مِجَسّين (15 دقيقة)
+# And for every cap that was cut, its cadence was raised by the same ratio, or the
+# request becomes larger than the cap and a permanent deficit accumulates: the sweep
+# stays **under** the refresh window, not above it (the arithmetic sits at each
+# constant). And reverting is two lines: restore the numbers, nothing else needs changing.
+UPSTREAM_BREAKER_AFTER = 3         # consecutive dead cycles before the breaker opens
+UPSTREAM_BREAKER_MAX_SECONDS = 900 # cap on the wait between probes (15 minutes)
 
-WATCH_HOURS = 48                   # مدّة مراقبة كل عملة
-WATCHLIST_CAP = 150                # حدّ العملات النشطة المتزامنة
-# بوّابة العمر عند الإشارة: لا نراقب عملةً أصغرَ من هذا العمر لحظةَ الإشارة.
+WATCH_HOURS = 48                   # how long each coin is watched
+WATCHLIST_CAP = 150                # cap on simultaneous active coins
+# The age gate at signal time: we do not watch a coin younger than this at the moment of the signal.
 #
-# مقيس على الإشارات المستقلّة في القاعدة: العملات الأصغر من يومين ترتفع فيها
-# نسبة الانهيار **29 ضعفاً**، ووسيط المردود −46.2% مقابل −5.1% للأكبر منها —
-# وثمنُها 4% من صفوف التدريب فقط. والغرضُ صريح: لا يُبنى بوتٌ على عملةٍ عمرُها
-# أقلّ من يومين، فجمعُ بياناتها إنفاقُ دورةٍ على ما لا يُتداول عليه.
+# Measured on independent signals in the database: coins younger than two days have
+# a **29x** higher collapse rate, and the median return is -46.2% vs -5.1% for older
+# ones — and the cost is only 4% of training rows. The purpose is explicit: no bot
+# is built on a coin under two days old, so collecting its data is spending a cycle
+# on what will not be traded.
 #
-# **الرفض ليس نهائياً ولا يُسجَّل حظراً**: العملة المرفوضة لا تدخل القائمة
-# أصلاً، فإن جاءتها إشارةٌ أخرى وهي حينها أكبر من يومين دخلت كأيّ عملة. الحكم
-# على كلّ إشارةٍ بعمرِها **لحظتَها** لا بحكم سابق.
+# **The rejection is not final and is not recorded as a ban**: the rejected coin
+# never enters the list at all, so if another signal arrives when it is older than
+# two days it enters like any other coin. Each signal is judged by its age **at that
+# moment**, not by a prior verdict.
 #
-# صفر يُلغي البوّابة.
+# Zero disables the gate.
 MIN_TOKEN_AGE_DAYS = 2.0
-# لحظة نشر بوابة العمر في الفرع (commit 5307ed7). تنظيف المراقبات التشغيلية
-# يقتصر على ما أُدخل بعد هذه اللحظة؛ لا نعيد تفسير التاريخ الأقدم بسياسة لاحقة.
+# The moment the age gate was published on the branch (commit 5307ed7). Cleanup of
+# operational watches is limited to what was admitted after this moment; we do not re-interpret older history with a later policy.
 AGE_GATE_ENABLED_AT = "2026-08-22T18:03:31+00:00"
-# نتيجة lookup بلا تاريخ ليست سبباً لإعادة نفس النداء كل دقيقة. نعيد فحصها
-# دورياً لأنّ المصدر قد يصلح بياناته، لكن بفاصل طويل؛ أخطاء النقل تُعاد أسرع.
+# A lookup result with no date is not a reason to repeat the same call every minute.
+# We re-check it periodically because the source may fix its data, but with a long
+# gap; transport errors are retried faster.
 AGE_MISSING_RETRY_SECONDS = 6 * 3600
 AGE_ERROR_RETRY_SECONDS = 300
-# fallback عمرٍ مستقلّ (2026-08-27): حين لا يجد filterTokens العملة نسأل
-# GeckoTerminal عن أقدم pool_created_at — مقيس: يحلّ 17/18 من مجهولي fomo،
-# نداءٌ واحد لكل عملة مجهولة جديدة، بلا مفتاح وبيمصة كروم كخطّ fomo نفسه.
+# An independent age fallback (2026-08-27): when filterTokens cannot find the coin
+# we ask GeckoTerminal for the oldest pool_created_at — measured: it resolves 17/18
+# of fomo's unknowns, one call per new unknown coin, no key, with a Chrome UA like the fomo line itself.
 AGE_GECKO_FALLBACK = True
-# سقف العمر الأعلى لإدخال EVM (2026-08-29): بوابة العمر الدنيا وحدها كانت
-# تُدخل عملات عمرها سنة–سنتين، وتعبئة دفتر حائزينها تُسقط الشبكة كلها في
-# إيقاف الإدخال (طابور روبن‑هود 08-29: 43 عملة، 38 منها فوق 10M كتلة
-# متبقية). القياس على إدخالات 4663+8453 منذ 22/8: سقف 60 يومًا كان سيرفض
-# 34/123 (28%) بثمن صفوفٍ شبه خاوية — الانفجار في EVM كله تقريبًا في
-# عمر <60 يومًا (0 من 37 موسومة بين 30–60 يومًا انفجرت، وكل الفوقية
-# قديمة بلا استثناء). صفر يُعطّل السقف. لا يُطبَّق على سولانا: شموسها
-# تُسحب من مصدر مختلف ولا يوجد طابور تعبئة هناك أصلًا.
+# The upper age cap for EVM admission (2026-08-29): the minimum-age gate alone was
+# admitting coins a year to two years old, and filling their holders ledger drops
+# the whole network into admission pause (the 08-29 Robinhood queue: 43 coins, 38 of
+# them above 10M blocks remaining). Measured on 4663+8453 admissions since 22/8: a
+# 60-day cap would have rejected 34/123 (28%) at the cost of nearly empty rows — the
+# explosion in EVM is almost entirely under 60 days of age (0 of 37 labeled coins
+# aged 30-60 days exploded, and every one above that is old without exception).
+# Zero disables the cap. Not applied to Solana: its mints are pulled from a
+# different source and there is no fill queue there at all.
 EVM_MAX_TOKEN_AGE_DAYS = 60
-# حفظ دفتر EVM عند إعادة تنشيط المراقبة (2026-08-29): كان upsert_watch
-# يمحو balances/backfill/replay كلها عند كل إعادة تنشيط، فتُبنى الطوابير
-# من الصفر أبدًا. إن كانت الفجوة منذ انتهاء النافذة السابقة أقصر من هذا
-# السقف يبقى الدفتر وتُوسَّع to_block فقط؛ الأطول يعيد البناء من genesis
-# (الفجوة الطويلة قد تكون فاتت تحويلاتٍ لا يعوضها الدفتر القديم).
+# Keep the EVM ledger when reactivating a watch (2026-08-29): upsert_watch used to
+# wipe balances/backfill/replay on every reactivation, so the queues were built from
+# scratch forever. If the gap since the previous window ended is shorter than this
+# cap the ledger stays and only to_block is extended; a longer one rebuilds from
+# genesis (a long gap may have missed transfers that the old ledger cannot compensate for).
 EVM_REACTIVATION_KEEP_LEDGER_SECONDS = 48 * 3600
-# بوابة الصعود المسبق (2026-08-27): إشارة على عملة صعدت أكثر من هذا الحدّ
-# (log-return، 1.5 = +150%) في آخر 24 ساعة قبل الإشارة لا تفتح مراقبة.
-# القياس على 2,968 إشارة موسومة: نهائي 48س لهذه الفئة -36% وrug 7.1% —
-# هي واصلون متأخرون (وقود خروج الحيتان) لا بداية صعود. الإشارة تُحفظ
-# دائمًا؛ المرفوض فتحُ المراقبة فقط. 0 يعطّل البوابة.
+# The pre-signal runup gate (2026-08-27): a signal on a coin that rose more than
+# this (log-return, 1.5 = +150%) in the last 24 hours before the signal does not
+# open a watch. Measured on 2,968 labeled signals: the 48h final for this class is
+# -36% with rug at 7.1% — they are late joiners (whale exit fuel), not the start of
+# a rise. The signal is always saved; only opening the watch is rejected. 0 disables the gate.
 MAX_PRE_SIGNAL_RUNUP = 1.5
-# backoff حكم الرفض (2026-08-28): العملة الصاعدة تتلقى 5-10 إشارات يوميًا
-# وكل واحدة كانت تعيد استعلام الشموع. الحكم الرافض يُقرأ من الذاكرة هذه
-# المدة ثم يُعاد تقييمه — الصعود قد يهدأ فتصبح الإشارة اللاحقة مبكرة بحق.
-# ساعة واحدة توازن بين كفاءة الحساب وفرصة إعادة التقييم الجدّية.
+# Backoff for the rejection verdict (2026-08-28): a rising coin receives 5-10
+# signals a day and each one used to re-query the candles. The rejecting verdict is
+# read from memory for this duration and then re-evaluated — the runup may subside,
+# making the later signal genuinely early. One hour balances computation efficiency
+# against a serious chance of re-evaluation.
 RUNUP_RETRY_SECONDS = 3600
-# تعريف الانفجار (fv15، قرار المالك 2026-08-28 بعد قياس 2,378 انفجارًا):
-# قمة ≥ +100% خلال 48 ساعة، ونصفها (+50%) متاحة خلال أول 24 ساعة.
-# المقاس: يلتقط 85.5% من الانفجارات و96% من العمالقة (10x+)، والفائت
-# وسيطه المتاح خلال اليوم الأول +26% فقط (صيد هامشي). نسبة الإيجاب 13.7%
-# — توازن سليم لتصنيف بلا اختلال حاد.
+# The definition of an explosion (fv15, owner's decision 2026-08-28 after measuring
+# 2,378 explosions): peak >= +100% within 48 hours, with half of it (+50%) reachable
+# within the first 24 hours. Measured: it captures 85.5% of explosions and 96% of
+# giants (10x+), and the missed one has a median of only +26% available in the first
+# day (marginal hunting). The positive rate is 13.7% — a healthy balance for
+# classification without severe imbalance.
 EXPLOSIVE_MIN_PEAK = 1.0
 EXPLOSIVE_HALF_AT_24H = 0.5
-# سنارة إعلان القوة (+20%): فلتر إسقاط مرشحين فقط — **ليست قاعدة دخول
-# أبدًا** (قرار المالك 2026-08-28: الدخول بعد +20% خاسر صافيًا -1% إلى
-# -11% عبر كل النوافذ). القياس على التاريخ الكامل بعد التعبئة: المنفجرة
-# تبلغ +20% وسيطيًا خلال 259د مقابل 816د لغير المنفجرة — عملة لم تعلن
-# قوتها خلال ~4 ساعات ⇒ إسقاطها من المراقبة يوفر بلا خسارة انتقاء.
+# The +20% strength-announcement hook: a candidate-dropping filter only —
+# **never an entry rule** (owner's decision 2026-08-28: entering after +20% is a
+# net loss of -1% to -11% across every window). Measured on the full history
+# after the fill: explosive coins reach +20% in a median of 259 minutes vs 816 for
+# non-explosive — a coin that has not announced its strength within ~4 hours =>
+# dropping it from the watch saves with no loss of selection.
 PLUS20_THRESHOLD = 0.20
-# إثراء socials من DEX Screener (fv16): نداء واحد لكل عملة جديدة عند قبولها
-# — يُخزّن في token_static ولا يُسأل ثانية. القيمة المقيسة الوحيدة المضافة
-# من المصدر (جرد كامل 2026-08-29: البقية مكرر أو أدنى من مخزوننا).
+# DEX Screener socials enrichment (fv16): one call per new coin at admission
+# — stored in token_static and never asked again. The only measured added value
+# from the source (full inventory 2026-08-29: the rest is duplicate or below what we already hold).
 DEX_SCREENER_SOCIALS = True
-# مجهولُ العمر يُرفض.
-# مقيسة) لا تاريخَ عنده أصلاً. ومقيس أنّ الجهلَ **لا يحمل خبراً** عن العمر:
-# مجهولات العمر كانت < يومين في 39.8% من الحالات مقابل 42.4% لمعروفاتها — أي
-# أنّ قبولها يقبل الصغيرَ بمعدّل السكّان نفسه، فتنهار البوّابة على ثلث الداخلين.
-# قبول عملات EVM الجديدة يتكيّف مع قدرة تعبئة دفتر الحائزين. العملات الحالية لا
-# تُحذف، والإشارات تبقى محفوظة حتى عند تأجيل المراقبة. منطقة الاستئناف تمنع
-# التذبذب قرب سقف الإيقاف: نتوقف عند 45 ولا نعود حتى ينخفض الطابور دون 20.
+# An unknown age is rejected.
+# measured) has no date at all. And it is measured that ignorance **carries no news** about age:
+# age-unknown coins were < two days old in 39.8% of cases vs 42.4% for the known
+# ones — meaning accepting them admits the young at the population's own rate, so the gate collapses on a third of entrants.
+# Admission of new EVM coins adapts to the holders-ledger fill capacity. Current
+# coins are not deleted, and signals stay saved even when the watch is deferred.
+# The resume band prevents oscillation near the pause cap: we stop at 45 and do not resume until the queue drops below 20.
 EVM_ADMISSION_FULL_BELOW = 15
 EVM_ADMISSION_REDUCED_BELOW = 30
 EVM_ADMISSION_PAUSE_AT = 45
 EVM_ADMISSION_RESUME_BELOW = 20
-LEADERBOARD_REFRESH_SECONDS = 3600 # تحديث صدارة المتصدّرين كل ساعة
-# سقف المصدر **50 متصدّراً** مؤكّداً بفحص حيّ (2026-08-10): تسع صيغ ترقيم
-# (limit/offset/skip/page/pageNumber/start/from/pageSize/take) تُهمَل بصمت —
-# قوائم المعرّفات متطابقة بايتاً. فالقيمة هنا لا ترفع العدد؛ تبقى لأنّها
-# البارامتر الذي يقبله المصدر وقد يُعمِل يوماً.
-LEADERBOARD_SIZE = 200             # عدد المتصدّرين المطلوبين (المصدر يسقّفهم بـ50)
-# الحلّ للسقف: الصدارة نفسها مقسّمة بحسب المدّة، وكلٌّ تعيد قائمتها المستقلّة —
-# ومقيس على الخام المؤرشف (2026-08-10): الأساسيّة 50 بينما **كل مدّة تعيد 100**،
-# فاتّحاد الأربع 214 متداولاً مميّزاً (164 لا تعرفهم الأساسيّة). على 7,200 حدث
-# شراء حقيقيّ من ثلاثة أيام: مطابقة الخمسين 265 (3.68%) مقابل 1,099 (15.26%)
-# للاتّحاد، أي ×4.15.
-# "all" = المسار الأساسيّ (totalPnL)؛ الباقي من upstream_leaderboard_period_paths.
-# **رتبة كل مدّة قياس مستقلّ**: الرابع في 24h ليس الرابع في totalPnL، فتُحفظ
-# خرائط منفصلة ولا تُدمج في رقم واحد.
+LEADERBOARD_REFRESH_SECONDS = 3600 # refresh the leaderboard every hour
+# The source's cap is **50 leaders**, confirmed by a live probe (2026-08-10): nine
+# pagination forms (limit/offset/skip/page/pageNumber/start/from/pageSize/take) are
+# silently ignored — the id lists are byte-identical. So the value here does not
+# raise the count; it stays because it is the parameter the source accepts and may honor one day.
+LEADERBOARD_SIZE = 200             # number of leaders requested (the source caps it at 50)
+# The workaround for the cap: the leaderboard itself is split by period, and each
+# period returns its own independent list — and measured on the archived raw
+# (2026-08-10): the main one 50 while **every period returns 100**, so the union of
+# the four is 214 distinct traders (164 unknown to the main one). On 7,200 real buy
+# events from three days: the fifty match 265 (3.68%) vs 1,099 (15.26%) for the union, i.e. x4.15.
+# "all" = the main path (totalPnL); the rest come from upstream_leaderboard_period_paths.
+# **Each period's rank is an independent measurement**: rank 4 in 24h is not rank 4
+# in totalPnL, so separate maps are kept and never merged into one number.
 LEADERBOARD_PERIODS = ("all", "24h", "7d", "30d")
-LEADERBOARD_PACING_SECONDS = 0.5   # فاصل بين نداءات المدد (كان 1.5 — ميزانية الدورة)
+LEADERBOARD_PACING_SECONDS = 0.5   # gap between period calls (was 1.5 — the cycle budget)
 
-# --- شموع OHLCV (getBarsNew) ---
-# مصدر الحقيقة السعرية للتوسيم. قوائم trending/verified لا تكفي: ربع العملات
-# المراقَبة لم تظهر فيها قطّ فبقيت بلا أي سعر.
-BARS_RESOLUTION = "5"              # 5 دقائق: 48 ساعة = 576 شمعة، تحت سقف 900
-BARS_PER_CYCLE = 9                 # عملات لكل دورة — رُفعت من 6 لاستيعاب الضابطة
-BARS_REFRESH_SECONDS = 900         # نُحدّث شموع كل عملة كل ~15 دقيقة
-BARS_PACING_SECONDS = 0.3          # كان 1.5: أكبر مُهدِر وحده (12ث من 27.5) — انظر CYCLE_SECONDS
-BARS_PRE_SIGNAL_HOURS = 2          # نسحب سياقاً قبل الإشارة أيضاً
-BARS_MAX_SPAN_HOURS = 72           # سقف النافذة المطلوبة (دون سقف 900 شمعة)
-BARS_COUNT_BACK = 900              # أقصى ما يعيده fomo في نداء واحد
-# أرشفة شموع 1 دقيقة التلقائية (2026-08-29): خطوة ملحقة بدورة الباني كل ساعة —
-# كل عملة تنضج نافذتها (48س) وتُبنى، تُؤرشف نافذتها 1m في نفس الدورة بلا
-# تدخل يدوي. سقف 3 عملات/دورة يكفي للوتيرة (~20 عملة جديدة/يوم) ولا يزاحم
-# البناء؛ والمتعثر (partial) يُعاد في الدورات التالية تلقائيًا.
+# --- OHLCV candles (getBarsNew) ---
+# The price source of truth for labeling. The trending/verified lists are not
+# enough: a quarter of watched coins never appeared in them and stayed without any price at all.
+BARS_RESOLUTION = "5"              # 5 minutes: 48 hours = 576 candles, under the 900 cap
+BARS_PER_CYCLE = 9                 # coins per cycle — raised from 6 to absorb the control group
+BARS_REFRESH_SECONDS = 900         # each coin's candles are refreshed every ~15 minutes
+BARS_PACING_SECONDS = 0.3          # was 1.5: the single biggest waster (12s of 27.5) — see CYCLE_SECONDS
+BARS_PRE_SIGNAL_HOURS = 2          # we also pull context from before the signal
+BARS_MAX_SPAN_HOURS = 72           # cap on the requested window (below the 900-candle cap)
+BARS_COUNT_BACK = 900              # the most fomo returns in a single call
+# Automatic 1-minute candle archiving (2026-08-29): a follow-up step in the hourly
+# builder cycle — every coin whose window matures (48h) and gets built has its 1m
+# window archived in the same cycle with no manual intervention. A cap of 3
+# coins/cycle matches the pace (~20 new coins/day) and does not compete with the
+# build; and a partial failure is retried automatically in later cycles.
 BARS_1M_ARCHIVE_PER_CYCLE = 3
-# عملة يردّ عليها fomo `no_data` هذا العدد من المرّات تُستبعد: لا سلسلة لها.
+# A coin that fomo answers with `no_data` this many times is excluded: it has no series.
 BARS_MAX_NO_DATA_ATTEMPTS = 3
 
-# --- سلامة الشموع: ذيول مستحيلة من المنبع ---
-# fomo تعيد أحياناً `h` (أو `l`) مستحيلاً فيزيائياً: شوهد h=2,626,092 لشمعة
-# إغلاقها 0.0219 (119 مليون ضعف!) — مؤكَّد بإعادة سحب حيّة 2026-07-30، أي أنّه
-# تشوّه دائم في المنبع لا خطأ نقل عندنا. أثره كارثيّ على الليبل: max_gain صار
-# +3.78 مليار% في 4 صفوف، ولوحة القيادة عرضت +62,570,743,609%.
-# العتبة 10× مقيسة على 650,679 شمعة: 132 شمعة فقط تتجاوز 2×، و39 تتجاوز 10×،
-# و22 تتجاوز 1000× — أي أنّ الذيول المشروعة تنتهي عملياً دون 2× والما بعدها
-# تشوّه. عند 10× نعلّم 0.009% من الشموع ونحمي كل الليبلات.
-# الذيل المعلَّم **لا يُحذف ولا يُصلَح** (الخام مقدَّس): يُستبعد من حساب القمّة
-# والقاع فقط، وبقيّة الشمعة (o/c) سليمة ومستعملة.
+# --- Candle integrity: impossible wicks from the source ---
+# fomo sometimes returns a physically impossible `h` (or `l`): h=2,626,092 was seen
+# for a candle whose close was 0.0219 (a 119-million multiple!) — confirmed by a
+# live re-pull on 2026-07-30, meaning it is a permanent distortion in the source,
+# not a transport error on our side. Its impact on the label is catastrophic:
+# max_gain became +3.78 billion % in 4 rows, and the dashboard showed
+# +62,570,743,609%.
+# The 10x threshold is measured on 650,679 candles: only 132 candles exceed 2x, 39
+# exceed 10x, and 22 exceed 1000x — meaning legitimate tails practically end below
+# 2x and everything beyond is distortion. At 10x we flag 0.009% of candles and protect every label.
+# The flagged wick is **never deleted or fixed** (the raw is sacred): it is excluded
+# from the peak/trough computation only, and the rest of the candle (o/c) is intact and used.
 BAR_WICK_MAX_RATIO = 10.0
-# اليوم الكامل يسمح بمضخة وانهيار حقيقيين أكبر من ×10. المقارنة مع شموع 5د
-# أظهرت 28 علماً كاذباً مؤكداً عند ×10، وصفر عند ×1000.
+# A full day allows genuine pumps and crashes larger than 10x. The comparison with
+# 5-minute candles showed 28 confirmed false flags at 10x, and zero at 1000x.
 DAILY_BAR_WICK_MAX_RATIO = 1000.0
 
-# --- عتبة «أصل كبير» ---
-# الأرشيف ليس عملات ميم فقط: مقيس 2026-07-30 وجود 116 إشارة على BTC ($1.27T)
-# وETH وSOL (103 إشارة) وUSDT وXRP وBNB وHYPE وسهم SNDK المرمّز — منها 21 نتيجة
-# موسومة. أصل بتريليون لا يسلك سلوك عملة بنصف مليون، فخلطهما يفسد أيّ استنتاج
-# عن «أثر القيمة السوقية». هذه العتبة مرجعٌ واحد لعلم `is_major` في تحليل
-# ومستخرج الميزات (PLAN §2.3-ج) — التصنيف لا الاستبعاد: العملة تبقى مسجَّلة.
+# --- The "major asset" threshold ---
+# The archive is not meme coins only: measured 2026-07-30 there are 116 signals on
+# BTC ($1.27T), ETH, SOL (103 signals), USDT, XRP, BNB, HYPE, and the tokenized
+# SNDK stock — including 21 labeled outcomes. A trillion-dollar asset does not
+# behave like a half-million coin, so mixing them corrupts any conclusion about
+# "the market-cap effect". This threshold is the single reference for the `is_major`
+# flag in analysis and the feature extractor (PLAN §2.3-c) — classification, not exclusion: the coin stays recorded.
 MAJOR_ASSET_MARKET_CAP_USD = 1_000_000_000.0
 
-# --- تصنيف الأصول (asset_class) ---
-# القيمة السوقية وحدها **لا تكفي**: أسهم مرمّزة مقيسة بقيم سوقية صغيرة جداً
-# (AAPL بـ$1.36M · DRAM $1.18M · NET $780k) لأنّ المرمَّز جزء ضئيل من السهم —
-# فتبدو «ميمات» لأيّ مرشّح يعتمد القيمة. **السعر هو المميّز الأقوى**: عملة الميم
-# لا تتداول فوق دولارات قليلة عملياً (توزيع مقيس: 267 من 297 عملة دون $0.1).
-ASSET_MEME_MAX_PRICE_USD = 5.0        # سعر أعلى ⇒ ليست ميم (سهم/سلعة/أصل كبير)
-ASSET_STABLE_PRICE_BAND = (0.95, 1.05)  # كل المشاهدات داخل النطاق ⇒ عملة مستقرّة
-# سقف معقولية القيمة السوقية: فوقه لا نثق بالرقم (شوهد $69T لعملة بـ$0.0888 —
-# حاصل سعر × معروض خرافيّ). لا نستعمله للحكم بل **نتجاهله** ونحكم بالسعر.
+# --- Asset classification (asset_class) ---
+# Market cap alone **is not enough**: tokenized stocks measured with very small
+# market caps (AAPL at $1.36M · DRAM $1.18M · NET $780k) because the tokenized
+# share is a tiny fraction of the stock — so they look like "memes" to any candidate
+# that relies on cap. **Price is the strongest discriminator**: a meme coin
+# practically never trades above a few dollars (measured distribution: 267 of 297 coins below $0.1).
+ASSET_MEME_MAX_PRICE_USD = 5.0        # a higher price => not a meme (stock/commodity/major asset)
+ASSET_STABLE_PRICE_BAND = (0.95, 1.05)  # all observations inside the band => a stablecoin
+# A market-cap plausibility ceiling: above it we do not trust the number ($69T was
+# seen for a coin at $0.0888 — price x mythical supply). We do not judge by it; we **ignore** it and judge by price.
 ASSET_MAX_CREDIBLE_MARKET_CAP_USD = 5e12
-# أرضية تصديق الاسم: عملات ميم تنتحل رموز الكبار (مقيس: «BTC» بقيمة $3.5M
-# و«SOL» بـ$4.9M). فقائمة الأسماء لا تُطبَّق إلّا مع قيمة سوقية معتبرة.
+# A name-trust floor: meme coins forge the majors' tickers (measured: "BTC" with a
+# $3.5M cap and "SOL" at $4.9M). So the name list applies only with a credible market cap.
 ASSET_SYMBOL_TRUST_MIN_MARKET_CAP_USD = 1e8
-# شبكة أمان بالأسماء لأصولٍ سعرها قد يقع تحت العتبة (XRP ~$1) — قائمة صريحة
-# قصيرة أصدق من استنباط هشّ، وكلّ اسم فيها مشاهَد فعلاً في أرشيفنا.
+# A name-based safety net for assets whose price may fall below the threshold
+# (XRP ~$1) — a short explicit list is more honest than fragile inference, and every
+# name in it was actually observed in our archive.
 ASSET_NON_MEME_SYMBOLS = frozenset({
     "BTC", "WBTC", "CBBTC", "ETH", "WETH", "SOL", "WSOL", "BNB", "WBNB", "XRP",
     "LTC", "DOGE", "ADA", "AVAX", "LINK", "UNI", "AAVE", "HYPE",
     "USDT", "USDC", "DAI", "USDE", "FDUSD", "TUSD", "PAXG", "XAUT",
 })
 
-# معرّف شبكة سولانا. مصدر واحد للحقيقة: تفسير سلطتي السكّ/التجميد يعتمد عليه
-# (سولانا وحدها تملكهما، وعلى EVM القيمة غير مقيسة لا «آمنة») — انظر
+# The Solana network id. One source of truth: the interpretation of the mint/freeze
+# authorities depends on it (Solana alone has both; on EVM it is unmeasured, not "safe").
 # extract._authority_to_int.
 SOLANA_NETWORK_ID = "1399811149"
 
-# --- شموع السوق الكلّي (macro) ---
-# مرجع النظام السوقي: عملة +40% أثناء ضخّ عام ليست كـ+40% في يوم ميت. الضابطة
-# بديل جزئي (~100 عملة صاخبة)؛ شموع المرجعيات نظيفة ومجانية عبر getBarsNew
-# (مؤكَّدة حيّاً 2026-07-28). تُخزَّن في token_bars بدقّة ساعية فلا تتصادم
-# مع شموع العملات المراقَبة (5 دقائق)، والموسِّم لا يقرأها (لا watch لها).
+# --- Whole-market (macro) candles ---
+# The market-regime reference: a coin +40% during a general pump is not the same as
+# +40% on a dead day. The control group is a partial substitute (~100 noisy coins);
+# the reference candles are clean and free via getBarsNew (confirmed live
+# 2026-07-28). They are stored in token_bars at hourly resolution so they never
+# collide with the watched coins' candles (5 minutes), and the labeler does not read them (they have no watch).
 MACRO_BARS = (
     ("SOL",  "So11111111111111111111111111111111111111112", "1399811149"),
     ("WETH", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "1"),
     ("WBTC", "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", "1"),
 )
-MACRO_BARS_RESOLUTION = "60"          # ساعية — تكفي لسياق النظام، ولا تثقل الدورة
-MACRO_BARS_REFRESH_SECONDS = 3600     # سحب واحد كل ساعة
-MACRO_BARS_SPAN_HOURS = 24 * 14       # أسبوعان لكل سحب (السحب الكامل يشفي الثغرات)
+MACRO_BARS_RESOLUTION = "60"          # hourly — enough for regime context, and light on the cycle
+MACRO_BARS_REFRESH_SECONDS = 3600     # one pull per hour
+MACRO_BARS_SPAN_HOURS = 24 * 14       # two weeks per pull (the full pull heals the gaps)
 
-# --- الموسِّم (labeler — عملية FomoLabeler المنفصلة) ---
-# منفصل عن المسجّل عمداً: المسجّل يسجّل خاماً فقط (منع تسرّب المستقبل)،
-# والتوسيم لا يجري إلّا بعد اكتمال النافذة.
-LABEL_WINDOW_HOURS = 48            # نافذة النتيجة — تطابق نافذة المراقبة
-LABEL_MARGIN_SECONDS = 900         # هامش بعد النافذة: تُغلق آخر شمعة ويلتقطها المسح
-LABEL_INTERVAL_SECONDS = 900       # دورة الموسِّم (كل 15 دقيقة)
-LABEL_BATCH = 500                  # حدّ التوسيم في الدورة الواحدة
-LABEL_ENTRY_MAX_LAG_SECONDS = 1800 # أقصى تأخّر لشمعة الدخول وإلّا status=no_entry
-LABEL_INDEPENDENCE_GAP_SECONDS = 1800  # فجوة اعتبار الإشارة مستقلّة (69% < 5 دقائق!)
-LABEL_RUG_THRESHOLD = -0.90        # عائد نهائي ≤ -90% ⇒ is_rug=1
+# --- The labeler (labeler — the separate FomoLabeler process) ---
+# Separate from the recorder by design: the recorder records raw only (preventing
+# future leakage), and labeling happens only after the window completes.
+LABEL_WINDOW_HOURS = 48            # the outcome window — matches the watch window
+LABEL_MARGIN_SECONDS = 900         # margin after the window: the last candle closes and the sweep catches it
+LABEL_INTERVAL_SECONDS = 900       # the labeler's cycle (every 15 minutes)
+LABEL_BATCH = 500                  # the labeling cap per cycle
+LABEL_ENTRY_MAX_LAG_SECONDS = 1800 # the entry candle's max lag, else status=no_entry
+LABEL_INDEPENDENCE_GAP_SECONDS = 1800  # the gap for a signal to count as independent (69% < 5 minutes!)
+LABEL_RUG_THRESHOLD = -0.90        # final return <= -90% => is_rug=1
 LABEL_LOG_PATH = os.path.join(HERE, "labeler.log")
 
-# --- بناء صفوف التدريب (build rows — عملية FomoBuildRows المنفصلة) ---
-# المرحلة الثالثة: تسطيح النتائج الموسومة إلى صفّ ميزات واحد. تزايديّة وعديمة
-# الأثر عند التكرار (INSERT OR REPLACE على (kind,key))، فالجدولة آمنة.
-# الدورة ساعة لا 15 دقيقة: الموسِّم لا ينتج صفوفاً جديدة إلّا بعد إغلاق نافذة
-# الـ48 ساعة، فالبناء الأسرع يمسح جدولاً لا جديد فيه.
+# --- Training rows build (build rows — the separate FomoBuildRows process) ---
+# Stage three: flattening the labeled outcomes into a single features row.
+# Incremental and a no-op when repeated (INSERT OR REPLACE on (kind,key)), so
+# scheduling it is safe. The cycle is an hour, not 15 minutes: the labeler produces
+# no new rows until a 48-hour window closes, so a faster build scans a table with nothing new in it.
 BUILD_ROWS_INTERVAL_SECONDS = 3600
-BUILD_ROWS_BATCH = 500             # حجم الدفعة الواحدة (كتابة ثم تحرير الذاكرة)
-# سقف الصفوف في الدورة الواحدة. المهمّ عند رفع FEATURE_VERSION: كل الصفوف تصير
-# pending دفعةً واحدة (~53 ألفاً)، والسقف يجعلها تُقضَم على دورات بدل قفل
-# القاعدة ساعةً ونصفاً في وجه المسجّل والموسِّم.
+BUILD_ROWS_BATCH = 500             # the single batch size (write, then release memory)
+# The rows cap per cycle. It matters when FEATURE_VERSION is raised: every row
+# becomes pending at once (~53k), and the cap makes them get bitten across cycles
+# instead of locking the database for an hour and a half against the recorder and the labeler.
 BUILD_ROWS_MAX_PER_CYCLE = 4000
 BUILD_ROWS_LOG_PATH = os.path.join(HERE, "build_rows.log")
 
-# --- الاحتفاظ بالأرشيف ---
-# حذف اللقطات الخام (snapshots) الأقدم من هذا العدد من الأيام. 0 = بلا حذف
-# (الافتراضي): اللقطات هي أرشيف إعادة الاشتقاق، فحذفها قرار صريح للمالك.
-# مع ضغط zlib تكبر القاعدة ~280 MB يومياً بدل ~1.3 GB، فالاحتفاظ الأبديّ معقول.
+# --- Archive retention ---
+# Delete raw snapshots older than this many days. 0 = no deletion (the default):
+# the snapshots are the re-derivation archive, so deleting them is the owner's
+# explicit decision. With zlib compression the database grows ~280 MB/day instead
+# of ~1.3 GB, so keeping them forever is reasonable.
 SNAPSHOT_RETENTION_DAYS = 0
-# تدوير recorder.log عند تجاوزه هذا الحجم (بايت). 0 = بلا تدوير.
+# Rotate recorder.log when it exceeds this size (bytes). 0 = no rotation.
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
-# --- الطبقة الاجتماعية (/feed/token/thesis) ---
-# عملات الميم تحرّكها الحشود؛ كنّا نسجّل السعر والحجم ولا نسجّل النقاش حولها.
-# دورة أبطأ من الشموع: الزخم الاجتماعي يتغيّر بالساعات لا بالدقائق.
-SOCIAL_PER_CYCLE = 5               # كان 7 (وقبله 4) — خُفِض في خفضِ الحجم، انظر
-                                   # «سقفُ الحجم» أعلى. 189/5 = 37.8د مسحاً، تحت
-                                   # نافذةِ 40د الجديدة. والسببُ أنّ الزخمَ
-                                   # الاجتماعيّ يتغيّر بالساعات لا بالدقائق، فعشرُ
-                                   # دقائقَ أخشنُ أرخصُ ثمنٍ في الملفّ كلّه.
-SOCIAL_REFRESH_SECONDS = 2400      # كان 1800 — رُفع مع السقف كي لا يتراكم عجز
-SOCIAL_ERROR_RETRY_SECONDS = 300   # خطأ عابر يُعاد خلال 5 دقائق لا 30 دقيقة
-SOCIAL_PACING_SECONDS = 0.3        # كان 1.0 — ميزانية الدورة
-SOCIAL_THRESHOLD = 0               # 0 = بلا حدّ أدنى لحصّة الكاتب (نريد الكلّ)
+# --- The social layer (/feed/token/thesis) ---
+# Meme coins are moved by crowds; we were recording price and volume but not the
+# discussion around them. A slower cycle than candles: social momentum changes over hours, not minutes.
+SOCIAL_PER_CYCLE = 5               # was 7 (and 4 before it) — cut in the volume cut, see
+                                   # the "volume cap" above. 189/5 = 37.8min per sweep, under
+                                   # the new 40min window. The reason is that social
+                                   # momentum changes over hours, not minutes, so a
+                                   # tenfold coarser cadence is the cheapest price in the whole file.
+SOCIAL_REFRESH_SECONDS = 2400      # was 1800 — raised with the cap so a deficit does not accumulate
+SOCIAL_ERROR_RETRY_SECONDS = 300   # a transient error is retried within 5 minutes, not 30
+SOCIAL_PACING_SECONDS = 0.3        # was 1.0 — the cycle budget
+SOCIAL_THRESHOLD = 0               # 0 = no minimum for an author's share (we want everyone)
 
-# --- تركيز الملكية (/proxy/tokenDetails + /hodlers/top) ---
-# العمود `market_ticks.top10_holders_pct` ميت: صفر من 1,430,475 صفّاً، لأنّ
-# قوائم trending/verified لا تحمل المفتاح إطلاقاً. هذان المصدران يعملان على
-# الشبكتين: tokenDetails يعطي top10 وعدد الحائزين، وhodlers/top يعطي التفصيل
-# فنشتقّ top1 (حوت مفرد خطر مختلف عن عشرة موزّعين).
-HOLDERS_PER_CYCLE = 8               # كانت 13 (وقبلها 6). **أكبرُ كتلةٍ في الدورة
-                                    # وحدَها**: نداءان لكل عملة (tokenDetails +
-                                    # hodlers/top) فـ13 كانت 26 نداءً = نصفَ حِمل
-                                    # المسجّل كلِّه. فهي أوّلُ ما يُخفَض وأكثرُه
-                                    # وفراً: 8 ⇒ 16 نداءً، أي -10 من -14.
-                                    # 189/8 = 23.6د مسحاً، تحت نافذةِ 25د الجديدة.
-                                    # والثمنُ حقيقيّ ويجب أن يُعرَف: لقطةُ التركّز
-                                    # عند t0 كانت حاضرةً في 9.8% من صفوف التدريب
-                                    # قبل رفعِ 6→13، وهذا الخفضُ يتراجع بها نحو
-                                    # ذلك الاتّجاه لا إلى قيمته. فإن سقطت التغطيةُ
-                                    # عند t0 فهذا أوّلُ ثابتٍ يُعاد.
-HOLDERS_REFRESH_SECONDS = 1500      # كان 900 — رُفع مع السقف كي لا يتراكم عجز
+# --- Ownership concentration (/proxy/tokenDetails + /hodlers/top) ---
+# The column `market_ticks.top10_holders_pct` is dead: zero of 1,430,475 rows,
+# because the trending/verified lists do not carry the key at all. These two sources
+# work on both networks: tokenDetails gives top10 and the holder count, and
+# hodlers/top gives the detail, so we derive top1 (a single dangerous whale is
+# different from ten distributed ones).
+HOLDERS_PER_CYCLE = 8               # was 13 (and 6 before it). **The single largest
+                                    # block in the cycle**: two calls per coin
+                                    # (tokenDetails + hodlers/top), so 13 was 26 calls
+                                    # = half the recorder's entire load. So it is the
+                                    # first thing cut and the biggest saving: 8 => 16
+                                    # calls, i.e. -10 of -14. 189/8 = 23.6min per
+                                    # sweep, under the new 25min window. And the cost
+                                    # is real and must be known: the concentration
+                                    # snapshot at t0 was present in 9.8% of training
+                                    # rows before the 6->13 raise, and this cut walks
+                                    # it back toward that direction, not to its value.
+                                    # If coverage at t0 collapses, this is the first
+                                    # constant to restore.
+HOLDERS_REFRESH_SECONDS = 1500      # was 900 — raised with the cap so a deficit does not accumulate
 HOLDERS_ERROR_RETRY_SECONDS = 300
-HOLDERS_PACING_SECONDS = 0.2        # كان 0.5 — ميزانية الدورة
+HOLDERS_PACING_SECONDS = 0.2        # was 0.5 — the cycle budget
 
-# --- سدّ فجوة القياس (/proxy/filterTokens) ---
-# `market_ticks` كان يُملأ من قائمتين عامّتين فقط، فعملة تسقط منهما تتوقّف عن
-# القياس وهي لا تزال داخل نافذة الـ48 ساعة: مقيس على القاعدة الحيّة أنّ 53 من
-# 189 مراقَبة نشطة بلا لقطة منذ ساعتين، و35 لم تُقَس ولا مرّة واحدة. أي أنّنا
-# كنّا نفقد بالضبط ما ندّعي قياسه.
+# --- Closing the measurement gap (/proxy/filterTokens) ---
+# `market_ticks` used to be filled from two public lists only, so a coin that fell
+# out of them stopped being measured while still inside its 48-hour window:
+# measured on the live database, 53 of 189 active watches had no snapshot for two
+# hours, and 35 had never been measured even once. That is, we were losing exactly what we claim to measure.
 #
-# `filterTokens` يطلب عناويننا بالاسم فيرجعها كلّها بلا اعتماد على شعبيّتها.
-# **وضع سدّ الفجوة لا المسح الشامل**: نطلب ما لم تلتقطه trending/verified في
-# هذه الدورة فقط (≈53 عنواناً ⇒ نداء واحد، 0.12 GB/يوم). المسح الشامل يكلّف
-# ثلاثة أضعاف ولا يضيف شيئاً: هذا المصدر فقير في العدّادات بنفس فقر verified،
-# فلا يُغني عملة غطّتها trending أصلاً.
-FILTER_TOKENS_BATCH = 150           # مقيس: 150 عنواناً/نداء ترجع 150/150
-FILTER_TOKENS_PACING_SECONDS = 0.5  # بين الدفعات حين تتجاوز الفجوة دفعةً واحدة
-# تقسيم فجوة filterTokens إلى شرائح بالتناوب (2026-08-27): كل change_*/volume_*
-# تأتي **جاهزة** داخل كل tick والميزات تقرأ أحدث tick فقط (market_features)،
-# فالكثافة كلَّ دقيقة طزاجةٌ زائدة لا سلسلةٌ زمنية. القياس الحي: 79 عنواناً
-# خارج القوائم العامة تُقاس كلَّ دورة = ~17% من نداءات fomo اليومية.
-# التقسيم إلى شرائح يقيس كلَّ عملة كلَّ N دورات بلا أي خسارة أعمدة؛ N=2
-# يخفض الفجوة للنصف (طزاجة ≤ دقيقتين بدل دقيقة) — وهي كافية لأن ticks
-# trending/verified للقوائم العامة نفسها تتجدد بمعدل أبطأ.
-FILTER_TOKENS_STRIDE = 2            # 1 = السلوك القديم (كل دورة)
+# `filterTokens` asks for our addresses by name, so it returns all of them
+# regardless of popularity. **Gap-fill mode, not a full sweep**: we ask only for
+# what trending/verified did not pick up this cycle (about 53 addresses => one
+# call, 0.12 GB/day). A full sweep costs three times as much and adds nothing:
+# this source is as poor in counters as verified, so it cannot substitute for a coin trending already covered.
+FILTER_TOKENS_BATCH = 150           # measured: 150 addresses/call return 150/150
+FILTER_TOKENS_PACING_SECONDS = 0.5  # between batches when the gap exceeds one batch
+# Splitting the filterTokens gap into alternating slices (2026-08-27): every
+# change_*/volume_* arrives **ready-made** inside each tick and the features read
+# only the newest tick (market_features), so per-minute density is excess
+# freshness, not a time series. Live measurement: 79 addresses outside the public
+# lists measured every cycle = ~17% of fomo's daily calls. Slicing measures each
+# coin every N cycles with no column loss at all; N=2 halves the gap (freshness <=
+# two minutes instead of one) — and that is enough, because the trending/verified
+# ticks of the public lists themselves refresh at a slower rate.
+FILTER_TOKENS_STRIDE = 2            # 1 = the old behavior (every cycle)
 
-# --- ملفّات المتداولين (/v2/users/{id}) ---
-# `signal_events.buyer_id` مخزَّن منذ اليوم الأوّل ولا جدول تجّار في القاعدة:
-# 5,572 معرّفاً مميّزاً، **3,202 منهم بـ≥3 أحداث**. فسؤال «هل هذا المشتري ماهر
-# أم يشتري كل شيء؟» بلا جواب رغم أنّ الجواب على بُعد نداء واحد. من يظهر مرّة
-# واحدة لا سلوك له نتعلّمه ⇒ المتكرّرون وحدهم يُجلبون.
-# **والحسابُ كلُّه أعلاه صار بلا معنى في 2026-08-20**: النداءُ الفرديُّ
-# `/v2/users/{id}` مات عند المصدر (404 «User not found» لكلّ معرّفٍ صحيحِ الشكل،
-# ومنه معرّفاتٌ خرجت لحظتَها من 200 على `/v2/leaderboard`)، فبقي المسجّل 21 ساعةً
-# يكتب `empty` لكلّ متداول: آخرُ صفٍّ ناجحٍ 2026-08-19T14:53:51Z ثمّ صمت. ولم
-# يُنذر شيءٌ لأنّ 404 و«حسابٌ محذوف» كانا حالةً واحدةً في الكود.
+# --- Trader profiles (/v2/users/{id}) ---
+# `signal_events.buyer_id` has been stored since day one and there is no traders
+# table in the database: 5,572 distinct ids, **3,202 of them with >=3 events**. So
+# the question "is this buyer skilled or does he buy everything?" had no answer
+# even though the answer is one call away. Whoever appears once has no behavior for
+# us to learn => only the repeaters are fetched.
+# **And the whole accounting above became meaningless on 2026-08-20**: the per-id
+# call `/v2/users/{id}` died at the source (404 "User not found" for every
+# well-formed id, including ids that had just come out of a 200 on
+# `/v2/leaderboard`), so the recorder spent 21 hours writing `empty` for every
+# trader: the last successful row 2026-08-19T14:53:51Z, then silence. And nothing
+# alerted, because 404 and "deleted account" were a single case in the code.
 #
-# والبديلُ رزمة: `/v2/users?userIds=…&userIds=…` تردّ 100 ملفٍّ في **نداءٍ واحد**
-# (المصدرُ يصرّح بالحدّ في خطأ التحقّق). فالسقفُ لم يعد يعني نداءات:
+# The replacement is a batch: `/v2/users?userIds=...&userIds=...` returns 100
+# profiles in **one call** (the source declares the limit in a validation error). So the cap no longer means calls:
 #
-#     الطريقة        نداء/دورة   تغطية/دورة   مسحُ 4,685 متكرّراً
-#     الفرديُّ (4)         4          4          19.5 ساعة
-#     الفرديُّ (2)         2          2          39.0 ساعة   ← وكلُّها 404
-#     الرزمةُ (50)         1         50          94 دقيقة
+#     Method        calls/cycle  coverage/cycle  sweep of 4,685 repeaters
+#     per-id (4)         4          4             19.5 hours
+#     per-id (2)         2          2             39.0 hours   <- and all of them 404
+#     batch (50)         1         50             94 minutes
 #
-# أي: **نداءٌ أقلُّ من الحالة المخفوضة، وتغطيةٌ أسرعُ خمساً وعشرين مرّة**. وبعد
-# اللحاق الأوّل (94 دقيقة) يخفّ الطلبُ من نفسه: من عبَر النافذةَ فقط يستحقّ،
-# وذلك ~3.3 متداولاً في الدقيقة، فالرزمةُ تصير صغيرةً بلا سقفٍ جديد.
-TRADERS_PER_CYCLE = 50              # صار «كم متداولاً» لا «كم نداءً»: نداءٌ واحد.
-TRADERS_BATCH_MAX = 100             # حدُّ المصدر المُصرَّح به. 50 نصفُه عن قصد:
-                                    # الطلبُ سطرٌ في العنوان (~45 حرفاً للمعرّف)،
-                                    # ولا داعيَ لملامسة أيّ حدٍّ لطولِ العنوان
-                                    # مقابل ربحِ نصفِ نداءٍ في الدورة.
-TRADERS_MIN_EVENTS = 3              # الحدّ الذي يجعل المتداول جديراً بالجلب
-TRADERS_REFRESH_SECONDS = 86400     # عاد إلى يومٍ من يومين: قاعدةُ «المسحُ تحت
-                                    # النافذة» صارت تُحقَّق بفارقٍ هائل (94 دقيقةً
-                                    # تحت 24 ساعة) بدل أن تُخرَق بـ26.7 ساعة.
+# I.e.: **fewer calls than the reduced state, and coverage twenty-five times
+# faster**. And after the first catch-up (94 minutes) the demand shrinks on its
+# own: only whoever crossed the window still qualifies, and that is ~3.3 traders a
+# minute, so the batch becomes small with no new cap.
+TRADERS_PER_CYCLE = 50              # now "how many traders", not "how many calls": one call.
+TRADERS_BATCH_MAX = 100             # the source's declared limit. 50 is half of it on purpose:
+                                    # the request is one line in the URL (~45 chars per id),
+                                    # and there is no reason to touch any URL-length limit
+                                    # for the profit of half a call per cycle.
+TRADERS_MIN_EVENTS = 3              # the threshold that makes a trader worth fetching
+TRADERS_REFRESH_SECONDS = 86400     # back to one day from two: the "sweep under the
+                                    # window" rule is now met with a huge margin (94
+                                    # minutes under 24 hours) instead of being broken by 26.7 hours.
 TRADERS_ERROR_RETRY_SECONDS = 3600
-TRADERS_PACING_SECONDS = 0.2        # كان 0.5 — ميزانية الدورة
+TRADERS_PACING_SECONDS = 0.2        # was 0.5 — the cycle budget
 
-# كم دورةً متتالية «سألنا ولم ينزل صفٌّ واحد» قبل أن يُكتب سطرُ خطأ يُرى في
-# اللوحة. ثلاثٌ لأنّ نداءَ التجّار واحدٌ في الدورة ويسأل 50: أن يكون الخمسون
-# محذوفين ثلاثَ مرّاتٍ ورا بعض ليس احتمالاً (قِيس: 7 غيابات حقيقيّة من 500)،
-# فالثالثةُ يقينٌ لا شكّ. ورقمٌ أكبرُ كان سيكلّف ساعاتٍ من الصمت بلا مقابل:
-# الانقطاعُ الذي أوجب هذا العدّاد دام 21 ساعة، وثلاثُ دقائقَ كانت تكفي لكشفه.
+# How many consecutive cycles of "we asked and not one row came down" before an
+# error line is written that shows up in the dashboard. Three, because the traders
+# call is one per cycle and asks for 50: all fifty deleted three times in a row is
+# not a possibility (measured: 7 real absences out of 500), so the third time is
+# certainty, not doubt. And a bigger number would have cost hours of silence for
+# nothing: the outage that forced this counter lasted 21 hours, and three minutes would have been enough to catch it.
 SHUTOUT_STREAK_ALERT = 3
 
-# --- طبقة السلسلة (Solana RPC عبر Helius) — عملية مستقلّة لا خطوة في الدورة ---
-# لماذا مستقلّة: دورة المسجّل 60 ثانية وميزانيتها ممتلئة (التمهّل كان يأكل 27.5ث
-# من 60). طبقة السلسلة لها إيقاعها الخاصّ وحدّ سرعتها الخاصّ، وخلطها في الدورة
-# يجعل بطء المصدر الخارجيّ يؤخّر جمع FOMO نفسه. ولأنّها منفصلة صار إيقاع 5 دقائق
-# **ممكناً** بعد أن كان مستحيلاً داخل الدورة: 73 عملة سولانا نشطة ÷ 5 = 15 نداءً
-# في الدقيقة، مقابل 13 تتحمّلها الدورة كلّها لكل شيء.
+# --- The chain layer (Solana RPC via Helius) — a separate process, not a step in the cycle ---
+# Why separate: the recorder cycle is 60 seconds and its budget is full (pacing was
+# eating 27.5s of the 60). The chain layer has its own rhythm and its own speed
+# limit, and mixing it into the cycle makes a slow external source delay the
+# collection of FOMO itself. And because it is separate, a 5-minute cadence became
+# **possible** after being impossible inside the cycle: 73 active Solana coins / 5
+# = 15 calls a minute, vs 13 that the whole cycle tolerates for everything.
 #
-# حدّ السرعة مقيس على المفتاح لا مفترضاً: 24 من 24 نجحت بتوازٍ 3 ⇒ **224 نداءً
-# في الدقيقة بلا فشل واحد** (وسيط 216ms). وبتوازٍ 10 يتدهور: 32 من 40 وأخطاء
-# -32603/-32600 ونداء انتظر 17 ثانية. ⇒ نُمهّل ولا نُزاحم؛ حاجتنا 15/دقيقة = 7%
-# من الطاقة المريحة، فلا داعي للاقتراب من الحدّ أصلاً.
-CHAIN_INTERVAL_SECONDS = 60         # دورة الطبقة كل دقيقة
-CHAIN_PER_CYCLE = 20                # 73 نشطة ÷ 20 = مسح كامل كل ~3.7 دقيقة
-CHAIN_REFRESH_SECONDS = 300         # الهدف المعلن: لقطة تركّز كل 5 دقائق
-CHAIN_ERROR_RETRY_SECONDS = 120     # مجهول ≠ آمن: الخطأ يُعاد سريعاً
-CHAIN_PACING_SECONDS = 0.4          # فاصل **بين** النداءات (توازٍ 1 لا 3)
+# The speed limit is measured on the key, not assumed: 24 of 24 succeeded at
+# parallelism 3 => **224 calls a minute without a single failure** (median 216ms).
+# And at parallelism 10 it degrades: 32 of 40 with -32603/-32600 errors and one
+# call waiting 17 seconds. => we pace, we do not crowd; our need of 15/min = 7% of
+# the comfortable capacity, so there is no reason to approach the limit at all.
+CHAIN_INTERVAL_SECONDS = 60         # the layer's cycle, every minute
+CHAIN_PER_CYCLE = 20                # 73 active / 20 = a full sweep every ~3.7 minutes
+CHAIN_REFRESH_SECONDS = 300         # the declared target: a concentration snapshot every 5 minutes
+CHAIN_ERROR_RETRY_SECONDS = 120     # unknown != safe: errors are retried fast
+CHAIN_PACING_SECONDS = 0.4          # the gap **between** calls (parallelism 1, not 3)
 CHAIN_TIMEOUT_SECONDS = 20.0
-# **العطل العابر ليس رفض مفتاح**، وقد خُلط الصنفان: `HTTP 522` (مهلة Cloudflare
-# إلى الأصل، مقيس 2026-08-17) و5xx و`ReadTimeout` أعطالُ ثوانٍ لا علاقة للمفتاح
-# بها ⇒ تدويره لا يشفيها ويُبرّد مفتاحاً سليماً بلا سبب، والصحيح تمهّلٌ ثمّ إعادة
-# **نفس** المفتاح. وكانت ميزانيّة الإعادة مشتقّة من عدد المفاتيح
-# (`attempts = len(keys)`) فبمفتاح واحد صارت محاولةً واحدة بلا تمهّل — لصنفٍ
-# تعريفه أنّه عابر ⇒ تُفصل هنا. والقيمة مقيّدة بميزانيّة الدورة لا بالتفضيل:
-# محاولة إضافية واحدة تكلّف ثانية للعملة الفاشلة، فحتّى لو فشلت العشرون كلّها
-# (انقطاع تامّ) بقيت الدقيقة سليمة — بخلاف محاولتين بثانية ونصف.
+# **A transient failure is not key rejection**, and the two classes were once
+# mixed: `HTTP 522` (a Cloudflare timeout to the origin, measured 2026-08-17), 5xx,
+# and `ReadTimeout` are failures of seconds that the key has nothing to do with =>
+# rotating it does not cure them and cools a healthy key for no reason; the right
+# move is to wait and retry the **same** key. And the retry budget used to be
+# derived from the number of keys (`attempts = len(keys)`), so with one key it
+# became a single attempt with no wait — for a class whose definition is transient
+# => separated here. And the value is bound by the cycle budget, not by
+# preference: one extra attempt costs one second for the failing coin, so even if
+# all twenty fail (a total outage) the minute stays intact — unlike two attempts at one and a half seconds.
 CHAIN_TRANSIENT_RETRIES = 1
 CHAIN_TRANSIENT_BACKOFF_SECONDS = 1.0
-# طلب الدفعة واحد، لكن العقدة قد تجيب كل تابع عند slot قريب لا مطابق. فرق أكبر
-# من هذا يجعل البسط والمقام من لحظتين مختلفتين فيُرفض القياس بدل نسبة مضلّلة.
+# The batch request is one, but the node may answer each method at a near slot, not
+# an identical one. A larger gap puts the numerator and denominator at two different moments, so the measurement is rejected instead of a misleading ratio.
 CHAIN_MAX_SLOT_LAG = 32
-# الطبقة البطيئة (صلاحيات المِنت وقابليّة التعديل وحيازة المطوّر). إيقاع ساعيّ
-# لأنّ ما تقيسه يتغيّر مرّة واحدة في عمر العملة إن تغيّر — و«مرّة واحدة» هذه
-# حدثٌ يجب أن نلحقه، فلا نُسقط الطبقة ولا نسألها كل خمس دقائق.
-# 6 عملات في الدقيقة × 60 = مسحٌ كامل لـ72 نشطة في ~12 دقيقة، أي كل عملة تُقاس
-# 5 مرّات في الساعة بحدّ `REFRESH` — وميزانيّاً نداءان لكل عملة (والثالث مشروط)
-# فالكلفة ~0.2 نداء/ثانية فوق الطبقة السريعة.
+# The slow layer (mint authority, mutability, developer holding). An hourly rhythm
+# because what it measures changes once in a coin's lifetime if at all — and that
+# "once" is an event we must catch, so we neither drop the layer nor ask it every
+# five minutes. 6 coins a minute x 60 = a full sweep of 72 active in ~12 minutes,
+# so each coin is measured 5 times an hour at the `REFRESH` cap — and budget-wise
+# two calls per coin (the third is conditional), so the cost is ~0.2 calls/second on top of the fast layer.
 CHAIN_AUTH_PER_CYCLE = 6
 CHAIN_AUTH_REFRESH_SECONDS = 3600
 CHAIN_AUTH_ERROR_RETRY_SECONDS = 900
-# الشبكات التي تقبل هذه الطبقة. سولانا وحدها **لهذه الطبقة**: معيار ERC-20 لا
-# يحمل قائمة حائزين على السلسلة، فلا `getTokenLargestAccounts` مقابلَ له على EVM.
-# شبكات EVM تُقاس بطبقة أخرى (`evm_layer.py`) تبني دفتر الأرصدة من التحويلات.
+# The networks this layer accepts. Solana alone **for this layer**: the ERC-20
+# standard does not carry an on-chain holder list, so there is no
+# `getTokenLargestAccounts` equivalent on EVM. EVM networks are measured by another
+# layer (`evm_layer.py`) that builds the balances ledger from transfers.
 CHAIN_NETWORKS = ("1399811149",)
 SOLANA_RPC_URL = "https://mainnet.helius-rpc.com/"
 # Wrapped SOL is a macro/reference asset as well as a possible FOMO signal.
@@ -468,107 +508,118 @@ CHAIN_UNSUPPORTED_TOKENS = frozenset({
 })
 CHAIN_LOG_PATH = os.path.join(HERE, "chain.log")
 
-# --- طبقة EVM: دفتر أرصدة نبنيه من سجلّات Transfer ---
-# لماذا دفتر بأنفسنا ولا مزوّد: مقيس على المراقَبة الحيّة 2026-08-13.
-#   · Etherscan V2 يرفض بلا مفتاح، وV1 القديم مشطوب، وSourcify يعرف 1 من 10.
-#   · Blockscout مجّانيّ بلا مفتاح لكنّه **5.6 ثانية للعملة** (لا 429 — بطء
-#     فقط) ⇒ مسح 57 عملة روبن‑هود = 5.5 دقيقة، وأعلى 50 حائزاً فقط.
-#   · NodeReal يعمل على BSC وحدها (27 من 27، 1.07ث للعملة) وحصّته المجّانيّة
-#     تكفي إيقاعاً ساعيّاً لا أكثر.
-# مقابل ذلك: العقدة الرسميّة مجّانيّة وبلا مفتاح، و**نداء `eth_getLogs` واحد
-# يغطّي كل عملات الشبكة معاً** (مقيس: روبن‑هود 57 عنواناً في 0.5ث، Base 22 في
-# 0.4ث). فالدفتر أرخص وأدقّ وأسرع إيقاعاً: عدد حائزين **مضبوط** (لا يعطيه أي
-# مزوّد مجّاناً على EVM، و`token_holders.holder_count` من FOMO فارغ لكل عملات
-# EVM) وأعلى‑أيّ‑عدد لا أعلى 50.
+# --- The EVM layer: a balances ledger we build from Transfer logs ---
+# Why a ledger of our own and not a provider: measured on the live watch 2026-08-13.
+#   · Etherscan V2 refuses without a key, old V1 is deprecated, and Sourcify knows 1 of 10.
+#   · Blockscout is free without a key but takes **5.6 seconds per coin** (no 429 —
+#     just slow) => sweeping 57 Robinhood coins = 5.5 minutes, and only the top 50 holders.
+#   · NodeReal works on BSC alone (27 of 27, 1.07s per coin) and its free tier is
+#     enough for an hourly rhythm and no more.
+# Against that: the official node is free and keyless, and **one `eth_getLogs`
+# call covers every coin of the network together** (measured: Robinhood 57
+# addresses in 0.5s, Base 22 in 0.4s). So the ledger is cheaper, more precise, and
+# faster in rhythm: an **exact** holder count (no free provider gives it on EVM,
+# and `token_holders.holder_count` from FOMO is empty for every EVM coin) and
+# any-count-top, not top 50.
 EVM_INTERVAL_SECONDS = 60
-# عنوان عقدة كل شبكة. **مقيس** لا مفترض:
-#   4663 روبن‑هود: العقدة الرسميّة، 57 عنواناً في مرشّح واحد ✅ · كتلة 0.101ث
-#   8453 Base    : العقدة الرسميّة، 22 عنواناً ✅ · كتلة 2.00ث
-#                  (publicnode يسقط فوق 5 عناوين بـ403 ⇒ ليس خياراً)
-#   56   BSC     : publicnode بحدّ **5 عناوين** للمرشّح ⇒ يُقسَّم إلى دفعات
-#                  (bsc-dataseed يرفض مدى الكتل أصلاً)
+# Each network's node URL. **Measured**, not assumed:
+#   4663 Robinhood: the official node, 57 addresses in one filter ✅ · block 0.101s
+#   8453 Base    : the official node, 22 addresses ✅ · block 2.00s
+#                  (publicnode drops above 5 addresses with 403 => not an option)
+#   56   BSC     : publicnode with a **5-address** filter cap => split into batches
+#                  (bsc-dataseed rejects block ranges outright)
 EVM_RPC_URLS = {
     "4663": "https://rpc.mainnet.chain.robinhood.com",
     "8453": "https://mainnet.base.org",
     "56": "https://bsc-rpc.publicnode.com",
     "143": "https://rpc.monad.xyz",
 }
-# Monad تنشر خدمة رسمية منفصلة للحالة التاريخية. نستخدمها فقط للبحث الثنائي عن
-# كتلة إنشاء العقد؛ `eth_getLogs` يبقى على RPC العادي لأن الخدمة لا توسع حدّه.
+# Monad publishes a separate official service for historical state. We use it only
+# for the binary search of the contract's creation block; `eth_getLogs` stays on
+# the normal RPC because the service does not widen its limit.
 EVM_HISTORICAL_RPC_URLS = {"143": "https://rpc-mainnet.monadinfra.com"}
-# كلتا العقدتين تدعمان `eth_getCode` التاريخي بما يكفي للبحث عن أول كتلة
-# ظهر فيها العقد. البدء من كتلة الإنشاء يتجاوز تاريخاً فارغاً بأمان.
+# Both nodes support historical `eth_getCode` enough to search for the first block
+# where the contract appeared. Starting from the creation block safely skips an empty history.
 EVM_CREATION_BLOCK_NETWORKS = ("8453", "143")
-# أكبر عدد عناوين في مرشّح واحد لكل شبكة — حدّ المزوّد لا اختيارنا.
+# The most addresses in one filter per network — the provider's limit, not our choice.
 EVM_ADDRESS_BATCH = {"4663": 60, "8453": 60, "143": 40, "56": 5}
-# سقف مدى `eth_getLogs` المقيس. الصفر يعني تكيّفاً بالتنصيف. القيمتان تمنعان
-# إهدار معظم سقف الدورة في رفض مدد معروفة سلفاً قبل بدء القراءة الفعلية.
+# The measured cap on the `eth_getLogs` range. Zero means adapt by halving. The
+# two values stop us from wasting most of the cycle cap on rejecting ranges known in advance, before the actual reading begins.
 EVM_LOG_RANGE_HINT = {"8453": 10_000, "143": 100}
-# كم نداء `eth_getLogs` يُحزَم في طلب HTTP واحد (دفعة JSON-RPC). **كل رقم مقيس
-# حيّاً 2026-08-19 على عملة مراقَبة حقيقيّة، ولا واحد منها مقدَّر**:
-#   8453 Base : عشرة سقفاً، لكنّ الحدّ الحقيقيّ **حجم الردّ لا العدد** —
-#               `-32020 backend response too large` يسقط الدفعة **كلّها ذرّيّاً**،
-#               وأكبر دفعة مقبولة تختلف بالعملة: قِيست 10 و5 و3 و2 و1 لخمس
-#               عملات. لذلك السقف يُقلَّص تكيّفيّاً عند الرفض ولا يُثبَّت.
-#               والمكسب حقيقيّ: 5×10,000 كتلة في 1.16ث مقابل 0.88ث للنداء الواحد.
-#   143 Monad : 40 — تحت حد QuickNode المقيس 50/ثانية للطلبات الفرعية، مع هامش.
-#   4663 روبن‑هود: **واحد**، أي لا دفعة. جُرِّبت 4×100,000 كتلة فنجحت منفردة
-#               (400 ألف كتلة في 1.45ث) لكنّ العقدة تكتم بـHTTP 429 على **كلفة**
-#               الطلب لا على عدده: ثمانية طلبات متتالية بإيقاع 1.5ث أعطت
-#               18 فرعيّة من 32 (54,572 كتلة/ث) وبإيقاع 2.0ث أعطت 24 من 32
-#               (67,516 كتلة/ث) — وكلاهما **أقلّ** من 71,000 كتلة/ث للنداء
-#               المنفرد. فالدفعة هنا تشتري كتماً لا سرعة.
-#   56   BSC  : واحد — الشبكة أصلاً خارج `EVM_NETWORKS` (لا عقدة أرشيف مجّانيّة).
+# How many `eth_getLogs` calls are packed into one HTTP request (a JSON-RPC
+# batch). **Every number is measured live on 2026-08-19 on a real watched coin;
+# not one of them is an estimate**:
+#   8453 Base : ten as the cap, but the real limit is **the response size, not
+#               the count** — `-32020 backend response too large` drops the
+#               **whole batch atomically**, and the largest accepted batch differs
+#               per coin: 10 and 5 and 3 and 2 and 1 were measured for five coins.
+#               So the cap is adaptively reduced on rejection, never fixed.
+#               And the gain is real: 5x10,000 blocks in 1.16s vs 0.88s for the single call.
+#   143 Monad : 40 — under QuickNode's measured 50/second limit for subrequests, with margin.
+#   4663 Robinhood: **one**, i.e. no batching. 4x100,000 blocks was tried and
+#               worked individually (400k blocks in 1.45s), but the node throttles
+#               with HTTP 429 on the **cost** of the request, not its count:
+#               eight consecutive requests at a 1.5s rhythm gave 18 subrequests of
+#               32 (54,572 blocks/s), and at a 2.0s rhythm 24 of 32 (67,516
+#               blocks/s) — and both are **less** than the 71,000 blocks/s of the
+#               single call. So batching here buys throttling, not speed.
+#   56   BSC  : one — the network is outside `EVM_NETWORKS` anyway (no free archive node).
 EVM_BATCH_SIZE = {"8453": 10, "143": 40, "4663": 1, "56": 1}
-# وإيقاعٌ خاصّ بالدفعة: الطلب الواحد صار يحمل عمل عشرة، فالفاصل 0.4ث المناسب
-# لنداء مفرد يستدعي الكتم. مقيس على Base: تسعة طلبات في نافذة ~15ث ⇒ 1.5ث.
+# And a pacing of its own for batches: a single request now carries the work of
+# ten, so the 0.4s gap suited to a single call invites throttling. Measured on
+# Base: nine requests in a ~15s window => 1.5s.
 EVM_BATCH_PACING_SECONDS = 1.5
-# الشبكات التي تُعرَف كتلةُ إنشاء العقد فيها بـ**مسح السكّ**: نداء `eth_getLogs`
-# واحد على المدى `0→head` بموضوعين `[Transfer, 0x0]` (السكّ من عنوان الصفر).
-# هذا هو الطريق الوحيد على روبن‑هود: عقدتها بلا أرشيف (~128 كتلة عمقاً) فالبحث
-# الثنائي على `eth_getCode` مستحيل — ولهذا كانت الإعادة تبدأ من **الكتلة صفر**.
-# والقياس 2026-08-19 يقول كم كان ذلك مكلفاً: أربع عملات مراقَبة سُكَّت عند
-# 0.2% و67.7% و88.6% و93.6% من السلسلة، أي أنّ ثلاثاً منها كانت تمشي في
-# 27–37 **مليون** كتلة فارغة قبل أوّل تحويل. والمسح يجيب في **نداء واحد 0.17ث**.
-# وBase/Monad مستثناتان لا بالنسيان: سقف المدى (10,000 و100 كتلة) يحرّم استعلام
-# `0→head` أصلاً (HTTP 413)، ولهما الأرشيف ⇒ `EVM_CREATION_BLOCK_NETWORKS`.
+# The networks where the contract's creation block is found by a **mint scan**:
+# one `eth_getLogs` call over the range `0->head` with two topics `[Transfer,
+# 0x0]` (a mint from the zero address). This is the only way on Robinhood: its
+# node has no archive (~128 blocks deep), so the binary search on `eth_getCode`
+# is impossible — which is why the replay used to start from **block zero**. And
+# the 2026-08-19 measurement says how expensive that was: four watched coins were
+# minted at 0.2%, 67.7%, 88.6%, and 93.6% of the chain, meaning three of them
+# walked through 27-37 **million** empty blocks before the first transfer. And
+# the mint scan answers in **one 0.17s call**. And Base/Monad are excluded, not
+# forgotten: their range cap (10,000 and 100 blocks) forbids a `0->head` query
+# outright (HTTP 413), and they have the archive => `EVM_CREATION_BLOCK_NETWORKS`.
 EVM_MINT_SCAN_NETWORKS = ("4663",)
-# الشبكات المفعَّلة فعلاً. تُوسَّع بعد التحقّق على الأولى لا قبله.
+# The networks actually enabled. Widened after verifying on the first one, not before.
 EVM_NETWORKS = ("4663", "8453", "143")
-# تأخير التأكيد بالكتل: لا نعالج كتلةً قد تُستبدل. روبن‑هود وBase طبقتان ثانيتان
-# بمُسلسِل (إعادة الترتيب شبه معدومة) وBSC تعيد ترتيب ~3 كتل ⇒ 12 هامش كافٍ
-# للثلاث، وكلفته على روبن‑هود 1.2 ثانية فقط من الطزاجة.
+# Confirmation delay in blocks: we do not process a block that may be replaced.
+# Robinhood and Base are layer-2s with a sequencer (reordering is nearly zero) and
+# BSC reorders ~3 blocks => a margin of 12 is enough for all three, and it costs
+# Robinhood only 1.2 seconds of freshness.
 EVM_CONFIRMATIONS = 12
-# سقف السجلّات في ردّ واحد عند المصدر. مقيس حيّاً: روبن‑هود يرفض بـ
-# `logs matched by query exceeds limit of 10000` ⇒ نُنصّف المدى ونعيد.
+# The cap on log records in one response at the source. Measured live: Robinhood
+# refuses with `logs matched by query exceeds limit of 10000` => we halve the range and retry.
 EVM_LOG_LIMIT = 10000
-EVM_BACKFILL_MAX_CALLS = 24         # سقف نداءات التعبئة الأوّليّة لعملة واحدة
-# كم كتلة تقطعها نداء التعبئة الواحدة **فعليًا** — لقياس عمل الطابور في
-# بوابة الإدخال (`evm_admission_policy`). مقيس من سجل evm.log الحيّ
-# (2026-08-29): التعبئة تُنجز مئات آلاف الكتل بالنداء الواحد — 1,714
-# تحويلًا في نداء واحد على Base، وعملة روبن‑هود كاملة (79,894 تحويلًا)
-# في 33 نداءً فقط. التقدير القديم (وحدة = سقف المدى 10K) ضخّم العمل
-# ×25 فأبقى البوابة موقوفة أبدًا رغم تقدّم التعبئة الحقيقي.
-#   4663: بلا سقف مدى (تنصيف تكيّفي) والقياس ~500K كتلة/نداء للمدى الفارغ.
-#   8453: سقف 10K نتيجة؛ القيمة الفعلية للنداء الواحد = سقف المدى نفسه.
-#   143:  سقف 100 كتلة/نداء — لا يتجاوزه أبدًا.
+EVM_BACKFILL_MAX_CALLS = 24         # cap on the initial backfill calls for a single coin
+# How many blocks one backfill call actually covers — for measuring the queue's
+# work in the admission gate (`evm_admission_policy`). Measured from the live
+# evm.log (2026-08-29): the backfill covers hundreds of thousands of blocks per
+# call — 1,714 transfers in one call on Base, and a whole Robinhood coin (79,894
+# transfers) in only 33 calls. The old estimate (unit = the 10K range cap)
+# inflated the work x25 and kept the gate paused forever despite the real backfill progress.
+#   4663: no range cap (adaptive halving), and the measurement is ~500K blocks/call for the empty range.
+#   8453: a 10K result cap; the effective value per call = the range cap itself.
+#   143:  a 100-block/call cap — it never exceeds it.
 EVM_BACKFILL_BLOCKS_PER_CALL = {"4663": 500_000, "8453": 10_000, "143": 100, "56": 10_000}
-EVM_BACKFILL_TOKENS_PER_CYCLE = 3   # عملات جديدة تُعبَّأ في الدورة الواحدة
-# وسقفٌ **بالزمن** فوق سقف العدد، وهو الذي يحمي الفترة فعلاً: نداء واحد يعلَق
-# حتى `EVM_TIMEOUT_SECONDS` فـ«24 نداءً» قد تكون ثانيتين أو ثماني دقائق. مقيس
-# على الدورة الحيّة الثانية: 72 نداءً (3 عملات × 24) استهلكت **118 ثانية**
-# والفترة 60. والتعبئة هي الوحيدة التي تُقطَع: تُستأنف من نقطتها في الدورة
-# القادمة بلا فقدان سجلّ. والقيمة 25 تُبقي الدورة عند ~50ث في أسوأ الحالات
-# (25 ميزانية + نداء عالق واحد) لا 118.
-# **ومَن تحميه ليس سولانا** — صيغةُ 08-13 قالت «الطبقة السريعة على سولانا في
-# نفس العملية»، و`chain_layer` يعمل في عمليّةٍ أخرى (`run_chain.py` / FomoChain،
-# ونداؤه الإنتاجيّ الوحيد `run_chain.py:123`). الذي يشارك هذه العمليّة وهذه
-# الدورة أربعُ خطواتٍ **بعد** التعبئة في `run_evm_replay.run_cycle`: لقطاتُ
-# تركّز EVM (الخطوة ٣ من `run_evm_cycle`)، ثمّ `bsc_layer`، ثمّ `evm_contract`
-# (ثلاثُ شبكات منذ 08-22 لا واحدة)، ثمّ `evm_replay` بميزانيّته الـ120ث. فالسقفُ
-# يحمي اليوم أكثر مما كان يحمي حين كُتب لا أقلّ ⇒ **لا يُرفع لتسريع التعبئة**.
-# (قِيس 08-22: سببٌ قديمٌ في تعليقٍ صحيحِ الرقم هو نفسُ ما حبس
-# `EVM_CONTRACT_NETWORKS` على Base تسعةَ أيّام.)
+EVM_BACKFILL_TOKENS_PER_CYCLE = 3   # new coins backfilled in one cycle
+# And a cap **in time** on top of the count cap, and it is the one that actually
+# protects the period: a single call can hang for up to `EVM_TIMEOUT_SECONDS`, so
+# "24 calls" may be two seconds or eight minutes. Measured on the second live
+# cycle: 72 calls (3 coins x 24) consumed **118 seconds** against a period of 60.
+# And the backfill is the only thing that gets cut: it resumes from its checkpoint
+# in the next cycle with no lost records. And a value of 25 keeps the cycle at
+# ~50s in the worst case (25 budget + one hung call), not 118.
+# **And what it protects is not Solana** — the 08-13 wording said "the fast layer
+# on Solana in the same process", and `chain_layer` runs in another process
+# (`run_chain.py` / FomoChain, whose only production entry is `run_chain.py:123`).
+# What shares this process and this cycle is the four steps **after** the backfill
+# in `run_evm_replay.run_cycle`: the EVM concentration snapshots (step 3 of
+# `run_evm_cycle`), then `bsc_layer`, then `evm_contract` (three networks since
+# 08-22, not one), then `evm_replay` with its 120s budget. So the cap protects
+# more today than when it was written, not less => **do not raise it to speed up the backfill**.
+# (Measured 08-22: an outdated reason inside a numerically correct comment is the
+# same thing that kept `EVM_CONTRACT_NETWORKS` stuck on Base for nine days.)
 EVM_BACKFILL_BUDGET_SECONDS = 25.0
 # Per-network budgets feed admission decisions independently. A provider/RPC
 # slowdown on one network must not consume the acceptance budget of another.
@@ -579,206 +630,235 @@ EVM_BACKFILL_BUDGET_SECONDS_BY_NETWORK = {
 }
 # QuickNode counts JSON-RPC subrequests inside a batch.
 EVM_RPC_SUBREQUEST_LIMIT = {"143": 50}
-# التعبئة تبدأ من **الكتلة صفر** لا من نافذة الـ48 ساعة: الرصيد ليس معدّلاً بل
-# تراكماً، فتحويل قديم فات يجعل كل حائز ناقصاً إلى الأبد بلا أثر ظاهر. والكلفة
-# صفر عمليّاً — المرشّح بلا مدًى يعيد كل تاريخ العملة في نداء واحد إن كانت أقلّ
-# من السقف (مقيس: 1,814 تحويلاً في 0.7 ثانية)، والقسمة تتكفّل بما فوقه.
+# The backfill starts from **block zero**, not from the 48-hour window: a balance
+# is not a delta but an accumulation, so one missed old transfer leaves every
+# holder short forever with no visible error. And the cost is practically zero —
+# a filter without a range returns the coin's whole history in one call if it is
+# under the cap (measured: 1,814 transfers in 0.7 seconds), and the halving handles whatever exceeds it.
 EVM_BACKFILL_FROM_BLOCK = 0
-EVM_PACING_SECONDS = 0.4            # العقد العامّة تُحدّد السرعة (شوهد 429)
-# وحين تكتم فعلاً (429): انتظار أطول ثمّ إعادة **نفس** المدى. مقيس على أوّل دورة
-# حيّة: تعبئة ثقيلة انتهت بمهلة استعلام، فكتمت العقدة النداءين بعدها. والقيمة
-# ليست تخميناً في اتّجاه واحد — سقف النداءات (`EVM_BACKFILL_MAX_CALLS`) هو ما
-# يمنع الانتظار من أكل الدورة، فالثانيتان أرخص من ثغرة دائمة في الدفتر.
+EVM_PACING_SECONDS = 0.4            # public nodes set the pace (a 429 was seen)
+# And when they do throttle (429): a longer wait, then retry the **same** range.
+# Measured on the first live cycle: a heavy backfill ended in a query timeout, so
+# the node throttled the two calls after it. And the value is not a one-way guess
+# — the call cap (`EVM_BACKFILL_MAX_CALLS`) is what stops the wait from eating
+# the cycle, so two seconds are cheaper than a permanent hole in the ledger.
 EVM_RATE_LIMIT_BACKOFF_SECONDS = 2.0
-# `eth_blockNumber` مرساة الدورة كلّها: فشله يُسقط مسح الشبكة بأسرها لا عملةً
-# واحدة (`evm_layer.py`)، وقد شوهد يفشل بـ`ReadTimeout` على روبن‑هود (4663 —
-# 37% من الإشارات) 2026-08-17. نداءٌ واحد رخيص لا يستحقّ ذلك الثمن ⇒ يُعاد.
-# والمؤشّر لا يتقدّم عند الفشل فلا ثغرة في الدفتر، لكنّ الدقيقة تُفقد.
+# `eth_blockNumber` anchors the whole cycle: its failure drops the entire network
+# sweep, not one coin (`evm_layer.py`), and it was seen failing with
+# `ReadTimeout` on Robinhood (4663 — 37% of signals) on 2026-08-17. One cheap
+# call is not worth that price => it is retried. And the pointer does not advance
+# on failure, so there is no hole in the ledger, but the minute is lost.
 EVM_HEAD_RETRIES = 2
 EVM_TIMEOUT_SECONDS = 25.0
-EVM_SNAPSHOT_SECONDS = 300          # لقطة تركّز لكل عملة كل 5 دقائق
-# سقف نداءات التطبيق الدوريّ لشبكة واحدة. الحالة العاديّة نداء واحد للشبكة
-# (مقيس: 57 عنواناً في 0.5 ثانية)، والسقف لدقيقة صاخبة تُقسَّم فيها المدد.
+EVM_SNAPSHOT_SECONDS = 300          # a concentration snapshot per coin every 5 minutes
+# The cap on the periodic apply calls for a single network. The normal case is
+# one call per network (measured: 57 addresses in 0.5 seconds), and the cap is for a noisy minute where ranges get split.
 EVM_APPLY_MAX_CALLS = 12
-# كم عملة تُلقَّط في الدورة الواحدة. اللقطة قراءة من القاعدة بلا نداء شبكة، لكنّ
-# جمع الأرصدة عمل حسابيّ ⇒ يُوزَّع بالتناوب مثل بقيّة الطبقات.
+# How many coins get snapshotted in one cycle. The snapshot is a database read
+# with no network call, but gathering the balances is computational work => rotated like the other layers.
 EVM_SNAPSHOT_PER_CYCLE = 20
 EVM_LOG_PATH = os.path.join(HERE, "evm.log")
-# فحص سلامة العقد. **الشبكات الثلاث** — وُسِّع 2026-08-22 بقياسٍ نقض القياس
-# الأوّل. كان الحكم «Base وحدها» مبنيّاً على أنّ BSC نسخٌ مطابقة من عقدَي تنفيذ
-# (21 من 27 وكيلاً) وروبن‑هود ستّة قوالب متكرّرة ⇒ «ثابت لا معلومة». والخطأ أنّ
-# تكرارَ القوالب قِيس في `code_size` وحده، أمّا `is_proxy` **فهو نفسه المعلومة**:
-#   BSC  56   : 26 من 40 وكيلاً ⇒ انقسام 65/35، أقوى عمودٍ مفرّقٍ قِسناه على أيّ
-#               شبكة (Base 3 من 40 وروبن‑هود 2 من 36). و`code_size` 8 قيم مميّزة
-#               و`function_count` 7، وmint/limit/trading تتباين 1 من 40 لكلٍّ.
-#   RH   4663 : `code_size` 20 قيمة مميّزة و`function_count` 16 — وتتباين في
-#               `has_pause` (1 من 36) حيث Base ثابتة. أي **أكثر** تبايناً لا أقلّ.
-#   Base 8453 : كما قِيس أوّلاً — 26 قيمة حجمٍ مميّزة، mint في 5 من 40.
-# الثابت فعلاً على الثلاث جميعاً: `has_blacklist` و`has_fee_setter` (صفر دائماً).
-# والسقفُ زمنيّ لا حصصيّ: 106 مراقَبة على الشبكات الثلاث ÷ 2 في الدورة = مسحٌ
-# كامل كلّ 53 دقيقة، تحت هدف الـ3600ث. لو تجاوزت المراقَبة 120 تجاوز المسحُ
-# الساعة وتقادمت الصفوف — والعلاج حينها إيقاعٌ لكلّ شبكة لا دفعةٌ أكبر، لأنّ
-# الحصّة أدناه حصّةُ عقدةٍ واحدة.
+# Contract safety inspection. **All three networks** — widened 2026-08-22 by a
+# measurement that overturned the first one. The verdict "Base alone" used to
+# rest on BSC being identical copies of two implementation contracts (21 of 27
+# proxies) and Robinhood six repeated templates => "constant, so no information".
+# The mistake was that template repetition was measured in `code_size` alone,
+# whereas `is_proxy` **is itself the information**:
+#   BSC  56   : 26 of 40 proxies => a 65/35 split, the strongest discriminating
+#               column we have measured on any network (Base 3 of 40, Robinhood 2
+#               of 36). And `code_size` has 8 distinct values and `function_count`
+#               7, and mint/limit/trading vary in 1 of 40 each.
+#   RH   4663 : `code_size` 20 distinct values and `function_count` 16 — and they
+#               vary in `has_pause` (1 of 36) where Base is constant. I.e.
+#               **more** variance, not less.
+#   Base 8453 : as first measured — 26 distinct size values, mint in 5 of 40.
+# What is truly constant across all three: `has_blacklist` and `has_fee_setter`
+# (always zero). And the cap is temporal, not quota-based: 106 watches across the
+# three networks / 2 per cycle = a full sweep every 53 minutes, under the 3600s
+# target. If the watchlist exceeds 120, the sweep would exceed the hour and rows
+# go stale — and the fix then is a per-network rhythm, not a bigger batch,
+# because the quota below is a single node's quota.
 EVM_CONTRACT_NETWORKS = ("8453", "56", "4663")
-# **حصّة `mainnet.base.org` مقيسة لا مقدَّرة** (2026-08-13): تسعة نداءات ناجحة ثمّ
-# 429، والإيقاع لا يغيّرها — 0.4ث و1.0ث أعطتا تسعة كلتاهما، فهي حصّةٌ بالعدد في
-# نافذة ~15ث لا فراغٌ بين النداءات. والعملة الواحدة تكلّف أربعة نداءات (بايت‑كود
-# + ثلاث صيغ ملكيّة) ⇒ اثنتان = ثمانية، تحت الحصّة بنداء. وكانت أربعاً فكتمت
-# العقدةُ الرابعةَ في دورتين حيّتين متتاليتين. **فلا تُرفع لتوسيع الشبكات**: الرقم
-# حصّةُ عقدةٍ واحدة لا سعةُ الطبقة، وثلاثةٌ = اثنا عشر نداءً تكتمها Base ثانيةً.
-# ومقيس 2026-08-22 أنّ عقدة روبن‑هود أضيق: 429 في 4 من 40 عند إيقاع 0.4ث دفعةً
-# واحدة — والدورة الحيّة تمسح اثنتين في ستّين ثانية فلا تقترب من ذلك.
+# **The `mainnet.base.org` quota is measured, not estimated** (2026-08-13): nine
+# successful calls then 429, and pacing does not change it — 0.4s and 1.0s both
+# gave nine, so it is a count quota in a ~15s window, not a gap between calls.
+# And one coin costs four calls (bytecode + three ownership forms) => two coins =
+# eight, one call under the quota. It used to be four, and the node throttled the
+# fourth in two consecutive live cycles. **So do not raise it to widen the
+# networks**: the number is a single node's quota, not the layer's capacity, and
+# three coins = twelve calls that Base throttles again. And measured 2026-08-22,
+# the Robinhood node is narrower: 429 in 4 of 40 at a 0.4s pace in a single
+# batch — and the live cycle sweeps two in sixty seconds, so it never approaches that.
 EVM_CONTRACT_PER_CYCLE = 2
 EVM_CONTRACT_REFRESH_SECONDS = 3600
 EVM_CONTRACT_ERROR_RETRY_SECONDS = 900
 
-# --- الإعادة الرجعيّة: صفوف تركّز لماضٍ مضى (`evm_replay.py`) ---
-# السلسلة سجلّ غير قابل للتغيير ومؤرَّخ بالكتل، فإعادة تشغيل تحويلاتها حتى الكتلة
-# التي كانت رأساً عند لحظة قديمة تعطي **ما كان معلوماً في تلك اللحظة بالضبط** — لا
-# معلومة من المستقبل. وهذا يختلف كلّ الاختلاف عن تعبئة إشارات رجعيّة (المرفوضة):
-# تلك تختلق صفوفاً لم يرها البوت، وهذه تُكمِل قياساً لصفٍّ موجود.
+# --- Retroactive replay: concentration rows for a past that has passed (`evm_replay.py`) ---
+# The chain is an immutable, block-dated log, so replaying its transfers up to the
+# block that was head at an old moment gives **exactly what was known at that
+# moment** — no information from the future. And this is completely different from
+# backfilling signals retroactively (which is rejected): that fabricates rows the
+# bot never saw, while this completes the measurement of a row that exists.
 #
-# الشبكات المتاحة للإعادة **مقيسة لا مختارة** (2026-08-13):
-#   4663 روبن‑هود ✅ العقدة تخدم `eth_getLogs` من الكتلة صفر بلا سقف مدًى.
-#   8453 Base     ✅ لكن بسقف **10,000 كتلة للمدى** (`-32614`, HTTP 413) = 5.5
-#                    ساعة ⇒ ~22 نداءً لعمر عملة، وحصّة تسعة نداءات في النافذة.
-#   56   BSC      ❌ لا عقدة مجّانيّة تخدم التاريخ: publicnode يرفض ما هو أقدم من
-#                    ~2000 كتلة بـ«Archive requests require a personal token»،
-#                    وbsc-dataseed يرفض المرشّح أصلاً (`-32005`)، و1rpc بسقف 50
-#                    كتلة، وdrpc يكتم من أوّل نداء. فـBSC تحتاج مزوّداً بمفتاح.
-#   143  Monad     ❌ **لا لعجزٍ بل لغياب عمل**: `watchlist` فيها صفر عملة
-#                    نشطة على 143 (مقابل 49 روبن‑هود و23 Base و35 BSC و82
-#                    سولانا، مقيس 2026-08-19) وثلاث عملات غير نشطة. ومع ذلك كانت
-#                    تأخذ ثلث دورات الإعادة وتنفق 2,950 نداءً مقابل **صفر لقطة**،
-#                    وسجلّها يطبع `كتل 38963051→38963050` أي بلا تقدّم كتلة واحدة.
-#                    تُعاد فوراً متى ظهرت عملة Monad نشطة — والمسار كلّه جاهز.
+# The networks available for replay are **measured, not chosen** (2026-08-13):
+#   4663 Robinhood ✅ the node serves `eth_getLogs` from block zero with no range cap.
+#   8453 Base     ✅ but with a **10,000-block range cap** (`-32614`, HTTP 413) =
+#                    5.5 hours => ~22 calls for a coin's lifetime, and a quota of nine calls per window.
+#   56   BSC      ❌ no free node serves history: publicnode refuses anything older
+#                    than ~2000 blocks with "Archive requests require a personal
+#                    token", bsc-dataseed rejects the filter outright
+#                    (`-32005`), 1rpc caps at 50 blocks, and drpc throttles from
+#                    the first call. So BSC needs a keyed provider.
+#   143  Monad     ❌ **not for inability but for lack of work**: `watchlist` has
+#                    zero active coins on 143 (vs 49 Robinhood, 23 Base, 35 BSC,
+#                    and 82 Solana, measured 2026-08-19) and three inactive coins.
+#                    Yet it was taking a third of the replay cycles and spending
+#                    2,950 calls for **zero snapshots**, and its log printed
+#                    `blocks 38963051->38963050`, i.e. without one block of progress.
+#                    It returns the moment an active Monad coin appears — the whole path is ready.
 EVM_REPLAY_NETWORKS = ("4663", "8453")
-# إيقاع اللقطات المُعادة = إيقاع الحيّة نفسه: عائلة `onchain_*` تقرأ لقطةً عند/قبل
-# t0 **ولقطةً قبلها بـ240–900ث** لحساب فروق الخمس دقائق، فشبكةٌ بلقطة واحدة لكل
-# صفّ تدريب تعطي الفروق كلّها NULL. والشبكة على `EVM_SNAPSHOT_SECONDS` تُطابق ما
-# كانت الطبقة الحيّة ستكتبه لو كانت تعمل حينها.
+# The replayed snapshots' cadence = the live cadence itself: the `onchain_*`
+# family reads a snapshot at/before t0 **and one 240-900s before it** to compute
+# the five-minute deltas, so a network with one snapshot per training row gives
+# all-null deltas. And a network on `EVM_SNAPSHOT_SECONDS` matches what the live
+# layer would have written had it been running then.
 EVM_REPLAY_STEP_SECONDS = EVM_SNAPSHOT_SECONDS
-# سقف نداءات السجلّات لعملة واحدة. أوسع من سقف التعبئة الحيّة (24) لأنّ هذه مهمّة
-# يدويّة بلا فترة دقيقة تحكمها، وBase تحتاج ~22 نداءً لعمر عملة بسبب سقف المدى.
+# The cap on log calls for a single coin. Wider than the live backfill cap (24)
+# because this is a manual task with no minute period governing it, and Base
+# needs ~22 calls for a coin's lifetime because of the range cap.
 EVM_REPLAY_MAX_CALLS = 120
-# من أين نبدأ البحث عن تاريخ العملة: قبل أوّل ظهور لها في قائمتنا بهذا القدر.
-# البدء بعد أوّل تحويل يجعل أرصدةً **سالبة** (من أرسل ما لم نره يستلمه) —
-# وهذا بالضبط ما يكشفه فحص المجموع الصفريّ أدناه، فيُوسَّع المدى ويُعاد.
+# Where we start searching for the coin's history: this far before its first
+# appearance in our list. Starting after the first transfer makes balances
+# **negative** (someone sent what we never saw them receive) — and that is exactly
+# what the zero-sum check below catches, so the range is widened and retried.
 EVM_REPLAY_LOOKBACK_SECONDS = 7 * 24 * 3600
-# مسافة مراسي الوقت↔الكتلة بالكتل. لازمة لروبن‑هود وحدها: عقدتها تعيد
-# `blockTimestamp: '0x0'` في كل سجلّ (مقيس) فلا وقت في السجلّ نفسه، بينما Base
-# وBSC تعيدان الطابع الحقيقيّ. وزمن كتلتها ثابت بقياسٍ لافت (0.1002ث و0.1003ث
-# على 100 ألف و300 ألف كتلة) ⇒ الاستقراء بين مرساتين متجاورتين خطؤه ثوانٍ.
+# The distance between time<->block anchors, in blocks. Needed for Robinhood
+# alone: its node returns `blockTimestamp: '0x0'` in every log (measured), so
+# there is no time in the log itself, while Base and BSC return the real
+# timestamp. And its block time is constant by a striking measurement (0.1002s
+# and 0.1003s over 100k and 300k blocks) => interpolating between two adjacent anchors has an error of seconds.
 EVM_REPLAY_ANCHOR_BLOCKS = 18_000
-# وسقف نداءات المراسي لعملة واحدة، **منفصل** عن سقف السجلّات: سقفٌ واحد مشترك
-# يجعل عملةً صاخبة تستنزفه على سجلّاتها فتبقى كتلها بلا وقت — أي نداءات بلا
-# صفوف. والقيمة محسوبة لا مقدَّرة: نافذة 48 ساعة على روبن‑هود = 1.728 مليون كتلة
-# ÷ 18,000 = 96 خليّة في أسوأ الحالات (عملة تتحرّك في كل نصف ساعة من النافذة).
-# والكلفة تنهار بعد أوّل العملات: المرساة صفة كتلة لا صفة عملة، والنوافذ متراكبة.
+# And the cap on anchor calls for a single coin, **separate** from the log cap:
+# one shared cap lets a noisy coin exhaust it on its logs, leaving its blocks
+# without time — i.e. calls without rows. And the value is calculated, not
+# estimated: a 48-hour window on Robinhood = 1.728 million blocks / 18,000 = 96
+# cells in the worst case (a coin that moves in every half hour of the window).
+# And the cost collapses after the first coins: an anchor is a property of a
+# block, not of a coin, and the windows overlap.
 EVM_REPLAY_ANCHOR_MAX_CALLS = 150
-# ومحاولات إعادة نداء المرساة عند الكتم. مقيسة الحاجة لا مفترضة: أوّل تشغيل حيّ
-# مات عند العملة الأولى بـ`EVMRateLimit` من `eth_getBlockByNumber` — عقدة روبن‑هود
-# العامّة تكتم بعد تسعة نداءات (حصّة لا تباعد: نفس الرقم على 0.4ث و1.0ث). ومسار
-# السجلّات ينتظر ويعيد نفس المدى، فرفعُ الكتم في مسار المراسي وحده يعني إسقاط
-# عملة كاملة بسبب ثانية مزدحمة. أربع محاولات × 2ث = ثمان ثوانٍ حدّاً أقصى للكتلة.
+# And the retries for an anchor call under throttling. The need is measured, not
+# assumed: the first live run died at the first coin with `EVMRateLimit` from
+# `eth_getBlockByNumber` — the public Robinhood node throttles after nine calls
+# (a quota, not a spacing: the same number at 0.4s and 1.0s). And the log path
+# waits and retries the same range, so throttling in the anchor path alone would
+# mean dropping a whole coin because of one crowded second. Four attempts x 2s =
+# eight seconds at most per block.
 EVM_REPLAY_ANCHOR_RETRIES = 4
-# وهامشٌ يُضاف إلى الوقت المستقرَأ لا يُطرح — الاتّجاه مقصود: زيادة وقت السجلّ
-# تُخرِج السجلّ الحدوديّ من اللقطة، والنقص يُدخِل تحويلاً من المستقبل. فالخطأ
-# المسموح تأخيرُ قياسٍ (كما تفعل تأكيدات الكتل في الطبقة الحيّة) لا استباقُه.
+# And a margin that is added to the interpolated time, never subtracted — the
+# direction is deliberate: increasing a log's time pushes a boundary log out of
+# the snapshot, and decreasing it pulls in a transfer from the future. So the
+# allowed error is a measurement delay (like the block confirmations in the live
+# layer), not an anticipation of it.
 EVM_REPLAY_TIME_MARGIN_SECONDS = 5
-# نافذة انتهت منذ هذا الهامش تُعاد حتى كتلة نهايتها فقط؛ النافذة النشطة تتبع
-# الرأس الحالي. يمنع هذا جلب أيام من السجل بعد انتهاء مراقبة العملة.
+# A window that ended this long ago is replayed up to its end block only; the
+# active window follows the current head. This prevents pulling days of logs after a coin's watch has ended.
 EVM_REPLAY_HEAD_GRACE_SECONDS = 900
-# ميزانية زمنيّة للمهمّة كلّها إن شُغّلت بحدّ (0 = بلا حدّ). المهمّة تُستأنف من
-# حالتها فالقطع لا يفقد شيئاً.
+# A time budget for the whole task when run with a cap (0 = no cap). The task
+# resumes from its state, so cutting it loses nothing.
 EVM_REPLAY_BUDGET_SECONDS = 0.0
-# سقف نداءات **مدى الحياة** لعملة واحدة في الإعادة، عبر كل الدورات. سقف
-# `EVM_REPLAY_MAX_CALLS` سقفُ دورة لا سقفُ عملة، فعملة لا تكتمل أبداً تُعيد
-# استئنافها إلى الأبد: قِيس 2026-08-19 على Base عملتان أنفقتا 15,270 و11,665
-# نداءً وانتهتا إلى `negative` بصفر صفوف، وثالثة 5,660 نداءً وهي `partial` بعد.
-# والقيمة محسوبة: أطول مشي حقيقيّ هو عملة Base من كتلة الإنشاء (~341 ألفاً) إلى
-# الرأس (50.1 مليون) ÷ سقف المدى 10,000 = ~4,960 نداءً، فـ8,000 تترك هامشاً
-# مضاعفاً للفشل العابر وتقطع الاستنزاف قبل أن يبلغ 15 ألفاً. والتوقّف يُسجَّل
-# بحالة نهائيّة صريحة (`budget`) لا بحالة تُعاد كل دورة: عملة تُرى في السجلّ
-# أفضل من عملة تأكل الميزانيّة صامتة.
+# A **lifetime** cap on calls for a single coin in the replay, across all cycles.
+# The `EVM_REPLAY_MAX_CALLS` cap is a cycle cap, not a coin cap, so a coin that
+# never completes gets its resume retried forever: measured 2026-08-19 on Base,
+# two coins spent 15,270 and 11,665 calls and ended `negative` with zero rows,
+# and a third 5,660 calls and still `partial`. And the value is calculated: the
+# longest real walk is a Base coin from the creation block (~341k) to the head
+# (50.1 million) / the 10,000 range cap = ~4,960 calls, so 8,000 leaves a doubled
+# margin for transient failures and cuts the drain before it reaches 15k. And
+# the stop is recorded with an explicit final state (`budget`), not a state
+# retried every cycle: a coin visible in the log is better than a coin silently eating the budget.
 EVM_REPLAY_TOKEN_CALL_CAP = 8_000
 EVM_REPLAY_LOG_PATH = os.path.join(HERE, "evm_replay.log")
-# عامل الإعادة المجدول يعالج عملة واحدة في كل دورة، ثم يدور بين الشبكات.
-# الحالة محفوظة في `evm_replay_state`، لذلك التوقف لا يفقد التقدّم.
+# The scheduled replay worker processes one coin per cycle, then rotates across
+# networks. The state is saved in `evm_replay_state`, so stopping loses no progress.
 EVM_REPLAY_INTERVAL_SECONDS = 60
 EVM_REPLAY_TOKENS_PER_CYCLE = 1
-# ميزانيّةُ الدورة للإعادة. عملةُ Base تحتاج ~22 نداءً لعمرها بسقف مدى 10,000
-# كتلة، فـ120ث تُنهي نافذةً معتبَرة بدل أن تُقطَع في منتصفها؛ ومساعدةُ التعبئة
-# الحيّة لها سقفٌ مستقلّ كي لا تأكل إحداهما نصيبَ الأخرى.
+# The cycle budget for the replay. A Base coin needs ~22 calls for its lifetime
+# at a 10,000-block range cap, so 120s finishes a meaningful window instead of
+# being cut in the middle of one; and the live backfill assist has its own cap so neither eats the other's share.
 EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE = 120.0
 EVM_BACKFILL_ASSIST_BUDGET_SECONDS = 45.0
 EVM_REPLAY_RUN_LOG_PATH = os.path.join(HERE, "evm_replay_run.log")
-# نبضةٌ في السجلّ حين لا يجري عمل. العامل قد يمرّ ساعاتٍ سليماً بلا سطر واحد
-# (دورةٌ لا شيء فيها مستحقّ) فيبدو السجلُّ الصامت ميتاً تماماً كالميت — قِيس
-# 2026-08-17: أربع ساعات صمتٍ وهو يعمل، والتشخيص احتاج قراءة `meta` بدلاً منه.
-# 900ث ⇒ أربعة أسطر في الساعة: يكفي لتمييز الحياة ولا يغرق التدوير.
+# A heartbeat line in the log when no work is happening. The worker can pass
+# hours healthy without a single line (a cycle with nothing due), so a silent
+# log looks exactly like a dead one — measured 2026-08-17: four hours of silence
+# while it was working, and the diagnosis needed reading `meta` instead of it.
+# 900s => four lines an hour: enough to tell life from death without drowning the rotation.
 EVM_REPLAY_HEARTBEAT_SECONDS = 900
-# عامل الإعادة المنفصل يسرّع الدفاتر الحيّة للشبكتين اللتين تحتاجانه؛ Robinhood
-# لها مسار ناضج ولا يجوز أن تزاحم Base/Monad في ميزانية المساعدة.
-# (143 مرفوعة معها: صفر عملة نشطة ⇒ المساعدة تنفق ميزانيّة على لا شيء)
+# The separate replay worker speeds up the live ledgers of the two networks that
+# need it; Robinhood has a mature path and must not compete with Base/Monad for
+# the assist budget. (143 is raised with it: zero active coins => the assist would spend budget on nothing)
 EVM_BACKFILL_ASSIST_NETWORKS = ("8453",)
-# **لا مزوّد بمفتاح على مسار الإعادة، وهذا قرارٌ لا نقص.** كان GoldRush يفهرس
-# أحداث Base وMonad، فحُذف في 2026-08-19 بعد قياسين: حسابُه يردّ HTTP 402 منذ
-# 2026-08-17، **والأخطر** أنّ محوّله كان يقرأ صفحةً واحدة من ردٍّ مُصفَّح فيُسقط
-# أحداثاً بصمت — والدفترُ تراكميّ فلا يظهر النقص خطأً بل تركّزاً كاذباً أو رصيداً
-# سالباً (المصيدة #29). والحصيلة في القاعدة: الشبكةُ التي لم تمرّ به قطّ هي
-# الوحيدة التي أنتجت بيانات (روبن‑هود 133 عملة و92,677 لقطة بـ5,309 نداءات)
-# مقابل 41,386 نداءً على Base بصفر لقطة. فمن أراد مزوّداً بمفتاح هنا فليقرأ
-# المصيدة أوّلاً: المُصفِّح يُسأل «هل بقيت صفحة؟» قبل أن يُقرأ ردّه.
+# **No keyed provider on the replay path, and that is a decision, not a lack.**
+# GoldRush used to index Base and Monad events, and was deleted on 2026-08-19
+# after two measurements: its account returns HTTP 402 since 2026-08-17, **and
+# the more dangerous part**, its adapter was reading a single page of a
+# paginated response and dropping events silently — and the ledger is
+# cumulative, so the shortage does not show up as an error but as false
+# concentration or a negative balance (trap #29). And the tally in the database:
+# the network that never went through it is the only one that produced data
+# (Robinhood 133 coins and 92,677 snapshots with 5,309 calls) vs 41,386 calls on
+# Base with zero snapshots. So whoever wants a keyed provider here should read
+# the trap first: the paginator is asked "is there a next page?" before its response is read.
 
-# --- قياس BSC اللحظي عبر NodeReal ---
-# `nr_getTokenHolders` يعيد أعلى الأرصدة مرتبة، و`nr_getTokenHolderCount`
-# يعيد العدد الكامل. هذا مسار لقطة مستقل عن دفتر Transfer التاريخي.
+# --- Live BSC measurement via NodeReal ---
+# `nr_getTokenHolders` returns the top balances sorted, and
+# `nr_getTokenHolderCount` returns the full count. This is a snapshot path independent of the historical Transfer ledger.
 BSC_NODEREAL_NETWORK = "56"
-# خمس نداءات NodeReal لكل عملة (عداد + معروض + أعلى 20 + رصيدا الحرق) ومع
-# فاصل الحصة المحافظ؛ عملات BSC الحالية تُمسح تناوبياً في نحو 13 دقيقة.
+# Five NodeReal calls per coin (count + supply + top 20 + the two burn balances)
+# with the conservative-quota pacing; current BSC coins are swept in rotation in about 13 minutes.
 BSC_NODEREAL_REFRESH_SECONDS = 900
 BSC_NODEREAL_ERROR_RETRY_SECONDS = 300
 BSC_NODEREAL_PER_CYCLE = 2
 BSC_NODEREAL_PACING_SECONDS = 1.0
-# أعلى نداء (`nr_getTokenHolders`) يستهلك 300 CU، وهو كامل CUPS للحصة المجانية.
-# فاصل بين كل نداءين يمنع ضمّ 50/20 CU معه في نفس الثانية.
+# The heaviest call (`nr_getTokenHolders`) consumes 300 CU, which is the entire
+# CUPS of the free tier. A gap between every two calls keeps the 50/20 CU from joining it in the same second.
 BSC_NODEREAL_CALL_PACING_SECONDS = 1.1
 
 
 
 def chain_keys_path() -> str:
-    """ملف مفاتيح مزوّدي السلسلة، بجانب القاعدة ومستثنى من git.
+    """The chain provider keys file, beside the database and excluded from git.
 
-    يدعم المفرد القديم والقوائم الجديدة معاً:
+    It supports both the old singular and the new lists:
     {"helius_api_keys":["...","..."], "nodereal_api_keys":["..."]}.
-    وطبقة EVM لا تحتاجها للعقد الرسمية.
-    يُقرأ **من القرص كل دورة** لا مرّة عند الإطلاق — نفس درس تدوير
-    رمز الجلسة: قيمة مجمَّدة في عملية لا تُعاد تشغيلها تفشل بعد ساعات بلا سبب
-    ظاهر. ولا يُطبع المفتاح ولا يُسجَّل إطلاقاً (FR-013).
+    And the EVM layer does not need it for the official nodes.
+    It is read **from disk every cycle**, not once at launch — the same lesson as
+    the session token rotation: a value frozen in a process that is not restarted
+    fails after hours with no visible cause. And the key is never printed or logged (FR-013).
     """
     return os.path.join(HERE, "chain_keys.json")
 
 
-# --- المجموعة الضابطة (الصنف السالب) ---
-# عملات تدخل المراقبة **بالاختيار العشوائي لا بإشارة**، وتُسجَّل بنفس الطريقة.
-# بلا هذا الصنف يستطيع النموذج تعلّم "أي عملة مُشار إليها ترتفع أكثر"، لكنّه لا
-# يستطيع أبداً الإجابة عن "هل الإشارة تعني شيئاً أصلاً" — إذ كانت كل عملة لها
-# سلسلة سعرية قد دخلت بإشارة، فلا مرجع للمقارنة.
-CONTROL_GROUP_SIZE = 40            # عدد الضابطة النشطة المستهدَف
-CONTROL_PER_CYCLE = 2              # حدّ الإدخال في الدورة — يوزّع العيّنة على الزمن
-                                   # بدل التقاط 40 عملة من لحظة سوقية واحدة
-CONTROL_WATCH_HOURS = 48           # نفس نافذة المُشار إليها (مقارنة عادلة)
-# v3 يوحّد كون الاختيار وسعر الدخول: الإشارة لا تدخل المقارنة إلا إذا ظهرت في
-# trending/verified في دورة قبولها، وسعر الطرفين يأتي من لقطة السوق نفسها.
+# --- The control group (the negative class) ---
+# Coins that enter monitoring **by random selection, not by signal**, recorded the
+# same way. Without this class the model can learn "any signaled coin rises
+# more", but it can never answer "does the signal mean anything at all" — when
+# every coin with a price series entered via a signal, there is no reference to compare against.
+CONTROL_GROUP_SIZE = 40            # the targeted number of active controls
+CONTROL_PER_CYCLE = 2              # the admission cap per cycle — it spreads the sample over time
+                                   # instead of grabbing 40 coins from a single market moment
+CONTROL_WATCH_HOURS = 48           # the same window as the signaled coins (a fair comparison)
+# v3 unifies the selection universe and the entry price: a signal enters the
+# comparison only if it appeared in trending/verified in its admission cycle, and both sides' price comes from the same market snapshot.
 CONTROL_DESIGN_VERSION = 3
 
-# الإشارات التي تُدخل عملة إلى المراقبة (المُشغّلات). الرواج/التحذيرات سياق لا مُشغّل.
+# The signals that admit a coin into monitoring (the triggers). Hype/warnings are context, not a trigger.
 TRIGGER_SIGNAL_TYPES = ("multi_user_buy", "large_buy")
-# كل الأنواع التي نطلبها من الـ feed. البيع سياق لا يُشغّل مراقبة:
-# multi_user_sell (بيع جماعي) و large_sell (تصريف حوت مفرد — مؤكَّد حيّاً
-# 2026-07-28، نفس شكل large_buy باتجاه معاكس: inHumanAmount = العملة المباعة).
-# الموسِّم يوسمها كغيرها متى توفّرت الشموع، فيتراكم مجاناً سجلّ
-# «بيع متصدّر/حوت → ماذا حدث للسعر» — مدخل نموذج الخروج لاحقاً.
+# All the types we request from the feed. Selling is context, not a trigger:
+# multi_user_sell (a group sell) and large_sell (a single whale distributing —
+# confirmed live 2026-07-28, the same shape as large_buy in the opposite
+# direction: inHumanAmount = the coin being sold). The labeler labels them like
+# any other whenever candles are available, so a "leader/whale sold -> what
+# happened to the price" record accumulates for free — input for the exit model later.
 FEED_TYPES = ("multi_user_buy", "large_buy", "multi_user_sell", "large_sell")
 FEED_LIMIT = 50

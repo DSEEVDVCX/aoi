@@ -1,21 +1,28 @@
-"""إرجاع عملات إعادةٍ عالقة إلى قائمة الانتظار — بانتقاءٍ لا بمحوٍ شامل.
+"""Return stuck replay tokens to the queue — by selection, not wholesale
+erasure.
 
-`repair_evm_ledger.py --apply` أداةُ عطبٍ في الدفتر نفسه: تمحو شبكاتِ EVM كاملةً
-(الأرصدة، المؤشّرات، كلّ صفوف التركّز) وتُلزم بالمجموعة كلّها في عمليّة واحدة،
-فهي تُسقط لقطاتِ شبكةٍ سليمة لتُفرج عن عملاتِ شبكةٍ أخرى. وهذه الأداة للحالة
-المقابلة: الدفتر والشِفرة سليمان، لكنّ حالة العملة كتبها **مسارٌ فُصل** — فبقيت
-`error`/`negative` برقمٍ محسوب، والحالة النهائيّة تمنع إعادتها إلى المسار الجديد.
+`repair_evm_ledger.py --apply` is the tool for a defect in the ledger
+itself: it wipes whole EVM networks (balances, cursors, every concentration
+row) and requires the full network set in one operation, so it drops a
+healthy network's snapshots to free another network's tokens. This tool is
+for the opposite case: the ledger and the code are sound, but the token's
+state was written by a **separate** path — so it stayed `error`/`negative`
+with a call count behind it, and the final status keeps it out of the new
+path.
 
-الحذف هو الإرجاع: `evm_replay_state` مشتقّةٌ بالكامل من سجلّات السلسلة، فمحوُ
-صفّها يعيد العملة إلى الطابور من نشأتها. والافتراض عرضٌ فقط، ولا يُكتب شيء إلّا
-بـ`--apply`.
+Deletion is the return: `evm_replay_state` is fully derived from chain
+logs, so deleting its row puts the token back in the queue from genesis.
+The default is display only; nothing is written without `--apply`.
 
-وحالةٌ ثالثة أخفى من الاثنتين: **يتيمٌ** — صفوفُ تركّزٍ من إعادةٍ بلا صفِّ حالة.
-لا حالةَ تُطابِق فلا `--status` يمسكه. تُعرَض في كلّ تشغيل **ولا تُحذف بحال**:
-مصدرُها مسارٌ مقصود (`db.admit` يمحو حالةَ عملةٍ أُعيد تنشيطها بعد فجوةٍ كان
-الدفترُ خلالها غير مراقَب، فتُمشى من نشأتها)، وصفوفُها هي عينُ ما لا يُستعاد
-إلّا بمشيٍ كامل. ومن أراد الحكمَ على صحّتها فلها أداةٌ تسألُ السلسلةَ نفسها:
-`audit_evm_ledger.py`. اليُتمُ خبرٌ عن الحالة، لا حكمٌ على الصفوف.
+And a third case, more hidden than either: an **orphan** — replay
+concentration rows with no state row. No state matches, so `--status`
+cannot catch them. They are shown on every run **and never deleted**: their
+source is a deliberate path (`db.admit` clears the state of a token
+reactivated after a gap during which the ledger went unwatched, so it is
+walked from genesis), and their rows are exactly what only a full walk
+reproduces. Whoever wants to judge their correctness has a tool that asks
+the chain itself: `audit_evm_ledger.py`. Orphanhood is news about the
+state, not a verdict on the rows.
 """
 from __future__ import annotations
 
@@ -28,12 +35,13 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import config  # noqa: E402
-import repair_evm_ledger  # noqa: E402 — مدقّقُ الشبكات واحد لا نسخة
+import repair_evm_ledger  # noqa: E402 — the network validator lives in one place, not a copy
 from db import RecorderDB  # noqa: E402
 
-# `done` ليست حالةً عالقة بل عملاً منجَزاً، ومحوُها يُسقط لقطاتٍ لا تُعاد إلّا
-# بمشيٍ كامل. من أراد إعادةَ منجَزٍ فله `run_evm_replay.py --redo`، ومن أراد محوَ
-# شبكةٍ لعطبٍ في الدفتر فله `repair_evm_ledger.py`.
+# `done` is not a stuck status but finished work, and deleting it drops
+# snapshots that only a full walk can reproduce. To redo finished work use
+# `run_evm_replay.py --redo`; to wipe a network for a ledger defect use
+# `repair_evm_ledger.py`.
 REFUSED_STATUSES = ("done",)
 
 
@@ -41,7 +49,8 @@ def candidates(
     db: RecorderDB, networks: tuple[str, ...], statuses: tuple[str, ...],
     tokens: tuple[str, ...] = (),
 ) -> list[dict]:
-    """صفوفُ الحالة المطابقة، أثقلَها نداءً أوّلاً (فهي الأجدر بالفحص قبل المحو)."""
+    """Matching state rows, heaviest by call count first (the ones most
+    worth inspecting before deletion)."""
     where = [
         f"network_id IN ({', '.join('?' for _ in networks)})",
         f"COALESCE(status, '') IN ({', '.join('?' for _ in statuses)})",
@@ -68,18 +77,24 @@ def candidates(
 def orphans(
     db: RecorderDB, networks: tuple[str, ...], tokens: tuple[str, ...] = (),
 ) -> list[dict]:
-    """صفوفُ إعادةٍ لا حالةَ لها — كتبها مسارٌ لم يُخلِّف سجلّاً يُنتقى به.
+    """Replay rows with no state row — written by a path that left no
+    record to select by.
 
-    `candidates` تنتقي من `evm_replay_state`، فعملةٌ كُتبت صفوفُها ثمّ اختفى صفُّ
-    حالتها تصير غيرَ مرئيّةٍ لهذه الأداة كلّها: لا حالةَ تُطابَق فلا شيء. وما
-    ينقصها هو صفُّ حالةٍ لا حذفُ صفوف: مشيُها ضاع، أمّا لقطاتُها فمقيسةٌ كما
-    كُتبت — دقّقها `audit_evm_ledger.py` على 4663 و8453 فجاءت تغطيتُها 100%.
+    `candidates` selects from `evm_replay_state`, so a token whose rows
+    were written and whose state row then vanished is invisible to this
+    whole tool: no state matches, so nothing does. What it lacks is a state
+    row, not row deletion: its walk was lost, but its snapshots are
+    measured exactly as written — `audit_evm_ledger.py` checked them on
+    4663 and 8453 and their coverage came out 100%.
 
-    ولذلك تُعرَض ولا تُحذف. والعرضُ نفسُه يبقى نافعاً: بعد أن صار إبطالُ الحكم
-    تحديثاً لا حذفاً (`db.stale_evm_replay_verdict`) لم يبقَ لليُتم إلّا مسارٌ
-    واحدٌ مقصود، فسطرٌ يظهر هنا صار خبراً يُقرأ بدل حالةٍ روتينيّة تُتجاهل.
+    That is why they are shown, never deleted. And the showing itself stays
+    useful: once invalidating a verdict became an update instead of a
+    delete (`db.stale_evm_replay_verdict`), orphanhood had only one
+    deliberate path left, so a line appearing here became news to read
+    rather than a routine status to ignore.
 
-    الشكلُ نفسُ شكل `candidates` كي يعمل `reset` و`_describe` بلا فرعٍ ثانٍ.
+    The shape matches `candidates` so `reset` and `_describe` work without
+    a second branch.
     """
     where = [
         f"c.network_id IN ({', '.join('?' for _ in networks)})",
@@ -107,11 +122,12 @@ def orphans(
 
 
 def reset(db: RecorderDB, rows: list[dict]) -> dict[str, int]:
-    """محوٌ عملةً عملةً بمعاملةٍ لكلّ عملة.
+    """Deletion token by token, one transaction per token.
 
-    `reset_evm_replay_token` هي نفسها التي يستعملها `--redo`، فلا مسارَ محوٍ ثانٍ
-    يُصان وحده. وعملةً عملةً لا دفعةً واحدة: العاملُ الحيّ قد يكون ممسكاً بالقاعدة،
-    فمعاملةٌ صغيرة تنتظر أقلّ، وتعذُّرُ واحدةٍ لا يُلغي ما نجح قبلها.
+    `reset_evm_replay_token` is the same one `--redo` uses, so there is no
+    second deletion path to maintain. And token by token, not one batch:
+    the live worker may be holding the database, so a small transaction
+    waits less, and one failure does not undo what succeeded before it.
     """
     out = {"tokens": 0, "rows_deleted": 0, "calls_freed": 0}
     for row in rows:
@@ -131,8 +147,8 @@ def _describe(rows: list[dict]) -> str:
         written = sum(int(r["rows_written"] or 0) for r in group)
         calls = sum(int(r["calls"] or 0) for r in group)
         lines.append(
-            f"  {status or '(بلا حالة)'}: {len(group)} عملة · {calls} نداءً "
-            f"سابقاً · {written} صفّاً سيُحذف"
+            f"  {status or '(no state)'}: {len(group)} tokens · {calls} "
+            f"calls spent · {written} rows to delete"
         )
     return "\n".join(lines)
 
@@ -141,19 +157,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--networks", nargs="+", required=True,
-        help="شبكاتُ الإعادة المقصودة، مثل 8453",
+        help="the intended replay networks, e.g. 8453",
     )
     parser.add_argument(
         "--status", nargs="+", default=["error"],
-        help="الحالات التي تُرجَع إلى الطابور (الافتراض: error)",
+        help="the statuses to return to the queue (default: error)",
     )
     parser.add_argument(
         "--token", nargs="*", default=[],
-        help="عناوين بعينها؛ الافتراض كلُّ ما طابق الحالة",
+        help="specific addresses; default is everything matching the status",
     )
     parser.add_argument(
         "--max", type=int, default=0,
-        help="سقفُ عملاتٍ تُرجَع في هذه العمليّة (0 = بلا سقف)",
+        help="cap on tokens returned in this run (0 = no cap)",
     )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
@@ -167,8 +183,8 @@ def main() -> int:
     refused = sorted(set(statuses) & set(REFUSED_STATUSES))
     if refused:
         print(
-            f"حالاتٌ لا تُرجَع بهذه الأداة: {', '.join(refused)} — "
-            "استعمل `run_evm_replay.py --redo` أو `repair_evm_ledger.py`"
+            f"statuses not returned by this tool: {', '.join(refused)} — "
+            "use `run_evm_replay.py --redo` or `repair_evm_ledger.py`"
         )
         return 2
 
@@ -177,30 +193,34 @@ def main() -> int:
         rows = candidates(db, networks, statuses, tuple(args.token))
         stray = orphans(db, networks, tuple(args.token))
         if stray:
-            # خبرٌ لا مرشَّح: لا `--orphans` ولا طريقَ حذفٍ من هنا. الصفوفُ مقيسةٌ
-            # وما ينقصها حالةٌ يكتبها المشيُ التالي من نفسه.
+            # News, not candidates: there is no `--orphans` and no deletion
+            # path from here. The rows are measured, and what they lack is
+            # a state row the next walk writes on its own.
             print(
-                f"يتامى (خبرٌ فقط، لا تُحذف): {len(stray)} عملة · "
-                f"{sum(int(r['rows_written'] or 0) for r in stray)} صفّاً — "
-                "للحكم على صحّتها: audit_evm_ledger.py"
+                f"orphans (informational only, never deleted): "
+                f"{len(stray)} tokens · "
+                f"{sum(int(r['rows_written'] or 0) for r in stray)} rows — "
+                "to judge their correctness: audit_evm_ledger.py"
             )
         if args.max > 0:
             rows = rows[: args.max]
         print(
-            f"شبكات: {', '.join(networks)} · حالات: {', '.join(statuses)}"
-            f" · مطابق: {len(rows)}"
+            f"networks: {', '.join(networks)} · statuses: {', '.join(statuses)}"
+            f" · matched: {len(rows)}"
         )
         if rows:
             print(_describe(rows))
         if not args.apply:
-            # العرضُ هو الافتراض لأنّ الحذف يُنفَق نداءاتٍ لا تُستردّ: عملة Base
-            # تُرجَع تعني مشياً كاملاً من نشأتها في الدورات القادمة.
-            print("عرضٌ فقط. أضف --apply للتنفيذ.")
+            # Display is the default because deletion spends calls that are
+            # not refunded: returning a Base token means a full walk from
+            # genesis in the coming cycles.
+            print("display only. add --apply to execute.")
             return 0
         done = reset(db, rows)
         print(
-            f"أُرجعت {done['tokens']} عملة · حُذف {done['rows_deleted']} صفّ "
-            f"تركّز · أُهدر سابقاً {done['calls_freed']} نداءً"
+            f"returned {done['tokens']} tokens · deleted "
+            f"{done['rows_deleted']} concentration rows · "
+            f"{done['calls_freed']} calls previously spent"
         )
     finally:
         db.close()

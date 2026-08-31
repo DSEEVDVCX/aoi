@@ -12,7 +12,7 @@ cols = blob["cols"]
 rows = blob["rows"]
 ix = {c: i for i, c in enumerate(cols)}
 
-# ---- families, taken from schema.sql section comments (أ..ز + labels) ----
+# ---- families, taken from schema.sql section comments (A..Z + labels) ----
 FAM = {}
 FAM["trigger"] = [
     "signal_type", "size_usd", "in_amount", "out_amount", "token_amount",

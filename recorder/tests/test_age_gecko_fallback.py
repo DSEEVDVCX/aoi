@@ -1,4 +1,4 @@
-"""اختبارات fallback عمر GeckoTerminal (pool_created_at) داخل resolve_ages."""
+"""Tests of the GeckoTerminal age fallback (pool_created_at) inside resolve_ages."""
 import asyncio
 import os
 
@@ -13,7 +13,7 @@ SCHEMA = os.path.join(
 
 
 class _FomoNoAgeClient:
-    """عميل fomo يجيب بلا أي عنصر — كأن filterTokens لم يجد العملة."""
+    """A fomo client that answers with no items — as if filterTokens could not find the token."""
 
     async def _post(self, *a, **k):
         return {"success": True, "responseObject": []}
@@ -23,7 +23,7 @@ class _FomoNoAgeClient:
 
 
 class _FakeGecko:
-    """زبون GeckoTerminal وهمي يعيد pool_created_at لأول عملة فقط."""
+    """A fake GeckoTerminal client that returns pool_created_at for the first token only."""
 
     def __init__(self):
         self.asked: list[str] = []
@@ -31,8 +31,8 @@ class _FakeGecko:
     async def pool_created_at(self, address: str, network_id: str) -> str | None:
         self.asked.append(address)
         if address.startswith("SOLV"):
-            return "2026-08-20T10:00:00Z"   # 5 أيام قبل NOW
-        return None                          # غير موجود عند GT أيضًا
+            return "2026-08-20T10:00:00Z"   # 5 days before NOW
+        return None                          # not at GT either
 
 
 NOW = "2026-08-25T15:00:00+00:00"
@@ -78,18 +78,20 @@ def test_gecko_fallback_fills_missing_age(db, monkeypatch):
         [("SOLVtoken1", "1399811149"), ("SOLXtoken2", "1399811149")],
         NOW, stats, gecko_fallback=gecko,
     ))
-    # العملة الأولى حُلَّت عبر GT
+    # the first token was resolved via GT
     assert gecko.asked == ["SOLVtoken1", "SOLXtoken2"]
     assert stats["age_resolved"] == 1
     assert stats.get("age_gecko_resolved") == 1
     created, observed = recorder.stored_age(db, "SOLVtoken1", "1399811149")
-    # القيمة تُخزَّن كما أرجعها GT (صيغة Z) — البوابة تقرؤها عبر parser الموحّد
+    # the value is stored exactly as GT returned it (Z format) — the gate
+    # reads it via the unified parser
     assert created == "2026-08-20T10:00:00Z"
-    assert observed == NOW          # ختم الملاحظة = لحظة الجلب (provenance)
+    assert observed == NOW          # the observation stamp = the fetch moment (provenance)
 
 
 def test_gecko_fallback_off_by_default(db, monkeypatch):
-    """بلا gecko_fallback: السلوك القديم تمامًا — missing لا يملؤها أحد."""
+    """Without gecko_fallback: exactly the old behavior — nobody fills in the
+    missing."""
     _seed_static(db)
     monkeypatch.setattr(recorder.config, "AGE_GATE_ENABLED_AT",
                         "2026-08-01T00:00:00+00:00")
@@ -105,7 +107,8 @@ def test_gecko_fallback_off_by_default(db, monkeypatch):
 
 
 def test_gecko_fallback_invalid_age_rejected(db, monkeypatch):
-    """GT يعيد مستقبلًا (بلا مدفوع) → يُرفض، لا يكتب عمرًا فاسدًا."""
+    """GT returns the future (unpaid tier) → rejected, no rotten age is
+    written."""
     db.upsert_static({
         "token_address": "FUTUREtok", "network_id": "1399811149",
         "symbol": "FUT", "name": "future",

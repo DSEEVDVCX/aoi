@@ -1,8 +1,9 @@
-"""بوّابة العمر على الذراع الضابطة — الذراعان بقاعدةٍ واحدة أو لا مقارنة.
+"""The age gate on the control arm — both arms under one rule, or no comparison.
 
-البوّابةُ وُضعت أوّلاً على مسار الإشارة وحده، فانفرق الذراعان في المتغيّر الأقوى
-أثراً: 1.5% من نوافذ الإشارة لعملةٍ دون يومين مقابل 50% من نوافذ الضابط. وأثرٌ
-يُقاس على ذراعين كهذين أثرُ عمرٍ لا أثرُ إشارة.
+The gate was first applied to the signal path alone, and the two arms then
+split on the strongest-effect variable: 1.5% of signal windows for a token
+under two days old versus 50% of controller windows. An effect measured on
+arms like these is an age effect, not a signal effect.
 """
 import os
 
@@ -36,7 +37,7 @@ def _age(db, token, *, days_old, net=SOL):
 
 
 def _signal_watch(db, token="signal-tok", net=SOL):
-    """الضابطة لا تُطلب إلّا وهناك إشارة — والأوزان تُقرأ من شبكات الإشارة."""
+    """The controller is only consulted when a signal exists — and the weights are read from the signal's networks."""
     db.upsert_watch(token, net, "large_buy", "s1", 48, NOW)
 
 
@@ -70,7 +71,7 @@ def test_old_control_candidate_is_admitted(db):
 
 
 def test_unknown_age_control_candidate_is_rejected(db):
-    """نفس القاعدة لا قاعدةٌ ألطف: ثمنُها 12 من 1,212 عملة (0.99%)."""
+    """The same rule, not a softer one: its cost is 12 of 1,212 tokens (0.99%)."""
     _signal_watch(db)
 
     added = recorder.admit_control_sample(db, [("nostatic", SOL, 1.0)], NOW)
@@ -80,7 +81,7 @@ def test_unknown_age_control_candidate_is_rejected(db):
 
 
 def test_both_arms_apply_the_same_rule(db):
-    """جوهرُ الإصلاح: عملةٌ واحدة تُرفض في المسارين، لا في واحدٍ منهما."""
+    """The heart of the fix: one token is rejected in both paths, not in just one of them."""
     _age(db, "young", days_old=0.5)
     stats = {"signals": 0, "watch_added": 0, "evm_admission_deferred": 0,
              "errors": 0, "age_rejected": 0, "age_unknown": 0,
@@ -95,7 +96,7 @@ def test_both_arms_apply_the_same_rule(db):
         db, raw, NOW, lambda _id: None, {},
         recorder.EVMAdmissionPolicy(frozenset(), 0, 1, 1, False), stats,
     ))
-    assert stats["age_rejected"] == 1          # مرفوضة كإشارة
+    assert stats["age_rejected"] == 1          # rejected as a signal
 
     _signal_watch(db, "other")
     assert recorder.admit_control_sample(db, [("young", SOL, 1.0)], NOW) == 0
@@ -120,10 +121,12 @@ def test_rejection_is_counted_in_cycle_stats(db):
 
 
 def test_network_weighting_survives_the_gate(db):
-    """البوّابة قبل الترجيح: إسقاطُ الصغيرة لا يُنقص نصيبَ شبكتها بلا إعادة وزن.
+    """The gate before weighting: dropping the young one must not shrink its
+    network's share without a re-weight.
 
-    شبكةُ الإشارة سولانا، والمرشّحون: صغيرةٌ على سولانا وقديمةٌ على سولانا.
-    الناتج يجب أن يكون القديمةَ — لا صفراً لأنّ الاختيار وقع على الصغيرة.
+    The signal's network is Solana, and the candidates are: a young one on
+    Solana and an old one on Solana. The result must be the old one — not
+    zero just because the pick landed on the young one.
     """
     _signal_watch(db)
     _age(db, "young", days_old=0.5)

@@ -1,16 +1,19 @@
-"""مسارات اللوحة الثقيلة: تُحسب مرّةً كلَّ مدّة، وطزاجتُها معلَنة.
+"""The dashboard's heavy routes: computed once per period, and their freshness is declared.
 
-الخلفيّة المقيسة: `/api/networks` كان يستهلك 2.2 ثانية من أصل 2.2 ثانية في كلّ
-تحديثٍ للوحة، وسببُها عقدةٌ تمسح ثلاثةَ ملايين سطرٍ لتُخرج خمسة. والقاعدةُ لا
-تُلمس (لا فهرسَ ولا كتابة)، فالحلُّ في الكود: ناتجٌ مخزَّنٌ في ذاكرة العمليّة،
-وفوقه ختمُ طزاجةٍ حيٌّ يكلّف 0.4 مللي ثانية.
+The measured background: `/api/networks` was eating 2.2 seconds of the 2.2
+seconds of every dashboard refresh, and the cause was a node scanning three
+million rows to produce five. The database is untouchable (no index, no
+write), so the fix lives in the code: a result cached in process memory, with
+a live freshness stamp on top that costs 0.4ms.
 
-وهنا نختبر ما يُرى من الخارج: أنّ الحسابَ لا يتكرّر، وأنّ الحمولةَ تقول عمرَها،
-وأنّ «آخر سوق» يبقى حيّاً فوق العدّ البائت **بلا أن يُفسد المخزَّن**.
+Here we test what's visible from outside: that the computation doesn't
+repeat, that the payload states its age, and that "last market" stays live on
+top of the stale count **without corrupting the cached rows**.
 
-المُشعِلُ محقون في كلّ اختبار: بلا ذلك يقرأ خيطُ التجديد الخلفيّ `config.DB_PATH`
-بعد أن يُرجعه `monkeypatch` إلى القاعدة الحقيقيّة — أي أنّ اختباراً يفتح قاعدةَ
-15 جيجابايت في الخلف ويصير فشلُه غيرَ مفهوم.
+The spawner is injected in every test: without it the background refresh
+thread reads `config.DB_PATH` after `monkeypatch` has restored the real
+database — meaning a test that opens the 15GB database behind your back and
+then fails in a way nobody can understand.
 """
 import sqlite3
 
@@ -39,7 +42,7 @@ CREATE TABLE market_ticks (
 
 
 class Spawner:
-    """يمسك التجديدَ الخلفيّ حتى يقرّر الاختبار تنفيذَه."""
+    """Holds the background refresh until the test decides to run it."""
 
     def __init__(self) -> None:
         self.pending: list = []
@@ -63,7 +66,7 @@ def spawner(monkeypatch):
 
 @pytest.fixture()
 def db(tmp_path, monkeypatch, spawner):
-    """قاعدةٌ صغيرة محلَّ القاعدة الحقيقيّة، وذاكرةٌ مؤقّتة نظيفة لكلّ اختبار."""
+    """A small database in place of the real one, and a clean temporary cache for every test."""
     path = tmp_path / "rec.db"
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
@@ -96,7 +99,7 @@ def client(db):
 
 
 def _counted(monkeypatch, name: str) -> list[int]:
-    """يغلّف دالةَ dao بعدّادٍ — به نعرف «حُسب مرّةً» من «حُسب في كلّ طلب»."""
+    """Wraps a dao function with a counter — how we tell "computed once" from "computed on every request"."""
     calls: list[int] = []
     original = getattr(dao, name)
 
@@ -108,7 +111,7 @@ def _counted(monkeypatch, name: str) -> list[int]:
     return calls
 
 
-# --- الحساب لا يتكرّر ---
+# --- the computation doesn't repeat ---
 def test_networks_computes_the_heavy_query_once(client, monkeypatch):
     calls = _counted(monkeypatch, "network_summary")
 
@@ -119,14 +122,15 @@ def test_networks_computes_the_heavy_query_once(client, monkeypatch):
 
 
 def test_network_summary_ttl_does_not_rescan_the_archive_aggressively():
-    """الملخّص يمسح ملايين ticks؛ آخرُ سوق حيٌّ فوقه فلا داعي لمسحه كل دقيقتين."""
+    """The summary scans millions of ticks; "last market" is live on top of it, so there's no reason to scan it every two minutes."""
     assert config.NETWORK_SUMMARY_TTL_SECONDS >= 600
 
 
 def test_labeling_is_cached_like_other_heavy_panels(client, db, monkeypatch):
-    """ملخّص التوسيم أثقلُ لوحةٍ بعد الشبكات (1.2 ثانية) — يُخزَّن كذلك.
+    """The labeling summary is the heaviest panel after networks (1.2 seconds) — cached the same way.
 
-    وآخرُ توسيمٍ فوقه حيٌّ: نبضُ الموسِّم يُقرأ في كلّ طلبٍ بلا انتظار التجديد.
+    And the latest labeling on top of it is live: the labeler's pulse is read
+    on every request without waiting for the refresh.
     """
     calls = _counted(monkeypatch, "labeling_outcomes")
 
@@ -134,7 +138,7 @@ def test_labeling_is_cached_like_other_heavy_panels(client, db, monkeypatch):
     second = client.get("/api/labeling", headers=HOST).json()
 
     assert len(calls) == 1
-    assert first["live"] is False            # لا جدول outcomes في قاعدة الاختبار
+    assert first["live"] is False            # no outcomes table in the test database
     assert second == first
     assert first["cache"]["ttl_seconds"] == config.LABELING_TTL_SECONDS
 
@@ -150,7 +154,7 @@ def test_counts_computes_once_within_its_ttl(client, monkeypatch):
 
 
 def test_ticks_summary_is_cached_too(client, monkeypatch):
-    """لا تناديه الصفحة اليوم، لكنّه يكلّف ثانيةً ونصفاً لمن يناديه غداً."""
+    """The page doesn't call it today, but it costs a second and a half for whoever calls it tomorrow."""
     calls = _counted(monkeypatch, "ticks_summary")
 
     body = client.get("/api/ticks-summary", headers=HOST).json()
@@ -160,7 +164,7 @@ def test_ticks_summary_is_cached_too(client, monkeypatch):
     assert body["total"] == 1
 
 
-# --- الحمولةُ تقول عمرَها ---
+# --- the payload states its age ---
 @pytest.mark.parametrize(
     ("path", "ttl_attr"),
     [
@@ -171,7 +175,7 @@ def test_ticks_summary_is_cached_too(client, monkeypatch):
     ],
 )
 def test_cached_routes_publish_their_freshness(client, path, ttl_attr):
-    """رقمٌ يُظنّ لحظيّاً وهو ليس كذلك أسوأُ من رقمٍ يقول عمرَه."""
+    """A number believed to be live when it isn't is worse than a number that states its age."""
     meta = client.get(path, headers=HOST).json()["cache"]
 
     assert meta["ttl_seconds"] == getattr(config, ttl_attr)
@@ -181,24 +185,26 @@ def test_cached_routes_publish_their_freshness(client, path, ttl_attr):
     assert meta["age_seconds"] >= 0
 
 
-# --- الطزاجةُ الحيّة فوق العدّ البائت ---
+# --- live freshness on top of the stale count ---
 def test_latest_tick_stays_live_while_counts_are_cached(client, db):
-    """جوهرُ التصميم: العدُّ يُخزَّن، والنبضُ يُقرأ في كلّ طلب."""
+    """The heart of the design: the count is cached, and the pulse is read on every request."""
     first = client.get("/api/networks", headers=HOST).json()["networks"][0]
     assert (first["tick_rows"], first["latest_tick"]) == (1, "2026-08-18T09:00:00+00:00")
 
     _tick(db, "2026-08-18T11:00:00+00:00")
     second = client.get("/api/networks", headers=HOST).json()["networks"][0]
 
-    assert second["tick_rows"] == 1                            # العدّ بائتٌ عن قصد
-    assert second["latest_tick"] == "2026-08-18T11:00:00+00:00"  # والنبضُ حيّ
+    assert second["tick_rows"] == 1                            # the count is stale on purpose
+    assert second["latest_tick"] == "2026-08-18T11:00:00+00:00"  # and the pulse is live
 
 
 def test_the_live_overlay_does_not_corrupt_the_cached_rows(client, db, monkeypatch):
-    """الصفوفُ المخزَّنة يتشاركها كلُّ طلب؛ رفعُ الختم فيها كان سيُثبِّت الحيَّ.
+    """The cached rows are shared by every request; lifting the stamp inside
+    them would have frozen the live one.
 
-    نُعمي القفزةَ الحيّة بعد أن ترفع الختمَ مرّة: لو كانت قد عدّلت المخزَّن في
-    مكانه لبقي الوقتُ المرفوع؛ والصحيحُ أن يرجع الختمُ المخزَّن كما هو.
+    We blind the live lookup after it has lifted the stamp once: if it had
+    modified the cache in place, the lifted time would have stayed; the
+    correct behavior is for the cached stamp to come back as it was.
     """
     client.get("/api/networks", headers=HOST)
     _tick(db, "2026-08-18T11:00:00+00:00")
@@ -211,15 +217,15 @@ def test_the_live_overlay_does_not_corrupt_the_cached_rows(client, db, monkeypat
     assert blind["latest_tick"] == "2026-08-18T09:00:00+00:00"
 
 
-# --- البياتةُ والفشل كما يظهران في الحمولة ---
+# --- staleness and failure as they appear in the payload ---
 def test_stale_payload_is_served_immediately_then_refreshed(client, db, spawner, monkeypatch):
-    """أحدَ عشرَ طلباً من الذاكرة والثاني عشر ينتظر ثانيتين — هذا ما نمنعه."""
+    """Eleven requests from memory and the twelfth waits two seconds — that's what we prevent."""
     monkeypatch.setattr(config, "NETWORK_SUMMARY_TTL_SECONDS", 0.0)
     client.get("/api/networks", headers=HOST)
     _tick(db, "2026-08-18T11:00:00+00:00")
 
     body = client.get("/api/networks", headers=HOST).json()
-    assert body["networks"][0]["tick_rows"] == 1      # البائتةُ رجعت بلا انتظار
+    assert body["networks"][0]["tick_rows"] == 1      # the stale one came back without waiting
     assert body["cache"]["stale"] is True
     assert body["cache"]["refreshing"] is True
 
@@ -228,7 +234,7 @@ def test_stale_payload_is_served_immediately_then_refreshed(client, db, spawner,
 
 
 def test_a_failed_refresh_keeps_the_last_good_numbers(client, spawner, monkeypatch):
-    """قاعدةٌ مشغولة تُسقط تجديداً: نُبقي القديمةَ ونقول إنّ التجديد تعذّر."""
+    """A busy database drops a refresh: we keep the old numbers and say the renewal failed."""
     monkeypatch.setattr(config, "NETWORK_SUMMARY_TTL_SECONDS", 0.0)
     client.get("/api/networks", headers=HOST)
 
@@ -244,37 +250,41 @@ def test_a_failed_refresh_keeps_the_last_good_numbers(client, spawner, monkeypat
     assert "database is locked" in body["cache"]["error"]
 
 
-# --- ما تفعله الصفحة نفسها ---
+# --- what the page itself does ---
 def test_the_page_asks_for_the_heavy_panels_less_often(client):
-    """الخادمُ يخزّن 60–120 ثانية، فسؤالُه كلَّ عشرٍ يجلب نفسَ الرقم ستَّ مرّات.
+    """The server caches 60–120 seconds, so asking it every ten brings the
+    same number six times over.
 
-    والحمولةُ الأخيرة تُعاد بينهما — بلا ذلك تفرغ اللوحةُ دقيقةً كاملة.
+    And the last payload is reused in between — without that the dashboard
+    would be empty for a whole minute.
     """
     page = client.get("/", headers=HOST).text
 
     assert "const HEAVY_EVERY = 6;" in page
     assert "heavyTick % HEAVY_EVERY === 0" in page
-    # الحرسُ الثاني: عدّادٌ وحدَه كان سيُبقي اللوحةَ فارغةً دقيقةً بعد جلبٍ فاشل.
+    # the second guard: a counter alone would have kept the dashboard empty
+    # for a minute after a failed fetch.
     assert "heavy.counts === null" in page
     assert 'wantHeavy ? getJSON("/api/counts") : heavy.counts' in page
-    # ولوحةُ التوسيم كذلك: 5 دقائق عمرُها أطولُ من دورةِ الشبكات، لكنّها
-    # تركب نفس الإيقاع — لا طلبَ جديد إلا في دورةٍ «ثقيلة».
+    # and the labeling panel too: its 5-minute lifetime is longer than the
+    # networks cycle, but it rides the same rhythm — no new request except in
+    # a "heavy" cycle.
     assert 'getOptionalJSON("/api/labeling", heavy.labeling' in page
     assert "paint(\"labeling\", () => renderLabeling(labeling))" in page
 
 
 def test_the_page_says_which_numbers_are_cached_and_which_are_live(client):
-    """رقمٌ يُظنّ لحظيّاً وهو ليس كذلك أسوأُ من رقمٍ يقول عمرَه."""
+    """A number believed to be live when it isn't is worse than a number that states its age."""
     page = client.get("/", headers=HOST).text
 
     assert "renderNetworks(networks.networks || [], networks.cache)" in page
-    assert "أعدادُ التغطية محسوبةٌ منذ" in page
-    assert "«آخر سوق» حيٌّ في كلّ تحديث" in page
+    assert "Coverage counts computed" in page
+    assert '"last market" is live on every refresh' in page
     assert "network-note" in page
 
 
 def test_a_cold_failure_is_not_hidden_behind_stale_numbers(client, monkeypatch):
-    """لا قيمةَ سابقة ⇒ الخطأ يظهر. كتمانُه بصفرٍ كان سيقرأ «لا شبكات»."""
+    """No previous value ⇒ the error shows. Silencing it with a zero would have read as "no networks"."""
     monkeypatch.setattr(
         dao, "network_summary",
         lambda conn: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
@@ -283,13 +293,14 @@ def test_a_cold_failure_is_not_hidden_behind_stale_numbers(client, monkeypatch):
         client.get("/api/networks", headers=HOST)
 
 
-# --- الحدُّ الذي لا يُساوَم عليه ---
+# --- the line that isn't negotiated ---
 def test_caching_writes_nothing_to_the_database(client, db):
-    """لا جدولَ تخزينٍ ولا ختمَ في `meta`: القاعدةُ تبقى كما وجدناها.
+    """No cache table and no stamp in `meta`: the database stays as we found it.
 
-    الحارسُ الحقيقيّ هو `mode=ro`، لكنّ هذا يمسك ما هو أخفى: مساراً يظنّ أنّه
-    يقرأ وهو يختم شيئاً — وأيُّ كاتبٍ ثانٍ يزاحم المسجّلَ على قفلٍ رأينا موتَه
-    ثلاثَ ساعاتٍ مرّة.
+    The real guard is `mode=ro`, but this one catches what's subtler: a path
+    that thinks it's reading while it stamps something — and any second
+    writer competes with the recorder for a lock whose death we've watched
+    for three hours once.
     """
     before = sorted(
         sqlite3.connect(db)

@@ -1,24 +1,25 @@
-"""أنبوب التدريب: نموذج توقّع العملات الانفجارية (fv15).
+"""Training pipeline: the explosive-coins prediction model (fv15).
 
-**تغيير المنهج 2026-08-28 (قرار المالك بعد قياس)**: الهدف القديم كان
-`win_trade` من محاكاة TP+20%/SL−30% — قياس 14,870 صفًا أثبت أن تلك
-الاستراتيجية هامشية (+0.14%/صفقة تأكله الرسوم) لأنها تقصّ أجنحة
-الرابحين (16% من الإشارات تصعد +100% وTP يخرج عند +20) وتترك الخسائر
-تمشي. المنهج الجديد: **التنبؤ بالانفجار القابل للالتقاط** مباشرة —
-ليبل `is_explosive` (قمة ≥2x ونصفها خلال 24س) الذي وُلد من نفس القياس،
-مع `time_to_plus20_min` (سنارة إعلان القوة) كمتغير تحليل وفلتر إسقاط
-مرشحين — **ليست قاعدة دخول أبدًا** (قياس المالك 2026-08-28: الدخول بعد
-+20% خاسر صافيًا في كل النوافذ، -1% إلى -11% مقابل +0.74% عند الإشارة).
+**Methodology change 2026-08-28 (owner decision after measurement)**: the old target
+was `win_trade` from a TP+20%/SL−30% simulation — a measurement of 14,870 rows proved
+that strategy marginal (+0.14%/trade, eaten by fees) because it clips the winners'
+wings (16% of signals climb +100% while TP exits at +20) and lets the losses walk.
+The new method: **predict the catchable explosion** directly — the `is_explosive`
+label (peak ≥2x with half of it within 24h), born from that same measurement, plus
+`time_to_plus20_min` (a strength-announcement hook) as an analysis variable and a
+filter that drops candidates — **never an entry rule** (owner measurement
+2026-08-28: entering after +20% is a net loser in every window, -1% to -11% versus
++0.74% at the signal).
 
-التقييم بقي ثلاثي الأمان: walk-forward زمني، AUC على عملات غير مرئية
-أثناء التدريب، وbootstrap بالعملة — لكن **المقياس الاقتصادي** صار
-"أعلى 20% بحسب النموذج: كم فيها من الانفجارات" بدل متوسط net_return
-لمحاكاة مهجورة.
+Evaluation keeps its three safety legs: time-ordered walk-forward, AUC on coins never
+seen during training, and a per-coin bootstrap — but the **economic metric** is now
+"of the top 20% by the model, how many are explosions" instead of the mean net_return
+of an abandoned simulation.
 
-الاستعمال:
-    py train_pipeline.py                      # هدف الانفجار (الافتراضي الجديد)
-    py train_pipeline.py --target explosive   # صريحًا (نفسه)
-    py train_pipeline.py --target win_trade   # الهدف القديم — للمرجعية فقط
+Usage:
+    py train_pipeline.py                      # the explosive target (the new default)
+    py train_pipeline.py --target explosive   # explicit (same thing)
+    py train_pipeline.py --target win_trade   # the old target — reference only
     py train_pipeline.py --min-train-days 5
 """
 
@@ -30,7 +31,7 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# بعد الكتمِ عن قصد: استيرادُ db/config يجرّ تحذيراتِ حِزمٍ لا شأنَ لنا بها.
+# Deliberately after the silencing: importing db/config drags in warnings from packages that are none of our business.
 import config  # noqa: E402
 from db import RecorderDB  # noqa: E402
 
@@ -41,11 +42,11 @@ FORBIDDEN = {
     "max_gain_24h", "max_gain_48h", "max_drawdown_48h", "time_to_peak_h",
     "is_rug", "net_return", "win_trade", "up20_48h", "up100", "up200",
     "up300", "up500", "up1000", "up2000",
-    # (fv15) ليبلان جديدان — مستقبلٌ صرف لا يجوز لمسهما كميزات أبدًا.
+    # (fv15) two new labels — pure future, never to be touched as features.
     "is_explosive", "time_to_plus20_min",
 }
 
-# أهداف معتمدة: الانفجار هو الافتراضي الجديد؛ القديم يُترك للمرجعية.
+# Approved targets: explosive is the new default; the old one is kept for reference.
 TARGETS = ("explosive", "win_trade")
 
 
@@ -58,13 +59,13 @@ PARAM_GRID = [
 
 
 def load_frame():
-    """الإطار النظيف: المجموعة الرئيسية + ليبل الانفجار من outcomes.
+    """The clean frame: the main set + the explosion label from outcomes.
 
-    ليبل `is_explosive` موسوم في `outcomes` (التوسيم/backfill 2026-08-28)
-    — لا محاكاة صفقات هنا إطلاقًا: الهدف قمة/سرعة مقيسة لا استراتيجية
-    خروج. `model_training_rows` يضم العمودين أصلًا (fv15 migration) لكن
-    الصفوف المبنية قبل التوسيم الجديد تحمل NULL — فنستبدلها من outcomes
-    بالمصدر الموثوق نفسه، ونحصر الإطار على الصفوف المحكومة.
+    The `is_explosive` label is stamped in `outcomes` (labeling/backfill 2026-08-28)
+    — no trade simulation happens here at all: the target is a measured peak/speed,
+    not an exit strategy. `model_training_rows` already carries both columns (fv15
+    migration), but rows built before the new labeling hold NULL — so we replace them
+    from outcomes, the same trusted source, and restrict the frame to judged rows.
     """
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     frame = pd.read_sql_query(
@@ -78,8 +79,8 @@ def load_frame():
         db._conn,
     )
     db.close()
-    # عمودا t المحليان (fv15) يُستبدلان بقيم outcomes الموثوقة:
-    # source-of-truth واحدة، وأي صف بُني قبل التوسيم يساوي صفه في outcomes.
+    # The two local t columns (fv15) are replaced with trusted outcome values:
+    # one source of truth, and any row built before the labeling equals its row in outcomes.
     frame = frame.drop(columns=["is_explosive", "time_to_plus20_min"],
                        errors="ignore")
     frame = frame.rename(columns={
@@ -94,21 +95,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", default="explosive",
                         choices=list(TARGETS),
-                        help="explosive (الجديد): قمة ≥2x ونصفها خلال 24س · "
-                             "win_trade (قديم): محاكاة TP/SL — مرجعية فقط")
+                        help="explosive (new): peak ≥2x with half of it within 24h · "
+                             "win_trade (old): TP/SL simulation — reference only")
     parser.add_argument("--min-train-days", type=int, default=4,
-                        help="عدد أيام التدريب قبل أول fold اختبار")
+                        help="number of training days before the first test fold")
     parser.add_argument("--val-folds", type=int, default=1,
-                        help="كم fold أول تستخدم لاختيار المعاملات (val)")
+                        help="how many leading folds to use for parameter selection (val)")
     args = parser.parse_args()
 
     frame = load_frame()
     target = "is_explosive" if args.target == "explosive" else "win_trade"
 
     if args.target == "win_trade":
-        # الهدف القديم — يبقى متاحًا للمقارنة التاريخية حصرًا.
-        print("⚠️  win_trade هدف مهجور (قياس 2026-08-28: +0.14%/صفقة) — "
-              "تشغيل مرجعي فقط.")
+        # The old target — kept available strictly for historical comparison.
+        print("⚠️  win_trade is an abandoned target (measurement 2026-08-28: +0.14%/trade) — "
+              "reference run only.")
         from exit_sim import ExitRule, simulate_trade
 
         db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
@@ -130,13 +131,13 @@ def main() -> None:
         feat_cols.remove(target)
     for c in ("max_gain_48h", "final_return_48h", "is_explosive",
               "time_to_plus20_min"):
-        assert c not in feat_cols, f"تسريب: {c} ضمن الميزات!"
-    # أعمدة نصية قليلة القيم → رقمية
+        assert c not in feat_cols, f"leak: {c} is among the features!"
+    # Low-cardinality text columns → numeric
     for c in feat_cols:
         if isinstance(frame[c].dtype, pd.StringDtype) or frame[c].dtype == object:
             frame[c] = pd.factorize(frame[c], use_na_sentinel=True)[0].astype(float)
-    print(f"إجمالي: {len(frame)} · ميزات: {len(feat_cols)} · هدف: {target} "
-          f"· إيجاب: {frame[target].mean():.1%}")
+    print(f"total: {len(frame)} · features: {len(feat_cols)} · target: {target} "
+          f"· positives: {frame[target].mean():.1%}")
 
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import roc_auc_score
@@ -145,7 +146,7 @@ def main() -> None:
     test_days = days[args.min_train_days:]
     val_days = test_days[: args.val_folds]
     test_days = test_days[args.val_folds:]
-    print(f"أيام: {len(days)} · val: {val_days} · test: {test_days}")
+    print(f"days: {len(days)} · val: {val_days} · test: {test_days}")
 
     def fit(tr, params):
         clf = HistGradientBoostingClassifier(
@@ -156,7 +157,7 @@ def main() -> None:
         clf.fit(tr[feat_cols], tr[target])
         return clf
 
-    # اختيار المعاملات على val فقط
+    # Parameter selection on val only
     best_params, best_auc = DEFAULT_PARAMS, -1.0
     if val_days:
         tr = frame[frame["day"] < val_days[0]]
@@ -166,12 +167,12 @@ def main() -> None:
             auc = roc_auc_score(te[target], clf.predict_proba(te[feat_cols])[:, 1])
             if auc > best_auc:
                 best_auc, best_params = auc, p
-        print(f"معاملات val: {best_params} (AUC={best_auc:.3f})")
+        print(f"val params: {best_params} (AUC={best_auc:.3f})")
 
-    # اختبار walk-forward
-    print("\n=== الاختبار الزمني ===")
-    print(f"{'يوم':<8}{'n':>5}{'AUC الكل':>9}{'AUC جديد':>10}"
-          f"{'أعلى20%: نسبة الانفجار':>22}")
+    # walk-forward test
+    print("\n=== time-ordered test ===")
+    print(f"{'day':<8}{'n':>5}{'AUC all':>9}{'AUC new':>10}"
+          f"{'top 20%: explosive rate':>22}")
     all_p, all_te = [], []
     for d in test_days:
         tr = frame[frame["day"] < d]
@@ -184,8 +185,8 @@ def main() -> None:
         auc_new = np.nan
         if m_new.sum() >= 10:
             auc_new = roc_auc_score(te.loc[m_new, target], p[m_new.values])
-        # المقياس الاقتصادي الجديد: في أعلى 20% بحسب النموذج، كم انفجارًا
-        # اصطدنا مقابل معدل اليوم؟ (lift) — هذا السؤال التشغيلي الحقيقي.
+        # The new economic metric: in the top 20% by the model, how many explosions
+        # did we catch versus the day's rate? (lift) — that is the real operational question.
         n = max(1, int(len(te) * 0.20))
         top = te.iloc[np.argsort(p)[::-1][:n]]
         lift = top[target].mean() / max(te[target].mean(), 1e-9)
@@ -195,7 +196,7 @@ def main() -> None:
         all_te.append(te)
 
     if not all_te:
-        print("لا توجد أيام اختبار — وسّع --min-train-days أو انتظر بيانات أطول.")
+        print("no test days — widen --min-train-days or wait for more data.")
         return
     P = np.concatenate(all_p)
     TE = pd.concat(all_te)
@@ -204,16 +205,16 @@ def main() -> None:
     m_new_all = ~TE["token_address"].isin(known_all)
     auc_new = (roc_auc_score(TE.loc[m_new_all, target], P[m_new_all.values])
                if m_new_all.sum() >= 10 else np.nan)
-    # الخلاصة الاقتصادية الكلية: أعلى 20% من كل أيام الاختبار
+    # The overall economic bottom line: top 20% across all test days
     n_all = max(1, int(len(TE) * 0.20))
     top_all = TE.iloc[np.argsort(P)[::-1][:n_all]]
-    print(f"\nالمجموع (n={len(TE)}): AUC الكل={auc_all:.3f} · "
-          f"AUC عملات جديدة={auc_new:.3f} (n={int(m_new_all.sum())}) · "
+    print(f"\nTotal (n={len(TE)}): AUC all={auc_all:.3f} · "
+          f"AUC new coins={auc_new:.3f} (n={int(m_new_all.sum())}) · "
           f"baseline={TE[target].mean():.1%}")
-    print(f"أعلى 20% بحسب النموذج: {top_all[target].mean():.1%} انفجارًا "
+    print(f"top 20% by the model: {top_all[target].mean():.1%} explosions "
           f"(lift ×{top_all[target].mean() / max(TE[target].mean(), 1e-9):.1f})")
 
-    # bootstrap بالعملة على AUC العملات الجديدة
+    # per-coin bootstrap on the new-coins AUC
     if m_new_all.sum() >= 10:
         rng = np.random.default_rng(0)
         b = []
@@ -225,16 +226,16 @@ def main() -> None:
                 continue
             b.append(roc_auc_score(TE.loc[keep, target], P[keep.values]))
         b = np.asarray(b)
-        print(f"AUC عملات جديدة: CI 95%=[{np.percentile(b, 2.5):.3f}, "
-              f"{np.percentile(b, 97.5):.3f}] · P(أفضلية)={(b > 0.5).mean():.1%}")
+        print(f"AUC new coins: CI 95%=[{np.percentile(b, 2.5):.3f}, "
+              f"{np.percentile(b, 97.5):.3f}] · P(edge)={(b > 0.5).mean():.1%}")
     if np.isnan(auc_new):
-        print("الخلاصة: لا عملات جديدة كافية للتقييم.")
+        print("Bottom line: not enough new coins to evaluate.")
     elif auc_new < 0.55:
-        print("الخلاصة: لا أفضلية قابلة للتعميم على العملات الجديدة — "
-              "النموذج لا يُعتمد للاكتشاف.")
+        print("Bottom line: no advantage that generalizes to new coins — "
+              "the model cannot be relied on for discovery.")
     else:
-        print("الخلاصة: أفضلية مرئية على العملات الجديدة — قيّم الحجم "
-              "الاقتصادي (lift) قبل الاعتماد.")
+        print("Bottom line: a visible advantage on new coins — evaluate the "
+              "economic size (lift) before relying on it.")
 
 
 if __name__ == "__main__":

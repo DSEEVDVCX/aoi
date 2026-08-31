@@ -1,11 +1,12 @@
-"""نقطة إطلاق الموسِّم للمهمّة المجدولة FomoLabeler (pythonw، stderr مخفيّ).
+"""Labeler launcher for the scheduled task FomoLabeler (pythonw, stderr hidden).
 
-نفس نمط run_recorder.py: تثبيت مجلّد العمل، سجلّ إقلاع، حلقة لا نهائية تبتلع
-أخطاء الدورة الواحدة ولا تموت. عملية منفصلة عن المسجّل عمداً — انظر labeler.py.
+Same pattern as run_recorder.py: pin the working directory, a boot log, an
+infinite loop that swallows single-cycle errors and never dies. A separate
+process from the recorder on purpose — see labeler.py.
 
-الاستخدام:
-  python run_labeler.py            # حلقة لا نهائية (المهمّة المجدولة)
-  python run_labeler.py 1          # دورة واحدة (تحقّق يدويّ)
+Usage:
+  python run_labeler.py            # infinite loop (the scheduled task)
+  python run_labeler.py 1          # single cycle (manual check)
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ def _log_boot(msg: str) -> None:
     try:
         with open(_BOOT_LOG, "a", encoding="utf-8") as fh:
             fh.write(msg + "\n")
-    except Exception:  # noqa: BLE001 — سجلّ الإقلاع لا يُسقط الإقلاع
+    except Exception:  # noqa: BLE001 — boot logging must not kill booting
         pass
 
 
@@ -46,7 +47,7 @@ def _log(msg: str) -> None:
     try:
         with open(config.LABEL_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line)
-    except Exception:  # noqa: BLE001 — الكتابةُ في السجلّ لا تُسقط ما تُسجّله
+    except Exception:  # noqa: BLE001 — writing the log must not kill what it logs
         pass
 
 
@@ -68,21 +69,23 @@ def main() -> None:
                 stats = label_pending(db, now_epoch=int(time.time()))
                 db.set_meta("labeler_last_run_at", utcnow_iso())
                 db.set_meta("labeler_last_stats", str(stats))
-                # نسجّل السطر فقط حين يحدث شيء — سطر كل 15 دقيقة إلى الأبد ضجيج.
+                # Log a line only when something happened — a line every 15
+                # minutes forever is noise.
                 if stats["signals"] or stats["watches"]:
                     _log(f"labeled: {stats}")
-            except Exception:  # noqa: BLE001 — درع الدورة؛ الحلقة لا تموت
+            except Exception:  # noqa: BLE001 — the cycle's shield; the loop must not die
                 import traceback
 
                 _log("labeler cycle crashed:\n" + traceback.format_exc())
-                # وأنقِذ الاتّصال قبل الدورة القادمة: لقطةُ قراءةٍ سُبقت في WAL
-                # تردّ كلَّ كتابةٍ من هذا الاتّصال بـ`database is locked` **بلا
-                # أن تنفع المهلة**، فتبقى كلّ دورةٍ تالية تنهار إلى إعادة تشغيل
-                # يدويّة (وقع في السلسلة 382 دورة، 2026-08-22/23). التفصيل في
-                # `db.recover_connection`.
+                # And rescue the connection before the next cycle: a read
+                # snapshot left behind in WAL rejects every write from this
+                # connection with `database is locked` **no matter the
+                # timeout**, so every later cycle crashes until a manual
+                # restart (happened in a 382-cycle streak, 2026-08-22/23).
+                # Details in `db.recover_connection`.
                 try:
                     _log(f"connection recovery: {db.recover_connection()}")
-                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                except Exception as rec_exc:  # noqa: BLE001 — the rescue hand must not kill the loop
                     _log(f"connection recovery failed: {type(rec_exc).__name__}")
             n += 1
             if cycles is not None and n >= cycles:

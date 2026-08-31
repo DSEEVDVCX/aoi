@@ -1,23 +1,25 @@
-"""نقطة إطلاق بناء صفوف التدريب للمهمّة المجدولة FomoBuildRows (pythonw).
+"""Training-rows build launcher for the scheduled task FomoBuildRows (pythonw).
 
-المرحلة الثالثة من الأنبوب، وكانت الوحيدة اليدويّة: المسجّل يجمع كل دقيقة،
-والموسِّم يعنون كل 15 دقيقة، ثم كان `build_training_rows.py` ينتظر يداً بشريّة.
-النتيجة أنّ النتائج الموسومة تتراكم بلا صفوف تدريب مقابلة، فتتجمّد الميزات عند
-`FEATURE_VERSION` قديمة بلا أن يُنبّه أحد.
+The third stage of the pipeline, and the only one that was manual: the
+recorder collects every minute, the labeler labels every 15 minutes, and then
+`build_training_rows.py` waited for a human hand. The result: labeled outcomes
+pile up with no matching training rows, and features freeze at an old
+`FEATURE_VERSION` with nobody alerted.
 
-الجدولة آمنة لثلاثة أسباب مقيسة لا مفترضة:
-  1. تزايديّة — `pending_outcomes` يختار ما ينقصه `FEATURE_VERSION` الحالي فقط.
-  2. عديمة الأثر عند التكرار — `INSERT OR REPLACE` على `(kind, key)`.
-  3. كاتب ثالث آمن — WAL نشط و`RecorderDB` يضبط `timeout=30` (db.py) تحسّباً
-     لازدحام المسجّل والموسِّم.
+Scheduling is safe for three measured, not assumed, reasons:
+  1. Incremental — `pending_outcomes` selects only what lacks the current
+     `FEATURE_VERSION`.
+  2. Idempotent — `INSERT OR REPLACE` on `(kind, key)`.
+  3. A third safe writer — WAL is on and `RecorderDB` sets `timeout=30`
+     (db.py) against contention with the recorder and the labeler.
 
-**بلا `--rebuild` إطلاقاً**: تلك الراية تحذف `training_rows` كاملاً، وحذفٌ مجدول
-بلا يد بشرية خطر لا يُحتمل. رفع `FEATURE_VERSION` وحده يكفي لإعادة البناء —
-الصفوف تُكتب فوقها في مكانها.
+**Never `--rebuild`**: that flag deletes `training_rows` entirely, and a
+scheduled delete with no human hand is an unbearable risk. Bumping
+`FEATURE_VERSION` alone is enough to rebuild — rows are overwritten in place.
 
-الاستخدام:
-  python run_build_rows.py            # حلقة لا نهائية (المهمّة المجدولة)
-  python run_build_rows.py 1          # دورة واحدة (تحقّق يدويّ)
+Usage:
+  python run_build_rows.py            # infinite loop (the scheduled task)
+  python run_build_rows.py 1          # single cycle (manual check)
 """
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ def _log_boot(msg: str) -> None:
     try:
         with open(_BOOT_LOG, "a", encoding="utf-8") as fh:
             fh.write(msg + "\n")
-    except Exception:  # noqa: BLE001 — سجلّ الإقلاع لا يُسقط الإقلاع
+    except Exception:  # noqa: BLE001 — boot logging must not kill booting
         pass
 
 
@@ -58,16 +60,17 @@ def _log(msg: str) -> None:
     try:
         with open(config.BUILD_ROWS_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(line)
-    except Exception:  # noqa: BLE001 — الكتابةُ في السجلّ لا تُسقط ما تُسجّله
+    except Exception:  # noqa: BLE001 — writing the log must not kill what it logs
         pass
 
 
 def run_cycle(db) -> dict:
-    """دورة واحدة: قضم الصفوف المعلّقة دفعةً دفعةً حتى السقف أو النفاد.
+    """One cycle: chew through pending rows batch by batch, up to the cap or until dry.
 
-    الصفوف المبنيّة تُرمى بعد كل دفعة (`pop("rows")`): العملية تعيش أياماً،
-    وتكديس عشرات الآلاف من القواميس في الذاكرة تسريب بطيء بلا فائدة — الكتابة
-    تمّت في القاعدة داخل `build`.
+    Built rows are discarded after each batch (`pop("rows")`): the process
+    lives for days, and stacking tens of thousands of dicts in memory is a
+    slow leak for no benefit — the write already happened in the database
+    inside `build`.
     """
     import config
     from build_training_rows import build
@@ -83,16 +86,17 @@ def run_cycle(db) -> dict:
         stats["skipped_no_event"] += part["skipped_no_event"]
         stats["batches"] += 1
         if processed < take or processed == 0:
-            break  # نفدت الصفوف المعلّقة
+            break  # pending rows exhausted
         remaining -= processed
     return stats
 
 
 def _check_config() -> int:
-    """تحقّق قبل التسجيل في جدولة المهامّ — يطابق `backup_db.py --check-config`.
+    """Pre-scheduling check — mirrors `backup_db.py --check-config`.
 
-    يفتح القاعدة فعلاً ويعدّ المعلّق: خطأ إعداد يُكتشف الآن أفضل من مهمّة مسجّلة
-    تفشل صامتةً كل ساعة تحت pythonw بلا نافذة ولا مخرَج.
+    Actually opens the database and counts the pending: a configuration error
+    is better caught now than by a registered task failing silently every hour
+    under pythonw with no window and no output.
     """
     import config
     import features
@@ -106,10 +110,10 @@ def _check_config() -> int:
         "BUILD_ROWS_LOG_PATH",
     ):
         if not hasattr(config, name):
-            print(f"config.{name} مفقود", file=sys.stderr)
+            print(f"config.{name} is missing", file=sys.stderr)
             return 1
     if not os.path.exists(config.DB_PATH):
-        print(f"قاعدة البيانات غير موجودة: {config.DB_PATH}", file=sys.stderr)
+        print(f"database not found: {config.DB_PATH}", file=sys.stderr)
         return 1
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:
@@ -118,9 +122,9 @@ def _check_config() -> int:
         db.close()
     print(
         f"ok · feature_version={features.FEATURE_VERSION} "
-        f"· كل {config.BUILD_ROWS_INTERVAL_SECONDS}ث "
-        f"· سقف {config.BUILD_ROWS_MAX_PER_CYCLE}/دورة "
-        f"· معلّق الآن: {'نعم' if pend else 'لا'}"
+        f"· every {config.BUILD_ROWS_INTERVAL_SECONDS}s "
+        f"· cap {config.BUILD_ROWS_MAX_PER_CYCLE}/cycle "
+        f"· pending now: {'yes' if pend else 'no'}"
     )
     return 0
 
@@ -144,20 +148,23 @@ def main() -> None:
                 stats["seconds"] = round(time.time() - started, 1)
                 db.set_meta("build_rows_last_run_at", utcnow_iso())
                 db.set_meta("build_rows_last_stats", str(stats))
-                # نسجّل فقط حين يُبنى شيء — سطر كل ساعة إلى الأبد ضجيج.
+                # Log only when something was built — a line every hour
+                # forever is noise.
                 if stats["built"] or stats["skipped_no_event"]:
                     _log(f"built: {stats}")
-            except Exception:  # noqa: BLE001 — درع الدورة؛ الحلقة لا تموت
+            except Exception:  # noqa: BLE001 — the cycle's shield; the loop must not die
                 import traceback
 
                 _log("build_rows cycle crashed:\n" + traceback.format_exc())
-                # وأنقِذ الاتّصال قبل الدورة القادمة: لقطةُ قراءةٍ سُبقت في WAL
-                # تردّ كلَّ كتابةٍ من هذا الاتّصال بـ`database is locked` **بلا
-                # أن تنفع المهلة**، وفترةُ هذه الحلقة ساعة — فعطبٌ دائم هنا
-                # يكلّف ساعةً لكلّ دورة ساقطة. التفصيل في `db.recover_connection`.
+                # And rescue the connection before the next cycle: a read
+                # snapshot left behind in WAL rejects every write from this
+                # connection with `database is locked` **no matter the
+                # timeout**, and this loop's period is an hour — a permanent
+                # fault here costs an hour per dropped cycle. Details in
+                # `db.recover_connection`.
                 try:
                     _log(f"connection recovery: {db.recover_connection()}")
-                except Exception as rec_exc:  # noqa: BLE001 — يد إنقاذ لا تُسقط الحلقة
+                except Exception as rec_exc:  # noqa: BLE001 — the rescue hand must not kill the loop
                     _log(f"connection recovery failed: {type(rec_exc).__name__}")
             n += 1
             if cycles is not None and n >= cycles:

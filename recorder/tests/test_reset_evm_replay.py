@@ -1,8 +1,10 @@
-"""اختبارات أداة الإرجاع الانتقائيّ: ما تمسّه، وما ترفض مسّه.
+"""Tests for the selective-return tool: what it touches, and what it
+refuses to touch.
 
-الخطر هنا ليس عطباً حسابيّاً بل حذفاً زائداً: الأداة تُنفَّذ يدويّاً على قاعدة
-التدريب الحيّة، فالمفحوص هو الحدود — لقطةٌ حيّة لا تُمسّ، وعملةٌ منجَزة لا تُمحى،
-وشبكةٌ أخرى لا تُصاب، والعرضُ لا يكتب.
+The danger here is not a math bug but over-deletion: the tool is run by
+hand against the live training database, so what gets examined is the
+boundaries — a live snapshot is not touched, a finished token is not
+wiped, another network is not hit, and display writes nothing.
 """
 import os
 
@@ -51,7 +53,8 @@ def _seed(db, token, net, status, *, calls=0, replay_rows=0, live_rows=0):
 
 
 def _seed_orphan(db, token, net, rows):
-    """صفوفُ إعادةٍ بلا `evm_replay_state` — هذا ما يخلّفه مسارٌ حُذف بعد الكتابة."""
+    """Replay rows with no `evm_replay_state` — what a path deleted after
+    writing leaves behind."""
     db.upsert_watch(token, net, "trending", "sig", 48, NOW)
     for index in range(rows):
         assert db.insert_chain_concentration({
@@ -80,7 +83,8 @@ def test_candidates_match_status_and_network_only(db):
 
 
 def test_candidates_are_ordered_by_calls_spent(db):
-    """الأثقلُ نداءً أوّلاً: هو الأجدر بأن يُقرأ سطرُه قبل الموافقة على المحو."""
+    """Heaviest by calls first: its line is the one most worth reading
+    before approving the deletion."""
     _seed(db, TOK, NET, "partial", calls=5)
     _seed(db, TOK2, NET, "partial", calls=5_660)
 
@@ -90,12 +94,13 @@ def test_candidates_are_ordered_by_calls_spent(db):
 
 
 def test_candidates_count_the_replay_rows_that_a_reset_would_delete(db):
-    """العدد يُعرَض قبل `--apply` لأنّه الكلفة الوحيدة غير القابلة للاسترداد."""
+    """The count is shown before `--apply` because it is the only
+    unrecoverable cost."""
     _seed(db, TOK, NET, "partial", replay_rows=3, live_rows=2)
 
     found = reset_evm_replay.candidates(db, (NET,), ("partial",))
 
-    assert found[0]["rows_written"] == 3      # الحيّة ليست من شأن هذه الأداة
+    assert found[0]["rows_written"] == 3      # live rows are not this tool's business
 
 
 def test_reset_returns_the_token_to_the_queue_and_leaves_live_rows(db):
@@ -106,14 +111,16 @@ def test_reset_returns_the_token_to_the_queue_and_leaves_live_rows(db):
     )
 
     assert done == {"tokens": 1, "rows_deleted": 3, "calls_freed": 240}
-    # حذفُ صفّ الحالة **هو** الإرجاع: الحالة مشتقّة، وغيابُها يعني «لم تُعَد بعد».
+    # deleting the state row **is** the return: state is derived, and its
+    # absence means "not replayed yet".
     assert db.evm_replay_state(TOK, NET) is None
     assert _count(db, NET, replay=True) == 0
     assert _count(db, NET, replay=False) == 2
 
 
 def test_reset_does_not_touch_another_network_on_the_same_token(db):
-    """السبب الذي من أجله وُجدت الأداة: مسارٌ فُصل عن شبكةٍ واحدة لا عن الدفتر."""
+    """The reason the tool exists: a path separated from one network, not
+    from the whole ledger."""
     _seed(db, TOK, NET, "error", replay_rows=2)
     _seed(db, TOK, OTHER, "done", replay_rows=5)
 
@@ -126,10 +133,12 @@ def test_reset_does_not_touch_another_network_on_the_same_token(db):
 
 
 def test_a_done_token_is_refused_not_silently_skipped(db, monkeypatch):
-    """`done` عملٌ منجَز: محوُه يُسقط لقطاتٍ لا تُستعاد إلّا بمشيٍ كامل.
+    """`done` is finished work: deleting it drops snapshots recoverable
+    only by a full walk.
 
-    والرفضُ برمز خروج لا بتجاهلٍ صامت: مشغّلٌ كتب `--status done --apply` وقرأ
-    «مطابق: 0» يظنّ الشبكة نظيفة، فيبحث عن العطب في مكانٍ سليم.
+    And the refusal is by exit code, not silent skipping: an operator who
+    wrote `--status done --apply` and read "matched: 0" would think the
+    network clean and hunt for the defect somewhere healthy.
     """
     monkeypatch.setattr(reset_evm_replay.sys, "argv", [
         "reset_evm_replay.py", "--networks", NET, "--status", "done", "--apply",
@@ -145,7 +154,8 @@ def test_an_unknown_network_is_refused_before_any_write(db, monkeypatch):
 
 
 def test_the_default_run_writes_nothing(db, tmp_path, monkeypatch, capsys):
-    """العرضُ افتراضٌ: أداةٌ يدويّة على قاعدةٍ حيّة لا تُنفّذ بالنسيان."""
+    """Display is the default: a manual tool on a live database must not
+    execute by accident."""
     _seed(db, TOK, NET, "error", calls=240, replay_rows=3)
     db._conn.commit()
     monkeypatch.setattr(
@@ -157,13 +167,14 @@ def test_the_default_run_writes_nothing(db, tmp_path, monkeypatch, capsys):
 
     assert reset_evm_replay.main() == 0
 
-    assert "عرضٌ فقط" in capsys.readouterr().out
+    assert "display only" in capsys.readouterr().out
     assert db.evm_replay_state(TOK, NET)["status"] == "error"
     assert _count(db, NET, replay=True) == 3
 
 
 def test_apply_resets_only_the_first_max_tokens(db, tmp_path, monkeypatch, capsys):
-    """سقفٌ للدفعة: 76 عملة تُرجَع دفعةً واحدة تشتري لنفسها كلَّ ميزانيّة الدورة."""
+    """A cap on the batch: 76 tokens returned in one run buy themselves the
+    whole cycle's budget."""
     _seed(db, TOK, NET, "error", calls=240)
     _seed(db, TOK2, NET, "error", calls=10)
     db._conn.commit()
@@ -176,13 +187,14 @@ def test_apply_resets_only_the_first_max_tokens(db, tmp_path, monkeypatch, capsy
 
     assert reset_evm_replay.main() == 0
 
-    assert "أُرجعت 1 عملة" in capsys.readouterr().out
-    assert db.evm_replay_state(TOK, NET) is None            # الأثقل نداءً أوّلاً
+    assert "returned 1 tokens" in capsys.readouterr().out
+    assert db.evm_replay_state(TOK, NET) is None            # heaviest by calls first
     assert db.evm_replay_state(TOK2, NET)["status"] == "error"
 
 
 def test_an_orphan_is_invisible_to_candidates_which_is_why_orphans_exists(db):
-    """السببُ الذي من أجله وُجدت `orphans`: `--status` لا يمسك ما لا حالةَ له."""
+    """The reason `orphans` exists: `--status` cannot catch what has no
+    state."""
     _seed_orphan(db, TOK, NET, 4)
 
     assert reset_evm_replay.candidates(db, (NET,), ("error", "partial", "")) == []
@@ -191,9 +203,10 @@ def test_an_orphan_is_invisible_to_candidates_which_is_why_orphans_exists(db):
 
 
 def test_orphans_ignores_live_rows_and_other_networks(db):
-    """اللقطةُ الحيّة ليست يتيمة: هي مقيسةٌ لحظتها ولا حالةَ إعادةٍ تُنتظَر لها."""
+    """A live snapshot is not an orphan: it was measured at its moment, and
+    no replay state is expected of it."""
     _seed_orphan(db, TOK, NET, 2)
-    _seed(db, TOK2, NET, "partial", replay_rows=3, live_rows=5)   # له حالة ⇒ ليس يتيماً
+    _seed(db, TOK2, NET, "partial", replay_rows=3, live_rows=5)   # has state ⇒ not an orphan
     _seed_orphan(db, TOK, OTHER, 7)
 
     found = reset_evm_replay.orphans(db, (NET,))
@@ -203,7 +216,8 @@ def test_orphans_ignores_live_rows_and_other_networks(db):
 
 
 def test_orphans_carry_the_candidate_shape_so_one_printer_serves_both(db):
-    """`_describe` تقرأ الحقولَ بلا حراسة، فحقلٌ ناقصٌ هنا يُسقط تشغيلاً كاملاً."""
+    """`_describe` reads the fields unguarded, so a missing field here
+    would crash a whole run."""
     _seed_orphan(db, TOK, NET, 3)
     _seed(db, TOK2, NET, "error", replay_rows=2)
 
@@ -211,11 +225,11 @@ def test_orphans_carry_the_candidate_shape_so_one_printer_serves_both(db):
     picked = reset_evm_replay.candidates(db, (NET,), ("error",))
 
     assert set(stray[0]) == set(picked[0])
-    assert reset_evm_replay._describe(stray)          # لا KeyError ولا None في حساب
+    assert reset_evm_replay._describe(stray)          # no KeyError and no None in the math
 
 
 def test_an_orphan_is_reported_even_when_not_requested(db, tmp_path, monkeypatch, capsys):
-    """الإظهارُ إفادةٌ لا يكلّف شيئاً: يتيمٌ صامتٌ يبقى في الدفتر إلى الأبد."""
+    """Showing costs nothing: a silent orphan stays in the ledger forever."""
     _seed_orphan(db, TOK, NET, 6)
     db._conn.commit()
     monkeypatch.setattr(reset_evm_replay.config, "DB_PATH", str(tmp_path / "t.db"))
@@ -226,19 +240,21 @@ def test_an_orphan_is_reported_even_when_not_requested(db, tmp_path, monkeypatch
     assert reset_evm_replay.main() == 0
 
     out = capsys.readouterr().out
-    assert "يتامى (خبرٌ فقط، لا تُحذف): 1 عملة · 6 صفّاً" in out
-    assert "audit_evm_ledger.py" in out              # الطريقُ إلى الحكم
-    assert _count(db, NET, replay=True) == 6         # خبرٌ لا حذف
+    assert "orphans (informational only, never deleted): 1 tokens · 6 rows" in out
+    assert "audit_evm_ledger.py" in out              # the road to a verdict
+    assert _count(db, NET, replay=True) == 6         # news, not deletion
 
 
 def test_no_flag_deletes_an_orphan_because_its_rows_are_the_measured_part(db,
         tmp_path, monkeypatch, capsys):
-    """اليُتمُ فقدُ حالةٍ لا فسادُ صفوف؛ ومصدرُه مسارٌ مقصود (`db.admit`).
+    """Orphanhood is a lost state, not corrupted rows; and its source is a
+    deliberate path (`db.admit`).
 
-    كان هناك `--orphans` يشملها في الحذف، وكان ذلك خطأً: `audit_evm_ledger.py`
-    قرأ 77 لقطةً على 4663 و8453 فجاءت تغطيتُها 100.000000% — فالحذفُ كان
-    سيُتلف بياناتِ تدريبٍ مقيسةً صحيحة ويُلزم مشياً جديداً. وما ينقصها صفُّ
-    حالةٍ يكتبه المشيُ التالي من نفسه.
+    There used to be an `--orphans` that included them in deletion, and it
+    was wrong: `audit_evm_ledger.py` read 77 snapshots on 4663 and 8453
+    and their coverage came out 100.000000% — deletion would have
+    destroyed correct, measured training data and required a new walk.
+    What they lack is a state row the next walk writes on its own.
     """
     _seed_orphan(db, TOK, NET, 6)
     db._conn.commit()
@@ -250,7 +266,8 @@ def test_no_flag_deletes_an_orphan_because_its_rows_are_the_measured_part(db,
     assert reset_evm_replay.main() == 0
     assert _count(db, NET, replay=True) == 6
 
-    # والحجّةُ نفسُها مُزالة: لا بابَ خلفيّ يعيدها بلا مراجعة
+    # and the argument itself is gone: no back door returns them without
+    # review
     monkeypatch.setattr(reset_evm_replay.sys, "argv", [
         "reset_evm_replay.py", "--networks", NET, "--orphans", "--apply",
     ])

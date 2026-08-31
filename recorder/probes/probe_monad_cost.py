@@ -1,7 +1,7 @@
-"""ما تنفقه Monad (143) في الطبقة الحيّة مقابل ما تعطيه — قراءة فقط.
+"""What Monad (143) costs the live layer versus what it gives — read-only.
 
-`EVM_REPLAY_NETWORKS` أسقطت 143 في 08-19 لصفر عملة نشطة، لكنها باقية في
-`EVM_NETWORKS` (طبقة التطبيق/التعبئة/اللقطة). هذا يقيس هل ما زالت تنفق.
+`EVM_REPLAY_NETWORKS` dropped 143 on 08-19 for zero active coins, but it remains in
+`EVM_NETWORKS` (the apply/backfill/snapshot layer). This measures whether it still spends.
 """
 import os
 import sqlite3

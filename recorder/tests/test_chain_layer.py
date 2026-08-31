@@ -1,4 +1,4 @@
-"""اختبارات طبقة السلسلة: المستخرِج والدورة وشطب المفتاح (بلا شبكة)."""
+"""Tests for the chain layer: the extractor, the cycle, and key redaction (no network)."""
 import os
 from datetime import datetime, timedelta
 
@@ -33,10 +33,11 @@ def _watch(db, token, *, control=False, network=SOL):
 
 
 def _envelope(amounts, supply, decimals=6, ui_supply=None, ui_amounts=None):
-    """يحاكي دفعة `getTokenSupply` + `getTokenLargestAccounts`.
+    """Mimics a `getTokenSupply` + `getTokenLargestAccounts` batch.
 
-    `ui_supply`/`ui_amounts` تُمرَّر **خاطئة** في بعض الاختبارات عمداً: القياس
-    يجب أن يأتي من `amount` الصحيح لا من العشريّ الجاهز.
+    `ui_supply`/`ui_amounts` are deliberately passed **wrong** in some tests:
+    the measurement must come from the correct `amount`, not from the
+    ready-made decimal.
     """
     unit = 10 ** decimals
     return {
@@ -67,11 +68,11 @@ def _envelope(amounts, supply, decimals=6, ui_supply=None, ui_amounts=None):
 
 
 # ---------------------------------------------------------------------------
-# المستخرِج
+# The extractor
 # ---------------------------------------------------------------------------
 def test_extract_computes_four_tiers():
-    """20 حساباً متساوية بـ2% لكلٍّ ⇒ 2/10/20/40%."""
-    amounts = [2_000_000] * 20                      # كلٌّ 2% من 100 مليون
+    """20 equal accounts at 2% each ⇒ 2/10/20/40%."""
+    amounts = [2_000_000] * 20                      # each 2% of 100 million
     row = extract.extract_chain_concentration(
         _envelope(amounts, 100_000_000), "tok", SOL, NOW, NOW, "sig-1",
     )
@@ -81,23 +82,24 @@ def test_extract_computes_four_tiers():
     assert row["top10_pct"] == pytest.approx(20.0)
     assert row["top20_pct"] == pytest.approx(40.0)
     assert row["top_accounts"] == 20
-    assert row["supply"] == pytest.approx(100.0)     # 6 منازل عشرية
+    assert row["supply"] == pytest.approx(100.0)     # 6 decimal places
     assert row["decimals"] == 6
     assert row["is_control"] == 0
     assert row["entry_signal_id"] == "sig-1"
 
 
 def test_extract_sorts_descending_before_slicing():
-    """الترتيب هو كلّ المعنى في «أكبر واحد» — ردّ مبعثر لا يفسد top1."""
+    """Ordering is the whole meaning of "largest one" — a scattered reply must not break top1."""
     row = extract.extract_chain_concentration(
         _envelope([100, 900, 300, 200], 2_000), "tok", SOL, NOW, NOW, None,
     )
-    assert row["top1_pct"] == pytest.approx(45.0)    # 900 من 2000
-    assert row["top5_pct"] == pytest.approx(75.0)    # الأربعة كلّها = 1500
+    assert row["top1_pct"] == pytest.approx(45.0)    # 900 of 2000
+    assert row["top5_pct"] == pytest.approx(75.0)    # all four = 1500
 
 
 def test_extract_top_accounts_exposes_short_lists():
-    """عملة حائزوها ثلاثة: top20 = مجموع الكلّ لا «أكبر 20» — العمود يكشف ذلك."""
+    """A token with three holders: top20 = the sum of all of them, not "largest
+    20" — the column exposes that."""
     row = extract.extract_chain_concentration(
         _envelope([500, 300, 200], 1_000), "tok", SOL, NOW, NOW, None,
     )
@@ -109,23 +111,24 @@ def test_extract_top_accounts_exposes_short_lists():
 
 
 def test_extract_uses_base_units_not_ui_amount():
-    """القياس من `amount` الصحيح لا من `uiAmount` — هنا العشريّ مدسوس خاطئاً."""
+    """The measurement comes from the correct `amount`, not from `uiAmount` —
+    here the decimal is planted wrong."""
     row = extract.extract_chain_concentration(
         _envelope(
             [400, 100], 1_000,
-            ui_supply=999999.0,                     # عشريّ عرضٍ خاطئ تماماً
-            ui_amounts=[0.000001, 0.000001],        # وعشريّ كميّات خاطئ
+            ui_supply=999999.0,                     # a completely wrong supply decimal
+            ui_amounts=[0.000001, 0.000001],        # and wrong amount decimals
         ),
         "tok", SOL, NOW, NOW, None,
     )
     assert row["top1_pct"] == pytest.approx(40.0)
     assert row["top5_pct"] == pytest.approx(50.0)
-    assert row["supply"] == pytest.approx(0.001)     # 1000 ÷ 10^6 لا 999999
+    assert row["supply"] == pytest.approx(0.001)     # 1000 ÷ 10^6, not 999999
 
 
 def test_extract_keeps_precision_at_eighteen_decimals():
-    """معروض بـ18 منزلة يفقد أرقاماً بالعشريّات؛ الأعداد الصحيحة لا تفقد."""
-    supply = 10 ** 27 + 1                            # عدد لا يمثّله float
+    """An 18-decimal supply loses digits as a float; integers lose nothing."""
+    supply = 10 ** 27 + 1                            # a number no float can represent
     row = extract.extract_chain_concentration(
         _envelope([supply], supply, decimals=18), "tok", SOL, NOW, NOW, None,
     )
@@ -146,7 +149,8 @@ def test_extract_rejects_envelope_without_measurement():
 
 
 def test_extract_zero_supply_keeps_row_with_null_ratios():
-    """حرق كامل: الصفر **قياس** فيبقى الصفّ، والنِّسب تبقى NULL (لا قسمة على صفر)."""
+    """A full burn: zero is a **measurement**, so the row stays and the ratios
+    stay NULL (no division by zero)."""
     row = extract.extract_chain_concentration(
         _envelope([0], 0), "tok", SOL, NOW, NOW, None,
     )
@@ -168,35 +172,38 @@ def test_extract_missing_accounts_leaves_ratios_null_but_keeps_supply():
 
 
 # ---------------------------------------------------------------------------
-# شطب المفتاح (FR-013)
+# Key redaction (FR-013)
 # ---------------------------------------------------------------------------
 def test_redact_removes_key_from_any_message():
     key = "778a585b-4825-4df1-80c1-964d45b475cf"
-    msg = f"ConnectError: https://mainnet.helius-rpc.com/?api-key={key} فشل"
+    msg = f"ConnectError: https://mainnet.helius-rpc.com/?api-key={key} failed"
     out = solana_rpc._redact(msg, key)
     assert key not in out
-    assert "api-key=<محجوب>" in out
+    assert "api-key=<redacted>" in out
 
 
 def test_redact_scrubs_url_even_when_key_rotated():
-    """لو دُوِّر المفتاح على القرص بين النداء والاستثناء لم يطابق نصّ الرابط."""
+    """If the key was rotated on disk between the call and the exception, the
+    URL text no longer matches."""
     out = solana_rpc._redact("HTTP 401: .../?api-key=OLDVALUE&x=1", "NEWVALUE")
     assert "OLDVALUE" not in out
-    assert "&x=1" in out                              # الشطب لا يبتلع بقيّة النصّ
+    assert "&x=1" in out                              # redaction does not swallow the rest of the text
 
 
 def test_read_keys_prefers_environment(monkeypatch):
-    """البيئة تسبق الملف، والقيمة تُعاد في **قائمة** (الحوض لا يقبل مفرداً)."""
+    """The environment beats the file, and the value is returned in a **list**
+    (the pool does not accept a scalar)."""
     monkeypatch.setenv("HELIUS_API_KEY", "env-secret")
     monkeypatch.setattr(config, "chain_keys_path", lambda: "missing.json")
     assert solana_rpc._read_keys() == ["env-secret"]
 
 
 def test_read_keys_splits_multiple_environment_keys(monkeypatch):
-    """مفتاحان في البيئة بفاصلة ⇒ حوضٌ بمفتاحين، لا سلسلةٌ واحدة عجيبة."""
+    """Two comma-separated keys in the environment ⇒ a pool with two keys, not
+    one odd string."""
     monkeypatch.setenv("HELIUS_API_KEY", "one, two ,one")
     monkeypatch.setattr(config, "chain_keys_path", lambda: "missing.json")
-    assert solana_rpc._read_keys() == ["one", "two"]   # مع إسقاط المكرّر
+    assert solana_rpc._read_keys() == ["one", "two"]   # with the duplicate dropped
 
 
 async def test_helius_rotates_to_second_key_on_retryable_rpc_error(monkeypatch):
@@ -226,10 +233,12 @@ async def test_helius_rotates_to_second_key_on_retryable_rpc_error(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# العطل العابر ≠ رفض مفتاح: يُمهَل بنفس المفتاح ولا يُبرَّد (مقيس 2026-08-17)
+# A transient fault ≠ key rejection: retry with the same key, no cooldown
+# (measured 2026-08-17)
 # ---------------------------------------------------------------------------
 async def test_helius_retries_transient_522_with_a_single_key(monkeypatch):
-    """522 مهلة Cloudflare إلى الأصل: كانت خطأً نهائيّاً ثمنه 15 دقيقة تقادماً."""
+    """522 is Cloudflare timing out to the origin: it used to be a fatal error
+    costing 15 minutes of staleness."""
     monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["only-key"])
     monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
     seen = []
@@ -250,7 +259,8 @@ async def test_helius_retries_transient_522_with_a_single_key(monkeypatch):
 
     assert result["result"] == "ok"
     assert len(seen) == 2
-    # المفتاح سليم ⇒ يُعاد استخدامه ولا يُدخَل فترة تهدئة تحرمنا منه دقيقة.
+    # The key is fine ⇒ it is reused, with no cooldown period robbing us of it
+    # for a minute.
     assert all("only-key" in url for url in seen)
     assert rpc._keys._blocked_until == {}
 
@@ -279,7 +289,8 @@ async def test_helius_retries_read_timeout_with_a_single_key(monkeypatch):
 
 
 async def test_helius_deprioritized_retries_when_there_is_no_second_key(monkeypatch):
-    """«Slow down requests» إشارةُ حمل: بمفتاح واحد كانت المحاولة واحدة بلا تمهّل."""
+    """"Slow down requests" is a load signal: with one key it used to be a
+    single attempt with no backoff."""
     monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["only-key"])
     monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
     calls = []
@@ -306,7 +317,7 @@ async def test_helius_deprioritized_retries_when_there_is_no_second_key(monkeypa
 
 
 async def test_helius_transient_failure_message_still_hides_the_key(monkeypatch):
-    """الإعادة لا تُضعف FR-013: نصّ ReadTimeout يحمل الرابط كاملاً."""
+    """Retrying does not weaken FR-013: the ReadTimeout text carries the full URL."""
     monkeypatch.setattr(solana_rpc, "_read_keys", lambda: ["s3cret-key"])
     monkeypatch.setattr(config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
 
@@ -338,15 +349,15 @@ async def test_concentration_rejects_materially_different_slots(monkeypatch):
         ]
 
     rpc._post = _post
-    with pytest.raises(solana_rpc.ChainRPCError, match="غير متزامنتين"):
+    with pytest.raises(solana_rpc.ChainRPCError, match="not synchronized"):
         await rpc.fetch_concentration_raw("mint")
 
 
 # ---------------------------------------------------------------------------
-# الدورة
+# The cycle
 # ---------------------------------------------------------------------------
 class _RPC:
-    """عميل سلسلة مزيّف. `replies` قواميس، و`fail`/`key_missing` استثناءات."""
+    """Fake chain client. `replies` are dicts; `fail`/`key_missing` are exceptions."""
 
     def __init__(self, replies=None, fail=None, key_missing=False):
         self.calls = []
@@ -357,7 +368,7 @@ class _RPC:
     async def fetch_concentration_raw(self, mint):
         self.calls.append(mint)
         if self._key_missing:
-            raise solana_rpc.ChainKeyMissing("ملف مفاتيح السلسلة غائب")
+            raise solana_rpc.ChainKeyMissing("the chain key file is missing")
         if mint in self._fail:
             raise solana_rpc.ChainRPCError("getTokenSupply: JSON-RPC -32603: boom")
         return self._replies.get(mint, _envelope([], 0))
@@ -395,7 +406,7 @@ async def test_cycle_writes_row_and_marks_state_ok(db):
 
 
 async def test_cycle_skips_non_solana_networks(db):
-    """EVM لا يُسأل إطلاقاً: معيار ERC-20 بلا قائمة حائزين على السلسلة."""
+    """EVM is never asked at all: the ERC-20 standard has no on-chain holders list."""
     _watch(db, "bsc", network="56")
     _watch(db, "robinhood", network="4663")
     _watch(db, "sol", network=SOL)
@@ -405,7 +416,7 @@ async def test_cycle_skips_non_solana_networks(db):
 
     assert rpc.calls == ["sol"]
     assert stats["chain_due"] == 1
-    # ولا صفّ حالة للـEVM: لا نوسم بالفشل عملةً لم نسألها أصلاً.
+    # And no state row for EVM: we do not mark a token failed that we never asked.
     assert db._conn.execute("SELECT COUNT(*) FROM chain_fetch_state").fetchone()[0] == 1
 
 
@@ -446,7 +457,8 @@ async def test_cycle_marks_known_unsupported_mint_without_rpc_or_error(db, monke
 
 
 async def test_cycle_empty_reply_is_not_an_error(db):
-    """ردّ بلا قياس ≠ فشل: `empty` يعيد الجدولة بإيقاع عاديّ لا كل دقيقتين."""
+    """A reply without a measurement ≠ failure: `empty` reschedules at the
+    normal pace, not every two minutes."""
     _watch(db, "nothing")
     rpc = _RPC(replies={"nothing": {"supply": {"value": None}, "largest": {"value": []}}})
 
@@ -459,7 +471,8 @@ async def test_cycle_empty_reply_is_not_an_error(db):
 
 
 async def test_missing_key_propagates_without_marking_tokens(db):
-    """عيب إعداد لا عيب عملة: الطابور لا يُوسَم `error` بسبب ملفّ غائب."""
+    """A setup defect, not a token defect: the queue is not marked `error`
+    because a file is missing."""
     _watch(db, "mint1")
     rpc = _RPC(key_missing=True)
 
@@ -492,7 +505,7 @@ async def test_refresh_and_error_retry_windows(db):
 
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     await chain_layer.run_chain_cycle(rpc, db, soon, sleep=_noop)
-    assert len(rpc.calls) == 1                      # ما زال طازجاً
+    assert len(rpc.calls) == 1                      # still fresh
 
     later = (
         datetime.fromisoformat(NOW)
@@ -516,7 +529,7 @@ async def test_errored_token_retries_faster_than_refresh(db):
     ).isoformat()
     assert config.CHAIN_ERROR_RETRY_SECONDS < config.CHAIN_REFRESH_SECONDS
     await chain_layer.run_chain_cycle(rpc, db, retry, sleep=_noop)
-    assert len(rpc.calls) == 2                      # قبل نافذة الطزاجة
+    assert len(rpc.calls) == 2                      # before the freshness window
 
 
 async def test_signal_token_precedes_control_when_capped(db, monkeypatch):
@@ -531,7 +544,8 @@ async def test_signal_token_precedes_control_when_capped(db, monkeypatch):
 
 
 async def test_empty_networks_tuple_fetches_nothing(db, monkeypatch):
-    """قائمة شبكات فارغة تعني «لا شيء» لا «الكلّ» — الصمت أصدق من مسح أعمى."""
+    """An empty networks list means "nothing", not "everything" — silence is
+    more honest than a blind sweep."""
     _watch(db, "mint1")
     monkeypatch.setattr(config, "CHAIN_NETWORKS", ())
     rpc = _RPC()
@@ -542,10 +556,11 @@ async def test_empty_networks_tuple_fetches_nothing(db, monkeypatch):
     assert stats["chain_due"] == 0
 
 
-# --- أختام «آخر نجاح» لكل طابور (حدُّ التقادم في اللوحة) ---
+# --- "Last success" stamps per queue (the staleness threshold in the dashboard) ---
 def test_ok_stamps_are_written_per_queue_not_once_for_the_process():
-    """اللوحة كانت تُشفي أخطاء chain/evm بحدِّ **المسجّل** وهو لا يكتبه غيره؛
-    فموتُ المسجّل جمّد الحدَّ وبقيت الشارات حمراء. الآن لكلٍّ ختمُه من كاتبه."""
+    """The dashboard used to clear chain/evm errors by the **recorder's** stamp,
+    which nothing else writes; when the recorder died the threshold froze and
+    the badges stayed red. Now each queue gets its stamp from its own writer."""
     import run_chain
 
     stats = {"chain_errors": 0, "auth_errors": 0}
@@ -556,7 +571,8 @@ def test_ok_stamps_are_written_per_queue_not_once_for_the_process():
 
 
 def test_a_failing_queue_gets_no_stamp_while_its_neighbours_do():
-    """نجاح طابورٍ لا يشفي خطأ آخر: ختمُ الفاشل يُحجب وحده."""
+    """One queue succeeding does not heal another's error: the failing one's
+    stamp is withheld alone."""
     import run_chain
 
     out = run_chain._ok_stamps({
@@ -570,18 +586,20 @@ def test_a_failing_queue_gets_no_stamp_while_its_neighbours_do():
 
 
 def test_absent_counter_yields_no_stamp():
-    """دورةٌ لم تُشغّل طابوراً (استثناءٌ قطعها) لا تختم له نجاحاً كاذباً."""
+    """A cycle that ran no queue (an exception cut it short) does not stamp a
+    false success for it."""
     import run_chain
 
     assert run_chain._ok_stamps({}, NOW) == {}
 
 
 def test_stamps_survive_a_locked_database():
-    """قفلُ القاعدة عند الختم لا يرفع: الدورة نجحت فعلاً ولا تُسجَّل «تعثّرت»."""
+    """A database lock at stamping does not raise: the cycle really did
+    succeed and is not recorded as "stalled"."""
     import run_chain
 
     class _Locked:
         def note_error(self, _key, _value):
             return False
 
-    run_chain._stamp(_Locked(), {"chain_last_run_at": NOW})   # لا استثناء
+    run_chain._stamp(_Locked(), {"chain_last_run_at": NOW})   # no exception

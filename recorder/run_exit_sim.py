@@ -1,11 +1,11 @@
-"""تقرير مقارنة قواعد الخروج على الأرشيف الحالي.
+"""Report comparing exit rules over the current archive.
 
-    py run_exit_sim.py                        # المجموعة الافتراضية (الجمع الأماميّ)
-    py run_exit_sim.py --cost 0.02            # مع تكلفة 2% لكل دورة
-    py run_exit_sim.py --all-signals          # كل الإشارات لا أوّل إشارة لكل عملة
-    py run_exit_sim.py --source activity      # الرجعيّ: multi_user_buy من activity_events
+    py run_exit_sim.py                        # the default set (forward collection)
+    py run_exit_sim.py --cost 0.02            # with a 2% cost per round trip
+    py run_exit_sim.py --all-signals          # every signal, not the first per coin
+    py run_exit_sim.py --source activity      # retro: multi_user_buy from activity_events
 
-يقرأ فقط؛ آمن مع المسجّل العامل.
+Read-only; safe alongside the running recorder.
 """
 from __future__ import annotations
 
@@ -51,20 +51,22 @@ def main() -> None:
     try:
         trades = load_trades(db, independent_only=independent, source=source)
         if not trades:
-            print("لا صفقات صالحة بعد — انتظر تراكم الشموع.")
+            print("No valid trades yet — wait for bars to accumulate.")
             return
         holds = sorted(
             (t["bars"][-1]["ts"] - t["entry_ts"]) / 3600 for t in trades
         )
-        src_label = ("الرجعيّ: multi_user_buy من activity_events (بلا ضابطة ممكنة)"
-                     if source == "activity" else "الجمع الأماميّ: signal_events")
-        print(f"المصدر: {src_label}")
-        print(f"صفقات: {len(trades)} · وسيط المتابعة المتاحة: {holds[len(holds) // 2]:.1f} ساعة")
+        src_label = ("retro: multi_user_buy from activity_events (no control arm possible)"
+                     if source == "activity" else "forward collection: signal_events")
+        print(f"Source: {src_label}")
+        print(f"Trades: {len(trades)} · median follow-up available: {holds[len(holds) // 2]:.1f} hours")
 
-        # حالة النضج تُطبع **قبل** الأرقام لا بعدها: الجدول أدناه استطلاعيّ ما
-        # لم تكتمل النوافذ وتنضج الضابطة، ولا يجوز أن يُقرأ كنتيجة.
-        # عتبة المتابعة المكتملة = النافذة ناقص شمعة واحدة: آخر شمعة 5د تسبق
-        # نهاية النافذة بدقائق، فالفحص الحرفي (h>=48) يسقطها كلّها كذباً.
+        # Maturity status is printed **before** the numbers, not after: the table
+        # below is exploratory until the windows complete and the control arm
+        # matures, and must not be read as a result.
+        # The completed-follow-up threshold = the window minus one bar: the last
+        # 5m bar precedes the end of the window by minutes, so a literal check
+        # (h>=48) would falsely drop them all.
         mature = sum(1 for h in holds if h >= config.LABEL_WINDOW_HOURS - 1)
         db_controls = db._conn.execute(
             "SELECT COUNT(*) FROM watchlist WHERE is_control=1 AND active=1"
@@ -72,23 +74,23 @@ def main() -> None:
         blockers = []
         if mature == 0:
             blockers.append(
-                f"لا نافذة اكتملت (أقصى متابعة {holds[-1]:.1f}س من "
-                f"{config.LABEL_WINDOW_HOURS}س) ⇒ الأهداف البعيدة مُبخَّسة بنيوياً"
+                f"no completed window (max follow-up {holds[-1]:.1f}h of "
+                f"{config.LABEL_WINDOW_HOURS}h) ⇒ far targets are structurally understated"
             )
         if len(trades) < 1000:
-            blockers.append(f"العيّنة {len(trades)} صفقة، دون عتبة النضج (1000)")
+            blockers.append(f"the sample is {len(trades)} trades, below the maturity threshold (1000)")
         blockers.append(
-            f"لا مقارنة ضابطة في هذا التقرير ({db_controls} عملة ضابطة متاحة) "
-            "⇒ الفرق قد يكون خاصية سوق لا استراتيجية"
+            f"no control comparison in this report ({db_controls} control coins available) "
+            "⇒ the difference may be a market property, not a strategy"
         )
         print()
-        print("┌─ استطلاعيّ — لا تُبنَ عليه قرارات " + "─" * 36)
+        print("┌─ Exploratory — do not build decisions on it " + "─" * 36)
         for b in blockers:
             print(f"│ • {b}")
         print("└" + "─" * 70)
-        print(f"\nتكلفة الدورة المفترضة: {cost * 100:.1f}%\n")
+        print(f"\nAssumed round-trip cost: {cost * 100:.1f}%\n")
 
-        hdr = f"{'القاعدة':<34}{'متوسّط':>9}{'وسيط':>9}{'فوز':>8}{'أسوأ':>10}{'حيازة':>8}"
+        hdr = f"{'rule':<34}{'mean':>9}{'median':>9}{'win':>8}{'worst':>10}{'hold':>8}"
         print(hdr)
         print("-" * len(hdr))
         for rule in DEFAULT_RULES:
@@ -102,17 +104,18 @@ def main() -> None:
             print(
                 f"{r['rule']:<34}{r['mean'] * 100:>8.2f}%{r['median'] * 100:>8.2f}%"
                 f"{r['win_rate'] * 100:>7.1f}%{r['worst'] * 100:>9.1f}%"
-                f"{r['median_hold_h']:>7.1f}س"
+                f"{r['median_hold_h']:>7.1f}h"
             )
 
-        print("\n=== أقصى تكلفة تحتملها كل قاعدة قبل أن تصير خاسرة ===")
+        print("\n=== The maximum cost each rule can bear before turning losing ===")
         for rule in DEFAULT_RULES:
             be = breakeven_cost(trades, rule)
-            flag = "" if be > 0.03 else "  ← أضيق من انزلاق واقعيّ"
+            flag = "" if be > 0.03 else "  ← tighter than realistic slippage"
             print(f"  {rule.label:<34}{be * 100:>6.2f}%{flag}")
         print(
-            "\nثلث العملات سيولتها دون 50 ألف دولار؛ الانزلاق وحده قد يبتلع"
-            "\nالأفضلية كاملةً. القاعدة التي تعادلها دون ~3% ليست قابلة للتنفيذ عملياً."
+            "\nA third of the coins have liquidity under $50k; slippage alone can"
+            "\neat the entire edge. A rule that breaks even below ~3% is not"
+            "\npractically executable."
         )
     finally:
         db.close()

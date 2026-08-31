@@ -1,941 +1,1006 @@
-﻿# مشروع aoi — نظام جمع بيانات fomo.family وتوسيمها
+# aoi — fomo.family data collection and labeling system
 
-نظام يجمع بيانات منصّة التداول الاجتماعي [fomo.family](https://fomo.family)
-لحظةً بلحظة، ويحفظ **نتيجة** كل إشارة بعد 48 ساعة — بهدف بناء نموذج يتنبّأ بأي
-عملة سترتفع بعد إشارة شراء.
+A system that collects data from the social trading platform [fomo.family](https://fomo.family)
+moment by moment, and saves the **outcome** of each signal after 48 hours — with the goal
+of building a model that predicts which coin will rise after a buy signal.
 
-> **الحالة** (2026-08-29): الجمع والتوسيم **وبناء صفوف التدريب** كلّها تلقائية
-> (ثماني خدمات دائمة + مهمتي Bars1m والنسخ الاحتياطي، §2). مستخرج الميزات الحالي
-> **fv16 = 171 ميزة** ومشغّل.
+> **Status** (2026-08-29): collection, labeling, **and training-row building** are all
+> automatic (eight permanent services + the Bars1m and backup tasks, §2). The current
+> feature extractor is **fv16 = 171 features** and running.
 >
-> **بوّابة المرحلة 1 شُغِّلت مرّتين — 2026-08-02 و2026-08-07 — ولم تُجتَز.** في
-> 08-02 كان وسيط عائد الإشارة −28.9% مقابل −2.2% للضابطة، وفي 08-07 اختفى الفرق
-> (وسيط −0.1% للاثنين، `p`=0.25 على n=89/10). والسبب البنيويّ ليس ضعف الأثر
-> وحده: **تصميم الضابطة نفسه كان معطوباً** (`no_entry` 30.8% مقابل 2.3%، وكونان
-> غير متطابقين، وتوزيع شبكات مختلّ 0.36). فحُذفت الضابطة القديمة وأُعيد التصميم
-> `v3` (`CONTROL_DESIGN_VERSION = 3`).
+> **The phase-1 gate was run twice — 2026-08-02 and 2026-08-07 — and not passed.** In
+> 08-02 the signal's median return was −28.9% versus −2.2% for the control; in 08-07 the
+> difference vanished (median −0.1% for both, `p`=0.25 on n=89/10). The structural cause
+> is not just a weak effect: **the control design itself was broken** (`no_entry` 30.8%
+> versus 2.3%, two mismatched universes, network-distribution imbalance 0.36). So the old
+> control was deleted and redesigned as `v3` (`CONTROL_DESIGN_VERSION = 3`).
 >
-> الضابطة `v3` الناضجة الآن **426**: عتبة الفحص الاستكشافيّ (100) **مفتوحة**،
-> والعتبة الملزمة لقبول/رفض الأطروحة (500) لم تُبلَغ (74 متبقية). **لا تدريب
-> نموذج دخول معتمد** قبلها. الرقم حيٌّ؛ ارجع إلى `/api/labeling` بدل نسخ هذه
-> اللقطة. خطة ما بعد الجمع بالتفصيل: **[docs/PLAN.md](docs/PLAN.md)**.
+> Mature `v3` control count is now **426**: the exploratory review threshold (100) is
+> **open**, and the binding threshold for accepting/rejecting the thesis (500) has not
+> been reached (74 remaining). **No approved entry-model training** before it. The number
+> is live; refer to `/api/labeling` instead of copying this snapshot. The detailed
+> post-collection plan: **[docs/PLAN.md](docs/PLAN.md)**.
 
 ---
 
-## 1. لماذا هذا المشروع موجود
+## 1. Why this project exists
 
-fomo.family تعرض حالة السوق **الآن** ولا تحفظ التاريخ. فلا يمكن أن تسأل:
-«العملات التي اشتراها متصدّرون أمس — ماذا حدث لها؟». هذا النظام يسدّ الفجوة:
-يلتقط **لحظة القرار (t=0)** ثمّ يتابع السعر 48 ساعة، فتصير الإجابة ممكنة.
+fomo.family shows the market state **now** but keeps no history. You cannot ask:
+"the coins bought by top traders yesterday — what happened to them?" This system closes
+the gap: it captures the **decision moment (t=0)** then follows the price for 48 hours,
+making the answer possible.
 
-**لا يمكن تسجيل الماضي** (إلّا جزئياً — انظر §9). كل يوم تأخير = بيانات مفقودة.
+**The past cannot be recorded** (except partially — see §9). Every day of delay = lost data.
 
 ---
 
-## 2. المعمارية
+## 2. Architecture
 
-**ثماني خدمات دائمة مستقلّة**، ومعها مهمتا أرشفة Bars1m والنسخ الاحتياطي
-اليومية. كلّها **مهام Windows مجدولة** وتنجو من إعادة التشغيل، وتعمل
-بـ`pythonw.exe` فلا تظهر نافذة.
+**Eight independent permanent services**, plus the Bars1m archiving task and the daily
+backup. All are **Windows scheduled tasks** that survive reboots, running under
+`pythonw.exe` with no window.
 
 ```
         ┌──────────────────┐                    ┌──────────────────────────┐
-        │  fomo.family     │                    │  عُقَد البلوك تشين         │
-        │  (لا API رسميّ)   │                    │  Helius · RPC رسميّة      │
+        │  fomo.family     │                    │  blockchain nodes         │
+        │  (no official API)│                   │  Helius · official RPC    │
         └────────┬─────────┘                    └─────────────┬────────────┘
-                 │ curl_cffi (تجاوز Cloudflare)               │ chain_keys.json
-    ┌────────────▼─────────┐                                  │  (أحواض مفاتيح)
-    │  FomoApiServer :8080 │  مصادقة Privy ذاتية التجديد        │
+                 │ curl_cffi (Cloudflare bypass)             │ chain_keys.json
+    ┌────────────▼─────────┐                                  │  (key pools)
+    │  FomoApiServer :8080 │  self-renewing Privy auth         │
     └────────────┬─────────┘                                  │
-                 │ .privy_state.json (توكن على القرص)          │
+                 │ .privy_state.json (token on disk)          │
    ┌─────────────┴──────────────┐              ┌──────────────┴─────────────┐
-   │ FomoRecorder    كل 60 ث    │              │ FomoChain       كل 60 ث    │
-   │ FomoLabeler     كل 15 د    │              │ FomoEVMReplay   كل 60 ث    │
-   │ FomoBuildRows   كل ساعة    │              └──────────────┬─────────────┘
+   │ FomoRecorder    every 60s  │              │ FomoChain       every 60s  │
+   │ FomoLabeler     every 15m  │              │ FomoEVMReplay   every 60s  │
+   │ FomoBuildRows   hourly     │              └──────────────┬─────────────┘
    └─────────────┬──────────────┘                             │
                  └──────────────┬─────────────────────────────┘
-                                │  recorder.db (SQLite WAL — خمسة كتّاب)
+                                │  recorder.db (SQLite WAL — five writers)
                  ┌──────────────┴───────────────┐
       ┌──────────▼─────────┐        ┌───────────▼───────────┐
       │ FomoDashboard :8090│        │ FomoBackup            │
-      │ قراءة فقط mode=ro  │        │ يومياً 03:15 → OneDrive│
+      │ read-only mode=ro  │        │ daily 03:15 → OneDrive│
       └────────────────────┘        └───────────────────────┘
 ```
 
-| الخدمة | المجلّد | الدور | التواتر |
+| Service | Directory | Role | Frequency |
 |---|---|---|---|
-| `FomoApiServer` | `api/` | مصادقة Privy + غلاف REST لـ fomo | دائم :8080 |
-| `FomoRecorder` | `recorder/` | جمع الخام وتخزينه | كل 60 ثانية |
-| `FomoLabeler` | `recorder/` | حساب النتائج بعد نضج النافذة | كل 15 دقيقة |
-| `FomoChain` | `recorder/` | **تركّز الملكية من البلوك تشين**: سولانا (Helius) + صلاحيات المِنت + طبقة EVM وسلامة العقد وBSC في نفس العملية | دورة كل 60 ثانية؛ لقطة لكل عملة كل 5 دقائق، والصلاحيات ساعيّاً |
-| `FomoEVMReplay` | `recorder/` | **إعادة تاريخية** لأرصدة EVM من أحداث `Transfer` | كل 60 ثانية، عملة واحدة/دورة |
-| `FomoBuildRows` | `recorder/` | **بناء `training_rows`** تزايدياً (المرحلة 3، كانت يدويّة) | كل ساعة، سقف 4000 صفّ/دورة |
-| `FomoActivityHead` | `recorder/` | سدّ رأس `tradingActivity` حتى أول تداخل محلي | كل 5 دقائق |
-| `FomoDashboard` | `dashboard/` | مراقبة حيّة (قراءة فقط) | دائم :8090 |
-| `FomoBars1m` | `recorder/` | جولة أرشفة شموع الدقيقة للصف المؤهل | كل ساعة |
-| `FomoBackup` | `recorder/` | نسخة SQLite متسقة ومتحققة إلى OneDrive | يومياً 03:15 |
+| `FomoApiServer` | `api/` | Privy auth + REST wrapper for fomo | permanent :8080 |
+| `FomoRecorder` | `recorder/` | collect and store raw data | every 60 seconds |
+| `FomoLabeler` | `recorder/` | compute outcomes after the window matures | every 15 minutes |
+| `FomoChain` | `recorder/` | **ownership concentration from the blockchain**: Solana (Helius) + mint authorities + the EVM layer, contract safety, and BSC in the same process | 60s cycle; a snapshot per coin every 5 minutes, authorities hourly |
+| `FomoEVMReplay` | `recorder/` | **historical replay** of EVM balances from `Transfer` events | every 60 seconds, one coin/cycle |
+| `FomoBuildRows` | `recorder/` | **build `training_rows`** incrementally (phase 3, previously manual) | hourly, cap 4,000 rows/cycle |
+| `FomoActivityHead` | `recorder/` | plug the head of `tradingActivity` up to the first local overlap | every 5 minutes |
+| `FomoDashboard` | `dashboard/` | live monitoring (read-only) | permanent :8090 |
+| `FomoBars1m` | `recorder/` | archiving round of 1-minute candles for the eligible queue | hourly |
+| `FomoBackup` | `recorder/` | consistent, verified SQLite copy to OneDrive | daily 03:15 |
 
-**لماذا الفصل**: المسجّل يسجّل خاماً فقط. أي حساب لقيمة مشتقّة من المستقبل وقت
-التسجيل **تسرّبٌ بنيويّ** يفسد النموذج. الموسِّم عملية منفصلة لا تلمس صفّاً قبل
-اكتمال نافذته.
+**Why the separation**: the recorder records raw data only. Computing any value derived
+from the future at record time is a **structural leak** that corrupts the model. The
+labeler is a separate process that touches no row before its window completes.
 
-**ولماذا طبقة السلسلة عمليّةٌ منفصلة لا خطوةٌ في الدورة**: ميزانية الدورة (60
-ثانية) ممتلئة، ومصدرٌ خارجيّ ثانٍ داخلها يجعل بطأه يؤخّر جمع fomo نفسه. والفصل
-هو ما يجعل إيقاع الخمس دقائق **لكل عملة** ممكناً بلا مساس بذلك: الطبقة تدور كل
-60 ثانية وتأخذ 20 عملة مستحقّة (`CHAIN_PER_CYCLE`) فتكتمل الجولة قبل انتهاء
-`CHAIN_REFRESH_SECONDS = 300`، والكلفة 20 نداءً في الدقيقة مقابل **224 نداءً في
-الدقيقة مقيسة على المفتاح بلا فشل واحد** — أي ~9% من الطاقة المريحة.
-(`chain_layer.py`, `run_chain.py`)
+**And why the chain layer is a separate process, not a step in the cycle**: the cycle
+budget (60 seconds) is full, and a second external source inside it would let its
+slowness delay fomo collection itself. The separation is what makes the five-minute
+cadence **per coin** possible without harming that: the layer cycles every 60 seconds and
+takes 20 due coins (`CHAIN_PER_CYCLE`), completing the round before
+`CHAIN_REFRESH_SECONDS = 300` expires, at a cost of 20 calls per minute against **224
+calls per minute measured on the key with zero failures** — about ~9% of the comfortable
+capacity. (`chain_layer.py`, `run_chain.py`)
 
-**المزوّدون وأحواض المفاتيح**: سولانا على Helius، وEVM على **العقد الرسميّة**
-(روبن‑هود 4663 · Base 8453 · Monad 143) لأنّها قيست أفضل من المستكشفات،
-وNodeReal لحائزي BSC (56) — وهو المصدر الوحيد الذي يعطي عدد حائزي ERC-20
-مضبوطاً. و**لا مزوّدَ بمفتاح على مسار الإعادة**: GoldRush حُذف من الشِفرة في
-2026‑08‑19 — الحساب يردّ 402 منذ 2026‑08‑17، وكان مساره قد أنفق 41,386 نداءً على
-Base مقابل **صفر لقطة** (المصيدة #29). فالإعادة كلّها على العقد الرسميّة، وعودةُ
-أيّ مزوّدٍ بمفتاح تبدأ من `PROVIDERS` في `key_file.py` لا من محوّلٍ محفوظ.
-وMonad (143) **تُجمَع
-حيّةً ولا تُعاد** (`EVM_REPLAY_NETWORKS = 4663 · 8453`): ستّ إشارات في الأرشيف
-كلّه، وكانت تأخذ ثلث دورات الإعادة بصفر لقطة. المفاتيح تُقرأ من ملفّات
-محلّية (`chain_keys.json` وأمثالها) عبر `provider_keys.py` وتُدار **بأحواض
-دوّارة**: العملية المالكة وحدها تحمل الحوض، وتكتب في `meta` تقريراً بلا أيّ
-قيمة مفتاح (`pool_report()`) فتراه اللوحة نقطةً لكل مفتاح. (المصيدة #26)
+**Providers and key pools**: Solana on Helius, EVM on **official RPCs** (Robinhood 4663 ·
+Base 8453 · Monad 143) because they measured best, and NodeReal for BSC (56) holders —
+the only source that gives an exact ERC-20 holder count. And **no keyed provider is on
+the replay path**: GoldRush was deleted from the code on 2026-08-19 — the account had
+been returning 402 since 2026-08-17, and its path had spent 41,386 calls on Base for
+**zero snapshots** (trap #29). All replay now runs on official RPCs, and any keyed
+provider's return starts from `PROVIDERS` in `key_file.py`, not from a saved converter.
+Monad (143) is **collected live and never replayed** (`EVM_REPLAY_NETWORKS = 4663 ·
+8453`): six signals in the whole archive, and it was taking a third of replay cycles for
+zero snapshots. Keys are read from local files (`chain_keys.json` and the like) via
+`provider_keys.py` and managed in **rotating pools**: only the owning process holds the
+pool, and it writes a report with no key values at all to `meta` (`pool_report()`), which
+the dashboard shows as one dot per key. (Trap #26)
 
 ---
 
-## 3. تدفّق البيانات — دورة المسجّل الواحدة
+## 3. Data flow — one recorder cycle
 
 ```
-0)    تحديث صدارة المتصدّرين + أرشفة خامها في snapshots        (كل ساعة)
+0)    refresh the leaderboard head + archive its raw form in snapshots   (hourly)
 1)    GET /feed          → signal_events + watchlist + last_feed_event_at
 2)    POST /proxy/trendingTokens ┐
       GET  /proxy/verifiedTokens ├→ snapshots + market_ticks + token_static
       GET  /proxy/mostHeld       ┘
-2.3)  POST /proxy/filterTokens → سدّ فجوة القياس: المراقَبات التي لم تلتقطها
-      أيّ قائمة في هذه الدورة  (150 عنواناً/نداء — مقيس)
-2.2)  نوافذ إشارة مقارنة من الكون نفسه وسعر السوق نفسه المستخدَم للضابطة
-2.25) اختيار عملات ضابطة عشوائية  (هدف 40 نشطة · 2/دورة · فقط في دورة قبلت
-      إشارة مقارنة — فالكونان والسعر واحد)
-2.42) tokenDetails + /hodlers/top → token_holders + token_flow  (13 عملة/دورة)
-2.45) GET /v2/users/{id}          → traders                     (4 متداولين/دورة)
-2.5)  POST /proxy/getBarsNew      → token_bars                  (9 عملات/دورة)
-2.75) GET /feed/token/thesis      → token_social + token_thesis  (7 عملات/دورة)
-2.9)  POST /proxy/getBarsNew      → شموع SOL/WETH/WBTC الساعية   (كل ساعة)
-3)    تعطيل ما تجاوز 48 ساعة  (`SNAPSHOT_RETENTION_DAYS = 0` ⇒ لا تقليم:
-      الأرشيف الخام يُحفَظ كاملاً)
+2.3)  POST /proxy/filterTokens → close the measurement gap: watchlist entries not
+      captured by any list in this cycle  (150 addresses/call — measured)
+2.2)  comparison signal windows from the same universe and the same market price used
+      for the control
+2.25) pick random control coins  (target 40 active · 2/cycle · only in a cycle that
+      accepted a comparison signal — so universe and price are identical)
+2.42) tokenDetails + /hodlers/top → token_holders + token_flow  (13 coins/cycle)
+2.45) GET /v2/users/{id}          → traders                     (4 traders/cycle)
+2.5)  POST /proxy/getBarsNew      → token_bars                  (9 coins/cycle)
+2.75) GET /feed/token/thesis      → token_social + token_thesis  (7 coins/cycle)
+2.9)  POST /proxy/getBarsNew      → hourly SOL/WETH/WBTC candles   (hourly)
+3)    disable what passed 48 hours  (`SNAPSHOT_RETENTION_DAYS = 0` ⇒ no pruning:
+      the raw archive is kept in full)
 ```
 
-**التناوب مقصود لا تقصير**: كل مصدر مُثرٍ يمسح شريحة في الدورة، فزمن المسح
-الكامل = عدد المراقَبات ÷ الشريحة دقائق. الأعداد أعلاه ليست عشوائية بل ناتج
-شراء وقتٍ من التباطؤ (`*_PACING_SECONDS`) بعد قياس أنّ المنبع بلا حدّ نداءات
-وأنّ الحدّ الحقيقيّ هو الستّون ثانية نفسها (المصيدة #27).
+**The rotation is deliberate, not neglect**: each rich source scans a slice per cycle, so
+full-scan time = number of watchlist entries ÷ slice, in minutes. The numbers above are
+not arbitrary but the result of buying time from pacing (`*_PACING_SECONDS`) after
+measuring that the upstream has no call limit and that the real limit is the sixty
+seconds themselves (trap #27).
 
-كل نداء داخل `try/except` مستقلّ: فشل مصدر يُسجَّل في `meta.last_error_<src>`
-ويُتخطّى. **الحلقة لا تموت أبداً** — ودرعٌ أخير حول الدورة كلّها.
+Every call sits inside its own `try/except`: a source failure is logged to
+`meta.last_error_<src>` and skipped. **The loop never dies** — with a last-resort shield
+around the whole cycle.
 
-> ⚠️ وبكتابة البُوك‌كيبينغ نفسها مصيدة: استعمل `db.note_error` لا `set_meta`
-> عارياً. معالِج الأخطاء كتب مرّةً في القاعدة المقفلة فمات المسجّل 3س14د —
-> الحارسُ نفسه صار سببَ الموت (المصيدة #25).
+> ⚠️ Writing the bookkeeping itself is a trap: use `db.note_error`, not bare `set_meta`.
+> An error handler once wrote to the locked database and the recorder died for 3h14m —
+> the guard itself became the cause of death (trap #25).
 
-### دورة طبقة السلسلة (`FomoChain` — عملية منفصلة، دورة كل 60 ثانية)
+### The chain-layer cycle (`FomoChain` — separate process, 60-second cycle)
 
 ```
-1) سولانا: أقدم المراقَبات المستحقّة (20/دورة) → نداء واحد لكلٍّ
-   (getTokenLargestAccounts + getTokenSupply في طلب HTTP واحد)
-   → chain_concentration: top1/5/10/20 معاً — مقيس 230ms
-2) سولانا ساعيّاً (6/دورة): صلاحيات المِنت/التجميد و mutable → chain_authority
-3) EVM في نفس العملية وبحرسها الخاصّ: eth_getLogs واحد يغطّي **كل** عملات
-   الشبكة (4663 · 8453 · 143) → evm_balances (دفتر أرصدة من أحداث Transfer)
-   ومنه لقطة تركّز لكل عملة كل 5 دقائق
-4) سلامة العقد من البايت‑كود مباشرة (Base وحدها، 2/دورة) → evm_contract
-5) BSC (56) عبر NodeReal (2/دورة، كل 15 دقيقة) → عدد حائزين مضبوط وأعلى 20
+1) Solana: oldest due watchlist entries (20/cycle) → one call each
+   (getTokenLargestAccounts + getTokenSupply in a single HTTP request)
+   → chain_concentration: top1/5/10/20 together — measured 230ms
+2) Solana hourly (6/cycle): mint/freeze authorities and mutable → chain_authority
+3) EVM in the same process under its own guard: a single eth_getLogs covering **all**
+   the network's coins (4663 · 8453 · 143) → evm_balances (a balance ledger built from
+   Transfer events), from which a concentration snapshot per coin every 5 minutes
+4) contract safety straight from the byte-code (Base only, 2/cycle) → evm_contract
+5) BSC (56) via NodeReal (2/cycle, every 15 minutes) → exact holder count and top 20
 ```
 
-**التغطية ليست موحّدة، وهذا مقيس لا مُغفَل**: `EVM_ADDRESS_BATCH` حدّ المزوّد
-لا اختيارنا (روبن‑هود وBase 60 عنواناً للمرشّح، Monad 40، وBSC **5** فقط —
-لذلك BSC على NodeReal لا على دفتر التحويلات). وسلامة العقد على Base وحدها
-لأنّها الشبكة التي تباينت فيها القياسات؛ على 4663 تتكرّر الأحجام في ستّة قوالب
-متطابقة فالعمود يكاد يكون ثابتاً. وروبن‑هود تعيد `blockTimestamp: '0x0'` في كل
-سجلّ (مقيس 2026-08-13) فيلزمها جدول مراسي وقت↔كتلة (`evm_block_time`) لا
-تحتاجه Base ولا BSC.
+**Coverage is not uniform, and this is measured, not overlooked**: `EVM_ADDRESS_BATCH`
+is the provider's limit, not our choice (Robinhood and Base 60 addresses per filter,
+Monad 40, BSC only **5** — hence BSC on NodeReal rather than on the transfer ledger).
+Contract safety is Base-only because that is the network where measurements diverged; on
+4663 sizes repeat in six identical templates so the column is nearly constant. And
+Robinhood returns `blockTimestamp: '0x0'` in every record (measured 2026-08-13), so it
+needs a time↔block anchor table (`evm_block_time`) that Base and BSC do not need.
 
-ثلاث حالات لا حالتان في كل قياس — `ok` (قياس وصل) و`empty` (المصدر ردّ بلا
-قياس: عنوان ليس عملةً) و`error` — فإيقاع المحاولة التالية يختلف بينها.
+Three states, not two, for every measurement — `ok` (a measurement arrived), `empty`
+(the source replied with no measurement: the address is not a token), and `error` — so
+the next retry cadence differs between them.
 
-**لماذا هذه الطبقة وعندنا `token_holders` من fomo؟** لأنّ fomo يعطي
-`top10HoldersPercent` وحده وكل ~25 دقيقة (وسيط الفجوة المقيس 25.0د على 19,440
-زوجاً): فلا top1 — أي لا جواب عن «حوت مفرد أم عشرة موزّعون؟» وهما خطران
-مختلفان — ولا إيقاع يلحق تصريفاً يجري في دقائق.
+**Why this layer when fomo gives us `token_holders`?** Because fomo provides only
+`top10HoldersPercent`, and only every ~25 minutes (measured median gap 25.0m over 19,440
+pairs): no top1 — no answer to "one whale or ten distributed holders?", which are two
+different risks — and no cadence that can keep up with a dump unfolding in minutes.
 
-**وسولانا وحدها في التركّز، وليس تقصيراً**: معيار ERC-20 لا يحمل قائمة حائزين
-على السلسلة، فلا نداء عقدة يعطي أكبر حائزي EVM إطلاقاً. الطريق الوحيد إلى رقم
-مضبوط هو إعادة تشغيل كل حدث `Transfer` وحفظ الرصيد الناتج — وهو ما تفعله
-`FomoEVMReplay`، ومقيسٌ أنّه **رخيص لا مكلف**: نداء `eth_getLogs` واحد بمرشّح
-يحمل كل عناوين الشبكة (روبنهود 57 عنواناً في 0.5ث)، وتعبئة تاريخ عملة هادئة
-نداءٌ واحد (1,814 تحويلاً عبر 1.71 مليون كتلة، 0.7ث).
+**And Solana alone in concentration is not neglect**: the ERC-20 standard carries no
+holder list on-chain, so no node call gives EVM top holders at all. The only route to an
+exact number is replaying every `Transfer` event and saving the resulting balance — which
+is what `FomoEVMReplay` does, and it is measured **cheap, not expensive**: one
+`eth_getLogs` call with a filter carrying all the network's addresses (Robinhood 57
+addresses in 0.5s), and backfilling a quiet coin's history is a single call (1,814
+transfers across 1.71 million blocks, 0.7s).
 
-الإشارات موزّعة **42.5% سولانا / 57.5% EVM** (سولانا 40,848 من 96,106) — فأيّ
-عمل على السلسلة **تنفيذان لا واحد**. وتوزيع الشبكات هو ما يحدّد أين تُصرَف
-الجهود: روبن‑هود (4663) **31.6%** · BSC (56) **22.0%** · Base (8453) 3.9% ·
-Monad (143) ستّ إشارات. أي أنّ ثاني أكبر شبكة في الأرشيف هي تحديداً الشبكة التي
-**لا يصلح لها دفتر التحويلات** (حدّ المرشّح 5 عناوين) فتعمل على NodeReal
-بمقياس مختلف — تفاوتٌ في المنهج تفرضه حدود المزوّدين لا الاختيار.
+Signals split **42.5% Solana / 57.5% EVM** (Solana 40,848 of 96,106) — so any on-chain
+work is **two implementations, not one**. The network distribution decides where effort
+goes: Robinhood (4663) **31.6%** · BSC (56) **22.0%** · Base (8453) 3.9% · Monad (143)
+six signals. That is, the second-largest network in the archive is precisely the one the
+transfer ledger **does not work for** (filter cap of 5 addresses), so it runs on NodeReal
+with a different measure — a methodological divergence forced by provider limits, not by
+choice.
 
 ---
 
-## 4. نموذج البيانات (`recorder/recorder.db`)
+## 4. Data model (`recorder/recorder.db`)
 
-### الخام من fomo
+### Raw from fomo
 
-| الجدول | الغرض | ملاحظة حرجة |
+| Table | Purpose | Critical note |
 |---|---|---|
-| `signal_events` | لحظة القرار t=0، **45 عموداً** | `raw_json` مضغوط · حقول الحجم والإعجابات مُسترجَعة |
-| `watchlist` | من نراقب الآن + متى تنتهي | حالة تشغيل **قابلة للترقية** — ليست مصدر حقيقة |
-| `watch_windows` | **سجلّ immutable لكل نافذة** | مصدر الحقيقة للمقارنة والتوسيم؛ الفصل يمنع ترقية الضابطة إلى إشارة من محو نافذتها |
-| `token_bars` | شموع OHLCV — **مصدر الحقيقة السعرية** | 5 دقائق للمراقَبة · ساعية لـSOL/WETH/WBTC (مرجع السوق، منذ 2026-07-28) · يوميّة للتاريخ العميق (ATH) · `h/l/c_suspect` تعلّم قيم المنبع المستحيلة (منذ 2026-07-30) |
-| `market_ticks` | لقطة سوق من trending/verified/mostHeld/filterTokens | تغطية جزئية — الشموع تفوقها. و`top10_holders_pct` فيه **عمود ميت**: 0 من 1,430,475 صفّ (المصيدة #28) |
-| `token_static` | ثوابت العملة (mint/freeze/socials) | مرّة واحدة عند الدخول |
-| `token_social` | سلسلة زمنية للزخم الاجتماعي | `thesis_total` لا `thesis_count` |
-| `token_thesis` | صفّ لكل أطروحة بختم كتابتها | يتيح العدّ **التاريخي** |
-| `token_holders` | تركّز الملكية **من مصدرين** | صفٌّ لكل `source`: `tokenDetails` = تركّز السلسلة، `/hodlers/top` = تموضع مستخدمي fomo. **قياسان مختلفان لا نسختان** (§3) |
-| `token_flow` | تدفّق الشراء/البيع بطبقات 5د/1س/24س | النِسَب هي المعلومة لا القيم المطلقة؛ لا طبقة 12س في المنبع ⇒ لا عمود لها |
-| `traders` | ملفّ كل متداول متكرّر (17 عموداً) | مطابق لردّ `/v2/users/{id}` المقيس حيّاً — **لا `win_rate` ولا `realized_pnl`** (غير موجودين في الردّ) |
-| `snapshots` | أرشيف خام كامل لكل مصدر/دورة | يشمل **الصدارة الخام كل ساعة** (منذ 2026-07-28)؛ `SNAPSHOT_RETENTION_DAYS = 0` ⇒ لا تقليم |
-| `activity_events` | تاريخ `tradingActivity` الرجعيّ | جدول منفصل ليبقى الجمع الأماميّ نقيّاً؛ **مستبعَد من التدريب** (`is_live=0`) |
+| `signal_events` | the decision moment t=0, **45 columns** | `raw_json` compressed · size and likes fields recovered |
+| `watchlist` | what we watch now + when it ends | operational state, **upgradable** — not a source of truth |
+| `watch_windows` | **immutable record of every window** | source of truth for comparison and labeling; the separation prevents upgrading a control to a signal by erasing its window |
+| `token_bars` | OHLCV candles — **the price source of truth** | 5-minute for watchlist entries · hourly for SOL/WETH/WBTC (market reference, since 2026-07-28) · daily for deep history (ATH) · `h/l/c_suspect` flags impossible upstream values (since 2026-07-30) |
+| `market_ticks` | market snapshot from trending/verified/mostHeld/filterTokens | partial coverage — candles beat it. And its `top10_holders_pct` is a **dead column**: 0 of 1,430,475 rows (trap #28) |
+| `token_static` | coin constants (mint/freeze/socials) | once, on entry |
+| `token_social` | time series of social momentum | `thesis_total`, not `thesis_count` |
+| `token_thesis` | one row per thesis with its write timestamp | enables **historical** counting |
+| `token_holders` | ownership concentration **from two sources** | one row per `source`: `tokenDetails` = on-chain concentration, `/hodlers/top` = fomo users' positioning. **Two different measurements, not two copies** (§3) |
+| `token_flow` | buy/sell flow with 5m/1h/24h layers | the ratios are the information, not absolute values; no 12h layer upstream ⇒ no column for it |
+| `traders` | profile of every recurring trader (17 columns) | matches the live-measured `/v2/users/{id}` response — **no `win_rate`, no `realized_pnl`** (absent from the response) |
+| `snapshots` | full raw archive per source/cycle | includes the **raw leaderboard hourly** (since 2026-07-28); `SNAPSHOT_RETENTION_DAYS = 0` ⇒ no pruning |
+| `activity_events` | retrospective `tradingActivity` history | a separate table to keep forward collection clean; **excluded from training** (`is_live=0`) |
 
-### من البلوك تشين (طبقة `FomoChain` / `FomoEVMReplay`)
+### From the blockchain (`FomoChain` / `FomoEVMReplay` layers)
 
-| الجدول | الغرض | ملاحظة حرجة |
+| Table | Purpose | Critical note |
 |---|---|---|
-| `chain_concentration` | top1/5/10/20 + المعروض — **سولانا** | جدول مستقلّ لا أعمدة على `token_holders`: مصدر وإيقاع مختلفان. تقارب `top10_pct` بين المصدرين **تحقّق مجانيّ** |
-| `chain_authority` | صلاحيات المِنت/التجميد و mutable | صفٌّ لكل قياس لا صفّ يُحدَّث: ترك الصلاحية **حدث** يقع وسط النافذة |
-| `evm_balances` | دفتر أرصدة مبنيّ من أحداث `Transfer` | الرصيد **نصّ سِتّ‑عشريّ بعرض 64** لا عدد: uint256 يتجاوز حدّ SQLite، والحشو بالأصفار يجعل `ORDER BY balance_hex DESC` صحيحاً عدديّاً |
-| `evm_contract` | سلامة العقد من البايت‑كود (`eth_getCode`) | Base وحدها؛ التغطية 100% لا 10% — كل مزوّدي التحقّق قياساً دونه |
-| `evm_block_time` | مراسي وقت↔كتلة | لازمة **لروبن‑هود وحدها**: عقدتها تعيد `blockTimestamp: '0x0'` |
-| `evm_block_cursor` | إلى أين وصل تطبيق التحويلات | صفٌّ **للشبكة** لا للعملة: النداء نفسه واحد لكل الشبكة |
+| `chain_concentration` | top1/5/10/20 + supply — **Solana** | a standalone table, not columns on `token_holders`: different source and cadence. `top10_pct` agreement between the two sources is a **free cross-check** |
+| `chain_authority` | mint/freeze authorities and mutable | one row per measurement, not an updated row: an authority left **is an event** that happens mid-window |
+| `evm_balances` | balance ledger built from `Transfer` events | the balance is a **64-wide hex string**, not a number: uint256 exceeds SQLite's limit, and the zero padding makes `ORDER BY balance_hex DESC` numerically correct |
+| `evm_contract` | contract safety from byte-code (`eth_getCode`) | Base only; 100% coverage, not 10% — every verification provider measures below it |
+| `evm_block_time` | time↔block anchors | needed **for Robinhood alone**: its RPC returns `blockTimestamp: '0x0'` |
+| `evm_block_cursor` | how far transfer application has reached | one row **per network**, not per coin: the call itself is one per network |
 
-### مشتقّ (يُعاد بناؤه بلا شبكة)
+### Derived (rebuilt without the network)
 
-| الجدول | الغرض | ملاحظة حرجة |
+| Table | Purpose | Critical note |
 |---|---|---|
-| `outcomes` | **النتائج (labels)** | يملؤها الموسِّم حصراً |
-| `phase1_watch_outcomes` | View: نوافذ المقارنة المؤهّلة | `analysis_eligible=1 AND design_version>=3` — لا تعرض الضابطة القديمة |
-| `token_class` | تصنيف الأصل (ميم/كبير/مسعَّر/مستقرّة) | `classify_tokens.py` |
-| `training_rows` | **جدول التدريب**: 204 أعمدة مادية؛ العقد الحالي = 13 meta + **171 ميزة عند t=0** + 10 labels (وأعمدة أرشيفية ميتة باقية دون تصدير) | `build_training_rows.py` — **تزايديّ، والكتابة فوق الصفّ نفسها. لا تستعمل `--rebuild`** (أدناه) |
-| `model_training_rows` | **View: واجهة النموذج الآمنة** | تفرض `signal + is_live=1 + meme + ok + independent + feature_version≥2` وتزيل الإشارات المتزامنة. **درِّب عليها لا على الجدول** |
+| `outcomes` | **the results (labels)** | filled exclusively by the labeler |
+| `phase1_watch_outcomes` | View: eligible comparison windows | `analysis_eligible=1 AND design_version>=3` — the old control never reappears |
+| `token_class` | asset classification (meme/major/priced/stable) | `classify_tokens.py` |
+| `training_rows` | **the training table**: 204 physical columns; current contract = 13 meta + **171 features at t=0** + 10 labels (plus dead archival columns kept but not exported) | `build_training_rows.py` — **incremental, overwriting the same row. Do not use `--rebuild`** (below) |
+| `model_training_rows` | **View: the safe model interface** | enforces `signal + is_live=1 + meme + ok + independent + feature_version≥2` and removes coincident signals. **Train on the view, not the table** |
 
-### حالة التشغيل
+### Operational state
 
-| الجدول | الغرض |
+| Table | Purpose |
 |---|---|
-| `bars_fetch_state` · `social_fetch_state` · `holders_fetch_state` · `traders_fetch_state` · `chain_fetch_state` · `chain_auth_state` · `evm_contract_state` | حالة التناوب لكل مصدر — تقود الجدولة الدوّارة |
-| `evm_replay_state` · `evm_backfill_state` · `historical_bars_state` · `activity_bars_state` | تقدّم التعبئة الرجعية (قابلة للاستئناف) |
-| `meta` | عدّادات وحالة تشغيل: `last_error_*` · `last_feed_event_at` · `*_last_run_at` · تقارير أحواض المفاتيح |
+| `bars_fetch_state` · `social_fetch_state` · `holders_fetch_state` · `traders_fetch_state` · `chain_fetch_state` · `chain_auth_state` · `evm_contract_state` | rotation state per source — drives the round-robin scheduling |
+| `evm_replay_state` · `evm_backfill_state` · `historical_bars_state` · `activity_bars_state` | backfill progress (resumable) |
+| `meta` | counters and operational state: `last_error_*` · `last_feed_event_at` · `*_last_run_at` · key-pool reports |
 
-### `--rebuild` ليست خطوة تحضير — إنّها حذف
+### `--rebuild` is not a preparation step — it is deletion
 
-`build_training_rows.py --rebuild` **يحذف `training_rows` كاملاً** ثمّ يبني من
-الصفر. والبناء التزايديّ يكتب فوق الصفّ نفسه، فبَعدَ أيّ استرجاع لبيانات عن
-الماضي (أطروحات · ثوابت · شموع · أعلام تشوّه · تصنيف · ATH) أو أيّ رفع
-لـ`FEATURE_VERSION`، يكفي أن تدور `FomoBuildRows` — **لا `--rebuild`**. ولذلك
-[recorder/run_build_rows.py](recorder/run_build_rows.py) يمنعها صراحةً: حذفٌ
-مجدول يعني نافذةً تكون فيها 93 ألف صفّ غير موجودة.
+`build_training_rows.py --rebuild` **deletes `training_rows` entirely** and then builds
+from scratch. Incremental building overwrites the same row, so after any recovery of
+past data (theses · constants · candles · corruption flags · classification · ATH) or any
+`FEATURE_VERSION` bump, letting `FomoBuildRows` cycle is enough — **no `--rebuild`**.
+That is why [recorder/run_build_rows.py](recorder/run_build_rows.py) blocks it
+explicitly: a scheduled deletion means a window where 93 thousand rows do not exist.
 
-**لقطة الحالة** (2026-08-19، لحظة كتابة السطر — القاعدة تنمو كل دقيقة):
-**96,106 إشارة** · 750 عملة مصنَّفة (716 ميم · 17 كبير · 14 مسعَّر · 3 مستقرّة) ·
-190 عملة مراقَبة نشطة · **2.05 مليون شمعة** · 3.20 مليون تِك سوق ·
-43,408 أطروحة · 76,144 لقطة خام · **105,509 نتيجة موسومة** ·
-**93,698 صفّ تدريب** (76,385 حيّ · 17,313 رجعيّ مستبعَد) ·
-**305 ضابطة `v3` ناضجة** · 16.4 GB.
+**Status snapshot** (2026-08-19, at the moment this line was written — the database grows
+every minute): **96,106 signals** · 750 classified coins (716 meme · 17 major · 14
+priced · 3 stable) · 190 active watchlist entries · **2.05 million candles** · 3.20
+million market ticks · 43,408 theses · 76,144 raw snapshots · **105,509 labeled
+outcomes** · **93,698 training rows** (76,385 live · 17,313 retrospective, excluded) ·
+**305 mature `v3` controls** · 16.4 GB.
 
-**والرقم الحاكم وحده: 9,496.** ذلك ما يبقى في `model_training_rows` — أي **10%
-من صفوف التدريب** و**0.01× عدد الإشارات**. القمعُ ليس عطباً بل هو التصفية
-الصحيحة (حيّ · ميم · `status='ok'` · **مستقلّ** · `feature_version>=2` · بلا
-تكرار للإشارات المتزامنة)، و`is_independent` أقساها. فحين تسأل «كم بياناتنا؟»
-فالجواب 9,496 لا 96,106 — **عُدَّ الـview لا الجدول**.
+**And the single governing number: 9,496.** That is what remains in
+`model_training_rows` — **10% of training rows** and **0.01× the signal count**. The
+funnel is not a defect but the correct filter (live · meme · `status='ok'` ·
+**independent** · `feature_version>=2` · no coincident-signal duplication), and
+`is_independent` is its harshest cut. When you ask "how much data do we have?", the
+answer is 9,496, not 96,106 — **count the view, not the table**.
 
-> أعِد توليد هذه الأرقام بنفسك بدل الوثوق بها:
+> Regenerate these numbers yourself instead of trusting them:
 > ```sql
 > SELECT COUNT(*) FROM signal_events;
 > SELECT COUNT(*) FROM outcomes;
 > SELECT is_live, COUNT(*) FROM training_rows GROUP BY 1;
-> SELECT COUNT(*) FROM model_training_rows;                      -- الرقم الحاكم (بطيء)
+> SELECT COUNT(*) FROM model_training_rows;                      -- the governing number (slow)
 > SELECT COUNT(*) FROM phase1_watch_outcomes WHERE is_control=1 AND status='ok';
 > ```
-> `model_training_rows` **بطيء** على قاعدةٍ بـ16 GB (دقائق). لا تضعه في حلقة
-> ولا في مسار لوحة.
-> وللتحليل الكامل: `py recorder/pattern_analysis.py` و`py recorder/phase1_analysis.py`.
+> `model_training_rows` is **slow** on a 16 GB database (minutes). Do not put it in a
+> loop or a dashboard path.
+> For full analysis: `py recorder/pattern_analysis.py` and `py recorder/phase1_analysis.py`.
 
-### المبادئ الحاكمة
+### Governing principles
 
-1. **الخام دائماً** — كل صفّ يحفظ `raw_json` بجانب الحقول المستخرجة. هذا ما
-   جعل استرجاع الحقول المنسيّة ممكناً لاحقاً (§9).
-2. **لا فبركة (FR-007)** — الحقل الغائب `NULL` لا صفر. `False` محفوظ صراحةً
-   (`freezable=0` يعني «آمن»، مختلف عن `NULL` «مجهول»).
-3. **منع تسرّب المستقبل** — المسجّل لا يحسب label إطلاقاً.
-4. **مقاومة انحياز البقاء** — العملة الخاسرة والميّتة تُسجَّل كالرابحة تماماً.
-5. **قراءة فقط (FR-012)** — لا نداء يكتب حالة حساب أو تداول.
-6. **لا تصفية عند الجمع** — سجّل كل شيء، صفِّ عند النمذجة (§7).
-7. **التدريب على الحيّ فقط (`is_live=1`)** — الصفوف الرجعية تفتقر بنيوياً إلى
-   العائلات اللحظية (`market_ticks` · لقطات `token_social` · رتبة المتصدّر ·
-   شموع الماكرو)، فنمط الغياب فيها **يطابق الحِقبة** فيتعلّمه النموذج بدل
-   الإشارة — تسريب حِقبة كامل. الرجعيّ محفوظ للتحليل الاستكشافيّ ومستبعَد من
-   التدريب بالـview `model_training_rows`، لا بذاكرة من يكتب الاستعلام.
+1. **Always raw** — every row saves `raw_json` beside the extracted fields. This is what
+   made later recovery of forgotten fields possible (§9).
+2. **No fabrication (FR-007)** — an absent field is `NULL`, not zero. `False` is stored
+   explicitly (`freezable=0` means "safe", distinct from `NULL` "unknown").
+3. **No future leakage** — the recorder never computes a label.
+4. **Survivorship-bias resistance** — losing and dead coins are recorded exactly like
+   winners.
+5. **Read-only (FR-012)** — no call writes account or trading state.
+6. **No filtering at collection** — record everything, filter at modeling (§7).
+7. **Train on live data only (`is_live=1`)** — retrospective rows structurally lack the
+   real-time families (`market_ticks` · `token_social` snapshots · leaderboard rank ·
+   macro candles), so their missingness pattern **matches the era**, which the model
+   learns instead of the signal — a whole-era leak. The retrospective set is kept for
+   exploratory analysis and excluded from training by the `model_training_rows` view,
+   not by the query author's memory.
 
 ---
 
-## 5. قوانين المراقبة
+## 5. Watchlist rules
 
-| الإشارة | تُدخل المراقبة؟ |
+| Signal | Enters the watchlist? |
 |---|---|
 | `large_buy` | ✅ |
 | `multi_user_buy` | ✅ |
-| `multi_user_sell` | ❌ سياق فقط |
-| `large_sell` | ❌ سياق فقط (تصريف حوت — يُسجَّل ويُوسَم متى توفّرت الشموع) |
+| `multi_user_sell` | ❌ context only |
+| `large_sell` | ❌ context only (whale dump — recorded and labeled whenever candles exist) |
 
-- النافذة **48 ساعة** من أوّل ظهور. سقف 150 عملة (يخصّ المُشار إليها وحدها).
-- العملة النشطة **لا تُمدَّد** بإشارة جديدة (أوّل ظهور هو المرجع).
-- العملة المنتهية **تعود** بنافذة جديدة إن أشارت إليها إشارة لاحقة.
-- **لا شرط على الحجم ولا القيمة السوقية ولا الزخم** — عمداً (§7).
+- The window is **48 hours** from first sighting. Cap of 150 coins (applies to the
+  referenced coin alone).
+- An active coin is **not extended** by a new signal (first sighting is the reference).
+- An expired coin **returns** with a fresh window if a later signal references it.
+- **No condition on size, market cap, or momentum** — deliberately (§7).
 
-### المجموعة الضابطة (الصنف السالب)
+### The control group (the negative class)
 
-عملات تدخل **بالاختيار العشوائي لا بإشارة** (`is_control=1`). بلا هذا الصنف
-يمكن للنموذج تعلّم «أيّ عملة مُشار إليها ترتفع أكثر»، لكنّه **لا يستطيع أبداً**
-الإجابة عن «هل الإشارة تعني شيئاً أصلاً».
+Coins that enter **by random selection, not by signal** (`is_control=1`). Without this
+class a model can learn "any referenced coin rises more", but it can **never** answer
+"does the signal mean anything at all".
 
-شروط صلاحية المقارنة — كلّها مقصودة ومُختبَرة:
-عشوائيّ لا ترتيبيّ · بلا نظر إلى المستقبل · يُستبعد كل ما أُشير إليه ·
-بالتقسيط (عملتان/دورة، هدف 40 نشطة) · الترقية باتجاه واحد · سقف منفصل.
+Comparison validity conditions — all deliberate and tested: random, not ordinal · with
+no look-ahead · everything referenced is excluded · in installments (two coins/cycle,
+target 40 active) · one-directional upgrade · a separate cap.
 
-**والتصميم الحاليّ هو `v3` (`CONTROL_DESIGN_VERSION = 3`) لأنّ الأوّل كان
-معطوباً.** التصميم الأوّل سحب الضابطة من `trending/verified` والإشارة من
-`/feed`، فكان الكونان مختلفين وسعر الطرفين من مصدرين — والنتيجة `no_entry`
-بنسبة 30.8% للضابطة مقابل 2.3% للإشارة ومسافة اختلال شبكات 0.36، أي أنّ
-المقارنة كانت تقيس **قابلية التسعير** لا العائد (§8).
+**And the current design is `v3` (`CONTROL_DESIGN_VERSION = 3`) because the first one
+was broken.** The first design drew controls from `trending/verified` and signals from
+`/feed`, so the two universes differed and both sides' prices came from different
+sources — resulting in `no_entry` at 30.8% for the control versus 2.3% for the signal
+and a network-imbalance distance of 0.36, meaning the comparison measured
+**priceability**, not return (§8).
 
-و`v3` يوحّدهما **بتقييد الإشارة لا بتحريك الضابطة**: الإشارة لا تدخل المقارنة
-إلّا إذا ظهرت هي نفسها في `trending/verified` في دورة قبولها، وسعرُ الطرفين يأتي
-من **لقطة السوق نفسها** (§3 خطوتا 2.2 و2.25) — ولا تُقبل ضابطة إلّا في دورة
-قبلت إشارة مقارنة. ولم تُنقَل أهليّة الضابطة القديمة إلى `v3`؛
-و`phase1_watch_outcomes` تشترط `design_version>=3` صراحةً فلا تعود القديمة إلى
-التحليل بالخطأ.
+`v3` unifies them **by constraining the signal, not by moving the control**: a signal
+enters the comparison only if it itself appeared in `trending/verified` in its acceptance
+cycle, and both sides' prices come from **the same market snapshot** (§3, steps 2.2 and
+2.25) — and no control is accepted except in a cycle that accepted a comparison signal.
+Old-control eligibility was not carried over to `v3`; and `phase1_watch_outcomes`
+requires `design_version>=3` explicitly so the old one never returns to the analysis by
+mistake.
 
 ---
 
-## 6. الموسِّم — تعريفات النتائج
+## 6. The labeler — outcome definitions
 
-يعمل بعد `entry + 48h + 15min` فقط. الحقول في `outcomes`:
+It runs only after `entry + 48h + 15min`. Fields in `outcomes`:
 
-| الحقل | التعريف |
+| Field | Definition |
 |---|---|
-| `entry_px` | إغلاق **أوّل شمعة عند/بعد** الإشارة (تأخّر ≤30د وإلّا `no_entry`) |
-| `max_gain_1h/4h/24h/48h` | أقصى `high` في الشموع **التالية بعد شمعة الدخول** ÷ الدخول −1 |
-| `max_drawdown_48h` | أدنى `low` ÷ الدخول −1 |
-| `final_return_48h` | إغلاق آخر شمعة ÷ الدخول −1 |
-| `time_to_peak_h` | ساعات حتى القمّة |
-| `is_rug` | العائد النهائي ≤ −90% |
-| `bars_truncated` | السلسلة انتهت مبكراً >ساعة — **موت العملة إشارة لا نقص** |
-| `is_independent` | أوّل إشارة أو فجوة ≥30د (69% من الإشارات <5د = تكرار زائف) |
-| `split` | train/val/test بتجزئة **عنوان العملة** |
-| `status` | `ok` / `no_entry` / `no_bars` — سبب غياب القيم موثّق |
+| `entry_px` | close of the **first candle at/after** the signal (delay ≤30m, else `no_entry`) |
+| `max_gain_1h/4h/24h/48h` | max `high` in the candles **after the entry candle** ÷ entry − 1 |
+| `max_drawdown_48h` | lowest `low` ÷ entry − 1 |
+| `final_return_48h` | close of the last candle ÷ entry − 1 |
+| `time_to_peak_h` | hours until the peak |
+| `is_rug` | final return ≤ −90% |
+| `bars_truncated` | the series ended early by >1h — **a coin's death is a signal, not a gap** |
+| `is_independent` | first signal or a gap ≥30m (69% of signals <5m = false repetition) |
+| `split` | train/val/test by **coin address** partitioning |
+| `status` | `ok` / `no_entry` / `no_bars` — the reason values are absent is documented |
 
-**ضمانات عدم التسرّب**: سعر الدخول لا يسبق الإشارة · قمّة شمعة الدخول نفسها لا
-تُحسب مكسباً (قد تسبق التنفيذ) · لا توسيم قبل النضج.
-
----
-
-## 7. لماذا لا نصفّي عند الجمع
-
-سؤال متكرّر: «لماذا ندخل صفقة $995 و$172,169 بنفس المعاملة؟»
-
-لأنّك لو صفّيت عند الجمع — «لا تراقب إلّا فوق $50,000» — **تفقد إلى الأبد**
-القدرة على معرفة هل كانت العتبة صائبة. لن يبقى في بياناتك صفقة صغيرة واحدة
-لتقارن بها. التصفية عند الجمع **تُعدم الصنف السالب**.
-
-الترتيب الصحيح: سجّل كل شيء بلا تمييز → اكتشف العتبة من البيانات عند النمذجة.
-
-**السيناريوهات تُختبر كتوليفات مميّزات على الخام المؤرشف، لا كشروط دخول.**
+**No-leak guarantees**: the entry price never precedes the signal · the entry candle's
+own high is not counted as gain (it may precede execution) · no labeling before maturity.
 
 ---
 
-## 8. ما تقوله البيانات حتى الآن
+## 7. Why we don't filter at collection
 
-> ⚠️ **كل رقم في هذا القسم لقطةٌ بتاريخها، والقاعدة تنمو كل دقيقة.** لا تستند
-> إلى رقم منه في قرار: أعِد التوليد بـ`py recorder/pattern_analysis.py`
-> و`py recorder/phase1_analysis.py`. العتبات الملزمة في
-> [docs/PLAN.md](docs/PLAN.md) لا هنا.
+A recurring question: "why do we treat a $995 trade and a $172,169 trade alike?"
 
-### النتيجة الحاكمة: بوّابة المرحلة 1 لم تُجتَز (2026-08-02، ثمّ 08-07)
+Because if you filtered at collection — "only watch above $50,000" — you **lose forever**
+the ability to know whether the threshold was right. Not one small trade would remain in
+your data to compare against. Filtering at collection **executes the negative class**.
 
-هذا هو أهمّ ما تقوله البيانات، ويسبق كل ما بعده: **لم يُثبَت أنّ الإشارة تتفوّق
-على عملة عشوائية.**
+The correct order: record everything indiscriminately → discover the threshold from the
+data at modeling.
 
-| التشغيل | الإشارة | الضابطة | الحكم |
+**Scenarios are tested as feature combinations on the archived raw data, not as entry
+conditions.**
+
+---
+
+## 8. What the data says so far
+
+> ⚠️ **Every number in this section is a snapshot with a date, and the database grows
+> every minute.** Do not base a decision on any of them: regenerate with
+> `py recorder/pattern_analysis.py` and `py recorder/phase1_analysis.py`. The binding
+> thresholds live in [docs/PLAN.md](docs/PLAN.md), not here.
+
+### The governing result: the phase-1 gate was not passed (2026-08-02, then 08-07)
+
+This is the most important thing the data says, and it precedes everything after it:
+**it has not been shown that the signal beats a random coin.**
+
+| Run | Signal | Control | Verdict |
 |---|---|---|---|
-| 2026-08-02 | وسيط −28.9% · فوز 19.9% | وسيط −2.2% · فوز 33.3% | ❌ الإشارة **أسوأ** |
-| 2026-08-07 | وسيط −0.1% · فوز 48.3% (n=89) | وسيط −0.1% · فوز 50.0% (n=10) | ❌ لا فرق (`p`=0.25) |
+| 2026-08-02 | median −28.9% · win 19.9% | median −2.2% · win 33.3% | ❌ signal **worse** |
+| 2026-08-07 | median −0.1% · win 48.3% (n=89) | median −0.1% · win 50.0% (n=10) | ❌ no difference (`p`=0.25) |
 
-والأهمّ أنّ **الفرق غير قابل للتفسير سببياً** أصلاً، لثلاثة أسباب بنيوية قِيست
-لا خُمِّنت: الضابطة تُسحب من `trending/verified` والإشارة من `/feed` فالكونان
-غير متطابقين؛ ومسافة اختلال الشبكات 0.36 (الحرس يرفض فوق 0.10)؛ و`no_entry`
-30.8% للضابطة مقابل 2.3% للإشارة في 08-02 — أي أنّ `status='ok'` كان يقارن
-جزأين مختلفين في **قابلية التسعير** لا في العائد.
+More important, the **difference was not causally interpretable** in the first place, for
+three structural reasons that were measured, not guessed: the control was drawn from
+`trending/verified` and the signal from `/feed`, so the universes differed; the
+network-imbalance distance was 0.36 (the guard rejects above 0.10); and `no_entry` was
+30.8% for the control versus 2.3% for the signal in 08-02 — meaning `status='ok'` was
+comparing two different subsets in **priceability**, not in return.
 
-⇒ فحُذفت الضابطة القديمة وأُعيد تصميمها `v3`، ووحّد الكونَين **بتقييد الإشارة
-لا بتحريك الضابطة**: الإشارة لا تدخل المقارنة إلّا إذا ظهرت هي نفسها في
-`trending/verified` في دورة قبولها، وسعرُ الطرفين من **لقطة السوق نفسها**، ولا
-تُقبل ضابطة إلّا في دورةٍ قبلت إشارة مقارنة (§3 خطوتا 2.2 و2.25، و§5). ولم
-تُنقَل أهليّة الضابطة القديمة إلى التصميم الجديد. التقريران:
-[phase1-2026-08-02.md](docs/phase1-2026-08-02.md) (السجلّ الذي بُني عليه القرار)
-و[phase1-2026-08-07.md](docs/phase1-2026-08-07.md) (الأحدث).
+⇒ So the old control was deleted and redesigned as `v3`, and the two universes were
+unified **by constraining the signal, not by moving the control**: a signal enters the
+comparison only if it itself appeared in `trending/verified` in its acceptance cycle,
+both sides' prices come from **the same market snapshot**, and no control is accepted
+except in a cycle that accepted a comparison signal (§3, steps 2.2 and 2.25, and §5).
+Old-control eligibility was not carried over to the new design. The two reports:
+[phase1-2026-08-02.md](docs/phase1-2026-08-02.md) (the record the decision was built on)
+and [phase1-2026-08-07.md](docs/phase1-2026-08-07.md) (the newer one).
 
-### القراءة الأولى على النوافذ الجارية (2026-07-28)
+### First reading on ongoing windows (2026-07-28)
 
-> ⚠️ نتائج **أوّلية** على نوافذ **جارية غير مكتملة**، بلا مقارنة ضابطة ناضجة.
-> ليست نتائج نهائية ولا توصية تداول.
+> ⚠️ **Preliminary** results on **ongoing, incomplete** windows, with no mature control
+> comparison. Not final results and not trading advice.
 
-على 89 عملة (أوّل إشارة لكل عملة):
+Across 89 coins (first signal per coin):
 
-- **نسبة الفوز 41.6% · الوسيط −3.2% · المتوسّط +1.4%**
-- المتوسّط موجب بينما الوسيط سالب: **رابح واحد شاذّ (+1092%) يحمل الصافي كلّه**.
-- النمط الوحيد القويّ إحصائياً — **القيمة السوقية**، وهو رتيب:
+- **Win rate 41.6% · median −3.2% · mean +1.4%**
+- The mean is positive while the median is negative: **one outlier winner (+1092%)
+  carries the entire net**.
+- The only statistically strong pattern — **market cap**, and it is monotonic:
 
-| القيمة السوقية | n | فوز | وسيط | وسيط القمّة |
+| Market cap | n | Win | Median | Peak median |
 |---|---|---|---|---|
 | < 1M | 28 | 32% | −21.4% | +35.4% |
 | 1–10M | 38 | 50% | −0.1% | +14.0% |
 | 10M+ | 23 | 61% | +0.6% | +5.4% |
 
-- **أطروحة المشروع نفسها** («متصدّر اشترى»): n=6 فقط، وسيط −20.7%. لا دليل
-  أنّها تساعد — ولا دليل كافٍ أنّها لا تساعد.
-- **المدّة حتى القمّة**: الوسيط الخام 3.3 ساعة **مضلِّل** (اقتطاع يمينيّ). بعد
-  الحصر على العملات الناضجة: **11.4 ساعة**، و47% تبلغ قمّتها بعد 12 ساعة.
-  ⇒ نافذة الـ48 ساعة مبرَّرة.
-- **معدّل الإشارات**: `large_buy` ~1138/يوم · `multi_user_buy` ~14/يوم
-  (⇒ الأطروحة الأصلية تحتاج ~71 يوماً لبلوغ 1000 عيّنة).
-- **التكرار الزائف**: 14.2 إشارة/عملة، وسيط الفاصل **1.1 دقيقة**، و69% <5 دقائق.
+- **The project's own thesis** ("a top trader bought"): n=6 only, median −20.7%. No
+  evidence it helps — and no sufficient evidence it doesn't.
+- **Time to peak**: the raw median of 3.3 hours is **misleading** (right truncation).
+  After restricting to matured coins: **11.4 hours**, and 47% peak after 12 hours.
+  ⇒ The 48-hour window is justified.
+- **Signal rate**: `large_buy` ~1138/day · `multi_user_buy` ~14/day
+  (⇒ the original thesis needs ~71 days to reach 1,000 samples).
+- **False repetition**: 14.2 signals/coin, median gap **1.1 minutes**, and 69% <5 minutes.
 
-### القراءة الرجعية الأولى (2026-07-28) — الأطروحة المركزية على 9 أشهر
+### First retrospective reading (2026-07-28) — the central thesis over 9 months
 
-> ⚠️ **استطلاعية على داتا ناقصة**: النتائج أدناه من `activity_events`
-> (tradingActivity الرجعيّ) **وليست من الأنابيب الأمامية كاملة الميزات**.
-> فوق التحفّظات الإحصائية (بلا ضابطة رجعية، انحياز بقاء 2.3%، 9% بلا شموع
-> دخول، حقبات مختلطة)، الرجعيّ **يفتقد معظم أبعاد التمييز** التي نجمعها
-> حالياً — انظر الجدول التالي قبل قراءة أيّ رقم.
+> ⚠️ **Exploratory on incomplete data**: the results below come from `activity_events`
+> (retrospective tradingActivity) **and not from the fully featured forward pipelines**.
+> Beyond the statistical caveats (no retrospective control, 2.3% survivorship bias, 9%
+> without entry candles, mixed eras), the retrospective set **lacks most of the
+> discriminative dimensions** we currently collect — read the table below before reading
+> any number.
 
-**ما يملكه الحدث الرجعيّ**: النوع، العملة، الزمن، السعر/القيمة السوقية لحظتها،
-`unique_traders`/`top_trader_ids`/`total_volume`/`minutes` (لـmulti)،
-و`usd_amount` (لـswap الفردية).
+**What the retrospective event has**: the kind, the coin, the time, price/market cap at
+that moment, `unique_traders`/`top_trader_ids`/`total_volume`/`minutes` (for multi), and
+`usd_amount` (for single swaps).
 
-**ما يفتقده الرجعيّ مقابل الحدث الأماميّ — كلّه موثّق بسببه**:
+**What the retrospective lacks versus the forward event — every gap documented with its
+reason**:
 
-| البُعد الغائب عن الرجعيّ | متى يتوفر | الأثر على النتائج |
+| Dimension absent retroactively | Available when | Effect on results |
 |---|---|---|
-| **رتبة المتصدّر وقت الحدث** (`buyers_best_rank`, `top_trader_match_count`) | أماميّ فقط (أرشيف الصدارة منذ 2026-07-28) | أطروحة «جودة المشتري» غير قابلة للقياس رجعياً |
-| **سلسلة الزخم الاجتماعيّ** (`token_social` كل 30د) | أماميّ منذ بدء المراقبة | للرجعيّ يوجد العدد التاريخي للأطروحات فقط، لا تسارعها اللحظيّ |
-| **إعجابات الأطروحات لحظة الحدث** | ❌ ضائعة نهائياً للأماميّ والرجعيّ معاً | لا ميزة إجماع اجتماعيّ |
-| **سياق السوق اللحظيّ** (`market_ticks`: سيولة، حائزين، عدّادات بيع/شراء) | أماميّ فقط | لا تمييز سيولة/تمركز |
-| **شموع الماكرو** (SOL/WETH/WBTC) | منذ 2026-07-28 | عزل أثر النظام السوقيّ جزئيّ فقط (عبر الحقبات) |
-| **فيض `large_buy`/`large_sell`** (84% من بياناتنا الأمامية) | أماميّ حصراً | النتائج عن الكتل الجماعية فقط، **لا عن أطروحة الشراء الكبير** |
-| **المجموعة الضابطة** | أماميّ حصراً | لا حكم سببيّ: «هل الإشارة تتفوّق على عشوائيّ؟» يبقى مفتوحاً |
+| **Leaderboard rank at event time** (`buyers_best_rank`, `top_trader_match_count`) | forward only (leaderboard archive since 2026-07-28) | the "buyer quality" thesis is not measurable retroactively |
+| **Social momentum series** (`token_social` every 30m) | forward since watchlist entry | retroactively only the historical thesis count exists, not its real-time acceleration |
+| **Thesis likes at event time** | ❌ lost forever, forward and retro alike | no social-consensus feature |
+| **Real-time market context** (`market_ticks`: liquidity, holders, buy/sell counters) | forward only | no liquidity/concentration discrimination |
+| **Macro candles** (SOL/WETH/WBTC) | since 2026-07-28 | only partial isolation of market-system effect (across eras) |
+| **`large_buy`/`large_sell` flood** (84% of our forward data) | forward exclusively | results are about collective blocks only, **not about the large-buy thesis** |
+| **The control group** | forward exclusively | no causal verdict: "does the signal beat random?" stays open |
 
-⇒ اقرأ الأرقام أدناه كـ«شكل العالم لفرع multi_user بميزات فقيرة»؛ النموذج
-المدرَّب على الأماميّ الغنيّ قد يقسّم هذه النتائج تقسيماً مختلفاً جوهرياً.
+⇒ Read the numbers below as "the shape of the world for the multi_user branch with
+impoverished features"; the model trained on the rich forward data may partition these
+results fundamentally differently.
 
-من `backfill_activity` (819 حدث `multi_user_buy`/408 عملة، 472 مستقلّة موسومة):
+From `backfill_activity` (819 `multi_user_buy` events / 408 coins, 472 labeled
+independent):
 
-- **فوز 18.9% · وسيط −58.7% · متوسّط −18.0% · rug 23.1%** — الاحتفاظ 48 ساعة
-  خاسر وسيطاً بشدّة.
-- **وسيط القمّة خلال 24س: +46.2%** — النمط «ضخّ ثمّ تصريف»: معظم العملات تقفز
-  ثمّ تموت. سؤال الأطروحة الحقيقيّ هو **قاعدة الخروج لا الدخول**.
-- محاكي الخروج عليها (382 صفقة أوّل-لكل-عملة، تكلفة 2%):
-  احتفاظ وسيط **−72.3%** · جني+10% وسيط **+8%** وفوز 86% لكن متوسّط **−3.7%**
-  (الفشل الكارثيّ النادر يأكل المكاسب الصغيرة المقطوعة) · تعادل التكلفة **~0%**
-  لكل القواعد الثابتة.
-- **تفاوت الحقبات حادّ**: 2026-06 فوز 42%/متوسّط +100% مقابل 2025-12 فوز
-  9%/متوسّط −64% — يبرّر walk-forward الإلزاميّ (PLAN §2.4).
-- **دور النموذج بناءً عليها**: اللعب العمياء محسوم الخسارة وسيطاً؛ مهمّة النموذج
-  **فلترة الإشارات** (لا تُلعب كلّها) وأساسه المقيس الذي يجب هزمه = «العب كلّ
-  شيء بجني +10%» (PLAN §3.1).
+- **Win 18.9% · median −58.7% · mean −18.0% · rug 23.1%** — holding for 48 hours loses
+  heavily at the median.
+- **Median peak within 24h: +46.2%** — the "pump then dump" pattern: most coins jump,
+  then die. The thesis's real question is the **exit rule, not the entry**.
+- The exit simulator on it (382 first-per-coin trades, 2% cost): hold-to-end median
+  **−72.3%** · take-profit +10% median **+8%** with an 86% win rate but mean **−3.7%**
+  (the rare catastrophic failure eats the small clipped gains) · break-even versus cost
+  **~0%** for every fixed rule.
+- **Era variance is sharp**: 2026-06 win 42%/mean +100% versus 2025-12 win 9%/mean −64%
+  — justifying the mandatory walk-forward (PLAN §2.4).
+- **The model's role based on this**: blind play is decisively median-losing; the
+  model's job is **filtering signals** (don't play them all), and its measured baseline
+  to beat = "play everything with a +10% take-profit" (PLAN §3.1).
 
-### تصنيف الأصول (2026-07-30) — الأرشيف ليس سوق ميمات
+### Asset classification (2026-07-30) — the archive is not a meme market
 
-fomo منصّة **متعدّدة الأصول**. أحدث تصنيف (`token_class`، مشتقّ من كل المشاهدات،
-آخر تشغيل 2026-07-30) يغطّي **750 عملة**؛ والأعداد أدناه من ذلك التشغيل نفسه
-فأعِد `py recorder/classify_tokens.py` قبل الاستناد إليها:
+fomo is a **multi-asset** platform. The latest classification (`token_class`, derived
+from all sightings, last run 2026-07-30) covers **750 coins**; the numbers below are from
+that same run, so re-run `py recorder/classify_tokens.py` before relying on them:
 
-| الصنف | عملات | ملاحظة |
+| Class | Coins | Note |
 |---|---|---|
-| `meme` | **716** | الأغلبية الساحقة في الإشارات والنتائج |
-| `major` (قيمة > $1B) | 17 | BTC · ETH · SOL · BNB … |
-| `priced` (سعر > $5: أسهم/سلع مرمّزة) | 14 | AAPL · MU · PAXG … |
-| `stable` (سعر مثبَّت بالدولار) | 3 | — |
+| `meme` | **716** | the overwhelming majority in signals and outcomes |
+| `major` (value > $1B) | 17 | BTC · ETH · SOL · BNB … |
+| `priced` (price > $5: tokenized stocks/commodities) | 14 | AAPL · MU · PAXG … |
+| `stable` (dollar-pegged price) | 3 | — |
 
-> الأعداد تتغيّر بين التشغيلات لأنّ التصنيف مشتقّ من **كل** المشاهدات المتاحة
-> وقتها: التشغيل الأقدم (المذكور في القراءة الرجعية أعلاه وفي المصيدة #23) أعطى
-> 725 عملة (686/21/14/4). هذا ليس عطباً بل طبيعة مقياس مشتقّ — ولذلك يجب أن
-> يُعاد التصنيف **قبل** أيّ تحليل، لا أن يُقتبَس رقمه من وثيقة.
+> The counts change between runs because the classification is derived from **all**
+> sightings available at the time: the older run (cited in the retrospective reading
+> above and in trap #23) gave 725 coins (686/21/14/4). This is not a defect but the
+> nature of a derived measure — which is why classification must be re-run **before**
+> any analysis, not quoted from a document.
 
-المشاهَد فعلاً: BTC · ETH · SOL (103 إشارة) · BNB · XRP · TRX · DOGE · HYPE ·
-LTC · JUP · MORPHO · TRUMP · Cake · ذهب PAXG · وأسهم مرمّزة: AAPL ($339) ·
-SNDK ($1013) · MU ($958) · MSTR · HOOD · INTC · META · NET · DRAM.
+Actually sighted: BTC · ETH · SOL (103 signals) · BNB · XRP · TRX · DOGE · HYPE · LTC ·
+JUP · MORPHO · TRUMP · Cake · PAXG gold · and tokenized stocks: AAPL ($339) · SNDK
+($1013) · MU ($958) · MSTR · HOOD · INTC · META · NET · DRAM.
 
-**القيمة السوقية لا تكشفها**: AAPL بقيمة سوقية $1.36M فقط (المرمَّز جزء ضئيل من
-السهم) — فالسعر هو المميّز، وعملة الميم لا تتداول فوق دولارات قليلة (267 من 297
-عملة دون $0.1). وحُرست حالة الانتحال: عملة ميم اسمها «BTC» بقيمة $3.5M
-وأخرى «SOL» بـ$4.9M **لا** تُصنَّفان أصولاً كبرى (شرط قيمة سوقية معتبرة).
+**Market cap does not reveal them**: AAPL at a market cap of only $1.36M (the tokenized
+fraction is a sliver of the share) — so price is the discriminator, and a meme coin does
+not trade above a few dollars (267 of 297 coins under $0.1). And the impersonation case
+was guarded: a meme coin named "BTC" at $3.5M and another "SOL" at $4.9M are **not**
+classified as major assets (a substantial market-cap condition applies).
 
-### إعادة فحص النتائج بعد التصنيف — الادّعاءان صحّا
+### Re-examining results after classification — both claims held
 
-1. **أرقام الأطروحة المركزية لم تتأثّر**: 5 صفوف فقط من 487 غير ميمية.
-   ميمات فقط: فوز **18.0%** · وسيط **−59.7%** · rug **20.5%** · قمّة وسيطة
-   **+45.4%** — مطابقة عملياً للأرقام المنشورة (18.3% / −59.6% / 20.5%).
-2. **أثر القيمة السوقية حقيقيّ داخل الميمات وحدها** (481 عيّنة) — تدرّج أحاديّ
-   نظيف، لا أثر خلط أصول:
+1. **The central thesis numbers were unaffected**: only 5 of 487 rows are non-meme.
+   Memes only: win **18.0%** · median **−59.7%** · rug **20.5%** · median peak
+   **+45.4%** — practically identical to the published numbers (18.3% / −59.6% / 20.5%).
+2. **The market-cap effect is real within memes alone** (481 samples) — a clean
+   monotonic gradient, no asset-mixing effect:
 
-| القيمة السوقية (ميمات فقط) | n | فوز | وسيط | rug |
+| Market cap (memes only) | n | Win | Median | Rug |
 |---|---|---|---|---|
 | < $1M | 135 | 10.4% | −79.9% | **33.3%** |
 | $1–10M | 234 | 17.9% | −65.9% | 20.9% |
 | $10–100M | 89 | 24.7% | −29.4% | 4.5% |
 | > $100M | 23 | **39.1%** | **−9.4%** | **0%** |
 
-⇒ الفرق بين أصغر شريحة وأكبرها: فوز ×3.8 وrug من 33% إلى صفر. هذا **أقوى
-تدرّج مقيس في المشروع**، وقد نجا من ضبط تصنيف الأصول.
+⇒ The difference between the smallest and largest bins: win ×3.8 and rug from 33% to
+zero. This is the **strongest measured gradient in the project**, and it survived the
+asset-classification control.
 
-### التوقيع المركّب (2026-07-28، قِطع ثنائيّ — أقوى أثر مقيس حتى الآن)
+### The composite signature (2026-07-28, binary cuts — the strongest effect measured so far)
 
-| | إجمالي <$50k | إجمالي ≥$50k |
+| | Total <$50k | Total ≥$50k |
 |---|---|---|
-| **حشد صغار** (نصيب/فرد <$3.1k) | n=155 · فوز 12.9% · وسيط **−78.2%** · rug **31.6%** | n=84 · فوز 15.5% · وسيط −67.6% · rug 22.6% |
-| **نخبة كبار** (نصيب/فرد ≥$3.1k) | n=0 (شبه معدومة في الكون) | n=239 · فوز **23.4%** · وسيط **−37.8%** · rug **12.1%** |
+| **Small crowd** (per-head <$3.1k) | n=155 · win 12.9% · median **−78.2%** · rug **31.6%** | n=84 · win 15.5% · median −67.6% · rug 22.6% |
+| **Big elite** (per-head ≥$3.1k) | n=0 (nearly nonexistent in the universe) | n=239 · win **23.4%** · median **−37.8%** · rug **12.1%** |
 
-- «قلّة كبار + إجمالي ضخم» يتفوّق على «حشد صغار + إجمالي أصغر»: فوز ×1.8،
-  وسيط نصفه، rug ثلثه — بنية أحادية حقيقية لا ضجيج (لكنها **تفلتر لا تقلب**:
-  أفضل خلية وسيطها −37.8%).
-- كون الكتل يبدأ من ~11 مشترياً و~$20k — لا «ثلاثة أشخاص» ولا «كتلة صغيرة» فيه.
-- `are_top_traders` = 0 على كلّ الرجعيّ (علم عديم الفائدة رجعياً).
-- الأماميّ (n صغيرة جداً): `large_buy` ≥$10k + مشتٍرٍ مصنّف = فوز 42.9% (n=7)
-  — اتجاه منسجم، لا حكم.
+- "Few big buyers + huge total" beats "small crowd + smaller total": win ×1.8, median
+  halved, rug cut to a third — a real one-directional structure, not noise (but it
+  **filters, it doesn't flip**: the best cell's median is −37.8%).
+- The block universe starts at ~11 buyers and ~$20k — neither "three people" nor a
+  "small block" in it.
+- `are_top_traders` = 0 across all retrospective data (a useless flag retroactively).
+- Forward (very small n): `large_buy` ≥$10k + a classified buyer = win 42.9% (n=7) — a
+  consistent direction, not a verdict.
 
-### ماذا تدّعي هذه الأرقام وماذا لا تدّعي
+### What these numbers claim and what they don't
 
-هي وصف **اللعب العمياء بقواعد ثابتة** — لا حكم على «الأطروحة». ثلاث حقائق
-بنيوية يخفيها التجميع لو قُرئ وحده:
+They describe **blind play with fixed rules** — not a verdict on "the thesis". Three
+structural facts that aggregation hides if read alone:
 
-1. **الوسيط ≠ التوزيع**: ذيل أيمن حقيقيّ موجود — MarsCoin (شبكة 56، التُقطت
-   2026-07-27 20:17 بـ8 أطروحات) بلغت **+1962% قمّة و+1214% إغلاقاً حتى الآن**.
-   لكنّه صفّ واحد في 819؛ مقابله الوسيط −58.7%. كلاهما داتا حقيقية.
-2. **القواعد الثابتة تسحق الذيل تحديداً**: على MarsCoin نفسها من الدخول
-   الفعليّ — جني+10% خرج بعد **24 دقيقة** وفاته +1900%، والوقف المتحرّك 25%
-   خرج **−21.8% بعد 12 دقيقة** (ذيل شمعة) ثمّ صعدت 20×. أي أنّ «أفضل قاعدة»
-   على الفائز الكبير وعلى الوسيط متعاكسان بنيوياً — فسؤال «أيّ قاعدة ثابتة»
-   خاطئ أصلاً.
-3. **الاتجاه الواعد للخروج زخميّ لا عدديّ**: MarsCoin انفجر اجتماعياً
-   (8→393 أطروحة/71 كاتباً في `token_social`) ودخله متصدّر #2 بـ$39k ثمّ
-   باع #42 لاحقاً — **موت الزخم وتصرّف المتصدّر مسجَّلان لحظياً عندنا**،
-   وهو المرشّح الحقيقيّ لقاعدة خروج (PLAN §4.2). ملاحظة أمانة: العملة ما
-   زالت داخل نافذتها وقد هبطت 36% عن قمّتها — حتى القصّة الرابحة تُقرأ
-   بعد إغلاق النافذة لا أثناءها.
+1. **Median ≠ distribution**: a real right tail exists — MarsCoin (network 56, captured
+   2026-07-27 20:17 with 8 theses) reached **+1962% at peak and +1214% at close so
+   far**. But it is one row of 819; against it stands the median −58.7%. Both are real
+   data.
+2. **Fixed rules crush exactly the tail**: on MarsCoin itself from the actual entry —
+   take-profit +10% exited after **24 minutes** and missed +1900%, and the 25% trailing
+   stop exited **−21.8% after 12 minutes** (a candle wick) before a 20× climb. So "the
+   best rule" on the big winner and on the median are structurally opposite — the
+   question "which fixed rule" is simply wrong.
+3. **The promising exit direction is momentum-based, not numeric**: MarsCoin exploded
+   socially (8→393 theses/71 writers in `token_social`) and top trader #2 entered with
+   $39k then sold at #42 later — **momentum death and the top trader's dump are recorded
+   by us in real time**, and that is the real candidate for an exit rule (PLAN §4.2). A
+   note of honesty: the coin is still inside its window and has fallen 36% from its peak
+   — even the winning story is read after the window closes, not during it.
 
 ---
 
-## 9. ما استُرجع رجعياً وما ضاع نهائياً
+## 9. What was recovered retroactively and what is lost forever
 
-مبدأ «الخام دائماً» هو ما جعل الاسترجاع ممكناً: الحقول لم تكن ضائعة بل
-**غير مستخرَجة**.
+The "always raw" principle is what made recovery possible: the fields were not lost, just
+**not extracted**.
 
-| البيانات | الحالة | الأداة |
+| Data | Status | Tool |
 |---|---|---|
-| حقول حجم الصفقة | ✅ 100% (1485/1485) | `backfill_sizes.py` |
-| الشموع | ✅ أعمق من الأرشيف (تعود لـ2025-11) | تلقائيّ |
-| عدد الأطروحات التاريخي | ✅ 30,182 أطروحة، أقدمها 2025-08 | `backfill_thesis.py` |
-| **تاريخ إشارات multi_user** | ✅ **1151 حدثاً حتى 2025-10-22** (منها 819 شراء جماعيّ/408 عملة) — `/feed/tradingActivity` يصفّح رجوعاً | `backfill_activity.py` |
-| ضابطة تغطّي فترة الإشارات | ✅ 60 عملة من `snapshots` | `seed_control_retro.py` |
-| **إعجابات/ردود لحظة الإشارة** | ❌ **ضائعة نهائياً** | — |
-| **مسار رتب المتصدّرين قبل 2026-07-28** | ❌ **ضائع نهائياً** — كانت تُقرأ وتُرمى كل ساعة بلا أرشيف | يُؤرشَف خامها في `snapshots` منذ 2026-07-28 |
-| **فيض `large_buy` التاريخي** | ❌ `/feed` أحدث-فقط والترقيم مُتجاهَل (مُثبت) | الجمع الأماميّ منذ 2026-07-25 |
+| Trade size fields | ✅ 100% (1485/1485) | `backfill_sizes.py` |
+| Candles | ✅ deeper than the archive (back to 2025-11) | automatic |
+| Historical thesis count | ✅ 30,182 theses, oldest 2025-08 | `backfill_thesis.py` |
+| **multi_user signal history** | ✅ **1,151 events back to 2025-10-22** (of which 819 collective buys / 408 coins) — `/feed/tradingActivity` scrapes backward | `backfill_activity.py` |
+| A control covering the signal period | ✅ 60 coins from `snapshots` | `seed_control_retro.py` |
+| **Likes/replies at signal time** | ❌ **lost forever** | — |
+| **Leaderboard rank history before 2026-07-28** | ❌ **lost forever** — it was read and discarded hourly with no archive | raw archived in `snapshots` since 2026-07-28 |
+| **Historical `large_buy` flood** | ❌ `/feed` is newest-only and its pagination is ignored (proven) | forward collection since 2026-07-25 |
 
-**الخسارة الوحيدة**: fomo تعطي عدّاد الإعجابات **الحاليّ** فقط. لذا
-`token_thesis.fetched_at` مسجَّل: هو زمن قياس الإعجابات، ولا تُقرأ `num_likes`
-كأنّها قيمة وقت الكتابة. `token_social` يحلّها للمستقبل.
+**The one loss**: fomo gives only the **current** likes counter. So
+`token_thesis.fetched_at` is recorded: it is the time the likes were measured, and
+`num_likes` must not be read as the value at writing time. `token_social` resolves this
+for the future.
 
-> ⛔ **والاسترجاعُ نجح تقنيّاً وفشل استعماليّاً.** الصفوف الرجعية (`is_live=0`)
-> **مستبعَدةٌ من التدريب** ولا تدخل `model_training_rows`: لأنّها تفتقر بنيوياً
-> إلى العائلات اللحظية (`market_ticks` · لقطات `token_social` · رتبة المتصدّر ·
-> شموع الماكرو)، فنمطُ الغياب فيها **يطابق الحِقبة** فيتعلّمه النموذج بدل
-> الإشارة. وهي تُحفظ للتحليل الاستكشافيّ وحدَه. فلا تشغّل `backfill_activity.py`
-> ولا `backfill_activity_bars.py` بنيّة زيادة بيانات التدريب — لا تزيدها،
-> وتزيد فرصة أن يتسرّب زمنٌ إلى مكان ميزة (§4، المبدأ 7).
-
----
-
-## 10. المصائد المكتشفة — اقرأها قبل أي تعديل
-
-كل واحدة منها كلّفت وقتاً أو كادت تفسد البيانات.
-
-### بيانات وواجهة fomo
-
-1. **`getBarsNew` يحتاج `"address:networkId"` و`from`/`to`** — العنوان المجرّد
-   يرمي **502 من Cloudflare** فيبدو عطلاً في fomo وهو طلب مشوّه. نفس الشيء
-   لـ`tokenDetails`. (`_pair_id` في `fomo_client.py`)
-2. **توفّر OHLCV يتآكل** — عملة أعادت 192 شمعة ثمّ `404 No OHLCV data` بعد 15
-   دقيقة. لا تؤجّل السحب اعتماداً على بقاء التاريخ.
-3. **عدّاد الأطروحات يتشبّع عند 100** — الاستجابة تعيد 100 عنصر بينما
-   `responseObject.count` قد يبلغ **10,551**. استعمل `thesis_total`.
-4. **`currentSizeUsd` كان مُهدراً** — «شراء كبير» وسيطه **$3,448** فقط ويمتدّ
-   إلى $172,169. بلا هذا الحقل كل الصفقات سواء.
-5. **الـ feed قد يتجمّد** — شوهد متجمّداً 3 ساعات بينما المسجّل يعمل بلا خطأ.
-   `meta.last_feed_event_at` يميّز «سوق هادئ» عن «مصدر منقطع».
-6. **`/proxy/verifiedTokens` يرمي 502 أحياناً** من طرف fomo — خارج أيدينا.
-7. **`large_sell` نوع feed صالح كان غائباً** — مسبار 2026-07-25 أكّد ثلاثة
-   أنواع فقط؛ إعادة المسح (2026-07-28) كشفته. الدرس: قائمة الأنواع المؤكَّدة
-   ليست مغلقة — أعد مسح القيم المرشّحة دورياً. شكله = `large_buy` باتجاه
-   معاكس (`inHumanAmount` = العملة المباعة).
-
-### تخزين
-
-8. **`raw_json` أعمدة BLOB مضغوطة بـ zlib لا نصّ** — استعمل `db.decode_raw()`
-   دائماً. (الضغط خفض النموّ من ~1.3 GB/يوم إلى ~280 MB.)
-9. **`CREATE TABLE IF NOT EXISTS` لا يمسّ جدولاً موجوداً** — أي عمود جديد
-   يحتاج `_COLUMN_MIGRATIONS`، **والترحيل يسبق المخطّط** (الفهارس على الأعمدة
-   الجديدة تفشل قبله).
-10. **مفتاح `outcomes` القديم `(token, entry_ts)` يتصادم** — 201 إشارة لعملة
-   واحدة. المفتاح الآن `(kind, key)`.
-11. **`upsert_watch` بـ`INSERT OR IGNORE`** كان يبتلع كل إشارة لاحقة بعد
-    انتهاء المراقبة — نزيف صامت للقائمة حتى الصفر.
-
-### SQL وبايثون
-
-12. **منطق SQL ثلاثيّ القيم** — `NOT (NULL AND NULL) = NULL` فتُستبعد الصفوف
-    بصمت. استعمل `COALESCE` في شروط `LEFT JOIN`.
-13. **حلقة لا نهائية في backfill** — `WHERE col IS NULL` يعيد نفس الصفوف إن
-    بقيت NULL بعد المعالجة. تقدّم بمؤشّر `rowid`.
-14. **`asyncio_mode` غائب ⇒ تخطٍّ صامت** — 8 اختبارات async رُصدت skipped
-    والمجموعة «ناجحة». `pytest.ini` يرفعها إلى أخطاء.
-
-### تشغيل ونشر
-
-15. **`Stop-ScheduledTask` لا يقتل العملية فوراً** — الحالة تعود `Ready` بينما
-    `pythonw` حيّ. حراس السكربتات تفحص **العملية** لا حالة المهمّة.
-16. **`log_config=None` ضروريّ تحت pythonw** (منسّق uvicorn يستدعي `isatty()`)
-    — **لكنّه يعني صفر معالِجات تسجيل**. `serve.py` يركّب معالِج ملفّ مُدوَّراً.
-17. **اللوحة تُخدَّم بـ`Cache-Control: no-cache`** — بدونها يبقى المتصفّح على
-    نسخة قديمة إلى الأبد، بما في ذلك بعد إصلاح عطب.
-18. **`Element.append()` يعيد `undefined`** — لا تُسلسل `.textContent` عليه.
-
-### تحليل
-
-19. **الاقتطاع اليمينيّ يضلّل** — «لا قمم بعد 24 ساعة» كان استنتاجاً باطلاً؛
-    السبب أنّ أقصى متابعة متاحة كانت 22 ساعة. اضبط دائماً قبل الاستنتاج.
-20. **`errors_total` عدّاد مدى الحياة** — نسبته إلى الدورات ليست «صحّة حالية».
-21. **مخطّط اختبار منفصل ينجرف** — استعلام يعطب في الإنتاج كان يمرّ في
-    الاختبار. حارس الانجراف يبني قاعدة من `schema.sql` الحقيقي.
-22. **شموع fomo تحتوي قيماً مستحيلة** (2026-07-30) — `h = 2,626,092` لشمعة
-    إغلاقها 0.0219 (×119 مليون)، و`c = 12,052.5` بين إغلاقين ≈0.0004. **مؤكَّد
-    بإعادة سحب حيّة ⇒ تشوّه دائم في المنبع لا خطأ نقل**. الأثر: `max_gain`
-    +3.78 مليار% في 4 صفوف، واللوحة عرضت **+62,570,743,609%**. الحلّ:
-    `bar_context_flags` — السعر متّصل في المجمّع، فقيمة تتجاوز **كلا** جاريها
-    بـ×10 ولا تستمرّ هي تشوّه لا سعر. تُعلَّم (`h/l/c_suspect`) وتُستبعد من
-    الحساب، **ولا تُصلَح ولا تُحذف** (الخام مقدَّس). درسٌ عامّ: أيّ عمود مشتقّ
-    من مصدر خارجيّ يحتاج فحص معقولية فيزيائية قبل أن يصير ليبلاً.
-23. **الأرشيف ليس عملات ميم فقط** (2026-07-30) — أصول كبرى وأسهم وسلع مرمّزة
-    وعملات مستقرّة داخل الأرشيف (BTC $1.27T · SOL 103 إشارة · AAPL · PAXG …).
-    **حُلَّت**: جدول `token_class` يصنّف العملات عبر `classify_tokens.py` (آخر
-    تشغيل 2026-07-30: **750 عملة** = 716 ميم · 17 كبير · 14 مسعَّر · 3 مستقرّة؛
-    والعدد يتغيّر مع كل تشغيل لأنّه مشتقّ من كل المشاهدات المتاحة وقتها، فلا
-    تقتبسه من هنا). القيمة السوقية **لا تكفي** للكشف
-    (AAPL بـ$1.36M) والسعر هو المميّز، مع حرس ضدّ انتحال الرموز. أيّ تحليل أو
-    تدريب يجب أن يقيّد بـ`asset_class='meme'` أو يفصل الأصناف صراحةً.
-24. **`market_cap` مضلِّل في الذيل ولا يُوسَم تشوّهاً** — هو سعر × معروض فحسب،
-    فعملة بـ7.8×10¹⁴ رمزاً تُقرأ «$69 تريليون» (SMILE) بلا دولار حقيقيّ فيها.
-    **الفحص أثبت أنّه ليس عطباً**: لا عملة تتفاوت قيمتها >×50 بين المشاهدات إلّا
-    بحركة سعر حقيقية (BONK وMarsCoin). العلاج ميزاتيّ: لوغاريتم/شرائح، وتفضيل
-    `liquidity`. وسمُه «فاسداً» كان سيكون حكماً لا يسنده قياس.
-
-### حدودٌ صلبة: وقت · مفاتيح · أعمدة
-
-25. **معالِج الخطأ احتاج القاعدة المقفلة فمات معها** (2026-08-17) — أسطر
-    `last_error_*` تُكتب من **داخل** معالج الاستثناء؛ فحين كان المورد المتعطّل
-    هو القاعدة نفسها (`database is locked`) رفع `set_meta` بدوره، فأسقط
-    المعالِج، ومعه بقيّة الدورة، ثمّ درعَ الحلقة. النتيجة: المسجّل خرج بالرمز 1
-    وبقيت المهمّة `Ready` **ثلاث ساعات وربعاً صامتة** بلا سطر واحد في السجلّ
-    الدوريّ. **الحلّ**: `db.note_error()` — تحاول الكتابة وتعيد `False` ولا
-    ترفع. القاعدة: أيّ ختمٍ **دفتريّ** (وصفُ فشلٍ وقع أصلاً) يمرّ بـ`note_error`؛
-    و`set_meta` المجرّدة تبقى للحالة المُعتمَد عليها (`schema_version`، أختام
-    الدورات، جيل دفتر EVM) حيث **يجب** أن يُسمَع فشلُها. فقدُ سطرٍ وصفيّ أرخص
-    من فقد الدورة — والقياس لا يُكتب بهذا الطريق أبداً.
-26. **حوض المفاتيح يعيش في ذاكرة عمليّةٍ واللوحة عمليّةٌ أخرى** — فبلا ختمٍ
-    مكتوب لا سبيل للإجابة عن «هل هناك مفتاح ثانٍ أصلاً؟» ولا «هل أحدها مرفوض
-    الآن؟» إلّا بقراءة سجلٍّ نصّيّ. **الحلّ**: `KeyPool.stats()` و
-    `pool_report()` يكتبان في `meta` **أعداداً ومؤشّرات فقط — بلا أيّ قيمة
-    مفتاح ولا كسرٍ منها**: العدد لا يُعاد بناؤه إلى مفتاح، والبصمة تُطابَق ولا
-    تُصدَر. والسببُ أنّ ما يُكتب في `meta` يُنسخ احتياطيّاً ويُقرأ في سجلّات.
-    وللوحة **طريقٌ ثانٍ منفصل** (`keystore` يقرأ الملفّ مباشرةً) تعرض فيه اسم
-    الحساب وآخر أربعة أحرف بطلب المستخدم، يُحسب لحظتَه ولا يُكتب في `meta` ولا
-    في سجلّ. لا تخلط الطريقين: ما يجوز **عرضُه** ليس بالضرورة ما يجوز
-    **تسجيلُه**. (والمفتاح الموقوف يبقى في الملفّ لتراه اللوحة وتُعيد تشغيله،
-    ولا يدخل الحوض فلا يُنادى به.)
-27. **القيد على الجمع ليس حدود المصدر بل زمن الدورة** — المصدر لا يحدّ
-    النداءات: **صفر ردّ 429 في تاريخ المشروع كلّه**، و`errors: 0` في 274 دورة
-    من آخر 375. لكنّ التمهّل «لُطفاً بالمصدر» كان يأكل **27.5ث من 60** (46%)
-    والعملُ الحقيقيّ ~31.5ث، فوسيط الدورة 59ث و**32% منها تتجاوز 61ث** أي بلا
-    فسحة. و`run_forever` تنام `CYCLE_SECONDS - elapsed`، فدورةٌ تتجاوز
-    الميزانية **تُمدّد المدّة نفسها**: رفعُ السقوف بلا تقليل التمهّل يُبطئ المسح
-    بدل أن يُسرعه. **الحلّ**: قُلِّص التمهّل إلى ~11ث وأُنفق الموفَّر على
-    السقوف (الشموع كانت أكبر مُهدِر وحدها: 12ث من 27.5). القاعدة: اشترِ الوقت
-    من التمهّل **قبل** أن ترفع أيّ سقف لكل دورة.
-28. **عمودٌ لحقلٍ لا يرسله المصدر يبقى NULL أبداً — ويجتاز فحص المخطّط**
-    — `market_ticks.top10_holders_pct`: **صفر من 1,430,475 صفّاً**، لأنّ قوائم
-    `trending/verified` لا تحمل المفتاح إطلاقاً. العمود موجود، والمخطّط سليم،
-    والفحوص خضراء — ولا بيانات. **الحلّ**: التركيز يُجلب من مصدرين يعملان على
-    الشبكتين (`tokenDetails` يعطي top10 وعدد الحائزين، و`/hodlers/top` يعطي
-    التفصيل فنشتقّ منه top1: حوتٌ مفرد خطرٌ مختلف عن عشرة موزّعين)، وتركيز
-    السلسلة يُصلحه من فوق. والقاعدة المستخلَصة: **عمودٌ في `training_rows` لا
-    يُضاف إلّا ومعه مفتاحٌ في `ROW_COLUMNS` يكتبه** — ولذلك `dex_protocol` و
-    `is_top_trader_tagged` ليسا فيه (هما عمودا جمعٍ على `token_static` و
-    `signal_events`، ولا يُنتجهما `build_features`).
-29. **ردٌّ ناجحٌ ناقص أخطرُ من ردٍّ فاشل — ومع دفترٍ تراكميّ لا يظهر أبداً**
-    — نهايةُ أحداث GoldRush كانت **مُصفَّحة**، و`_chunk` تقرأ `data.items` مرّةً
-    ولا تتبع `links`، والمدى المطلوب `GOLDRUSH_BLOCK_CHUNK = 2,000,000` كتلة أي
-    أضعافُ صفحةٍ واحدة لأيّ عملة متحرّكة. لا 429 ولا 500 ولا رسالة: ردّ 200
-    وقائمةُ أحداث. والأثر أنّ الرصيد **تراكميّ**، فالتحويلُ المفقود لا يُنقص
-    صفّاً بل يقلب الرصيد سالباً أو يعطي تركّزاً كاذباً بعد آلاف النداءات: على
-    Base 41,386 نداءً · صفر لقطة · 76 عملة `error` بعد نفاد الرصيد · وعملتان
-    أنفقتا 15,270 و11,665 نداءً وانتهتا `negative`. **الحلُّ الذي كان**: الاقتطاع
-    يُكشَف من ثلاث دلائل (`pagination.has_more` · `total_count > len(items)` ·
-    `links.prev`/`next`) ويُرفَع **كحدّ مدى** فيُصغَّر المدى ويُعاد كاملاً، وعند
-    مدى الكتلة الواحدة يُرفَع خطأً صريحاً — ولا يُقبل نصفُ ردٍّ بحال. والمحوّلُ
-    نفسه حُذف في 2026‑08‑19 (الكلفةُ كانت السبب لا الشِفرة)، لكنّ القاعدة تبقى
-    لأوّل مزوّدٍ مُصفِّحٍ قادم (`alchemy_getAssetTransfers` مثلاً): **مزوّدٌ يُصفِّح
-    يُسأل «هل بقيت صفحة؟» قبل أن يُقرأ ردّه**، وإلّا كان الفحص الأخضر أسوأ من
-    الأحمر. و`eth_getLogs` على العقد الرسميّة لا يُصفِّح — يرفض المدى برسالةٍ
-    صريحة — وهو نصفُ سبب بقاء الإعادة عليه.
+> ⛔ **And the recovery succeeded technically but failed in use.** Retrospective rows
+> (`is_live=0`) are **excluded from training** and never enter `model_training_rows`:
+> because they structurally lack the real-time families (`market_ticks` ·
+> `token_social` snapshots · leaderboard rank · macro candles), their missingness pattern
+> **matches the era**, which the model learns instead of the signal. They are kept for
+> exploratory analysis alone. So do not run `backfill_activity.py` or
+> `backfill_activity_bars.py` intending to increase training data — they do not increase
+> it, and they increase the chance of an era leaking into where a feature should be
+> (§4, principle 7).
 
 ---
 
-## 11. التشغيل والصيانة
+## 10. Discovered traps — read before any change
 
-### الحالة الصحيحة
+Each one cost time or nearly corrupted the data.
+
+### fomo data and API
+
+1. **`getBarsNew` needs `"address:networkId"` and `from`/`to`** — a bare address throws
+   a **Cloudflare 502** that looks like a fomo outage but is a malformed request. Same
+   for `tokenDetails`. (`_pair_id` in `fomo_client.py`)
+2. **OHLCV availability decays** — a coin returned 192 candles then `404 No OHLCV data`
+   15 minutes later. Do not postpone pulls on the assumption history persists.
+3. **The thesis counter saturates at 100** — the response returns 100 items while
+   `responseObject.count` can reach **10,551**. Use `thesis_total`.
+4. **`currentSizeUsd` was being wasted** — the "large buy" median is only **$3,448** and
+   extends to $172,169. Without this field every trade looks the same.
+5. **The feed can freeze** — observed frozen for 3 hours while the recorder ran without
+   error. `meta.last_feed_event_at` distinguishes "quiet market" from "dead source".
+6. **`/proxy/verifiedTokens` sometimes throws 502** from fomo's side — outside our
+   control.
+7. **`large_sell` was a missing valid feed type** — a 2026-07-25 probe confirmed only
+   three types; the re-scan (2026-07-28) revealed it. Lesson: the confirmed type list is
+   not closed — re-scan candidate values periodically. Its shape = `large_buy` in the
+   opposite direction (`inHumanAmount` = the sold coin).
+
+### Storage
+
+8. **`raw_json` columns are zlib-compressed BLOBs, not text** — always use
+   `db.decode_raw()`. (Compression cut growth from ~1.3 GB/day to ~280 MB.)
+9. **`CREATE TABLE IF NOT EXISTS` does not touch an existing table** — any new column
+   needs `_COLUMN_MIGRATIONS`, **and the migration precedes the schema** (indexes on the
+   new columns fail before it).
+10. **The old `outcomes` key `(token, entry_ts)` collides** — 201 signals for one coin.
+    The key is now `(kind, key)`.
+11. **`upsert_watch` with `INSERT OR IGNORE`** was swallowing every later signal after a
+    watch ended — a silent bleed of the list down to zero.
+
+### SQL and Python
+
+12. **Three-valued SQL logic** — `NOT (NULL AND NULL) = NULL`, so rows are silently
+    excluded. Use `COALESCE` in `LEFT JOIN` conditions.
+13. **Infinite loop in backfill** — `WHERE col IS NULL` returns the same rows if they
+    stay NULL after processing. Advance with a `rowid` cursor.
+14. **A missing `asyncio_mode` ⇒ silent skipping** — 8 async tests were seen skipped
+    with the suite "green". `pytest.ini` raises it to an error.
+
+### Operations and deployment
+
+15. **`Stop-ScheduledTask` does not kill the process immediately** — the state returns
+    `Ready` while `pythonw` is alive. The script guards check the **process**, not the
+    task state.
+16. **`log_config=None` is required under pythonw** (uvicorn's formatter calls
+    `isatty()`) — **but it means zero logging handlers**. `serve.py` installs a rotating
+    file handler.
+17. **The dashboard is served with `Cache-Control: no-cache`** — without it the browser
+    keeps a stale version forever, including after a bug fix.
+18. **`Element.append()` returns `undefined`** — do not chain `.textContent` on it.
+
+### Analysis
+
+19. **Right truncation misleads** — "no peaks after 24 hours" was a false conclusion;
+    the cause was that the maximum follow-up available was 22 hours. Always adjust
+    before concluding.
+20. **`errors_total` is a lifetime counter** — its ratio to cycles is not "current
+    health".
+21. **A separate test schema drifts** — a query that failed in production passed in
+    test. The drift guard builds the database from the real `schema.sql`.
+22. **fomo candles contain impossible values** (2026-07-30) — `h = 2,626,092` for a
+    candle whose close is 0.0219 (×119 million), and `c = 12,052.5` between closes ≈
+    0.0004. **Confirmed by a live re-pull ⇒ permanent upstream corruption, not a
+    transport error**. Impact: `max_gain` +3.78 billion % in 4 rows, and the dashboard
+    showed **+62,570,743,609%**. The fix: `bar_context_flags` — price is continuous in
+    the aggregate, so a value exceeding **both** its neighbors by ×10 and not persisting
+    is corruption, not a price. They are flagged (`h/l/c_suspect`) and excluded from
+    computation, **not fixed and not deleted** (raw is sacred). A general lesson: any
+    column derived from an external source needs a physical-plausibility check before it
+    becomes a label.
+23. **The archive is not meme coins only** (2026-07-30) — major assets, tokenized stocks
+    and commodities, and stablecoins inside the archive (BTC $1.27T · SOL 103 signals ·
+    AAPL · PAXG …). **Resolved**: the `token_class` table classifies coins via
+    `classify_tokens.py` (last run 2026-07-30: **750 coins** = 716 meme · 17 major · 14
+    priced · 3 stable; and the count changes with every run because it is derived from
+    all sightings available at the time, so do not quote it from here). Market cap alone
+    is **not enough** for detection (AAPL at $1.36M) and price is the discriminator,
+    with a guard against ticker impersonation. Any analysis or training must constrain to
+    `asset_class='meme'` or separate the classes explicitly.
+24. **`market_cap` misleads in the tail and is not flagged corrupt** — it is merely price
+    × supply, so a coin with 7.8×10¹⁴ tokens reads "$69 trillion" (SMILE) with no real
+    dollar in it. **The check proved it is not a defect**: no coin's value varies >×50
+    between sightings except by real price movement (BONK and MarsCoin). The remedy is
+    featurization: log/bins, and prefer `liquidity`. Flagging it "corrupt" would have
+    been a judgment no measurement supports.
+
+### Hard limits: time · keys · columns
+
+25. **The error handler needed the locked database and died with it** (2026-08-17) — the
+    `last_error_*` lines are written from **inside** the exception handler; so when the
+    failing resource was the database itself (`database is locked`), `set_meta` raised in
+    turn, taking down the handler, the rest of the cycle, and then the loop's shield.
+    The result: the recorder exited with code 1 and the task sat `Ready` for **three
+    hours and a quarter, silent**, without a single line in the periodic log. **The
+    fix**: `db.note_error()` — it attempts the write and returns `False` without
+    raising. The rule: any **bookkeeping** stamp (a description of a failure that already
+    happened) goes through `note_error`; bare `set_meta` stays for depended-on state
+    (`schema_version`, cycle stamps, the EVM ledger generation) where its failure **must**
+    be heard. Losing a descriptive line is cheaper than losing the cycle — and the
+    measurement is never written through that route.
+26. **The key pool lives in one process's memory, and the dashboard is another
+    process** — without a written stamp there is no way to answer "is there even a
+    second key?" or "is one of them rejected right now?" except by reading a text log.
+    **The fix**: `KeyPool.stats()` and `pool_report()` write to `meta` **counts and
+    indicators only — with no key values or fragments**: the count cannot be
+    reconstructed into a key, and the fingerprint is matched, never published. The
+    reason is that whatever is written to `meta` gets backed up and read in logs. The
+    dashboard has a **separate second route** (`keystore` reads the file directly) that
+    shows the account name and last four characters on request, computed at that moment
+    and written neither to `meta` nor to logs. Do not mix the two routes: what may be
+    **displayed** is not necessarily what may be **logged**. (And a stopped key stays in
+    the file for the dashboard to see and re-enable, and never enters the pool so it is
+    never called.)
+27. **The constraint on collection is not the source's limits but cycle time** — the
+    source does not rate-limit calls: **zero 429 responses in the project's entire
+    history**, and `errors: 0` in 274 of the last 375 cycles. But "courtesy to the
+    source" pacing was eating **27.5s of every 60** (46%) while real work took ~31.5s,
+    so the cycle median was 59s and **32% of cycles exceeded 61s** — with no slack at
+    all. And `run_forever` sleeps `CYCLE_SECONDS - elapsed`, so a cycle exceeding its
+    budget **extends the same period**: raising caps without cutting pacing slows the
+    scan down instead of speeding it up. **The fix**: pacing was cut to ~11s and the
+    savings spent on caps (candles were the single biggest waster: 12s of the 27.5).
+    The rule: buy time from pacing **before** raising any per-cycle cap.
+28. **A column for a field the source never sends stays NULL forever — and passes the
+    schema check** — `market_ticks.top10_holders_pct`: **zero of 1,430,475 rows**,
+    because the `trending/verified` lists never carry the key at all. The column exists,
+    the schema is sound, the checks are green — and there is no data. **The fix**:
+    concentration is fetched from two sources that work on both networks
+    (`tokenDetails` gives top10 and the holder count, and `/hodlers/top` gives the
+    detail from which we derive top1: a single whale is a different risk from ten
+    distributed holders), and on-chain concentration fixes it from above. And the
+    derived rule: **a column in `training_rows` is added only with a key in
+    `ROW_COLUMNS` that writes it** — which is why `dex_protocol` and `is_top_trader_tagged`
+    are not in it (they are collection columns on `token_static` and `signal_events`,
+    not produced by `build_features`).
+29. **A successful but truncated response is more dangerous than a failed one — and with
+    a cumulative ledger it never shows** — GoldRush's event endpoint was **paginated**,
+    and `_chunk` read `data.items` once without following `links`, while the requested
+    range was `GOLDRUSH_BLOCK_CHUNK = 2,000,000` blocks — multiples of a single page for
+    any active coin. No 429, no 500, no message: a 200 response and a list of events.
+    And the impact is that the balance is **cumulative**, so a missing transfer does not
+    decrement a row but flips the balance negative or gives a false concentration after
+    thousands of calls: on Base, 41,386 calls · zero snapshots · 76 coins `error` after
+    credit exhaustion · and two coins that spent 15,270 and 11,665 calls and ended
+    `negative`. **The fix that was**: truncation is detected from three signs
+    (`pagination.has_more` · `total_count > len(items)` · `links.prev`/`next`) and raised
+    **as a range limit**, so the range shrinks and refetches whole, and at the
+    single-block range it raises an explicit error — a half response is never accepted.
+    And the converter itself was deleted on 2026-08-19 (the cost was the reason, not the
+    code), but the rule remains for the first paginating provider to come
+    (`alchemy_getAssetTransfers`, for example): **a paginating provider is asked "is
+    there another page?" before its response is read**, otherwise a green check is worse
+    than a red one. And `eth_getLogs` on the official RPCs does not paginate — it
+    rejects the range with an explicit message — which is half the reason replay stays
+    on them.
+
+---
+
+## 11. Operation and maintenance
+
+### The healthy state
 
 ```powershell
 Get-ScheduledTask -TaskName Fomo* | Select-Object TaskName,State
-# سبعُ مهامٍ يجب أن تكون Running جميعاً:
+# Seven tasks must all be Running:
 #   FomoApiServer · FomoRecorder · FomoLabeler · FomoChain
 #   FomoEVMReplay · FomoBuildRows · FomoDashboard
-# FomoBackup = Ready عادةً، وRunning أثناء النسخ اليومي فقط
+# FomoBackup = Ready usually, and Running only during the daily copy
 ```
 
-> **`Running` ليست دليل حياة، و`Ready` ليست دليل موت.** مهمّةٌ ماتت عمليّتها
-> تعود `Ready` بينما لا شيء يشتكي (المصيدة #15)، ومهمّةٌ فشلت في الإقلاع لا
-> تكتب حرفاً في سجلّها الدوريّ. الفحصُ الحقيقيّ سطران: `<name>_boot.log`
-> و`meta.*_last_run_at` — أو شريط اللوحة الذي يقرأهما لك.
+> **`Running` is not proof of life, and `Ready` is not proof of death.** A task whose
+> process died returns `Ready` while nothing complains (trap #15), and a task that
+> failed to boot writes not a character to its periodic log. The real check is two
+> lines: `<name>_boot.log` and `meta.*_last_run_at` — or the dashboard's top bar, which
+> reads them for you.
 
-| ماذا أفحص | أين |
+| What to check | Where |
 |---|---|
-| اللوحة الحيّة | http://127.0.0.1:8090/ — شريطها العلويّ يعرض حياة كل خدمة منفصلةً (موت الموسِّم صامت بلاها) |
-| صحّة الـ API | http://127.0.0.1:8080/health |
-| سجلّ المسجّل | `recorder/recorder.log` (إحصاء كل دورة) |
-| سجلّ الموسِّم | `recorder/labeler.log` (يُكتب عند التوسيم فقط) |
-| سجلّ طبقة السلسلة | `recorder/chain.log` (سولانا + EVM + BSC في عمليّة واحدة) و`recorder/evm.log` |
-| سجلّ إعادة EVM | `recorder/evm_replay.log` + `recorder/evm_replay_run.log` |
-| سجلّ بناء الصفوف | `recorder/build_rows.log` (كل ساعة) |
-| سجلّ الخادم | `api/server.log` (مُدوَّر 5MB×3) |
-| النسخ الاحتياطي | `recorder/backup.log` + حالة الطزاجة/مساحة القرص في اللوحة |
-| أخطاء الإقلاع | `*_boot.log` بجانب كل خدمة — **افحصه أوّلاً** |
+| Live dashboard | http://127.0.0.1:8090/ — its top bar shows each service's life separately (the labeler's death is silent without it) |
+| API health | http://127.0.0.1:8080/health |
+| Recorder log | `recorder/recorder.log` (per-cycle stats) |
+| Labeler log | `recorder/labeler.log` (written only when labeling) |
+| Chain-layer log | `recorder/chain.log` (Solana + EVM + BSC in one process) and `recorder/evm.log` |
+| EVM replay log | `recorder/evm_replay.log` + `recorder/evm_replay_run.log` |
+| Row-building log | `recorder/build_rows.log` (hourly) |
+| Server log | `api/server.log` (rotated 5MB×3) |
+| Backups | `recorder/backup.log` + freshness/disk-space status on the dashboard |
+| Boot errors | `*_boot.log` beside every service — **check it first** |
 
-### تثبيت الاعتماديات
+### Installing dependencies
 
 ```powershell
 py -m pip install -r requirements-dev.txt
 ```
 
-`requirements.txt` يغطي تشغيل مساحة العمل كاملة، و`requirements-dev.txt` يضيف
-أدوات الاختبار والـlint وفحص الأنواع. لا توجد اعتماديات ضمنية خاصة بجهاز المطوّر.
+`requirements.txt` covers running the whole workspace, and `requirements-dev.txt` adds
+the testing, lint, and type-check tools. There are no machine-specific implicit
+dependencies.
 
-### الاختبارات
+### Tests
 
 ```powershell
 .\run_tests.ps1
 ```
-ثماني خطوات، بلا أيّ إصلاح تلقائي ولا تعديل للملفات — وكلّها يجب أن تنجح:
+Eight steps, with no auto-fixing and no file modification — and all must pass:
 
-1. فحصٌ مُسبَق للمفسّر (`pytest`/`ruff`/`mypy` مثبّتةٌ لـ**هذا** المفسّر بعينه).
-2. `pytest` لمجموعة الـAPI.
-3. `pytest` لمجموعة المسجّل.
-4. `pytest` لمجموعة اللوحة.
+1. An interpreter pre-check (`pytest`/`ruff`/`mypy` installed for **this** exact
+   interpreter).
+2. `pytest` for the API suite.
+3. `pytest` for the recorder suite.
+4. `pytest` for the dashboard suite.
 5. `ruff check src/ tests/`.
 6. `ruff check recorder/ dashboard/`.
-7. `node dashboard/tools/check_key_render.mjs` — رسمُ اللوحة جافاسكربت لا
-   يمسّه `pytest`؛ تُستخرج دوالّ الصفحة وتُشغّل على حمولة تغطّي كل حالة.
-   **تُتخطّى بلا node** بدل أن تُفشل.
-8. `mypy src/fomo_api` (صرامة كاملة — الـAPI وحدَه اليوم).
+7. `node dashboard/tools/check_key_render.mjs` — the dashboard's JavaScript rendering is
+   not touched by `pytest`; the page functions are extracted and run on a payload
+   covering every state. **Skipped without node** rather than failed.
+8. `mypy src/fomo_api` (full strictness — the API only, for now).
 
-ومنها اختبارات حرس تسرّب المستقبل وسلامة الشموع وتصنيف الأصول والنسخ
-الاحتياطي المتسق وانجراف المخطّط.
+These include future-leak guards, candle-integrity, asset classification, consistent
+backup, and schema-drift tests.
 
-**نفس السكربت يشغّله CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
-على `windows-latest` بـPython 3.11 عند كل `push` و`pull_request`.
+**The same script is run by CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
+on `windows-latest` with Python 3.11 on every `push` and `pull_request`.
 
-> ⚠️ **فحصُ المفسّر ليس تزويقاً.** `py` على `windows-latest` يحلّ إلى 3.14
-> حيث لا اعتماديات، فمرّت **ثلاث دفعات حمراء** (2026-08-11 مرّتين،
-> و2026-08-17) بصفر اختبارٍ مُشغّل ونصٍّ يوهم أنّ كل شيء فشل. ولا تقرأ
-> نتيجة CI من مخرَج `gh run watch` عبر أنبوب — صفرُ الأنبوب يخفي
-> تشغيلاً فاشلاً؛ اقرأ `conclusion` صراحةً.
+> ⚠️ **The interpreter check is not pedantry.** `py` on `windows-latest` resolves to 3.14
+> where no dependencies exist, so **three red batches passed** (2026-08-11 twice, and
+> 2026-08-17) with zero tests run and text implying everything failed. And do not read a
+> CI result from `gh run watch` output through a pipe — the pipe's zero hides a failed
+> run; read `conclusion` explicitly.
 
-### النسخ الاحتياطي
+### Backup
 
-`FomoBackup` يستعمل `VACUUM INTO` إلى ملف مرحلي محلي، لذلك يأخذ لقطة متسقة بينما
-WAL والمسجّل يعملان بلا إعادة بدء عند كل كتابة. تُفحص النسخة بـ`PRAGMA quick_check`
-قبل نشرها ذرياً، وتُحفظ آخر ثلاث نسخ
-في `%OneDrive%\aoi-backups` خارج المستودع. لإعادة تهيئة الوجهة أو الوقت:
+`FomoBackup` uses `VACUUM INTO` to a local staging file, so it takes a consistent
+snapshot while WAL and the recorder keep running with no restart per write. The copy is
+verified with `PRAGMA quick_check` before an atomic publish, and the last three copies
+are kept in `%OneDrive%\aoi-backups` outside the repository. To reconfigure the
+destination or time:
 
 ```powershell
 .\recorder\setup_backup_task.ps1 -Destination "D:\aoi-backups" -At "03:15" -Keep 3
-Start-ScheduledTask -TaskName FomoBackup   # نسخة فورية عند الحاجة
+Start-ScheduledTask -TaskName FomoBackup   # an immediate copy when needed
 ```
 
-يمكن ضبط `AOI_BACKUP_DIR` لقرص خارجي أو مجلد مزامَن آخر. اللوحة تحذّر إذا لم
-توجد نسخة، أو تجاوز عمرها 36 ساعة، أو انخفضت مساحة القرص عن 25 GB.
+`AOI_BACKUP_DIR` can point to an external disk or another synced folder. The dashboard
+warns if no copy exists, or it is older than 36 hours, or free disk space drops below
+25 GB.
 
-### إعادة تشغيل خدمة بأمان
+### Restarting a service safely
 
 ```powershell
 Stop-ScheduledTask -TaskName FomoRecorder
 Start-Sleep -Seconds 5
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
   Where-Object { $_.CommandLine -like '*run_recorder.py*' } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # المصيدة #15
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # trap #15
 Start-ScheduledTask -TaskName FomoRecorder
 ```
 
-### سكربتات الصيانة (`recorder/`)
+### Maintenance scripts (`recorder/`)
 
-تُقسَّم بحسب ما تفعله، لأنّ خلطها هو أصل الحادث: **ترحيلٌ** يمسّ الخام، و**ملءٌ
-رجعيّ** يعيد بناء عمود من الخام المحفوظ، و**اشتقاقٌ** يبني طبقةً فوق الموسَّم،
-و**تحليلٌ** لا يكتب شيئاً.
+They are grouped by what they do, because mixing them is the root of incidents:
+**migration** touches raw data, **backfill** rebuilds a column from saved raw data,
+**derivation** builds a layer on top of the labeled data, and **analysis** writes
+nothing.
 
-#### ترحيل ونسخ (يمسّ الخام أو الملفّ)
+#### Migration and backup (touches raw data or files)
 
-| السكربت | الغرض | يتطلّب إيقاف المسجّل |
+| Script | Purpose | Requires stopping the recorder |
 |---|---|---|
-| `migrate_compress.py` | ضغط `raw_json` القديم + VACUUM | نعم |
-| `backup_db.py` | نسخة SQLite متسقة ومتحققة + احتفاظ بآخر 3 | لا |
-| `reset_evm_replay.py` | إرجاع عملات إعادةٍ **بعينها** إلى الطابور بعد فصل مسارٍ كتب حالتها — الحذف هو الإرجاع (`evm_replay_state` مشتقّة بالكامل). عرضٌ فقط بلا `--apply`، ويرفض `done` لأنّه عملٌ منجَز لا حالةٌ عالقة | لا |
-| `repair_evm_ledger.py` | تصفير بيانات دفتر EVM المشتقّة بعد إصلاح صحّته — **لا يمسّ** الخام ولا النوافذ ولا الأسعار ولا الليبلات. الوضع الافتراضي قراءة فقط؛ `--apply` ينفّذ، و`--finalize-training` يحذف صفوف تدريب EVM وحدها ليعيد البانيَ بناءها من لقطاتٍ مصحَّحة | لا |
+| `migrate_compress.py` | compress old `raw_json` + VACUUM | yes |
+| `backup_db.py` | consistent, verified SQLite copy + keep last 3 | no |
+| `reset_evm_replay.py` | return **specific** replay coins to the queue after a path wrote their state — deletion *is* the revert (`evm_replay_state` is fully derived). Display-only without `--apply`, and it refuses `done` because that is finished work, not a stuck state | no |
+| `repair_evm_ledger.py` | zero out derived EVM ledger data after fixing its integrity — **it does not touch** raw data, windows, prices, or labels. Read-only by default; `--apply` executes, and `--finalize-training` deletes EVM training rows alone so the builder rebuilds them from corrected snapshots | no |
 
-#### ملء رجعيّ (يعيد بناء عمود — لا يجلب حقيقة جديدة إلّا حيث يُصرَّح)
+#### Backfill (rebuilds a column — brings no new truth except where authorized)
 
-| السكربت | الغرض | شبكة |
+| Script | Purpose | Network |
 |---|---|---|
-| `backfill_extracted_fields.py` | تعبئة أعمدةٍ استُخرجت متأخّرةً من الخام المحفوظ (likes · views · num_replies · pinned …) — **كانت في `raw_json` من اليوم الأوّل** ولم يقرأها المستخرج، فضاعت من التحليل وحدَه لا من الأرشيف | لا |
-| `backfill_bar_flags.py` | إعادة حساب أعلام تشوّه الشموع (المصيدة #22) | لا |
-| `backfill_sizes.py` | ملء حقول الحجم رجعياً | نعم (يوقف المسجّل) |
-| `backfill_thesis.py` | استرجاع تاريخ الأطروحات | نعم |
-| `backfill_bars.py` | التاريخ السعريّ اليوميّ لكلّ عملة لحساب ATH موثوق. الواجهة تقصّ عند ~900 شمعة فنسحب بدقّة `1D` ونتصفّح للخلف بأقدم ختمٍ عاد. الكتابة idempotent و`historical_bars_state` تجعله قابلاً للاستئناف — **ولا تُعتبر السلسلة صالحة للميزات إلّا عند `last_status='ok'`** | نعم |
-| `backfill_training_ath.py` | ترقية صفوف تدريب قديمة إلى ميزة ATH اليوميّة بلا إعادة بناء كل الميزات (الإصدار 3 غيّر عائلة ATH فقط) | لا |
-| `backfill_activity.py` | استرجاع تاريخ tradingActivity (حتى 2025-10-22) — ⛔ **لا تشغّله**: مصدرُ الصفوف الرجعية المستبعَدة من التدريب (§4، المبدأ 7) | لا |
-| `backfill_activity_bars.py` | شموع أزمنة أحداث الرجعيّ (لتوسيمها) — نفس التحذير | لا |
+| `backfill_extracted_fields.py` | fill columns extracted late from saved raw data (likes · views · num_replies · pinned …) — **they were in `raw_json` from day one** and the extractor never read them, so they were lost to analysis alone, not to the archive | no |
+| `backfill_bar_flags.py` | recompute candle corruption flags (trap #22) | no |
+| `backfill_sizes.py` | backfill the size fields | yes (stops the recorder) |
+| `backfill_thesis.py` | recover thesis history | yes |
+| `backfill_bars.py` | the daily price history per coin for a trustworthy ATH. The endpoint truncates at ~900 candles, so we pull at `1D` resolution and page backward by the oldest timestamp returned. The write is idempotent and `historical_bars_state` makes it resumable — **and the series counts for features only when `last_status='ok'`** | yes |
+| `backfill_training_ath.py` | upgrade old training rows to the daily ATH feature without rebuilding every feature (version 3 changed the ATH family alone) | no |
+| `backfill_activity.py` | recover tradingActivity history (back to 2025-10-22) — ⛔ **do not run it**: the source of the retrospective rows excluded from training (§4, principle 7) | no |
+| `backfill_activity_bars.py` | candles for the retrospective events' times (to label them) — same warning | no |
 
-#### اشتقاق (طبقةٌ فوق الموسَّم — بلا شبكة)
+#### Derivation (a layer above the labeled data — no network)
 
-| السكربت | الغرض |
+| Script | Purpose |
 |---|---|
-| `classify_tokens.py` | تصنيف الأصول: ميم/كبير/مسعَّر/مستقرّة (المصيدة #23) |
-| `build_training_rows.py` | بناء `training_rows` من النتائج الموسومة — و`FomoBuildRows` يشغّله كل ساعة تلقائياً |
-| `relabel_suspect.py` | حذف نتائجَ نافذتُها مشوّهة ليعيد الموسِّم حسابها (يتطلّب إيقاف المسجّل) |
-| `seed_control_retro.py` | ضابطة رجعية من اللقطات (يتطلّب إيقاف المسجّل) — تحليل حساسية لا نتيجة أساسية |
+| `classify_tokens.py` | asset classification: meme/major/priced/stable (trap #23) |
+| `build_training_rows.py` | build `training_rows` from labeled outcomes — and `FomoBuildRows` runs it hourly, automatically |
+| `relabel_suspect.py` | delete outcomes whose window is corrupted so the labeler recomputes them (requires stopping the recorder) |
+| `seed_control_retro.py` | retrospective control from snapshots (requires stopping the recorder) — a sensitivity analysis, not a primary result |
 
-#### تحليل وتدريب (قراءة فقط)
+#### Analysis and training (read-only)
 
-| السكربت | الغرض |
+| Script | Purpose |
 |---|---|
-| `phase1_analysis.py` | بوّابة المرحلة 1: هل نوافذ الإشارة تتفوّق على الضابطة؟ يولّد تقرير `docs/phase1-*.md` |
-| `pattern_analysis.py` | تحليل أنماط قابل للتفسير مع لايقين على مستوى العملة — يفصل «لمس +20% في 24س» عن «مربحٌ عند نهاية 48س» صراحةً |
-| `run_exit_sim.py` | مقارنة قواعد الخروج + نقاط التعادل |
-| `train_pipeline.py` | أنبوب التدريب النهائي: walk-forward زمنيّ + منع انتقال العملة بين الطيّات + هدفٌ من المحاكاة. يعمل على `model_training_rows` ويقيّم على العملات الجديدة وحدها بالإضافة إلى كل الإشارات، **ويرفض الاستنتاج عند تسريب هدفٍ مشتقّ في الميزات** |
-| `backtest_strategy.py` | باك تست الاستراتيجية المستنتجة على كل الأرشيف (train + val + test)، بعتباتٍ من `train` وحدها |
-| `export_dataset.py` | تصدير حزمة تحليل خارجية (صفوف + شموع + سعر الدخول معاً — الهدف ناتجُ محاكاة تمشي على الشموع، فمن يملك الصفوف بلا شموع لا يستطيع إعادة بنائه) |
+| `phase1_analysis.py` | the phase-1 gate: do signal windows beat the control? generates the `docs/phase1-*.md` report |
+| `pattern_analysis.py` | interpretable pattern analysis with per-coin uncertainty — explicitly separates "touched +20% within 24h" from "profitable at the end of 48h" |
+| `run_exit_sim.py` | exit-rule comparison + break-even points |
+| `train_pipeline.py` | the final training pipeline: time-based walk-forward + coin leakage prevention across folds + a simulation-derived target. Runs on `model_training_rows` and evaluates on new coins alone in addition to all signals, **and refuses the conclusion when a target-derived leak is found in the features** |
+| `backtest_strategy.py` | backtest the inferred strategy on the whole archive (train + val + test), with thresholds from `train` alone |
+| `export_dataset.py` | export an external analysis bundle (rows + candles + entry price together — the target is the output of a simulation that walks the candles, so whoever holds the rows without the candles cannot rebuild it) |
 
-سكربتات الترحيل تدعم `--dry-run`.
+Migration scripts support `--dry-run`.
 
-> **حالة الدفتر الآن**: `meta.evm_ledger_rebuild_required = 1` و
-> `evm_ledger_generation = 5` — أي أنّ إصلاحاً في صحّة دفتر EVM قد وقع وبيانات
-> EVM المشتقّة تحتاج تصفيراً وإعادة بناء عبر `repair_evm_ledger.py`. لا تستنتج
-> من ميزات EVM قبل نزول هذه الراية إلى 0.
+> **The ledger's current state**: `meta.evm_ledger_rebuild_required = 1` and
+> `evm_ledger_generation = 5` — meaning a fix to EVM ledger integrity has occurred and
+> the derived EVM data needs zeroing and rebuilding via `repair_evm_ledger.py`. Draw no
+> conclusions from EVM features before this flag drops to 0.
 
-سكربتات الترحيل تدعم `--dry-run`.
+Migration scripts support `--dry-run`.
 
-**قبل أيّ تدريب** (بهذا الترتيب): `classify_tokens.py` ثمّ
-`build_training_rows.py` — **بلا `--rebuild`**. تلك الراية **تحذف** الجدول أوّلاً
-(انظر §4)؛ والبناء التزايديّ يكتب فوق الصفّ الموجود، فبمجرّد رفع
-`FEATURE_VERSION` يعيد `FomoBuildRows` وحده بناء ما تغيّر. أمّا سببُ الترتيب فهو
-أنّ أيّ استرجاعٍ لبياناتٍ **عن الماضي** بعد بناء الصفّ (أطروحات · ثوابت · شموع ·
-أعلام تشوّه · تصنيف) يغيّر قيم ميزاته، فصفوفٌ بُنيت في أوقات مختلفة تصير غير
-متّسقة بصمت — راجع [docs/PLAN.md](docs/PLAN.md) المرحلة 3.
+**Before any training** (in this order): `classify_tokens.py` then
+`build_training_rows.py` — **without `--rebuild`**. That flag **deletes** the table
+first (see §4); incremental building overwrites the existing row, so on any
+`FEATURE_VERSION` bump `FomoBuildRows` alone rebuilds what changed. The reason for the
+order is that any recovery of **past** data after a row was built (theses · constants ·
+candles · corruption flags · classification) changes its feature values, so rows built
+at different times silently become inconsistent — see [docs/PLAN.md](docs/PLAN.md),
+phase 3.
 
-### محاكي قواعد الخروج
+### The exit-rule simulator
 
 ```powershell
 cd recorder; py run_exit_sim.py --cost 0.02
-cd recorder; py run_exit_sim.py --source activity --cost 0.02   # على الرجعيّ
+cd recorder; py run_exit_sim.py --source activity --cost 0.02   # on the retrospective set
 ```
 
-أداة لاختبار **متى نخرج؟** — تحاكي الجني والوقف والوقف المتحرّك والحدّ الزمنيّ
-على الشموع، وتحسب نقطة التعادل أمام التكلفة.
+A tool for testing **when do we exit?** — it simulates take-profit, stop-loss,
+trailing-stop, and time-limit rules on the candles, and computes the break-even point
+against cost.
 
-⚠️ **أداة لا نتيجة.** التشغيلات الحالية على نوافذ مبتورة وعيّنة دون عتبة النضج،
-فمخرجاتها استطلاعية لا تُبنى عليها قرارات. تفاصيلها ومنهجها في
-[recorder/README.md](recorder/README.md#محاكي-قواعد-الخروج-exit_simpy).
-
----
-
-## 12. الأمان
-
-- **الاعتمادات**: `api/.privy_state.json` (توكن التجديد الدوّار) و
-  `.privy_state.json.consumer_key`. تُكتب 0600، **لا تُطبع أبداً**، ومُغطّاة
-  في `.gitignore`. احذف الملفّ للإبطال الكامل.
-- **التجديد التلقائي**: `TokenRefresher` كل 60 ثانية بلا متصفّح. توكن fomo عمره
-  60 دقيقة بالضبط؛ المسجّل يعيد قراءة القرص كل دورة (كان يجمّده فيرمي 401/ساعة).
-- **المنافذ محلّية فقط**: 8080 و8090 على `127.0.0.1`.
-- **اللوحة قراءة محضة**: تفتح القاعدة `mode=ro` — لا كتابة إلى SQLite ولا
-  تعطيل للمسجّل، ولا أيّ مسار كتابة في الخادم.
-- **قراءة فقط تجاه fomo**: لا نداء يكتب حالة حساب أو تداول.
-- **حارسا اللوحة يبقيان** رغم انعدام مسارات الكتابة: حارس `Host` ضدّ DNS
-  rebinding على كل المسارات، وCSRF (رمز جلسة + `Origin/Referer`) لأي طلب يغيّر
-  الحالة — أرخص من تذكّر إعادتهما عند أوّل مسار كتابة يُضاف.
-- **Redis غائب** — النظام يعمل على `FakeRedis` في الذاكرة. كافٍ محلياً؛ الجلسات
-  تُمسح عند إعادة التشغيل ويعيد الإقلاع توليدها.
+⚠️ **A tool, not a result.** Current runs are on truncated windows and a sample below
+the maturity threshold, so its outputs are exploratory and not a basis for decisions.
+Its details and methodology are in
+[recorder/README.md](recorder/README.md#exit-rule-simulator-exit_simpy).
 
 ---
 
-## 13. التوثيق التفصيلي
+## 12. Security
 
-### مراجع دائمة
+- **Credentials**: `api/.privy_state.json` (the rotating renewal token) and
+  `.privy_state.json.consumer_key`. Written 0600, **never printed**, and covered by
+  `.gitignore`. Delete the file for a full revoke.
+- **Auto-renewal**: `TokenRefresher` every 60 seconds without a browser. The fomo token
+  lives exactly 60 minutes; the recorder re-reads the disk every cycle (it used to
+  freeze it and die 401 once an hour).
+- **Local-only ports**: 8080 and 8090 on `127.0.0.1`.
+- **The dashboard is read-only**: it opens the database `mode=ro` — no writes to SQLite,
+  no disabling of the recorder, and no write path in the server.
+- **Read-only toward fomo**: no call writes account or trading state.
+- **The dashboard's two guards stay** despite the absence of write paths: a `Host`
+  guard against DNS rebinding on every route, and CSRF (session token + `Origin/Referer`)
+  for any state-changing request — cheaper than remembering to re-add them at the first
+  write route.
+- **No Redis** — the system runs on in-memory `FakeRedis`. Sufficient locally; sessions
+  are wiped on restart and boot regenerates them.
 
-| الوثيقة | المحتوى |
+---
+
+## 13. Detailed documentation
+
+### Standing references
+
+| Document | Contents |
 |---|---|
-| [`docs/PLAN.md`](docs/PLAN.md) | **ماذا نفعل بعد جمع البيانات — بالتفصيل.** المرجعُ الملزم وحدَه لعتبات النمذجة والتداول الورقي، ولقرار البوّابة وشروط نقضه |
-| [`recorder/README.md`](recorder/README.md) | المسجّل والموسِّم: الشموع، الاجتماعي، الضابطة، الضغط |
-| [`api/README.md`](api/README.md) | الخادم: المصادقة، التنبيهات، السجلّات |
-| [`dashboard/README.md`](dashboard/README.md) | اللوحة: المقاييس، قرارات التصميم |
-| `specs/001-fomo-family-api/` | المواصفات الأصلية (spec, plan, contracts) |
+| [`docs/PLAN.md`](docs/PLAN.md) | **What we do after data collection — in detail.** The sole binding reference for modeling and paper-trading thresholds, for the gate decision and the conditions to overturn it |
+| [`recorder/README.md`](recorder/README.md) | The recorder and labeler: candles, social, control, compression |
+| [`api/README.md`](api/README.md) | The server: authentication, alerts, logs |
+| [`dashboard/README.md`](dashboard/README.md) | The dashboard: metrics, design decisions |
+| `specs/001-fomo-family-api/` | The original specifications (spec, plan, contracts) |
 
-### تقارير مؤرَّخة — **لقطاتٌ لا مراجع**
+### Dated reports — **snapshots, not references**
 
-كلُّ ملفٍّ هنا أرقامُ يومِ صدوره وحدَه؛ والقاعدة تنمو كل دقيقة فكلُّ عددٍ فيه
-أصغرُ من الواقع اليوم. ولا يُقتبَس رقمٌ منها في قرار — أعِد التوليد أوّلاً.
+Every file here carries only its publication day's numbers; the database grows every
+minute, so every count in them is smaller than today's reality. No number from them is
+quoted into a decision — regenerate first.
 
-| التقرير | الحالة | يعاد توليده بـ |
+| Report | Status | Regenerate with |
 |---|---|---|
-| [`docs/phase1-2026-08-07.md`](docs/phase1-2026-08-07.md) | **أحدثُ** تشغيلٍ للمرحلة 1 (n=89 إشارة مقابل 10 ضابطة · وسيط −0.1%/−0.1% · `U=503`, `p=0.2522` · اختلال شبكات 0.360) — **البوّابة غير مجتازة** | `py recorder/phase1_analysis.py` |
-| [`docs/phase1-2026-08-02.md`](docs/phase1-2026-08-02.md) | **سجلٌّ محفوظٌ عن قصد**: التقريرُ الذي بُني عليه قرارُ «لم تجتز» في `PLAN.md`، يبقى ليُراجَع القرارُ بمصدره | نفسه |
-| [`docs/pattern-analysis-2026-08-08.md`](docs/pattern-analysis-2026-08-08.md) | **أحدثُ** تحليل أنماط (4,097 إشارة مستقلة صالحة · 346 عملة) | `py recorder/pattern_analysis.py` |
-| [`docs/pattern-analysis-2026-08-07.md`](docs/pattern-analysis-2026-08-07.md) | **مُتجاوَزة** بالتي بعدها؛ تُحفظ لتُقارن اللقطتان لا لتُقرأ وحدها | نفسه |
+| [`docs/phase1-2026-08-07.md`](docs/phase1-2026-08-07.md) | **The newest** phase-1 run (n=89 signals versus 10 controls · median −0.1%/−0.1% · `U=503`, `p=0.2522` · network imbalance 0.360) — **gate not passed** | `py recorder/phase1_analysis.py` |
+| [`docs/phase1-2026-08-02.md`](docs/phase1-2026-08-02.md) | **A record kept on purpose**: the report the "not passed" decision in `PLAN.md` was built on; it stays so the decision can be reviewed at its source | same |
+| [`docs/pattern-analysis-2026-08-08.md`](docs/pattern-analysis-2026-08-08.md) | **The newest** pattern analysis (4,097 valid independent signals · 346 coins) | `py recorder/pattern_analysis.py` |
+| [`docs/pattern-analysis-2026-08-07.md`](docs/pattern-analysis-2026-08-07.md) | **Superseded** by the next one; kept so the two snapshots can be compared, not to be read alone | same |
 
-> لماذا تُحفظ لقطةٌ متجاوَزة أصلاً؟ لأنّ الفرق بين لقطتين متتاليتين هو القياس
-> الوحيد لاستقرار النتيجة: تحليل 08-07 غطّى **4,215** إشارة و**322** عملة،
-> وتحليل 08-08 غطّى **4,097** و**346** — عدد الإشارات **نقص** بينما نضجت العملات
-> يوماً. رقمٌ يتحرّك هكذا بين يومين ليس أساساً لقرار، وحفظُ اللقطة القديمة هو ما
-> يُظهر ذلك.
+> Why keep a superseded snapshot at all? Because the difference between two consecutive
+> snapshots is the only measurement of a result's stability: the 08-07 analysis covered
+> **4,215** signals and **322** coins, and the 08-08 analysis covered **4,097** and
+> **346** — the signal count **fell** while coins matured by a day. A number that moves
+> like that between two days is not a basis for a decision, and keeping the old snapshot
+> is what shows it.

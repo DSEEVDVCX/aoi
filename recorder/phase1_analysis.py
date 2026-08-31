@@ -1,4 +1,4 @@
-"""تحليل بوابة المرحلة 1: هل نوافذ الإشارة تتفوّق على الضابطة؟"""
+"""Phase-1 gate analysis: do signal windows beat the control arm?"""
 from __future__ import annotations
 
 import argparse
@@ -122,7 +122,7 @@ def _read_rows(db_path: str, *, include_retro_controls: bool) -> list[dict]:
 
 
 def _deduplicate_tokens(rows: list[dict]) -> tuple[list[dict], dict[str, int]]:
-    """أقدم نافذة لكل عملة، ثم حذف العملات التي ظهرت في المجموعتين."""
+    """The oldest window per coin, then drop coins that appeared in both groups."""
     first: dict[tuple[int, str, str], dict] = {}
     group_tokens: dict[int, set[tuple[str, str]]] = {0: set(), 1: set()}
     duplicates = Counter()
@@ -323,95 +323,108 @@ def render_markdown(primary: dict, sensitivity: dict, *, db_path: str) -> str:
     date = generated_dt.date().isoformat()
     missingness_significant = primary["missingness"]["p_two_sided"] < ALPHA
     structural_blockers = missingness_significant or primary["network_imbalance"]
-    gate = "ناجحة" if primary["success"] and not structural_blockers else "غير مجتازة"
+    gate = "passed" if primary["success"] and not structural_blockers else "not passed"
     sensitivity_changed = sensitivity["success"] != primary["success"]
     exclusions = primary["exclusions"]
-    return f"""# نتيجة المرحلة 1 — {date}
+    return f"""# Phase 1 result — {date}
 
-> أُنشئ في {generated} من `{db_path}` بواسطة `py recorder/phase1_analysis.py`.
-> آخر ختم دخول مشمول: `{primary['max_entry_ts']}`. النتيجة الأساسية: حيّ فقط،
-> `asset_class='meme'` صراحة، ضابطة `source='control'` فقط، وأقدم نافذة واحدة
-> لكل عملة مع حذف العملات التي ظهرت في المجموعتين.
+> Generated at {generated} from `{db_path}` by `py recorder/phase1_analysis.py`.
+> Latest included entry stamp: `{primary['max_entry_ts']}`. The primary result: live
+> only, `asset_class='meme'` explicitly, control with `source='control'` only, and the
+> single oldest window per coin, dropping coins that appeared in both groups.
 
-## المعيار المثبّت
+## The fixed criterion
 
-- أصغر فرق وسيط يستحق المتابعة: **5 نقاط مئوية** لصالح الإشارة.
-- نجاح البوابة يتطلب تفوّقاً ذا معنى في **الوسيط ونسبة الفوز معاً**.
-- Mann–Whitney U أحادي الاتجاه (`signal` أعلى رتبةً من `control`) عند `alpha=0.05`.
-- فحص حساسية القدرة لمكوّن Mann–Whitney فقط. يفترض، على نحو صريح ومحدود،
-  إزاحة موقعية +5 نقاط لتوزيع الضابطة كله؛ **ليس قدرة البوابة المركبة** ولا
-  يثبت القدرة لكل شكل أثر ممكن.
-- فواصل الثقة bootstrap بنسبة 95%. لا t-test بسبب الالتواء الشديد.
+- The smallest median difference worth pursuing: **5 percentage points** in favor of
+  the signal.
+- Gate success requires a meaningful edge in **both the median and the win rate**.
+- One-sided Mann–Whitney U (`signal` ranked higher than `control`) at `alpha=0.05`.
+- The power sensitivity check covers the Mann–Whitney component only. It assumes,
+  explicitly and narrowly, a +5-point location shift of the whole control
+  distribution; **not the power of the composite gate**, and it does not establish
+  power for every possible effect shape.
+- Confidence intervals are 95% bootstrap. No t-test because of the extreme skew.
 
-## تكوين العينة
+## Sample composition
 
-- حُذفت {exclusions['duplicate_signal_windows_removed']} نافذة إشارة مكررة
-  و{exclusions['duplicate_control_windows_removed']} نافذة ضابطة مكررة، وأُزيلت
-  {exclusions['overlap_tokens_removed']} عملات ظهرت في المجموعتين.
-- توزيع الشبكات، الإشارة: {_network_text(primary['networks'][0])}.
-- توزيع الشبكات، الضابطة: {_network_text(primary['networks'][1])}.
-- مسافة الاختلال الكلية بين نسب الشبكات: {primary['network_total_variation']:.3f}
-  (أكبر من 0.10 ⇒ اختلال جوهري وفق حرس التحليل).
+- {exclusions['duplicate_signal_windows_removed']} duplicate signal windows and
+  {exclusions['duplicate_control_windows_removed']} duplicate control windows were
+  removed, and {exclusions['overlap_tokens_removed']} coins that appeared in both
+  groups were dropped.
+- Network distribution, signal: {_network_text(primary['networks'][0])}.
+- Network distribution, control: {_network_text(primary['networks'][1])}.
+- Total-variation distance between network shares: {primary['network_total_variation']:.3f}
+  (above 0.10 ⇒ material imbalance by the analysis guard).
 
-| المجموعة | كل النوافذ | `ok` | `no_entry` | `no_bars` | نسبة الفقد الكلية |
+| Group | all windows | `ok` | `no_entry` | `no_bars` | total missing rate |
 |---|---:|---:|---:|---:|---:|
-| الإشارة | {signal_status['total']} | {signal_status['ok']} | {signal_status['no_entry']} | {signal_status['no_bars']} | {signal_status['missing_rate'] * 100:.1f}% |
-| الضابطة | {control_status['total']} | {control_status['ok']} | {control_status['no_entry']} | {control_status['no_bars']} | {control_status['missing_rate'] * 100:.1f}% |
+| Signal | {signal_status['total']} | {signal_status['ok']} | {signal_status['no_entry']} | {signal_status['no_bars']} | {signal_status['missing_rate'] * 100:.1f}% |
+| Control | {control_status['total']} | {control_status['ok']} | {control_status['no_entry']} | {control_status['no_bars']} | {control_status['missing_rate'] * 100:.1f}% |
 
-فحص فقد النتيجة (`no_entry` + `no_bars`): `Fisher exact p={_p(primary['missingness']['p_two_sided'])}`؛
-الفرق {'دال، ولذلك التصفية على `ok` انتقائية ولا تسمح بحكم سببي نهائي' if missingness_significant else 'غير دال في العينة الحالية'}.
-لا تُسند عوائد مفبركة لصفوف `no_bars`؛ تبقى ضمن تحليل الفقدان فقط وتُستبعد من
-مقاييس العائد التي لا يمكن اشتقاقها.
-`bars_truncated` لم يُستبعد لأنه قد يعني موت الأصل لا نقصاً: نسبته
-{signal['truncated_rate'] * 100:.1f}% للإشارة و{control['truncated_rate'] * 100:.1f}% للضابطة.
+Outcome-missingness test (`no_entry` + `no_bars`): `Fisher exact p={_p(primary['missingness']['p_two_sided'])}`;
+the difference is {'significant, so filtering to `ok` is selective and permits no final causal verdict' if missingness_significant else 'not significant in the current sample'}.
+No fabricated returns are imputed for `no_bars` rows; they stay within the
+missingness analysis only and are excluded from the return metrics, which cannot be
+derived for them.
+`bars_truncated` was not excluded because it may mean the asset died rather than a
+data gap: its rate is {signal['truncated_rate'] * 100:.1f}% for the signal and
+{control['truncated_rate'] * 100:.1f}% for the control.
 
-## النتيجة الوصفية
+## Descriptive result
 
-| المقياس | الإشارة (n={signal['n']}) | الضابطة (n={control['n']}) | الفرق |
+| Metric | Signal (n={signal['n']}) | Control (n={control['n']}) | Difference |
 |---|---:|---:|---:|
-| العائد النهائي ضمن نافذة 48س، الوسيط | {_pct(signal['median'])} | {_pct(control['median'])} | {_pct(median_diff['estimate'])} |
-| العائد النهائي، المتوسط | {_pct(signal['mean'])} | {_pct(control['mean'])} | {_pct(signal['mean'] - control['mean'])} |
-| نسبة الفوز | {signal['win_rate'] * 100:.1f}% | {control['win_rate'] * 100:.1f}% | {_pct(win_diff['estimate'])} |
-| قمّة 24س، الوسيط | {_pct(signal['peak_24h_median'])} | {_pct(control['peak_24h_median'])} | {_pct(signal['peak_24h_median'] - control['peak_24h_median'])} |
+| Final return within the 48h window, median | {_pct(signal['median'])} | {_pct(control['median'])} | {_pct(median_diff['estimate'])} |
+| Final return, mean | {_pct(signal['mean'])} | {_pct(control['mean'])} | {_pct(signal['mean'] - control['mean'])} |
+| Win rate | {signal['win_rate'] * 100:.1f}% | {control['win_rate'] * 100:.1f}% | {_pct(win_diff['estimate'])} |
+| 24h peak, median | {_pct(signal['peak_24h_median'])} | {_pct(control['peak_24h_median'])} | {_pct(signal['peak_24h_median'] - control['peak_24h_median'])} |
 | rug | {signal['rug_rate'] * 100:.1f}% | {control['rug_rate'] * 100:.1f}% | {_pct(signal['rug_rate'] - control['rug_rate'])} |
 
-- فرق الوسيط 95% CI: **[{_pct(median_diff['low'])}, {_pct(median_diff['high'])}]**.
-- فرق الفوز 95% CI: **[{_pct(win_diff['low'])}, {_pct(win_diff['high'])}]**.
-- Mann–Whitney: `U={mw['u']:.0f}`، `p` للتفوّق الرتبي={_p(mw['p_greater'])}،
-  `p` ثنائي={_p(mw['p_two_sided'])}، rank-biserial={mw['rank_biserial']:+.3f}.
+- Median difference 95% CI: **[{_pct(median_diff['low'])}, {_pct(median_diff['high'])}]**.
+- Win-rate difference 95% CI: **[{_pct(win_diff['low'])}, {_pct(win_diff['high'])}]**.
+- Mann–Whitney: `U={mw['u']:.0f}`, rank-superiority `p`={_p(mw['p_greater'])},
+  two-sided `p`={_p(mw['p_two_sided'])}, rank-biserial={mw['rank_biserial']:+.3f}.
 
-## القدرة والقرار
+## Power and decision
 
-- حساسية قدرة Mann–Whitney المشروطة بنموذج الإزاحة +5 نقاط:
-  **{power['current_power'] * 100:.1f}%**. لا نعرض n مطلوباً لأن النجاح الفعلي
-  مركّب من فرق الوسيط وفاصله وفرق الفوز أيضاً، والمحاكاة الحالية لا تمثله كاملاً.
-- **حالة بوابة المرحلة 1: {gate}.** البيانات لا تحقق تفوقاً في الوسيط ونسبة
-  الفوز معاً، كما أن اختلاف الشبكات وفقد الدخول يمنعان تفسير الفرق كأثر الإشارة.
-- **القرار العملي: لا يبدأ تدريب نموذج الدخول العام الآن.** أصلح تصميم الضابطة
-  أولاً أو انتقل إلى فرضية فرعية محددة مسبقاً؛ النمذجة على هذه المقارنة ستخلط
-  أثر الإشارة باختلاف الكون والشبكة وقابلية التسعير.
+- Mann–Whitney power sensitivity conditional on the +5-point shift model:
+  **{power['current_power'] * 100:.1f}%**. No required n is shown because actual
+  success is composite — the median difference and its interval and the win-rate
+  difference too — and the current simulation does not represent all of it.
+- **Phase-1 gate status: {gate}.** The data show no edge in the median and the win
+  rate together, and the network difference and entry missingness bar reading the
+  difference as an effect of the signal.
+- **Practical decision: general entry-model training does not start now.** Fix the
+  control design first, or move to a pre-specified sub-hypothesis; modeling on this
+  comparison would mix the signal effect with universe, network, and priceability
+  differences.
 
-## تحليل الحساسية
+## Sensitivity analysis
 
-بإضافة الضابطة الرجعية `control_retro`: n الإشارة={sensitivity['summaries'][0]['n']}،
-n الضابطة={sensitivity['summaries'][1]['n']}، فرق الوسيط
-{_pct(sensitivity['median_difference']['estimate'])}، و`p` للتفوّق الرتبي
-={_p(sensitivity['mann_whitney']['p_greater'])}. تحليل الحساسية
-{'يغيّر حكم النجاح الحسابي، ولذلك لا يجوز دمج المصدرين' if sensitivity_changed else 'لا يغيّر حكم النجاح الحسابي'}؛
-لكنه لا يصلح نتيجة أساسية لأن مسار جمعه واسترجاع شموعه مختلف.
+Adding the retro control `control_retro`: signal n={sensitivity['summaries'][0]['n']},
+control n={sensitivity['summaries'][1]['n']}, median difference
+{_pct(sensitivity['median_difference']['estimate'])}, and rank-superiority `p`
+={_p(sensitivity['mann_whitney']['p_greater'])}. The sensitivity analysis
+{'changes the computational success verdict, so the two sources must not be merged' if sensitivity_changed else 'does not change the computational success verdict'};
+but it cannot serve as the primary result because its collection path and bar
+retrieval are different.
 
-## لماذا النتيجة ليست حكماً سببياً
+## Why the result is not a causal verdict
 
-- الضابطة تُسحب من `trending/verified` بينما الإشارة تأتي من feed؛ الكونان غير
-  متطابقين، وتوزيع الشبكات غير متوازن.
-- الضابطة التي تتلقى إشارة قبل توسيم نافذتها قد تُرقّى في `watchlist` ويضيع صفها
-  الضابط؛ هذا حذف انتقائي لا يمكن إصلاحه رجعياً من الجدول الحالي.
-- فرق الفقدان (`no_entry` أو `no_bars`) يعني أن تحليل `status='ok'` يقارن جزأين مختلفين في قابلية
-  التسعير. Fisher يشخّص المشكلة ولا يعالج انحيازها.
-- تصنيف `token_class` مشتق من كل المشاهدات المتاحة وقد يتغير لاحقاً. لذلك هذا
-  التقرير لقطة قابلة للتدقيق، لا عينة مسجلة مسبقاً وغير قابلة للتغير.
-- Mann–Whitney يقيس ترتيب التوزيع لا فرق الوسيط تحديداً، وrank-biserial هو أثر
-  ترتيب زوجي. معيار الوسيط منفصل ومحسوب بفاصل bootstrap.
+- The control is drawn from `trending/verified` while the signal comes from the feed;
+  the two universes do not match, and the network distribution is unbalanced.
+- A control that receives a signal before its window is labeled may be promoted in
+  `watchlist` and its control row is lost; that is selective deletion which cannot be
+  repaired retroactively from the current table.
+- A missingness difference (`no_entry` or `no_bars`) means the `status='ok'` analysis
+  compares two parts that differ in priceability. Fisher diagnoses the problem; it
+  does not cure its bias.
+- The `token_class` classification is derived from all available observations and may
+  change later. So this report is an auditable snapshot, not a pre-registered,
+  immutable sample.
+- Mann–Whitney measures distribution order, not the median difference specifically,
+  and rank-biserial is a pairwise order effect. The median criterion is separate and
+  computed with a bootstrap interval.
 """
 
 

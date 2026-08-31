@@ -103,11 +103,11 @@ async def main() -> None:
 
         await page.goto("https://fomo.family", wait_until="domcontentloaded")
         print("=" * 70, flush=True)
-        print(">>> سجّل دخولك، ثم تنقّل في الموقع لالتقاط المسارات:", flush=True)
-        print(">>>   1) افتح صفحة المتصدرين (Leaderboard)", flush=True)
-        print(">>>   2) افتح ملف متداول ومرّر نشاطه (activity)", flush=True)
-        print(">>>   3) افتح التنبيهات/الإشعارات (Alerts)", flush=True)
-        print(">>> اضغط Ctrl+C هنا عند الانتهاء (يُحفظ تلقائياً كل 5 ثوانٍ).", flush=True)
+        print(">>> Sign in, then navigate the site to capture the endpoints:", flush=True)
+        print(">>>   1) Open the Leaderboard page", flush=True)
+        print(">>>   2) Open a trader's profile and scroll their activity", flush=True)
+        print(">>>   3) Open the alerts/notifications view", flush=True)
+        print(">>> Press Ctrl+C here when done (saved automatically every 5 seconds).", flush=True)
         print("=" * 70, flush=True)
 
         def _dump() -> None:
@@ -125,7 +125,7 @@ async def main() -> None:
             pass
         finally:
             _dump()
-            print(f"\n>>> تم حفظ {len(captured)} مسار في {OUT}", flush=True)
+            print(f"\n>>> Saved {len(captured)} endpoints to {OUT}", flush=True)
             try:
                 await browser.close()
             except Exception:

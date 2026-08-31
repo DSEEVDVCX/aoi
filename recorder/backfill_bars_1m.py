@@ -1,24 +1,26 @@
-"""أرشفة شموع 1 دقيقة لنوافذ القرار — لكل عملات المجموعة الرئيسية.
+"""Archive 1-minute bars for decision windows — for every main-group token.
 
-المالك (2026-08-28): «نفّذ لكل العملات لا الجديدة فقط — أعمل مع AI آخر
-لاستخراج أفضل طريقة تدريب ولا أريد انتظار الضابطة». الأرشفة تفتح للتحليل
-المحيط الأولي الخارجي: دقة الدقيقة لكل من `time_to_plus20` والمحاكاة،
-والدقائق الـ15 الأولى بعد الإشارة (نافذة إعلان الانفجار المبكر).
+The owner (2026-08-28): "Run it for every token, not just the new ones — I am
+working with another AI to extract the best training method and I do not want
+to wait for the control arm." Archiving opens the outer initial-envelope
+analysis: minute precision for `time_to_plus20` and simulation, and the first
+15 minutes after the signal (the early-explosion announcement window).
 
-القياس الحي قبل البناء (2026-08-28):
-- `resolution=1` يعمل على /proxy/getBarsNew (200 شمعة/نداء حي).
-- **الأرشيف متاح**: عملة عمرها 34 يومًا أعادت 500 شمعة من نافذة إشارتها.
-- 704 عملات المجموعة الرئيسية × ~6 نداءات (500/نداء × نافذة 48س) =
-  4,224 نداءً للكامل.
+Live measurement before building (2026-08-28):
+- `resolution=1` works on /proxy/getBarsNew (200 bars/call live).
+- **Archive is available**: a 34-day-old token returned 500 bars from its
+  signal window.
+- 704 main-group tokens × ~6 calls (500/call × a 48h window) = 4,224 calls for
+  the full set.
 
-التصميم: قابل للاستئناف (حالة historical_bars_state بمفتاح resolution='1'،
-حفظ الموقع في cursor_to)، بلا SQL يدوي (كتابة عبر db.insert_bars)،
-وتوقيت خلفي محترم للحد (نداء كل PACING ثانية). العملات التي مصدرها لا
-يعيدها (no_data) لا تُعاد كل تشغيل.
+Design: resumable (historical_bars_state with resolution='1', position kept
+in cursor_to), no hand-written SQL (writes via db.insert_bars), and polite
+timing that respects the limit (one call every PACING seconds). Tokens the
+source does not return (no_data) are not retried on every run.
 
-الاستعمال:
-    python backfill_bars_1m.py              # تشخيص
-    python backfill_bars_1m.py --apply      # تنفيذ (استئناف تلقائي)
+Usage:
+    python backfill_bars_1m.py              # diagnose
+    python backfill_bars_1m.py --apply      # execute (auto-resume)
     python backfill_bars_1m.py --apply --limit 50
 """
 from __future__ import annotations
@@ -37,23 +39,24 @@ import config  # noqa: E402
 from db import RecorderDB  # noqa: E402
 
 RES = "1"
-PAGE = 500                    # مقيس: أقصى ما يعيده المصدر للدقيقة الواحدة
-PACING = 1.0                  # ثانية بين النداءات — حذر مع رصيد fomo
-WINDOW_H = 48                 # نافذة القرار
+PAGE = 500                    # measured: the most the source returns at 1-minute resolution
+PACING = 1.0                  # seconds between calls — cautious with the fomo balance
+WINDOW_H = 48                 # the decision window
 
 
 async def _load_client():
-    """زبين fomo حي: توكن الخادم المحلي من القرص (نفس مسار المسجّل)."""
+    """A live fomo client: local-server token from disk (same path as the recorder)."""
     import recorder
 
     return recorder._build_client(recorder._load_access_token())
 
 
 def _targets(db: RecorderDB) -> list[dict]:
-    """كل عملات المجموعة الرئيسية: أقدم قرار لكل عملة — نافذته هي المدى.
+    """Every main-group token: the earliest decision per token — its window is the range.
 
-    الضابطة والنشطة كذلك: المالك طلب «كل العملات» — نضمّن المراقَبات
-    (kind=watch) فنافذتها نفسها قرار قابل للتحليل، والإشارات وحدها كذلك.
+    The control arm and active ones too: the owner asked for "every token" — we
+    include watched entries (kind=watch) since their windows are themselves an
+    analyzable decision, and signal-only ones as well.
     """
     rows = db._conn.execute(
         """SELECT o.token_address, o.network_id, MIN(o.entry_ts) AS entry_ts
@@ -99,7 +102,7 @@ def _save_state(db: RecorderDB, token: str, net: str, *, cursor_to: int | None,
 
 
 def _extract_bars(raw: dict) -> list[dict]:
-    """مغلّف getBarsNew → صفوف شموع (نفس شكل مستخرج المسجّل)."""
+    """getBarsNew envelope → bar rows (same shape as the recorder's extractor)."""
     ro = raw.get("responseObject") if isinstance(raw, dict) else None
     if not isinstance(ro, dict):
         return []
@@ -108,7 +111,7 @@ def _extract_bars(raw: dict) -> list[dict]:
     for i, t in enumerate(ts):
         try:
             out.append({
-                "token_address": None,  # يملؤه المستدعي
+                "token_address": None,  # filled by the caller
                 "network_id": None,
                 "resolution": RES,
                 "ts": int(t),
@@ -124,10 +127,10 @@ def _extract_bars(raw: dict) -> list[dict]:
 
 
 async def archive_token(client, db: RecorderDB, t: dict, stats: dict) -> None:
-    """أرشفة نافذة 48س (بدء决策 - سياق) لعملة واحدة — استئناف من cursor_to."""
+    """Archive a 48h window (decision start − context) for one token — resumes from cursor_to."""
     token, net = t["token_address"], str(t["network_id"])
     entry = int(t["entry_ts"])
-    start = entry - 3600                      # ساعة سياق قبل القرار
+    start = entry - 3600                      # one hour of context before the decision
     end = entry + WINDOW_H * 3600
     st = _state(db, token, net)
     if st and st["last_status"] == "ok":
@@ -142,10 +145,11 @@ async def archive_token(client, db: RecorderDB, t: dict, stats: dict) -> None:
         try:
             raw = await _fetch_bars_raw(client, token, net, start, cursor,
                                         resolution=RES)
-        except Exception:  # noqa: BLE001 — عطب عابر: تمهّل ثم أعد المحاولة
-            # قياس 2026-08-28: موجة 404 عابرة أوقفت 456 عملة في دقيقة
-            # (عملاتها تعمل عند إعادة المحاولة) — فالصواب تمهّل قصير مرتين
-            # قبل الاستسلام، والحالة partial تجعل الاستئناف اللاحق آمنًا.
+        except Exception:  # noqa: BLE001 — transient failure: back off then retry
+            # Measurement 2026-08-28: a transient 404 wave stalled 456 tokens
+            # in a minute (they work on retry) — so the right move is two
+            # short backoffs before giving up, and the partial state keeps a
+            # later resume safe.
             retried = False
             for wait_s in (5, 15):
                 await asyncio.sleep(wait_s)
@@ -165,7 +169,7 @@ async def archive_token(client, db: RecorderDB, t: dict, stats: dict) -> None:
         calls += 1
         bars = _extract_bars(raw)
         if not bars:
-            # لا بيانات في هذا المقطع: إما بداية السلسلة أو فجوة.
+            # no data in this segment: either the start of the series or a gap.
             _save_state(db, token, net, cursor_to=start, oldest_ts=cursor,
                         status="ok", candles=candles, calls=calls)
             stats["done"] += 1
@@ -178,7 +182,7 @@ async def archive_token(client, db: RecorderDB, t: dict, stats: dict) -> None:
         wrote = db.insert_bars(bars)
         candles += len(bars)
         oldest = min(int(b["ts"]) for b in bars)
-        cursor = min(cursor, oldest) - 60     # ننزل تحت أقدم شمعة بمقدار دقيقة
+        cursor = min(cursor, oldest) - 60     # drop one minute below the oldest bar
         stats["rows"] += wrote
         _save_state(db, token, net, cursor_to=cursor, oldest_ts=oldest,
                     status="partial", candles=candles, calls=calls)
@@ -204,10 +208,10 @@ async def main() -> int:
             if (s := _state(db, t["token_address"], str(t["network_id"])))
             and s["last_status"] == "ok"
         )
-        print(f"أهداف المجموعة الرئيسية: {len(targets):,} "
-              f"(منجز سابقًا: {done_prior:,})")
+        print(f"main-group targets: {len(targets):,} "
+              f"(already done: {done_prior:,})")
         if not args.apply:
-            print("\nتشخيص فقط — مرّر --apply للتنفيذ.")
+            print("\ndiagnosis only — pass --apply to execute.")
             return 0
 
         stats = {"done": 0, "rows": 0, "errors": 0, "already_done": 0}
@@ -224,7 +228,7 @@ async def main() -> int:
                 await client.aclose()
             except Exception:  # noqa: BLE001
                 pass
-        print(f"اكتملت الجولة: done={stats['done']} · rows={stats['rows']:,} · "
+        print(f"round complete: done={stats['done']} · rows={stats['rows']:,} · "
               f"err={stats['errors']} · skip={stats['already_done']}")
         return 0
     finally:

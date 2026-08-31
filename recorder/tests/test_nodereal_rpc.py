@@ -1,4 +1,4 @@
-"""اختبارات عميل NodeReal بلا شبكة أو مفاتيح حقيقية."""
+"""NodeReal client tests without network or real keys."""
 from __future__ import annotations
 
 import httpx
@@ -53,7 +53,8 @@ async def test_holder_count_keeps_unsupported_contract_count_null():
 
 @pytest.mark.asyncio
 async def test_rate_limit_error_is_distinguished(monkeypatch):
-    # المفاتيح تُثبَّت هنا: بلا ذلك يقرأ الحوض ملفَ الجهاز فيتعلّق الاختبار به.
+    # Keys are pinned here: without this the pool would read the machine's
+    # file and the test would hang off it.
     monkeypatch.setattr(nodereal_rpc, "_read_keys", lambda: ["only-key"])
     monkeypatch.setattr(nodereal_rpc.config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
     rpc = nodereal_rpc.NodeRealRPC.__new__(nodereal_rpc.NodeRealRPC)
@@ -101,7 +102,8 @@ async def test_nodereal_rotates_to_second_key_on_cups_limit(monkeypatch):
 
 
 async def test_nodereal_retries_a_transient_5xx_without_burning_the_key(monkeypatch):
-    """5xx عطلُ الخدمة لا عطبُ المفتاح: كان خطأً نهائيّاً ولو كان مفتاحٌ سليم."""
+    """A 5xx is the service's outage, not the key's: it used to be a final
+    error even when the key was healthy."""
     monkeypatch.setattr(nodereal_rpc, "_read_keys", lambda: ["only-key"])
     monkeypatch.setattr(nodereal_rpc.config, "CHAIN_TRANSIENT_BACKOFF_SECONDS", 0)
     seen = []

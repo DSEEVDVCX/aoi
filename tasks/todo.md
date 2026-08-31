@@ -1,931 +1,931 @@
-# قائمة مهام: إكمال بيانات FOMO والبلوك تشين
+# Task list: completing FOMO and blockchain data
 
-هذه القائمة تنفذ `tasks/plan.md`. كل مهمة يجب أن تنتهي باختبارات وتقرير تحقق قبل
-نقل المهمة التالية إلى `completed`.
+This list executes `tasks/plan.md`. Every task must end with tests and a verification report before
+the next task is moved to `completed`.
 
-## المرحلة 0 - خط الأساس والتدقيق
+## Phase 0 - Baseline and audit
 
-### T001 - عقد تقرير الجاهزية [مكتمل 2026-08-19]
+### T001 - Readiness report contract [completed 2026-08-19]
 
-**الوصف:** تحديد مخطط JSON ثابت لتقرير صحة كل مصدر وتغطيته.
+**Description:** Define a stable JSON schema for a per-source health and coverage report.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [x] يفرق المخطط بين `ok`, `empty`, `missing`, `error`, `stale`, و`unsupported`.
-- [x] يتضمن التغطية حسب اليوم والشبكة وعائلة الميزات.
-- [x] لا يتضمن أسراراً أو raw payloads.
+- [x] The schema distinguishes `ok`, `empty`, `missing`, `error`, `stale`, and `unsupported`.
+- [x] It includes coverage by day, network, and feature family.
+- [x] It contains no secrets or raw payloads.
 
-**التحقق:** اختبارات schema على fixtures كاملة وناقصة.
+**Verification:** Schema tests on complete and incomplete fixtures.
 
-**الاعتماديات:** لا شيء.
+**Dependencies:** none.
 
-**الملفات المتوقعة:** `recorder/data_readiness.py`, `recorder/tests/test_data_readiness.py`.
+**Expected files:** `recorder/data_readiness.py`, `recorder/tests/test_data_readiness.py`.
 
-### T002 - تنفيذ قارئ الجاهزية [مكتمل 2026-08-19]
+### T002 - Implement the readiness reader [completed 2026-08-19]
 
-**الوصف:** بناء أداة قراءة فقط للقاعدة تنتج JSON وملخصاً نصياً.
+**Description:** Build a read-only database tool that produces JSON and a text summary.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [x] تفتح SQLite في `mode=ro`.
-- [x] تقيس counts, timestamps, states, coverage, وfeature versions.
-- [x] لا تنفذ أي `INSERT`, `UPDATE`, أو migration.
+- [x] Opens SQLite in `mode=ro`.
+- [x] Measures counts, timestamps, states, coverage, and feature versions.
+- [x] Executes no `INSERT`, `UPDATE`, or migration.
 
-**التحقق:** `py -3 -m pytest recorder/tests/test_data_readiness.py`.
+**Verification:** `py -3 -m pytest recorder/tests/test_data_readiness.py`.
 
-**الاعتماديات:** T001.
+**Dependencies:** T001.
 
-### T003 - إضافة فحوص سلامة البيانات [مكتمل 2026-08-19]
+### T003 - Add data-integrity checks [completed 2026-08-19]
 
-**الوصف:** إضافة uniqueness، ثبات model view، timestamps، وحالات EVM.
+**Description:** Add uniqueness, model-view stability, timestamps, and EVM states.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [x] يكشف duplicate decision rows.
-- [x] يكشف replay ناجحاً بأرصدة سالبة أو صفوف تدريب قديمة.
-- [x] يعرض failures دون تعديل القاعدة.
+- [x] Detects duplicate decision rows.
+- [x] Detects a successful replay with negative balances or stale training rows.
+- [x] Displays failures without modifying the database.
 
-**التحقق:** fixtures مع أعطال متعمدة.
+**Verification:** Fixtures with deliberate faults.
 
-**الاعتماديات:** T002.
+**Dependencies:** T002.
 
-### T004 - تثبيت التقرير المرجعي [مكتمل 2026-08-19]
+### T004 - Freeze the reference report [completed 2026-08-19]
 
-**الوصف:** تشغيل أداة الجاهزية وحفظ تقرير مؤرخ مولد آلياً.
+**Description:** Run the readiness tool and save an auto-generated dated report.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [x] التقرير يذكر وقت القياس ومسار القاعدة وحجمها.
-- [x] أرقام كل العائلات الحالية موجودة.
-- [x] لا أرقام يدوية غير قابلة لإعادة الإنتاج.
+- [x] The report states the measurement time, database path, and size.
+- [x] Numbers for every current family are present.
+- [x] No manual, non-reproducible numbers.
 
-**التحقق:** إعادة التشغيل ومقارنة المخطط.
+**Verification:** Re-run and schema comparison.
 
-**الاعتماديات:** T003.
+**Dependencies:** T003.
 
-## نقطة تحقق A [مكتملة 2026-08-19]
+## Checkpoint A [completed 2026-08-19]
 
-- [x] اختبارات الوحدة كاملة تمر: `786 passed`.
-- [x] التقرير المرجعي محفوظ في `docs/data-readiness-2026-08-19.json` و`.md`.
-- [x] حجم وختم `recorder/recorder.db` متطابقان قبل وبعد التقرير.
+- [x] Full unit tests pass: `786 passed`.
+- [x] The reference report is saved in `docs/data-readiness-2026-08-19.json` and `.md`.
+- [x] `recorder/recorder.db` size and stamp are identical before and after the report.
 
-## المرحلة 1 - صحة EVM
+## Phase 1 - EVM integrity
 
-### T005 - نسخة احتياطية متحققة [مكتمل 2026-08-19]
+### T005 - Verified backup [completed 2026-08-19]
 
-**الوصف:** أخذ snapshot متسق قبل أي finalize أو reset مشتق.
+**Description:** Take a consistent snapshot before any finalize or derivative reset.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [x] `backup_db.py` ينتهي بنجاح.
-- [x] `PRAGMA quick_check` للنسخة يعيد `ok`.
-- [x] النسخة محفوظة خارج المشروع في `C:\Users\rr\OneDrive\aoi-backups`.
+- [x] `backup_db.py` finishes successfully.
+- [x] `PRAGMA quick_check` on the backup returns `ok`.
+- [x] The backup is stored outside the project in `C:\Users\rr\OneDrive\aoi-backups`.
 
-**التحقق:** تقرير backup موجود.
+**Verification:** A backup report exists.
 
-**الاعتماديات:** T004.
+**Dependencies:** T004.
 
-### T006 - تقرير حالة إصلاح EVM [مكتمل 2026-08-19]
+### T006 - EVM repair status report [completed 2026-08-19]
 
-**الوصف:** تشغيل `repair_evm_ledger.py` في وضع الفحص للشبكات المسموحة.
+**Description:** Run `repair_evm_ledger.py` in inspect mode for the allowed networks.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [x] يسجل active pending وreplay pending لكل شبكة.
-- [x] يفصل `partial`, `negative`, `budget`, `empty`, `done`.
-- [x] لا finalize ما دام pending أكبر من صفر.
-- [x] كُشف عطل تنافس كاتبي EVM وأزيل بجعل `run_evm_replay.py` المالك الوحيد.
+- [x] Logs active pending and replay pending per network.
+- [x] Separates `partial`, `negative`, `budget`, `empty`, `done`.
+- [x] No finalize while pending is above zero.
+- [x] An EVM writer-contention defect was found and removed by making `run_evm_replay.py` the sole owner.
 
-**التحقق:** مقارنة التقرير مع `evm_replay_state` و`evm_backfill_state`.
+**Verification:** Compare the report with `evm_replay_state` and `evm_backfill_state`.
 
-**الاعتماديات:** T005.
+**Dependencies:** T005.
 
-### T007 - إنهاء backfill الحي [قيد التنفيذ عبر FomoEVMReplay]
+### T007 - Finish the live backfill [in progress via FomoEVMReplay]
 
-**الوصف:** معالجة دفاتر العملات النشطة حتى حالة نهائية صحيحة.
+**Description:** Process active tokens' ledgers to a correct final state.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] `active_pending=0` للشبكات المستهدفة.
-- [ ] cursor لا يتقدم عند فشل دفعة.
-- [ ] لا رصيد سالب لعنوان عادي.
+- [ ] `active_pending=0` for the target networks.
+- [ ] The cursor does not advance when a batch fails.
+- [ ] No negative balance for a regular address.
 
-**التحقق:** اختبارات EVM وسجل تقدم مؤرخ.
+**Verification:** EVM tests and a dated progress log.
 
-**الاعتماديات:** T006.
+**Dependencies:** T006.
 
-### T008 - إنهاء replay للنوافذ الناضجة [قيد التنفيذ عبر FomoEVMReplay]
+### T008 - Finish replay for mature windows [in progress via FomoEVMReplay]
 
-**الوصف:** استكمال `4663` و`8453` مع احترام حدود النداءات والحالات النهائية.
+**Description:** Complete `4663` and `8453` respecting call budgets and final states.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] `replay_pending=0` للنوافذ الناضجة المطلوبة.
-- [ ] الحالات غير القابلة للإكمال تنتهي بسبب صريح ولا تعاد إلى الأبد.
-- [ ] لا صف concentration يكتب لحالة negative.
+- [ ] `replay_pending=0` for the required mature windows.
+- [ ] Non-completable cases end with an explicit reason and are not retried forever.
+- [ ] No concentration row is written for a negative state.
 
-**التحقق:** تقرير قبل/بعد وحالات عينة.
+**Verification:** A before/after report and sample states.
 
-**الاعتماديات:** T007.
+**Dependencies:** T007.
 
-### T009 - تدقيق السلسلة لعينة EVM
+### T009 - On-chain audit of an EVM sample
 
-**الوصف:** مقارنة supply وأرصدة أعلى الحائزين عند كتل مختارة.
+**Description:** Compare supply and top-holder balances at selected blocks.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] عينة من كل شبكة مدعومة.
-- [ ] أكبر خمسة حائزين يطابقون أو فرقهم تحت العتبة الموثقة.
-- [ ] أي اختلاف يصنف ولا يخفى.
+- [ ] A sample from every supported network.
+- [ ] The top five holders match, or their difference is under the documented threshold.
+- [ ] Any mismatch is classified, not hidden.
 
-**التحقق:** `audit_evm_ledger.py` وتقرير JSON.
+**Verification:** `audit_evm_ledger.py` and a JSON report.
 
-**الاعتماديات:** T008.
+**Dependencies:** T008.
 
-### T010 - Finalize وإعادة بناء EVM
+### T010 - Finalize and rebuild EVM
 
-**الوصف:** حذف مشتقات التدريب EVM فقط وإعادة بنائها من اللقطات المصححة.
+**Description:** Delete only the EVM training derivatives and rebuild them from the corrected snapshots.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] finalize يرفض إن عاد pending.
-- [ ] `training_missing=0` بعد البناء.
-- [ ] `evm_ledger_rebuild_required=0` في النهاية.
+- [ ] Finalize refuses if pending returns.
+- [ ] `training_missing=0` after the build.
+- [ ] `evm_ledger_rebuild_required=0` at the end.
 
-**التحقق:** اختبارات repair، ثم تقرير جاهزية جديد.
+**Verification:** Repair tests, then a new readiness report.
 
-**الاعتماديات:** T009.
+**Dependencies:** T009.
 
-## نقطة تحقق B [بانتظار اكتمال T007 وT008]
+## Checkpoint B [waiting for T007 and T008]
 
-- [ ] كل اختبارات EVM تمر.
-- [ ] تقرير audit محفوظ.
-- [ ] صفوف EVM مبنية بالإصدار الحالي فقط.
+- [ ] All EVM tests pass.
+- [ ] An audit report is saved.
+- [ ] EVM rows are built on the current version only.
 
-## المرحلة 2 - تاريخ ملفات المتداولين
+## Phase 2 - Trader-profile history
 
-### T011 - تصميم وترحيل `trader_snapshots`
+### T011 - Design and migrate `trader_snapshots`
 
-**الوصف:** إضافة جدول append-only وفهارسه دون كسر `traders`.
+**Description:** Add an append-only table with its indexes without breaking `traders`.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] migration idempotent.
-- [ ] المفتاح `(trader_id, recorded_at)` يمنع التكرار.
-- [ ] `raw_json` مضغوط عبر مسار DB الموحد.
+- [ ] Idempotent migration.
+- [ ] The key `(trader_id, recorded_at)` prevents duplicates.
+- [ ] `raw_json` is compressed through the unified DB path.
 
-**التحقق:** اختبارات schema وmigration.
+**Verification:** Schema and migration tests.
 
-**الاعتماديات:** T004.
+**Dependencies:** T004.
 
-### T012 - كتابة مزدوجة للملف واللقطة
+### T012 - Dual write for profile and snapshot
 
-**الوصف:** تحديث دورة traders لتكتب snapshot وlatest state في معاملة واحدة.
+**Description:** Update the traders cycle to write the snapshot and latest state in one transaction.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] فشل أحد الإدراجين لا يترك حالة نصفية.
-- [ ] لقطة قديمة لا تمحى.
-- [ ] latest table يبقى متوافقاً مع اللوحة.
+- [ ] A failure in either insert leaves no half state.
+- [ ] An old snapshot is never erased.
+- [ ] The latest table stays consistent with the leaderboard.
 
-**التحقق:** اختبارات دورة traders والتراجع عند الخطأ.
+**Verification:** Tests for the traders cycle and rollback on error.
 
-**الاعتماديات:** T011.
+**Dependencies:** T011.
 
-### T013 - منع النسخ المتطابقة غير المحدودة
+### T013 - Prevent unlimited identical copies
 
-**الوصف:** مقارنة hash أو الحقول المهمة قبل كتابة snapshot جديد.
+**Description:** Compare a hash or the key fields before writing a new snapshot.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] الملف غير المتغير لا يكتب كل دورة.
-- [ ] heartbeat يومي يحفظ استمرارية القياس.
-- [ ] الملف المتغير يكتب فوراً.
+- [ ] An unchanged profile is not written every cycle.
+- [ ] A daily heartbeat preserves measurement continuity.
+- [ ] A changed profile is written immediately.
 
-**التحقق:** اختبار ثلاث دورات: مطابق، مطابق، متغير.
+**Verification:** A three-cycle test: identical, identical, changed.
 
-**الاعتماديات:** T012.
+**Dependencies:** T012.
 
-### T014 - أولوية المشتري الجديد
+### T014 - New-buyer priority
 
-**الوصف:** تقديم buyer ظهر في إشارة جديدة على المسح الدوري الطويل.
+**Description:** Prioritize a buyer who appears in a new signal over the long periodic sweep.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا يجوع المتداولون القدامى إلى الأبد.
-- [ ] تقاس مدة الإشارة إلى أول snapshot.
-- [ ] حد الدورة يبقى ضمن 60 ثانية.
+- [ ] Old traders are not starved forever.
+- [ ] The time from signal to first snapshot is measured.
+- [ ] The cycle limit stays within 60 seconds.
 
-**التحقق:** اختبار queue مختلطة ومقياس latency.
+**Verification:** A mixed-queue test and a latency metric.
 
-**الاعتماديات:** T012.
+**Dependencies:** T012.
 
-## المرحلة 3 - ميزات المتداول
+## Phase 3 - Trader features
 
-### T015 - عقد ميزات ملف المتداول
+### T015 - Trader-profile feature contract
 
-**الوصف:** تثبيت أسماء وتعريفات ميزات profile point-in-time.
+**Description:** Fix the names and definitions of point-in-time profile features.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا معرفات أو handles في الميزات.
-- [ ] لكل نسبة مقام وحالة missing موثقة.
-- [ ] `buyer_profile_age_min` موجود.
+- [ ] No identifiers or handles in the features.
+- [ ] Every ratio has a documented denominator and missing state.
+- [ ] `buyer_profile_age_min` exists.
 
-**التحقق:** مراجعة العقد واختبارات حسابية.
+**Verification:** Contract review and computational tests.
 
-**الاعتماديات:** T013.
+**Dependencies:** T013.
 
-### T016 - تنفيذ ميزات profile عند `t0`
+### T016 - Implement profile features at `t0`
 
-**الوصف:** قراءة أحدث `trader_snapshot.recorded_at <= t0`.
+**Description:** Read the latest `trader_snapshot.recorded_at <= t0`.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] صف بعد `t0` لا يغير الميزات.
-- [ ] عدم وجود لقطة يعيد NULL لا آخر ملف حالي.
-- [ ] الحسابات اللوغاريتمية آمنة.
+- [ ] A row after `t0` does not change the features.
+- [ ] The absence of a snapshot returns NULL, not the current latest profile.
+- [ ] Logarithmic computations are safe.
 
-**التحقق:** اختبار future-row إلزامي.
+**Verification:** A mandatory future-row test.
 
-**الاعتماديات:** T015.
+**Dependencies:** T015.
 
-### T017 - ميزات تاريخ المتداول السابق
+### T017 - Prior trader-history features
 
-**الوصف:** تجميع الإشارات والنتائج الناضجة السابقة للمتداول.
+**Description:** Aggregate the trader's prior signals and mature outcomes.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] الصف الحالي مستبعد.
-- [ ] النتيجة السابقة لا تدخل إن لم ينته أفقها قبل `t0`.
-- [ ] الحد الأدنى والتنعيم موثقان.
+- [ ] The current row is excluded.
+- [ ] A prior outcome does not enter unless its horizon ended before `t0`.
+- [ ] The minimum sample and smoothing are documented.
 
-**التحقق:** اختبارات صفوف متداخلة زمنياً.
+**Verification:** Tests on overlapping time rows.
 
-**الاعتماديات:** T016.
+**Dependencies:** T016.
 
-### T018 - تجميع جودة عدة متداولين
+### T018 - Multi-trader quality aggregation
 
-**الوصف:** اشتقاق ميزات مجموعة topTraders دون كشف الهوية.
+**Description:** Derive topTraders group features without revealing identity.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] median/best/coverage تحسب على المقاس فقط.
-- [ ] قائمة فارغة تختلف عن قائمة لم تقس ملفاتها.
-- [ ] لا يتجاوز صف واحد وزن مجموعة كاملة بلا علم تغطية.
+- [ ] median/best/coverage are computed on the measured only.
+- [ ] An empty list differs from a list whose profiles were never measured.
+- [ ] A single row does not carry the weight of a whole group without a coverage flag.
 
-**التحقق:** اختبارات قوائم مختلطة.
+**Verification:** Mixed-list tests.
 
-**الاعتماديات:** T017.
+**Dependencies:** T017.
 
-### T019 - دمج ميزات المتداول في التدريب
+### T019 - Merge trader features into training
 
-**الوصف:** تحديث schema و`FEATURE_COLUMNS` والباني والإصدار.
+**Description:** Update the schema, `FEATURE_COLUMNS`, the builder, and the version.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] migrations + ROW_COLUMNS متطابقة.
-- [ ] coverage report يعرض العائلة.
-- [ ] model view لا يقبل صف إصدار قديم.
+- [ ] migrations and ROW_COLUMNS match.
+- [ ] The coverage report shows the family.
+- [ ] The model view accepts no old-version row.
 
-**التحقق:** `test_features.py`, `test_build_rows_cycle.py`.
+**Verification:** `test_features.py`, `test_build_rows_cycle.py`.
 
-**الاعتماديات:** T018.
+**Dependencies:** T018.
 
-## نقطة تحقق C
+## Checkpoint C
 
-- [ ] كتابة trader snapshots تعمل حياً.
-- [ ] future-row tests تمر.
-- [ ] تقرير تغطية يحدد صلاحية العائلة زمنياً.
+- [ ] Trader-snapshot writing works live.
+- [ ] Future-row tests pass.
+- [ ] A coverage report states the family's validity over time.
 
-## المرحلة 4 - حضور المصادر وعناقيد الإشارات
+## Phase 4 - Source presence and signal clusters
 
-### T020 - ترحيل `token_source_presence`
+### T020 - Migrate `token_source_presence`
 
-**الوصف:** إضافة جدول مشتق خفيف وفهارس point-in-time.
+**Description:** Add a light derived table with point-in-time indexes.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا raw envelope مكرر في الجدول.
-- [ ] source وobserved_at إلزاميان.
-- [ ] rank nullable.
+- [ ] No duplicated raw envelope in the table.
+- [ ] source and observed_at are mandatory.
+- [ ] rank is nullable.
 
-**التحقق:** اختبارات schema.
+**Verification:** Schema tests.
 
-**الاعتماديات:** T004.
+**Dependencies:** T004.
 
-### T021 - إعادة بناء الحضور من snapshots
+### T021 - Rebuild presence from snapshots
 
-**الوصف:** استخراج trending/verified/most_held التاريخي بدفعات قابلة للاستئناف.
+**Description:** Extract historical trending/verified/most_held in resumable batches.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] idempotent.
-- [ ] يربط بالعنوان والشبكة لا الفهرس وحده.
-- [ ] checkpoint يمنع إعادة مسح كامل كل تشغيل.
+- [ ] Idempotent.
+- [ ] Joins by address and network, not index alone.
+- [ ] A checkpoint prevents a full rescan on every run.
 
-**التحقق:** fixtures للعنصر المحذوف وتغير الترتيب.
+**Verification:** Fixtures for the deleted item and order changes.
 
-**الاعتماديات:** T020.
+**Dependencies:** T020.
 
-### T022 - قياس دلالة الرتبة
+### T022 - Measure the meaning of rank
 
-**الوصف:** اختبار هل ترتيب كل قائمة ثابت المعنى أم مجرد ترتيب استجابة.
+**Description:** Test whether each list's ordering carries stable meaning or is just response order.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] تقرير لكل مصدر.
-- [ ] rank يبقى NULL للمصدر غير المثبت.
-- [ ] لا تبنى rank features قبل القرار.
+- [ ] A report per source.
+- [ ] rank stays NULL for an unproven source.
+- [ ] No rank features are built before the decision.
 
-**التحقق:** إعادة طلبات وعينات زمنية موثقة.
+**Verification:** Replayed requests and documented time samples.
 
-**الاعتماديات:** T021.
+**Dependencies:** T021.
 
-### T023 - ميزات مسار المصدر
+### T023 - Source-path features
 
-**الوصف:** إضافة first seen، duration، appearances، transitions، وتعدد المصادر.
+**Description:** Add first seen, duration, appearances, transitions, and source multiplicity.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] كل استعلام مقيد بـ`observed_at <= t0`.
-- [ ] filterTokens لا يعامل كقائمة شعبية.
-- [ ] source categorical يعالج بثبات بين train/serve.
+- [ ] Every query is constrained by `observed_at <= t0`.
+- [ ] filterTokens is not treated as a popularity list.
+- [ ] The source categorical is handled consistently between train and serve.
 
-**التحقق:** future-row واختبار انتقالات.
+**Verification:** Future-row and transition tests.
 
-**الاعتماديات:** T022.
+**Dependencies:** T022.
 
-### T024 - تدقيق معرفات trade/swap/transfer
+### T024 - Audit trade/swap/transfer identifiers
 
-**الوصف:** قياس معنى وتغطية المعرفات قبل استعمالها لإزالة التكرار.
+**Description:** Measure the meaning and coverage of the identifiers before using them for dedup.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] تقرير uniqueness والتطابق عبر أنواع الأحداث.
-- [ ] NULLs لا تتطابق مع بعضها.
-- [ ] قاعدة dedup مثبتة قبل التنفيذ.
+- [ ] A uniqueness and cross-event-match report.
+- [ ] NULLs do not match each other.
+- [ ] The dedup rule is proven before implementation.
 
-**التحقق:** عينة raw يدوية واختبار آلي.
+**Verification:** A manual raw sample and an automated test.
 
-**الاعتماديات:** T004.
+**Dependencies:** T004.
 
-### T025 - ميزات عناقيد الإشارات
+### T025 - Signal-cluster features
 
-**الوصف:** حساب 5/15/30/60 دقيقة، المشترين، واتجاه الأحداث.
+**Description:** Compute 5/15/30/60-minute windows, buyers, and event direction.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] استبعاد الحدث الحالي حيث يلزم.
-- [ ] dedup يطبق قاعدة T024.
-- [ ] signal/activity المتطابق لا يعد مرتين.
+- [ ] The current event is excluded where required.
+- [ ] Dedup applies the T024 rule.
+- [ ] A matching signal/activity is not counted twice.
 
-**التحقق:** اختبارات حدود النافذة والتكرار.
+**Verification:** Window-boundary and duplication tests.
 
-**الاعتماديات:** T024.
+**Dependencies:** T024.
 
-### T026 - دمج عائلات المصدر والعناقيد
+### T026 - Merge the source and cluster families
 
-**الوصف:** تحديث الصفوف والإصدار والتصدير.
+**Description:** Update rows, version, and export.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] coverage حسب المصدر واليوم.
-- [ ] لا حقبة collection-start قابلة للتعرف دون علم واضح.
-- [ ] صف الحي يستخدم نفس دالة التدريب.
+- [ ] Coverage by source and day.
+- [ ] No recognizable collection-start era without a clear flag.
+- [ ] The live row uses the same function as training.
 
-**التحقق:** اختبارات build/export.
+**Verification:** Build/export tests.
 
-**الاعتماديات:** T023, T025.
+**Dependencies:** T023, T025.
 
-## المرحلة 5 - tradingActivity
+## Phase 5 - tradingActivity
 
-### T027 - تشخيص توقف backfill
+### T027 - Diagnose the backfill stoppage
 
-**الوصف:** تحديد سبب وجود 190 حدثاً فقط.
+**Description:** Determine why only 190 events exist.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] السبب مدعوم بسجل أو استجابة فعلية.
-- [ ] يعرف هل المشكلة endpoint أو pagination أو المهمة.
-- [ ] لا تعديل قبل وجود تشخيص.
+- [ ] The cause is supported by a log or an actual response.
+- [ ] It determines whether the problem is the endpoint, pagination, or the task.
+- [ ] No modification before a diagnosis exists.
 
-**التحقق:** تشغيل محدود read-only وتقرير.
+**Verification:** A limited read-only run and a report.
 
-**الاعتماديات:** T004.
+**Dependencies:** T004.
 
-### T028 - إصلاح checkpoint والإعادة
+### T028 - Fix checkpoint and resume
 
-**الوصف:** جعل pagination قابلاً للاستئناف ومقاوماً للفراغ العابر.
+**Description:** Make pagination resumable and resistant to transient emptiness.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] checkpoint يحفظ id وأقدم timestamp.
-- [ ] الفراغ يعاد قبل اعتباره نهاية.
-- [ ] نوع خطأ نهائي موثق.
+- [ ] The checkpoint saves the id and oldest timestamp.
+- [ ] Emptiness is retried before being treated as the end.
+- [ ] A terminal error type is documented.
 
-**التحقق:** اختبارات صفحات متكررة وفارغة وخطأ وسط السلسلة.
+**Verification:** Tests for repeated, empty, and mid-chain error pages.
 
-**الاعتماديات:** T027.
+**Dependencies:** T027.
 
-### T029 - جرد أنواع النشاط الجديدة
+### T029 - Inventory new activity types
 
-**الوصف:** تسجيل الأنواع والأشكال قبل توسيع المستخرج.
+**Description:** Record the types and shapes before extending the extractor.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] unknown محفوظ خاماً ولا يسقط المهمة.
-- [ ] كل نوع مدعوم له fixture.
-- [ ] لا حقول مفبركة بين الشكل المسطح والمتداخل.
+- [ ] unknown is stored raw and does not drop the task.
+- [ ] Every supported type has a fixture.
+- [ ] No fabricated fields between the flat and nested shapes.
 
-**التحقق:** tests لكل نوع.
+**Verification:** Tests per type.
 
-**الاعتماديات:** T028.
+**Dependencies:** T028.
 
-### T030 - إكمال bars/labels للنشاط
+### T030 - Complete bars/labels for activity
 
-**الوصف:** تغطية الأسعار والنتائج للأحداث الجديدة تدريجياً.
+**Description:** Gradually cover prices and outcomes for the new events.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] no_data ظاهر وليس مخفياً.
-- [ ] لا ازدواج مع signal_events.
-- [ ] التقدم والتغطية في تقرير الجاهزية.
+- [ ] no_data is visible, not hidden.
+- [ ] No duplication with signal_events.
+- [ ] Progress and coverage appear in the readiness report.
 
-**التحقق:** integration backfill -> bars -> label.
+**Verification:** Integration backfill -> bars -> label.
 
-**الاعتماديات:** T029.
+**Dependencies:** T029.
 
-### T031 - تقرير تحيز الحي مقابل الرجعي
+### T031 - Live-versus-retro bias report
 
-**الوصف:** تقرير يقرر الاستخدام المسموح لـactivity.
+**Description:** A report deciding the allowed use of activity.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] مقارنة الشبكات والأنواع والتغطية والحقب.
-- [ ] قرار صريح: تحليل فقط أو تدريب منفصل.
-- [ ] لا دمج تلقائي مع model view.
+- [ ] A comparison of networks, types, coverage, and eras.
+- [ ] An explicit decision: analysis only, or separate training.
+- [ ] No automatic merge into the model view.
 
-**التحقق:** تقرير قابل لإعادة التشغيل.
+**Verification:** A re-runnable report.
 
-**الاعتماديات:** T030.
+**Dependencies:** T030.
 
-## نقطة تحقق D
+## Checkpoint D
 
-- [ ] activity يتقدم أو له سبب توقف نهائي موثق.
-- [ ] لا تغيير في تدريب الاعتماد دون تقرير التحيز.
-- [ ] عائلات FOMO الجديدة لها تغطية واختبارات زمنية.
+- [ ] Activity advances or has a documented terminal-stop cause.
+- [ ] No dependency-training change without the bias report.
+- [ ] New FOMO families have coverage and time tests.
 
-## المرحلة 6 - اكتشاف DEX
+## Phase 6 - DEX discovery
 
-### T032 - جرد البروتوكولات والأحواض
+### T032 - Inventory protocols and pools
 
-**الوصف:** تحليل `dex_protocol`, `pair`, الشبكات، والتغطية.
+**Description:** Analyze `dex_protocol`, `pair`, the networks, and coverage.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] جدول تكرارات حسب الشبكة.
-- [ ] اختيار شبكة/بروتوكول أول مبرر بالبيانات.
-- [ ] قائمة أشكال pair الخام محفوظة كfixtures منزوعة الأسرار.
+- [ ] A frequency table by network.
+- [ ] A justified first network/protocol choice based on the data.
+- [ ] A list of raw pair shapes saved as sanitized fixtures.
 
-**التحقق:** تقرير جرد.
+**Verification:** An inventory report.
 
-**الاعتماديات:** T004.
+**Dependencies:** T004.
 
-### T033 - عقد adapter DEX
+### T033 - DEX adapter contract
 
-**الوصف:** تعريف واجهة موحدة لاكتشاف pool وفك swap/liquidity.
+**Description:** Define a unified interface for pool discovery and swap/liquidity decoding.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا تفاصيل بروتوكول في features.py.
-- [ ] side, amounts, decimals, block، وevent index معرفة بوضوح.
-- [ ] unsupported حالة طبيعية.
+- [ ] No protocol details in features.py.
+- [ ] side, amounts, decimals, block, and event index are clearly defined.
+- [ ] unsupported is a normal state.
 
-**التحقق:** اختبارات interface مزيفة.
+**Verification:** Mock interface tests.
 
-**الاعتماديات:** T032.
+**Dependencies:** T032.
 
-### T034 - ترحيل جداول DEX
+### T034 - Migrate DEX tables
 
-**الوصف:** إضافة pools, swaps, liquidity events, snapshots, states.
+**Description:** Add pools, swaps, liquidity events, snapshots, states.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] migrations idempotent.
-- [ ] المفاتيح تمنع reorg/retry duplicates.
-- [ ] فهارس point-in-time والاستعلام الساخن موجودة.
+- [ ] Idempotent migrations.
+- [ ] The keys prevent reorg/retry duplicates.
+- [ ] Point-in-time and hot-query indexes exist.
 
-**التحقق:** اختبارات schema/query plan الأساسية.
+**Verification:** Basic schema/query-plan tests.
 
-**الاعتماديات:** T033.
+**Dependencies:** T033.
 
-### T035 - اكتشاف وتحقق الأحواض للبروتوكول الأول
+### T035 - Pool discovery and verification for the first protocol
 
-**الوصف:** ربط FOMO pair بالسلسلة والتحقق من الأصول.
+**Description:** Link the FOMO pair on-chain and verify the assets.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] token/quote مطابقان.
-- [ ] decimals موثقة.
-- [ ] discovery source وverified_at موجودان.
+- [ ] token/quote match.
+- [ ] decimals documented.
+- [ ] discovery source and verified_at exist.
 
-**التحقق:** ≥20 حوضاً حقيقياً أو كل المتاح إن كان أقل.
+**Verification:** ≥20 real pools, or all available if fewer.
 
-**الاعتماديات:** T034.
+**Dependencies:** T034.
 
-## المرحلة 7 - Swap والسيولة
+## Phase 7 - Swap and liquidity
 
-### T036 - Decoder Swap للبروتوكول الأول
+### T036 - Swap decoder for the first protocol
 
-**الوصف:** فك أحداث الشراء والبيع والسعر الفعلي.
+**Description:** Decode buy and sell events and the actual price.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] اتجاه الصفقة مثبت بعينات شراء وبيع معروفة.
-- [ ] إعادة الفك deterministic.
-- [ ] transfer وحده لا يصبح swap.
+- [ ] The trade direction is proven with known buy and sell samples.
+- [ ] Decoding is deterministic.
+- [ ] A transfer alone does not become a swap.
 
-**التحقق:** fixtures on-chain واختبارات وحدة.
+**Verification:** On-chain fixtures and unit tests.
 
-**الاعتماديات:** T035.
+**Dependencies:** T035.
 
-### T037 - Cursor وجمع حي للأحداث
+### T037 - Event cursor and live collection
 
-**الوصف:** عملية مستقلة تجمع swaps مع confirmations واستئناف.
+**Description:** A standalone process that collects swaps with confirmations and resume.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا ثغرات عند فشل دفعة.
-- [ ] لا تكرار عند إعادة التشغيل.
-- [ ] reorg policy موثقة.
+- [ ] No gaps when a batch fails.
+- [ ] No duplication on restart.
+- [ ] A documented reorg policy.
 
-**التحقق:** integration RPC mock وفشل وسط الدفعة.
+**Verification:** Integration with a mocked RPC and mid-batch failure.
 
-**الاعتماديات:** T036.
+**Dependencies:** T036.
 
-### T038 - Backfill نوافذ الأحواض
+### T038 - Backfill pool windows
 
-**الوصف:** ملء تاريخ نوافذ العملات المراقبة فقط.
+**Description:** Fill the history of watched tokens' windows only.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] يبدأ من pool creation أو حد موثق.
-- [ ] ينتهي عند watch window لا رأس أبدي.
-- [ ] budget/cursor قابلان للاستئناف.
+- [ ] Starts at pool creation or a documented boundary.
+- [ ] Ends at the watch window, not an eternal head.
+- [ ] budget/cursor are resumable.
 
-**التحقق:** تقرير blocks/events/calls.
+**Verification:** A blocks/events/calls report.
 
-**الاعتماديات:** T037.
+**Dependencies:** T037.
 
-### T039 - Decoder أحداث السيولة
+### T039 - Liquidity-event decoder
 
-**الوصف:** استخراج mint/burn/add/remove بحسب البروتوكول.
+**Description:** Extract mint/burn/add/remove according to the protocol.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] actor وamounts وevent type صحيحة.
-- [ ] remove liquidity لا يخلط مع token burn.
-- [ ] raw محفوظ.
+- [ ] actor, amounts, and event type are correct.
+- [ ] remove liquidity is not confused with a token burn.
+- [ ] raw is preserved.
 
-**التحقق:** عينات معاملات معروفة.
+**Verification:** Known-transaction samples.
 
-**الاعتماديات:** T036.
+**Dependencies:** T036.
 
-### T040 - لقطات الاحتياطي والانزلاق
+### T040 - Reserve and slippage snapshots
 
-**الوصف:** حساب reserves, liquidity USD, price impact، والسعة التنفيذية.
+**Description:** Compute reserves, liquidity USD, price impact, and executable capacity.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] الحساب يراعي fee والبروتوكول.
-- [ ] لا يستخدم سعر مستقبل لتقويم quote.
-- [ ] النتائج تقارن بمعاملات فعلية.
+- [ ] The computation accounts for fee and protocol.
+- [ ] No future price is used to value the quote.
+- [ ] Results are compared against actual transactions.
 
-**التحقق:** اختبارات حسابية وcross-check on-chain.
+**Verification:** Computational tests and an on-chain cross-check.
 
-**الاعتماديات:** T039.
+**Dependencies:** T039.
 
-### T041 - تحقق متقاطع FOMO/DEX
+### T041 - FOMO/DEX cross-check
 
-**الوصف:** مقارنة OHLCV وtoken_flow مع swaps المجمعة.
+**Description:** Compare OHLCV and token_flow with the collected swaps.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] فروق السعر والحجم حسب نافذة موثقة.
-- [ ] outliers مسماة لا محذوفة بصمت.
-- [ ] معيار جودة الحوض محدد.
+- [ ] Price and volume differences by a documented window.
+- [ ] Outliers are named, not silently deleted.
+- [ ] A pool quality standard is defined.
 
-**التحقق:** تقرير تطابق.
+**Verification:** A match report.
 
-**الاعتماديات:** T038, T040.
+**Dependencies:** T038, T040.
 
-## نقطة تحقق E
+## Checkpoint E
 
-- [ ] بروتوكول واحد يعمل end-to-end.
-- [ ] اتجاه swap والسعر والسيولة مدققون.
-- [ ] العملية الجديدة لا تؤخر FOMO recorder.
+- [ ] One protocol works end-to-end.
+- [ ] Swap direction, price, and liquidity are audited.
+- [ ] The new process does not slow the FOMO recorder.
 
-## المرحلة 8 - ميزات DEX والمحافظ
+## Phase 8 - DEX and wallet features
 
-### T042 - ميزات سيولة وتنفيذ عند `t0`
+### T042 - Liquidity and execution features at `t0`
 
-**الوصف:** بناء liquidity, price impact، والسعة التنفيذية.
+**Description:** Build liquidity, price impact, and executable capacity.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] كل query ينتهي عند `t0`.
-- [ ] اختيار الحوض dominant موثق.
-- [ ] غياب الحوض NULL/unsupported لا صفر.
+- [ ] Every query ends at `t0`.
+- [ ] The dominant-pool choice is documented.
+- [ ] Pool absence is NULL/unsupported, not zero.
 
-**التحقق:** future-row tests.
+**Verification:** Future-row tests.
 
-**الاعتماديات:** T041.
+**Dependencies:** T041.
 
-### T043 - ميزات تدفق DEX
+### T043 - DEX flow features
 
-**الوصف:** نوافذ 5/15/60 دقيقة للحجوم والفريدين وأكبر الصفقات.
+**Description:** 5/15/60-minute windows for volumes, unique traders, and largest trades.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] dedup حسب tx/event.
-- [ ] quote normalization موثق.
-- [ ] wash proxy لا يسمى wash يقيناً؛ يوصف كمؤشر فقط.
+- [ ] Dedup by tx/event.
+- [ ] Documented quote normalization.
+- [ ] A wash proxy is not called certain wash; it is described as an indicator only.
 
-**التحقق:** اختبارات windows والتجميع.
+**Verification:** Window and aggregation tests.
 
-**الاعتماديات:** T041.
+**Dependencies:** T041.
 
-### T044 - جدول أحداث Transfer اختياري مدروس
+### T044 - A considered optional Transfer-events table
 
-**الوصف:** تقييم تكلفة حفظ التحويلات اللازمة للميزات التاريخية الدقيقة.
+**Description:** Evaluate the cost of storing the transfers needed for precise historical features.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] قياس حجم يوم/شبكة قبل الترحيل الكامل.
-- [ ] قرار حفظ كامل أو ملخص مبرر.
-- [ ] لا تكرار لما يكفيه evm_balances بلا فائدة.
+- [ ] Measure per-day/per-network volume before a full migration.
+- [ ] A justified decision: full storage or summary.
+- [ ] No duplication of what evm_balances already suffices for.
 
-**التحقق:** benchmark وتقرير قرار.
+**Verification:** A benchmark and a decision report.
 
-**الاعتماديات:** T010.
+**Dependencies:** T010.
 
-### T045 - ميزات الحائزين الجدد والخارجين
+### T045 - New-holder and exit features
 
-**الوصف:** إضافة نوافذ 5/15/60 دقيقة من snapshots/events الصحيحة.
+**Description:** Add 5/15/60-minute windows from the correct snapshots/events.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] EVM وSolana يفصلان حسب قدرة المصدر.
-- [ ] first seen في الدفتر الناقص لا يعامل أول ملكية تاريخية.
-- [ ] complete-history flag موجود.
+- [ ] EVM and Solana are separated by source capability.
+- [ ] first seen in an incomplete ledger is not treated as the first historical ownership.
+- [ ] A complete-history flag exists.
 
-**التحقق:** اختبارات دفتر كامل وناقص.
+**Verification:** Tests on complete and incomplete ledgers.
 
-**الاعتماديات:** T044.
+**Dependencies:** T044.
 
-### T046 - ميزات المطور والحيتان
+### T046 - Developer and whale features
 
-**الوصف:** حركة المطور وأكبر الحائزين قبل القرار.
+**Description:** The developer's and top holders' movement before the decision.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] هوية المطور لها provenance.
-- [ ] عدم معرفة المطور NULL.
-- [ ] تحركات بعد `t0` لا تدخل.
+- [ ] The developer identity has provenance.
+- [ ] An unknown developer is NULL.
+- [ ] Movements after `t0` do not enter.
 
-**التحقق:** future-row وfixtures متعددة المحافظ.
+**Verification:** Future-row and multi-wallet fixtures.
 
-**الاعتماديات:** T045.
+**Dependencies:** T045.
 
-### T047 - أحداث الصلاحيات والإدارة
+### T047 - Authority and admin events
 
-**الوصف:** تتبع ownership/mint/freeze/fee/limits عند توفر events أو state.
+**Description:** Track ownership/mint/freeze/fee/limits when events or state are available.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] التغيير مؤرخ بالكتلة.
-- [ ] لا inference قطعي من selector فقط دون وصفه كعلم خطر.
-- [ ] proxy logic يعالج منفصلاً.
+- [ ] The change is dated by block.
+- [ ] No definitive inference from a selector alone without describing it as a risk flag.
+- [ ] proxy logic is handled separately.
 
-**التحقق:** عقود fixtures واختبارات transitions.
+**Verification:** Contract fixtures and transition tests.
 
-**الاعتماديات:** T035.
+**Dependencies:** T035.
 
-## المرحلة 9 - البناء والتصدير
+## Phase 9 - Build and export
 
-### T048 - تحديث schema وfeature version
+### T048 - Update schema and feature version
 
-**الوصف:** دمج العائلات المقبولة في حزمة إصدار واحدة.
+**Description:** Merge the accepted families into a single version package.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] schema/db/features متطابقة.
-- [ ] لا عمود training بلا منتج في build_features.
-- [ ] model view يتطلب الإصدار الجديد.
+- [ ] schema/db/features match.
+- [ ] No training column without a producer in build_features.
+- [ ] The model view requires the new version.
 
-**التحقق:** schema parity tests.
+**Verification:** Schema parity tests.
 
-**الاعتماديات:** T019, T026, T042, T043, T045, T046.
+**Dependencies:** T019, T026, T042, T043, T045, T046.
 
-### T049 - إزالة N+1 من التدريب والمحاكاة
+### T049 - Remove N+1 from training and simulation
 
-**الوصف:** تحميل bars المطلوبة بكفاءة بدلاً من استعلام لكل صف.
+**Description:** Load the required bars efficiently instead of a query per row.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] النتائج مطابقة للطريقة القديمة على عينة.
-- [ ] التقييم الكامل ينتهي ضمن ميزانية زمنية محددة.
-- [ ] الذاكرة ضمن حد مقبول.
+- [ ] Results match the old method on a sample.
+- [ ] The full evaluation finishes within a set time budget.
+- [ ] Memory stays within an acceptable limit.
 
-**التحقق:** benchmark واختبار تطابق.
+**Verification:** A benchmark and a match test.
 
-**الاعتماديات:** T048.
+**Dependencies:** T048.
 
-### T050 - إعادة بناء كاملة قابلة للاستئناف
+### T050 - A resumable full rebuild
 
-**الوصف:** بناء الصفوف بالإصدار الجديد بدفعات.
+**Description:** Build the rows with the new version in batches.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا صف مختلط في model view.
-- [ ] restart يكمل ولا يعيد الكل.
-- [ ] تقرير تغطية بعد كل دفعة.
+- [ ] No mixed row in the model view.
+- [ ] A restart continues instead of redoing everything.
+- [ ] A coverage report after every batch.
 
-**التحقق:** interrupt/resume test وتقرير نهائي.
+**Verification:** An interrupt/resume test and a final report.
 
-**الاعتماديات:** T049.
+**Dependencies:** T049.
 
-### T051 - تحديث حزمة التصدير وprovenance
+### T051 - Update the export package and provenance
 
-**الوصف:** إضافة الملفات والعائلات الجديدة وأدوار الأعمدة.
+**Description:** Add the new files, families, and column roles.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] columns.json يمنع identifiers/targets.
-- [ ] coverage حسب اليوم والشبكة.
-- [ ] provenance لكل ميزة.
+- [ ] columns.json blocks identifiers/targets.
+- [ ] Coverage by day and network.
+- [ ] Provenance for every feature.
 
-**التحقق:** إعادة بناء الهدف والصفوف من export.
+**Verification:** Rebuilding the target and rows from the export.
 
-**الاعتماديات:** T050.
+**Dependencies:** T050.
 
-### T052 - مجموعة اختبارات تسرب شاملة
+### T052 - A comprehensive leakage test suite
 
-**الوصف:** توليد future rows في كل جدول جديد.
+**Description:** Generate future rows in every new table.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] صف الميزات لا يتغير.
-- [ ] maturity guard لنتائج المتداول يعمل.
-- [ ] قرار `t0+Delta` منفصل عن `t0`.
+- [ ] The feature row does not change.
+- [ ] The maturity guard works for trader outcomes.
+- [ ] The `t0+Delta` decision is separate from `t0`.
 
-**التحقق:** suite مستقلة تفشل عند إزالة أي قيد زمني.
+**Verification:** A standalone suite that fails when any time constraint is removed.
 
-**الاعتماديات:** T051.
+**Dependencies:** T051.
 
-## نقطة تحقق F
+## Checkpoint F
 
-- [ ] build/export كاملان.
-- [ ] train pipeline سريع بما يكفي.
-- [ ] اختبارات التسرب والتغطية كلها تمر.
+- [ ] Build/export are complete.
+- [ ] The train pipeline is fast enough.
+- [ ] All leakage and coverage tests pass.
 
-## المرحلة 10 - التقييم
+## Phase 10 - Evaluation
 
-### T053 - تجميد splits والأهداف والتكاليف
+### T053 - Freeze splits, targets, and costs
 
-**الوصف:** كتابة manifest قبل أي تدريب جديد.
+**Description:** Write a manifest before any new training.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] train/val/test dates/tokens محفوظة.
-- [ ] target وexit rule والتكاليف مثبتة.
-- [ ] لا فتح Test أثناء التطوير.
+- [ ] train/val/test dates/tokens are saved.
+- [ ] The target, exit rule, and costs are fixed.
+- [ ] Test is not opened during development.
 
-**التحقق:** hash للmanifest والبيانات.
+**Verification:** A hash of the manifest and the data.
 
-**الاعتماديات:** T052.
+**Dependencies:** T052.
 
-### T054 - تشغيل baselines
+### T054 - Run baselines
 
-**الوصف:** لعب الكل، market cap، liquidity، momentum، والنموذج الحالي.
+**Description:** Play-all, market cap, liquidity, momentum, and the current model.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] نفس الفترة والتكلفة لكل baseline.
-- [ ] نتائج العملات الجديدة منفصلة.
-- [ ] calibration وnet return موجودان.
+- [ ] The same period and cost for every baseline.
+- [ ] New-token results are separate.
+- [ ] Calibration and net return are present.
 
-**التحقق:** تقرير baseline مؤرخ.
+**Verification:** A dated baseline report.
 
-**الاعتماديات:** T053.
+**Dependencies:** T053.
 
-### T055 - دراسة الاستئصال على Val
+### T055 - Ablation study on Val
 
-**الوصف:** trader/source/onchain/DEX كل عائلة منفصلة ثم مجتمعة.
+**Description:** trader/source/onchain/DEX, each family separately then combined.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] لا اختيار على Test.
-- [ ] bootstrap بالعملة.
-- [ ] slices حسب اليوم والشبكة والبروتوكول.
+- [ ] No selection on Test.
+- [ ] Bootstrap at the token level.
+- [ ] Slices by day, network, and protocol.
 
-**التحقق:** تقرير ablation قابل لإعادة التشغيل.
+**Verification:** A re-runnable ablation report.
 
-**الاعتماديات:** T054.
+**Dependencies:** T054.
 
-### T056 - اختيار نموذج وعتبة مجمدين
+### T056 - Frozen model and threshold choice
 
-**الوصف:** اختيار واحد من نتائج Val وفق معيار مكتوب مسبقاً.
+**Description:** A single choice from the Val results per a pre-written criterion.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] يهزم baselines على Val بعد التكلفة.
-- [ ] لا يعتمد على عائلة ذات تغطية حقبية منحازة.
-- [ ] model card يثبت المعاملات والميزات.
+- [ ] It beats the baselines on Val after cost.
+- [ ] It does not depend on a family with biased era coverage.
+- [ ] The model card records the parameters and features.
 
-**التحقق:** إعادة التدريب بنفس seed/hash.
+**Verification:** Retraining with the same seed/hash.
 
-**الاعتماديات:** T055.
+**Dependencies:** T055.
 
-### T057 - فتح اختبار جديد مرة واحدة
+### T057 - Open a fresh test once
 
-**الوصف:** تقييم النموذج المجمد على الفترة/العملات المحجوزة.
+**Description:** Evaluate the frozen model on the reserved period/tokens.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] AUC/PR/calibration والعملات الجديدة مبلغة.
-- [ ] صافي الربح والتراجع والتكاليف مبلغة.
-- [ ] النتيجة لا يعاد ضبطها بعد رؤيتها.
+- [ ] AUC/PR/calibration and new tokens are reported.
+- [ ] Net profit, drawdown, and costs are reported.
+- [ ] The result is not re-tuned after being seen.
 
-**التحقق:** تقرير نهائي immutable.
+**Verification:** An immutable final report.
 
-**الاعتماديات:** T056، وبوابة الضابطة إن كان الوصف اعتمادياً.
+**Dependencies:** T056, and the control-group gate if the description is dependent.
 
-## المرحلة 11 - التداول الورقي
+## Phase 11 - Paper trading
 
-### T058 - مخطط سجل القرار الورقي
+### T058 - Paper-decision log schema
 
-**الوصف:** تسجيل القبول والرفض والإصدار والتنفيذ.
+**Description:** Record acceptance, rejection, version, and execution.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] أسباب no-trade منظمة.
-- [ ] feature/model versions إلزامية.
-- [ ] لا أسرار أو مفاتيح.
+- [ ] No-trade reasons are structured.
+- [ ] feature/model versions are mandatory.
+- [ ] No secrets or keys.
 
-**التحقق:** schema tests.
+**Verification:** Schema tests.
 
-**الاعتماديات:** T056.
+**Dependencies:** T056.
 
-### T059 - محاكي تنفيذ مع سيولة الحوض
+### T059 - Execution simulator with pool liquidity
 
-**الوصف:** استبدال cost الثابت وحده بانزلاق وحجم قابل للتنفيذ.
+**Description:** Replace the fixed cost alone with slippage and executable size.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] الصفقة ترفض إذا تجاوزت السعة.
-- [ ] entry/exit impact منفصلان.
-- [ ] fallback القديم موسوم بوضوح عند غياب DEX.
+- [ ] A trade is rejected if it exceeds capacity.
+- [ ] entry/exit impact are separate.
+- [ ] The old fallback is clearly flagged when DEX data is absent.
 
-**التحقق:** سيناريوهات سيولة عميقة وضحلة وسحب سيولة.
+**Verification:** Deep-liquidity, shallow-liquidity, and liquidity-withdrawal scenarios.
 
-**الاعتماديات:** T040, T058.
+**Dependencies:** T040, T058.
 
-### T060 - تشغيل حي صامت مجمد
+### T060 - A frozen silent live run
 
-**الوصف:** تشغيل النموذج دون مال لمدة الجولة المحددة.
+**Description:** Run the model without money for the defined round duration.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] كل إشارة تسجل حتى المرفوضة.
-- [ ] النموذج والعتبة لا يتغيران وسط الجولة.
-- [ ] stale data ينتج no-trade.
+- [ ] Every signal is logged, including rejected ones.
+- [ ] The model and threshold do not change mid-round.
+- [ ] Stale data produces no-trade.
 
-**التحقق:** مراقبة يومية وتقرير اكتمال.
+**Verification:** Daily monitoring and a completion report.
 
-**الاعتماديات:** T059.
+**Dependencies:** T059.
 
-### T061 - تقرير الجولة وبوابة القرار
+### T061 - Round report and decision gate
 
-**الوصف:** تقييم الربح والتراجع والثبات دون انتقاء.
+**Description:** Evaluate profit, drawdown, and stability without cherry-picking.
 
-**معايير القبول:**
+**Acceptance criteria:**
 
-- [ ] كل الصفقات والتكاليف مدرجة.
-- [ ] تحليل حساسية أكبر رابح وأعلى 1%.
-- [ ] الحكم: مثبت، مرفوض، أو غير حاسم.
+- [ ] All trades and costs are included.
+- [ ] A sensitivity analysis of the biggest winner and the top 1%.
+- [ ] The verdict: confirmed, rejected, or inconclusive.
 
-**التحقق:** تقرير مؤرخ لا يعاد تحرير نتائجه.
+**Verification:** A dated report whose results are not re-edited.
 
-**الاعتماديات:** T060.
+**Dependencies:** T060.
 
 ## Definition of Done
 
-- [ ] لا مصدر جديد بلا raw/provenance/timestamp/state.
-- [ ] لا ميزة جديدة بلا اختبار point-in-time.
-- [ ] لا عائلة تدخل الاعتماد قبل تغطية Train/Test غير حقبية.
-- [ ] لا EVM finalize قبل صفر pending وتدقيق عينة.
-- [ ] لا Test-shopping أو random row split.
-- [ ] لا ادعاء ربح دون سيولة وانزلاق ورسوم.
-- [ ] لا تداول حقيقي ضمن هذه الخطة.
+- [ ] No new source without raw/provenance/timestamp/state.
+- [ ] No new feature without a point-in-time test.
+- [ ] No family enters the training dependencies without non-era-biased Train/Test coverage.
+- [ ] No EVM finalize before zero pending and a sample audit.
+- [ ] No Test-shopping or random row split.
+- [ ] No profit claim without liquidity, slippage, and fees.
+- [ ] No real trading within this plan.

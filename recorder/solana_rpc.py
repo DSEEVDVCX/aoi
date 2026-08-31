@@ -1,18 +1,21 @@
-"""عميل قراءة لسولانا RPC (Helius) — طبقة السلسلة.
+"""Read-only client for Solana RPC (Helius) — the chain layer.
 
-**قراءة فقط** (FR-012): لا يستدعي إلّا توابع استعلام (`getTokenSupply`،
-`getTokenLargestAccounts`، `getAccountInfo`، `getAsset`، `getTokenAccountsByOwner`)
-ولا يوقّع معاملة ولا يرسل شيئاً إلى السلسلة.
+**Read-only** (FR-012): it calls query methods only (`getTokenSupply`,
+`getTokenLargestAccounts`, `getAccountInfo`, `getAsset`, `getTokenAccountsByOwner`)
+and signs no transaction and sends nothing to the chain.
 
-**المفتاح لا يُطبع ولا يُسجَّل** (FR-013)، وهذا أخطر ممّا يبدو هنا: مفتاح Helius
-يقع في *مسار* الرابط (`?api-key=...`)، ورسائل استثناءات httpx تحمل الرابط كاملاً
-(`httpx.HTTPStatusError` و`ConnectError` كلاهما). والمسجّل يكتب نصّ الاستثناء إلى
-`meta.last_error_*` وتعرضه لوحة القيادة ⇒ استثناء غير مُعالَج = مفتاح مكشوف في
-القاعدة وعلى الشاشة. فكل استثناء يمرّ عبر `_redact()` قبل أن يُرى، ولا يُعاد رفع
-الأصليّ خارج هذه الوحدة.
+**The key is never printed nor logged** (FR-013), and that is more dangerous
+here than it looks: the Helius key sits in the URL *path* (`?api-key=...`),
+and httpx exception messages carry the full URL (`httpx.HTTPStatusError` and
+`ConnectError` both do). The recorder writes the exception text to
+`meta.last_error_*` and the dashboard displays it ⇒ an unhandled exception =
+an exposed key in the database and on screen. So every exception passes
+through `_redact()` before being seen, and the original is never re-raised
+outside this module.
 
-ويُقرأ المفتاح **من القرص عند كل نداء** لا مرّة عند الإطلاق: عملية طويلة العمر
-تُجمّد قيمة الإطلاق فتفشل بعد تدويرها بلا سبب ظاهر — نفس درس رمز جلسة FOMO.
+And the key is **read from disk on every call**, not once at startup: a
+long-lived process freezes the startup value and then fails after rotation
+with no visible cause — the same lesson as the FOMO session token.
 """
 from __future__ import annotations
 
@@ -25,32 +28,33 @@ from provider_keys import KeyPool, read_keys
 
 
 class ChainKeyMissing(RuntimeError):
-    """لا مفتاح على القرص — الطبقة تتوقّف بوضوح بدل أن تفشل بـ401 كل دورة."""
+    """No key on disk — the layer stops clearly instead of failing with 401 every cycle."""
 
 
 class ChainRPCError(RuntimeError):
-    """فشل نداء السلسلة. رسالته **مشطوبة** من المفتاح دائماً."""
+    """A chain call failed. Its message is always **scrubbed** of the key."""
 
 
 def _read_keys() -> list[str]:
-    """كل المفاتيح المتاحة بالترتيب: البيئة، ثمّ الجمع، ثمّ المفرد القديم.
+    """All available keys in order: the environment, then the plural, then the old singular.
 
-    (كان هنا `_read_key()` مفردٌ سابقٌ للتعدّد؛ حُذف بعد أن صار كل نداء يمرّ
-    بالحوض — بقاؤه ميتاً يعني طريقَ قراءةٍ ثانياً بقواعدَ أخرى ينتظر مَن يستعمله
-    بالخطأ فيفقد التدوير بلا أيّ خطأ ظاهر. رسالةُ الغياب انتقلت إلى `_post`
-    محتفظةً بمسار الملف.)
+    (A singular `_read_key()` used to live here before the plural support; it
+    was deleted once every call started going through the pool — keeping it
+    dead leaves a second read path with different rules, waiting for someone
+    to use it by mistake and silently lose rotation. The missing-key message
+    moved to `_post`, keeping the file path.)
     """
     return read_keys("helius_api_keys", "helius_api_key", "HELIUS_API_KEY")
 
 
 def _redact(text: str, key: str) -> str:
-    """يشطب المفتاح من أي نصّ قبل تسجيله أو رفعه.
+    """Scrubs the key from any text before logging or raising it.
 
-    يشطب أيضاً `api-key=<أي شيء>` احتياطاً: لو تغيّر المفتاح على القرص بين
-    النداء والاستثناء لم يعد `key` مطابقاً للموجود في الرابط، فالشطب بالقيمة
-    وحدها لا يكفي.
+    It also scrubs `api-key=<anything>` as a safety net: if the key on disk
+    changed between the call and the exception, `key` no longer matches what
+    is in the URL, so scrubbing by value alone is not enough.
     """
-    out = text.replace(key, "<محجوب>") if key else text
+    out = text.replace(key, "<redacted>") if key else text
     if "api-key=" in out:
         head, _, tail = out.partition("api-key=")
         rest = tail
@@ -60,12 +64,12 @@ def _redact(text: str, key: str) -> str:
                 break
         else:
             rest = ""
-        out = head + "api-key=<محجوب>" + rest
+        out = head + "api-key=<redacted>" + rest
     return out
 
 
 class SolanaRPC:
-    """عميل غير متزامن لعقدة سولانا. يُعاد استخدام الاتّصال بين النداءات."""
+    """Async client for a Solana node. The connection is reused across calls."""
 
     def __init__(self, url: str | None = None, timeout: float | None = None) -> None:
         self._base = url or config.SOLANA_RPC_URL
@@ -77,25 +81,28 @@ class SolanaRPC:
         await self._client.aclose()
 
     def key_stats(self) -> dict[str, Any]:
-        """صورةُ حوض المفاتيح للرصد — أعدادٌ فقط، بلا أي قيمة (FR-013).
+        """A snapshot of the key pool for monitoring — counts only, no values (FR-013).
 
-        تُقرأ من القرص أوّلاً كي يعكس العدد ما هو موجود **الآن** لا ما كان عند
-        الإطلاق: المفتاح الجديد يُضاف بلا إعادة تشغيل، فتقريرٌ متجمّد على قيمة
-        الإطلاق كان سيقول «مفتاح واحد» بعد إضافة الثاني.
+        Disk is read first so the count reflects what exists **now**, not what
+        existed at startup: a new key can be added without a restart, and a
+        report frozen on the startup value would still say "one key" after a
+        second one is added.
         """
         try:
             self._keys.refresh(_read_keys())
-        except Exception:  # noqa: BLE001 — قراءةُ قرصٍ فاشلة لا تُسقط تقريراً
+        except Exception:  # noqa: BLE001 — a failed disk read must not sink the report
             pass
         return self._keys.stats()
 
     async def _step_aside(self, *, rejected: bool) -> None:
-        """رفضُ المفتاح يُدوَّر، والعطلُ العابر يُمهَل بنفس المفتاح.
+        """A rejected key gets rotated; a transient fault backs off on the same key.
 
-        الفرق جوهريّ: 401/429 تعني «هذا المفتاح لا يخدمك الآن» ⇒ غيّره. أمّا
-        522 ومهلة القراءة فتعني «الخدمة نفسها متعطّلة» ⇒ تدويرُ المفاتيح يبرّدها
-        كلّها بلا ذنب ولا يجلب نجاحاً. وبمفتاح واحد لا بديل أصلاً ⇒ التمهّل هو
-        كلّ ما نملكه، وهو ما كان غائباً.
+        The difference is essential: 401/429 means "this key will not serve
+        you now" ⇒ switch keys. But 522 and read timeouts mean "the service
+        itself is down" ⇒ rotating keys cools them all down, at no fault of
+        theirs, and brings no success. And with a single key there is no
+        alternative anyway ⇒ backing off is all we have, and that is what was
+        missing.
         """
         if rejected and len(self._keys.keys) > 1:
             self._keys.rotate(block_current=True)
@@ -103,16 +110,16 @@ class SolanaRPC:
         await asyncio.sleep(float(config.CHAIN_TRANSIENT_BACKOFF_SECONDS))
 
     async def _post(self, payload: Any) -> Any:
-        """طلب HTTP واحد (منفرد أو دفعة). يرفع ChainRPCError مشطوبةً عند الفشل."""
+        """One HTTP request (single or batch). Raises a redacted ChainRPCError on failure."""
         self._keys.refresh(_read_keys())
         if not self._keys.keys:
-            # المسار في الرسالة (وهو ليس سرّاً): «لا مفاتيح» بلا موضعِ الملف
-            # يُرسل القارئ يبحث عن مكانٍ يضع فيه المفتاح.
+            # The path in the message (it is not a secret): "no keys" without
+            # the file location sends the reader hunting for where to put a key.
             raise ChainKeyMissing(
-                "لا توجد قيم في helius_api_keys أو helius_api_key — الملف: "
+                "no values in helius_api_keys or helius_api_key — file: "
                 f"{config.chain_keys_path()}"
             )
-        # المحاولات لا تُشتقّ من عدد المفاتيح وحده (راجع `CHAIN_TRANSIENT_RETRIES`).
+        # Attempts are not derived from the key count alone (see `CHAIN_TRANSIENT_RETRIES`).
         attempts = max(
             int(config.CHAIN_TRANSIENT_RETRIES) + 1, len(self._keys.keys),
         )
@@ -127,7 +134,7 @@ class SolanaRPC:
                         await self._step_aside(rejected=True)
                         continue
                 elif status >= 500 and attempt + 1 < attempts:
-                    # 522 مهلة Cloudflare إلى الأصل: المفتاح سليم والخدمة لا.
+                    # 522 is a Cloudflare timeout to the origin: the key is fine, the service is not.
                     await self._step_aside(rejected=False)
                     continue
                 if status >= 400:
@@ -153,51 +160,56 @@ class SolanaRPC:
                     for error in errors
                 )
                 if retryable and attempt + 1 < attempts:
-                    # «Slow down requests» إشارةُ حمل: بمفتاح ثانٍ نجرّبه، وبمفتاح
-                    # واحد نُمهّل — ولا نمرّ بلا شيء كما كان.
+                    # "Slow down requests" is a load signal: with a second key
+                    # we try it, with a single key we back off — rather than
+                    # passing through doing nothing, as it used to be.
                     await self._step_aside(rejected=True)
                     continue
                 return body
             except ChainRPCError:
                 raise
             except httpx.TransportError as exc:
-                # مهلة قراءة أو انقطاع اتّصال: عطلٌ عابر لا عطبُ مفتاح.
+                # Read timeout or connection drop: a transient fault, not a broken key.
                 if attempt + 1 < attempts:
                     await self._step_aside(rejected=False)
                     continue
                 raise ChainRPCError(_redact(f"{type(exc).__name__}: {exc}", key)) from None
-            except Exception as exc:  # noqa: BLE001 — لا يخرج استثناء أصليّ من هنا
+            except Exception as exc:  # noqa: BLE001 — no original exception leaves this point
                 raise ChainRPCError(_redact(f"{type(exc).__name__}: {exc}", key)) from None
-        raise ChainRPCError("تعذّر النداء بعد استنفاد المحاولات والمفاتيح")
+        raise ChainRPCError("call failed after exhausting retries and keys")
 
     @staticmethod
     def _unwrap(body: Any, method: str) -> Any:
-        """يستخرج `result` أو يرفع خطأ JSON-RPC.
+        """Extracts `result`, or raises a JSON-RPC error.
 
-        المصدر يعيد 200 مع كتلة `error` (شوهد `-32603` و`-32600` عند المزاحمة)،
-        فالنجاح ليس رمز الحالة بل وجود `result`.
+        The source returns 200 with an `error` block (`-32603` and `-32600`
+        were seen under contention), so success is not the status code but the
+        presence of `result`.
         """
         if not isinstance(body, dict):
-            raise ChainRPCError(f"{method}: ردّ غير متوقّع ({type(body).__name__})")
+            raise ChainRPCError(f"{method}: unexpected response ({type(body).__name__})")
         if "error" in body and body["error"] is not None:
             err = body["error"]
             code = err.get("code") if isinstance(err, dict) else None
             msg = err.get("message") if isinstance(err, dict) else str(err)
             raise ChainRPCError(f"{method}: JSON-RPC {code}: {str(msg)[:150]}")
         if "result" not in body:
-            raise ChainRPCError(f"{method}: لا result ولا error في الردّ")
+            raise ChainRPCError(f"{method}: neither result nor error in the response")
         return body["result"]
 
     async def fetch_concentration_raw(self, mint: str) -> dict[str, Any]:
-        """العرض + أكبر الحسابات في **طلب HTTP واحد** عبر دفعة JSON-RPC.
+        """Supply + largest accounts in **one HTTP request** via a JSON-RPC batch.
 
-        `getTokenLargestAccounts` يعطي الكميّات ولا يعطي العرض الكلّي، والنسبة
-        تحتاج المقامَ — فالنداءان لازمان. الدفعة تجعلهما طلباً واحداً (مقيس:
-        4 من 4 في طلب واحد)، فتبقى الكلفة نداءً واحداً للعملة في الدورة.
+        `getTokenLargestAccounts` gives the amounts but not the total supply,
+        and a ratio needs its denominator — so both calls are required. The
+        batch makes them a single request (measured: 4 of 4 in one request),
+        keeping the cycle's cost at one call per token.
 
-        لا نأخذ العرض من `market_ticks.total_supply` (وهو مملوء 100%) عمداً:
-        مصدر آخر بإيقاع آخر، فقد يقيس العرض لحظةً غير لحظة الكميّات — والحرق
-        والطبع يغيّران العرض فعلاً. بسط ومقام من نفس اللحظة أو لا نسبة.
+        We deliberately do not take supply from `market_ticks.total_supply`
+        (100% populated): it is another source at another cadence, so it may
+        measure supply at a moment other than the amounts' — and burns and
+        minting really do change supply. Numerator and denominator from the
+        same moment, or no ratio at all.
         """
         payload = [
             {"jsonrpc": "2.0", "id": "supply", "method": "getTokenSupply", "params": [mint]},
@@ -206,11 +218,11 @@ class SolanaRPC:
         ]
         body = await self._post(payload)
         if not isinstance(body, list):
-            raise ChainRPCError(f"الدفعة أعادت {type(body).__name__} لا قائمة")
+            raise ChainRPCError(f"batch returned {type(body).__name__}, not a list")
         by_id = {str(item.get("id")): item for item in body if isinstance(item, dict)}
         missing = [k for k in ("supply", "largest") if k not in by_id]
         if missing:
-            raise ChainRPCError(f"الدفعة ناقصة: {', '.join(missing)}")
+            raise ChainRPCError(f"batch is missing entries: {', '.join(missing)}")
         supply = self._unwrap(by_id["supply"], "getTokenSupply")
         largest = self._unwrap(by_id["largest"], "getTokenLargestAccounts")
         supply_slot = (supply.get("context") or {}).get("slot") if isinstance(supply, dict) else None
@@ -218,8 +230,8 @@ class SolanaRPC:
         if (isinstance(supply_slot, int) and isinstance(largest_slot, int)
                 and abs(supply_slot - largest_slot) > config.CHAIN_MAX_SLOT_LAG):
             raise ChainRPCError(
-                "لقطتا العرض والحسابات غير متزامنتين: "
-                f"فارق {abs(supply_slot - largest_slot)} slot"
+                "supply and largest-accounts snapshots are not synchronized: "
+                f"delta {abs(supply_slot - largest_slot)} slots"
             )
         return {
             "supply": supply,
@@ -227,13 +239,15 @@ class SolanaRPC:
         }
 
     async def fetch_authority_raw(self, mint: str) -> dict[str, Any]:
-        """حساب المِنت + أصل DAS في **طلب HTTP واحد** (الطبقة البطيئة).
+        """Mint account + DAS asset in **one HTTP request** (the slow layer).
 
-        المصدران لازمان ولا يُغني أحدهما عن الآخر — مقيس على 48 عملة حيّة:
-        `getAccountInfo` يعطي صلاحية السكّ والتجميد والعرض من حساب المِنت نفسه
-        ولا يعرف `mutable` إطلاقاً؛ و`getAsset` (DAS) يعطي `mutable` والمنشئين
-        ولا يعطي صلاحية السكّ. و21 من 48 عملة على `spl-token` القديم بلا
-        امتدادات ميتاداتا أصلاً، فسلطة التعديل عندها لا تُقرأ إلّا من DAS.
+        Both sources are required and neither replaces the other — measured
+        on 48 live tokens: `getAccountInfo` gives mint authority, freeze, and
+        supply from the mint account itself but knows nothing of `mutable`;
+        `getAsset` (DAS) gives `mutable` and the creators but not mint
+        authority. And 21 of 48 tokens are on legacy `spl-token` with no
+        metadata extensions at all, so their mutability can only be read
+        from DAS.
         """
         payload = [
             {"jsonrpc": "2.0", "id": "mint", "method": "getAccountInfo",
@@ -242,14 +256,16 @@ class SolanaRPC:
         ]
         body = await self._post(payload)
         if not isinstance(body, list):
-            raise ChainRPCError(f"الدفعة أعادت {type(body).__name__} لا قائمة")
+            raise ChainRPCError(f"batch returned {type(body).__name__}, not a list")
         by_id = {str(item.get("id")): item for item in body if isinstance(item, dict)}
         missing = [k for k in ("mint", "asset") if k not in by_id]
         if missing:
-            raise ChainRPCError(f"الدفعة ناقصة: {', '.join(missing)}")
+            raise ChainRPCError(f"batch is missing entries: {', '.join(missing)}")
         out = {"mint": self._unwrap(by_id["mint"], "getAccountInfo")}
-        # DAS قد يفشل وحده (عملة غير مفهرسة) وحساب المِنت وحده يكفي لأهمّ
-        # عمودين — فلا نُسقِط القياس كلّه بسببه، بل نحفظ خطأه مكان القيمة.
+        # DAS may fail alone (an unindexed token) and the mint account alone
+        # suffices for the two most important columns — so we do not drop the
+        # whole measurement because of it; we save its error in place of the
+        # value.
         try:
             out["asset"] = self._unwrap(by_id["asset"], "getAsset")
         except ChainRPCError as exc:
@@ -258,11 +274,12 @@ class SolanaRPC:
         return out
 
     async def fetch_owner_token_balance_raw(self, owner: str, mint: str) -> Any:
-        """رصيد عنوانٍ بعينه من عملةٍ بعينها — نداء ثانٍ مشروط لحيازة المطوّر.
+        """A specific address's balance of a specific token — the conditional second call for developer holdings.
 
-        `getTokenAccountsByOwner` مع فلتر `mint` يعيد حسابات ذلك العنوان فقط،
-        فهو نداء رخيص (لا مسح للسلسلة). لا يمكن دمجه في دفعة الأصل لأنّ عنوان
-        المطوّر نفسه لا يُعرف إلّا من ردّها.
+        `getTokenAccountsByOwner` with a `mint` filter returns only that
+        address's accounts, so it is a cheap call (no chain scan). It cannot
+        be merged into the mint batch because the developer's address itself
+        is known only from that batch's reply.
         """
         body = await self._post({
             "jsonrpc": "2.0", "id": "owner", "method": "getTokenAccountsByOwner",

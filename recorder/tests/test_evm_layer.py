@@ -1,8 +1,9 @@
-"""اختبارات طبقة EVM: فكّ السجلّ، القسمة عند القصّ، الدفتر، والدورة (بلا شبكة).
+"""Tests for the EVM layer: log decoding, splitting on truncation, the ledger, and the cycle (no network).
 
-لا نداء شبكة في أي اختبار: العميل مزيّف يعيد سجلّات مصنوعة، والدفتر يُقرأ من
-قاعدة مؤقّتة. ما يُتحقَّق منه هو ما يُفسده الصمت: رصيد ناقص، مدًى يُطبَّق مرّتين،
-لقطة تُبنى على دفتر نصف معبَّأ.
+No network call in any test: the client is fake and returns handmade logs,
+and the ledger is read from a temporary database. What is verified is what
+silence corrupts: a missing balance, a range applied twice, a snapshot built
+on a half-filled ledger.
 """
 import json
 import os
@@ -47,7 +48,8 @@ def _watch(db, token=TOK, *, network=NET, control=False):
 
 
 # ---------------------------------------------------------------------------
-# العطل العابر: مهلة القراءة انتظارٌ لا عطب (مقيس على 4663 يوم 2026-08-17)
+# Transient faults: a read timeout is a wait, not a break (measured on 4663,
+# 2026-08-17)
 # ---------------------------------------------------------------------------
 def _mock_rpc(handler):
     rpc = evm_rpc.EVMRPC(urls={NET: "https://node.test/rpc"})
@@ -56,7 +58,7 @@ def _mock_rpc(handler):
 
 
 async def test_read_timeout_is_classified_as_rate_limit_not_hard_error():
-    """كان يسقط في `except Exception` العامّ ⇒ EVMRPCError لا يُعاد أبداً."""
+    """It used to fall into the generic `except Exception` ⇒ EVMRPCError was never raised."""
     def handler(request):
         raise httpx.ReadTimeout("timed out", request=request)
 
@@ -69,7 +71,7 @@ async def test_read_timeout_is_classified_as_rate_limit_not_hard_error():
 
 
 async def test_block_number_retries_a_transient_read_timeout(monkeypatch):
-    """مرساة الشبكة: فشلها يُسقط مسح 4663 كلّه لا عملةً واحدة."""
+    """The network's anchor: its failure drops the whole 4663 scan, not one token."""
     monkeypatch.setattr(config, "EVM_RATE_LIMIT_BACKOFF_SECONDS", 0)
     calls = []
 
@@ -102,7 +104,7 @@ async def test_block_number_gives_up_after_the_configured_retries(monkeypatch):
             await rpc.block_number(NET)
     finally:
         await rpc.aclose()
-    assert len(calls) == 3          # محاولة + إعادتان، ثمّ يُرفع لا يُصمت
+    assert len(calls) == 3          # one attempt + two retries, then it raises instead of going silent
 
 
 def _topic(addr):
@@ -110,7 +112,7 @@ def _topic(addr):
 
 
 def _log(frm, to, value, block, token=TOK):
-    """سجلّ `Transfer` خام كما تعيده العقدة (قيم ستّ‑عشريّة نصّاً)."""
+    """A raw `Transfer` log as the node returns it (hex values as text)."""
     return {
         "address": token,
         "topics": [evm_rpc.TRANSFER_TOPIC, _topic(frm), _topic(to)],
@@ -120,7 +122,7 @@ def _log(frm, to, value, block, token=TOK):
 
 
 # ---------------------------------------------------------------------------
-# فكّ السجلّ
+# Decoding the log
 # ---------------------------------------------------------------------------
 def test_decode_transfer_reads_value_from_data_not_topics():
     rec = evm_rpc.decode_transfer(_log(A, B, 12_345, 900))
@@ -130,14 +132,14 @@ def test_decode_transfer_reads_value_from_data_not_topics():
 
 
 def test_decode_transfer_keeps_uint256_exactly():
-    """قيمة تتجاوز 64 بتّاً: الحساب في بايثون بلا حدّ، ولو مرّ على float فسد."""
+    """A value beyond 64 bits: the arithmetic is unbounded in Python; passing through a float would corrupt it."""
     big = 2 ** 200 + 7
     rec = evm_rpc.decode_transfer(_log(A, B, big, 1))
     assert rec["value"] == big
 
 
 def test_decode_transfer_rejects_non_standard_event():
-    """توقيع مشترك بحقول مختلفة: يُهمَل ولا يُخمَّن."""
+    """A shared signature with different fields: it is ignored, not guessed."""
     bad = _log(A, B, 1, 1)
     bad["topics"] = bad["topics"][:2]
     assert evm_rpc.decode_transfer(bad) is None
@@ -162,25 +164,25 @@ def test_decode_transfer_rejects_wrong_signature_and_malformed_words():
 
 
 def test_deltas_aggregate_and_sign():
-    """عنوان يتحرّك مرّتين ⇒ كتابة واحدة، والإشارة تفرّق المرسل من المستلم."""
+    """An address that moves twice ⇒ one write, and the sign distinguishes sender from receiver."""
     logs = [_log(A, B, 100, 10), _log(B, C, 30, 11)]
     out = evm_layer._deltas_by_token(logs)
     assert out[TOK][A] == (-100, 10, None)
-    assert out[TOK][B] == (70, 11, 10)        # +100 ثمّ −30
+    assert out[TOK][B] == (70, 11, 10)        # +100 then −30
     assert out[TOK][C] == (30, 11, 11)
 
 
 def test_deltas_keep_burn_address():
-    """رصيد عنوان الصفر معلومة (كم حُرق) — الاستثناء موضعه حساب النسب."""
+    """The zero address's balance is information (how much was burned) — the exception belongs in the ratio calculation."""
     out = evm_layer._deltas_by_token([_log(A, ZERO, 50, 5)])
     assert ZERO in out[TOK]
 
 
 # ---------------------------------------------------------------------------
-# القسمة عند القصّ
+# Splitting on truncation
 # ---------------------------------------------------------------------------
 class _PagingRPC(evm_rpc.EVMRPC):
-    """يورّث العميل الحقيقيّ ويستبدل `get_logs` وحدها: المقسوم هو ما نفحصه."""
+    """Inherits the real client and replaces only `get_logs`: what gets split is what we test."""
 
     def __init__(self, limit_above=100, per_block=None):
         self.ranges = []
@@ -212,7 +214,7 @@ async def test_paging_halves_range_until_accepted():
     assert resume == 400
     assert calls == len(rpc.ranges) > 1
     assert len(logs) == 1
-    # لا فجوة ولا تراكب: القسمة تغطّي المدى كلّه بالضبط مرّة واحدة.
+    # No gap and no overlap: the split covers the whole range exactly once.
     covered = sorted(r for r in rpc.ranges if r[1] - r[0] <= 100)
     merged = []
     for lo, hi in covered:
@@ -273,7 +275,7 @@ async def test_contract_creation_block_returns_none_for_an_eoa():
 
 
 async def test_paging_reads_oldest_first():
-    """الترتيب الزمنيّ شرط صحّة الرصيد حين يُثبَّت عند صفر."""
+    """Chronological order is a correctness requirement for the balance when it is pinned at zero."""
     rpc = _PagingRPC(limit_above=100)
     await rpc.get_logs_paged(NET, [TOK], 0, 400, max_calls=50, sleep=_noop)
     accepted = [r for r in rpc.ranges if r[1] - r[0] <= 100]
@@ -281,7 +283,7 @@ async def test_paging_reads_oldest_first():
 
 
 async def test_paging_stops_at_call_cap_and_reports_resume():
-    """بلوغ السقف ⇒ `complete=False` وكتلة استئناف، لا «اكتمل» كذباً."""
+    """Reaching the cap ⇒ `complete=False` and a resume block, not a lying "done"."""
     rpc = _PagingRPC(limit_above=10)
 
     logs, calls, complete, resume = await rpc.get_logs_paged(
@@ -290,24 +292,27 @@ async def test_paging_stops_at_call_cap_and_reports_resume():
 
     assert calls == 3
     assert complete is False
-    # الثلاثة كلّها قُصَّت فلم يُقرأ شيء ⇒ الاستئناف من أوّل المدى: هذا صدقٌ لا
-    # تعثّر — القسمة تتقدّم في الدورة التاليّة بسقف حقيقيّ (24 نداءً).
+    # All three were truncated, so nothing was read ⇒ resume from the start
+    # of the range: this is honesty, not failure — the split progresses next
+    # cycle under a real cap (24 calls).
     assert resume == 0
     assert logs == []
 
 
 async def test_paging_raises_when_single_block_exceeds_limit():
-    """كتلة واحدة تفوق السقف: لا قسمة ممكنة ⇒ استثناء لا حلقة أبديّة."""
+    """A single block above the cap: no split is possible ⇒ an exception, not an infinite loop."""
     rpc = _PagingRPC(limit_above=-1)
     with pytest.raises(evm_rpc.EVMLogLimit):
         await rpc.get_logs_paged(NET, [TOK], 7, 7, max_calls=5, sleep=_noop)
 
 
 async def test_paging_stops_at_time_budget_not_only_call_count():
-    """السقف الزمنيّ هو ما يحمي الفترة: نداء واحد قد يعلَق 25 ثانية.
+    """The time budget is what protects the period: a single call can hang
+    for 25 seconds.
 
-    مقيس على الدورة الحيّة الثانية: 72 نداءً استهلكت 118 ثانية والفترة 60 —
-    فعدد النداءات لا يقول شيئاً عن الزمن. والخروج هنا بنقطة استئناف لا بخسارة.
+    Measured on the second live cycle: 72 calls consumed 118 seconds against
+    a 60-second period — so call count says nothing about time. And the exit
+    here is with a resume point, not a loss.
     """
     import time
 
@@ -315,10 +320,11 @@ async def test_paging_stops_at_time_budget_not_only_call_count():
 
     logs, calls, complete, resume = await rpc.get_logs_paged(
         NET, [TOK], 0, 1000, max_calls=50, sleep=_noop,
-        deadline=time.monotonic() - 1,          # الميزانية منتهية سلفاً
+        deadline=time.monotonic() - 1,          # the budget is already spent
     )
 
-    # نداء واحد دائماً ولو انتهت الميزانية: بلا هذا تدور العملة بلا تقدّم أبداً.
+    # Always one call even with the budget spent: without this the token
+    # would spin forever with no progress.
     assert calls == 1
     assert complete is False
     assert resume == 0
@@ -326,7 +332,7 @@ async def test_paging_stops_at_time_budget_not_only_call_count():
 
 
 async def test_paging_ignores_a_deadline_that_never_comes():
-    """ميزانية واسعة ⇒ السلوك كما هو بلا فرق (لا تقصير خفيّ)."""
+    """A generous budget ⇒ behavior unchanged (no hidden shortening)."""
     import time
 
     rpc = _PagingRPC(limit_above=100, per_block={150: [_log(A, B, 5, 150)]})
@@ -340,14 +346,15 @@ async def test_paging_ignores_a_deadline_that_never_comes():
 
 
 # ---------------------------------------------------------------------------
-# الدفعة: عدّة نداءات في طلب HTTP واحد
+# Batching: several calls in one HTTP request
 #
-# السقف حدٌّ للنداء الواحد لا للطلب، فالدفعة تضاعف المدى المقروء بنفس عدد
-# الطلبات — وهي في المعيار نفسه (JSON-RPC 2.0 §6) لا تحايلاً عليه. وثمنها أنّ
-# النجاح والفشل يختلطان في ردٍّ واحد، وهو ما تفحصه هذه الاختبارات.
+# The cap is a limit per call, not per request, so batching doubles the range
+# read for the same number of requests — and it is in the standard itself
+# (JSON-RPC 2.0 §6), not a workaround. Its price is that success and failure
+# mix in a single reply, which is what these tests examine.
 # ---------------------------------------------------------------------------
 class _BatchRPC(_PagingRPC):
-    """يضيف الدفعة إلى عميل القسمة: `batches` هو ما حُزم في طلبٍ واحد."""
+    """Adds batching to the splitting client: `batches` is what was packed into a single request."""
 
     def __init__(self, *args, too_large_once=False, gag_oldest_once=False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -378,16 +385,19 @@ class _BatchRPC(_PagingRPC):
 
 
 def test_monad_batch_size_stays_below_quicknode_subrequest_limit():
-    """QuickNode Monad يحسب كل subrequest داخل JSON-RPC batch ضمن 50/ث."""
+    """QuickNode Monad counts every subrequest inside a JSON-RPC batch against 50/sec."""
     assert 1 <= config.EVM_BATCH_SIZE["143"] <= 50
 
 
 def test_split_range_uses_the_hint_only_when_it_actually_shrinks():
-    """مدًى طوله = التلميح بالضبط لا يُقسَم بالتلميح، وإلّا أعاد نفسه إلى الأبد.
+    """A range whose length equals the hint must not be split by the hint,
+    or it returns itself forever.
 
-    هذا شرط بقاء لا تحسين: `range(lo, hi+1, hint)` على مدًى بطول التلميح يعيد
-    مدًى واحداً هو نفسه، فيُدفَع إلى المكدّس ليُرفَض ثانيةً — حلقةٌ تأكل سقف
-    النداءات كلّه بصفر تقدّم، وتظهر في السجلّ كعملة «تعمل» بلا صفوف.
+    This is a survival condition, not an optimization: `range(lo, hi+1,
+    hint)` over a range of hint length returns a single range identical to
+    itself, which gets pushed onto the stack and rejected again — a loop that
+    eats the whole call cap with zero progress, and shows up in the log as a
+    token that "works" with no rows.
     """
     assert evm_rpc._split_range(0, 400, 100) == [
         (0, 99), (100, 199), (200, 299), (300, 399), (400, 400),
@@ -397,12 +407,12 @@ def test_split_range_uses_the_hint_only_when_it_actually_shrinks():
 
 
 async def test_batch_carries_one_sub_call_per_range_and_maps_replies_by_id():
-    """الردّ يُقرأ بالـ`id` لا بالترتيب: المعيار لا يضمن ترتيب مصفوفة الردّ."""
+    """The reply is read by `id`, not by position: the standard does not guarantee the reply array's order."""
     seen = {}
 
     def handler(request):
         seen["body"] = json.loads(request.content)
-        # مقلوبٌ عمداً: القراءة بالترتيب تنسب سجلّات مدًى إلى مدًى آخر.
+        # Deliberately reversed: positional reading would attribute one range's logs to another.
         return httpx.Response(200, json=[
             {"jsonrpc": "2.0", "id": 2, "result": [_log(A, B, 5, 250)]},
             {"jsonrpc": "2.0", "id": 0, "result": []},
@@ -429,10 +439,12 @@ async def test_batch_carries_one_sub_call_per_range_and_maps_replies_by_id():
 
 
 async def test_batch_marks_only_the_truncated_sub_call_as_a_range_limit(monkeypatch):
-    """نداءٌ قُصَّ في دفعة لا يُسقط أخاه: لكلٍّ نتيجته وعلاجه.
+    """One truncated call in a batch does not take its siblings down: each
+    gets its own result and its own remedy.
 
-    وهذا هو الفرق العمليّ بين الدفعة والنداء: الرفع عند أوّل فشل يرمي نتائج
-    ناجحة دُفع ثمن طلبها، والقصّ (10,000 سجلّ) شائعٌ في مدًى واحد من عشرة.
+    And this is the practical difference between batching and single calls:
+    raising on the first failure throws away successful results already paid
+    for, and truncation (10,000 logs) is common in one range out of ten.
     """
     monkeypatch.setattr(config, "EVM_LOG_LIMIT", 2)
 
@@ -454,12 +466,12 @@ async def test_batch_marks_only_the_truncated_sub_call_as_a_range_limit(monkeypa
         await rpc.aclose()
 
     assert isinstance(out[0], list) and len(out[0]) == 1
-    assert isinstance(out[1], evm_rpc.EVMLogLimit)      # بلغ السقف ⇒ قسّم المدى
-    assert isinstance(out[2], evm_rpc.EVMBatchLimit)    # ثقل ردّ ⇒ قلّص العدد
+    assert isinstance(out[1], evm_rpc.EVMLogLimit)      # hit the cap ⇒ split the range
+    assert isinstance(out[2], evm_rpc.EVMBatchLimit)    # heavy response ⇒ shrink the count
 
 
 async def test_batching_covers_the_same_range_in_fewer_requests(monkeypatch):
-    """نفس التغطية بالضبط، وثلث الطلبات — وهذه هي الغلّة كلّها."""
+    """Exactly the same coverage with a third of the requests — and that is the whole yield."""
     monkeypatch.setitem(config.EVM_LOG_RANGE_HINT, NET, 100)
     monkeypatch.setitem(config.EVM_BATCH_SIZE, NET, 4)
     rpc = _BatchRPC(limit_above=100, per_block={150: [_log(A, B, 5, 150)]})
@@ -469,7 +481,7 @@ async def test_batching_covers_the_same_range_in_fewer_requests(monkeypatch):
     )
 
     assert (complete, resume, len(logs)) == (True, 400, 1)
-    # نداءات العقدة كما هي (ستّة) — والطلبات ثلاثة: رفضٌ، فدفعةُ أربعة، فمفرد.
+    # Node calls unchanged (six) — and three requests: a rejection, then a batch of four, then a single.
     assert rpc.ranges == [
         (0, 400), (0, 99), (100, 199), (200, 299), (300, 399), (400, 400),
     ]
@@ -480,11 +492,15 @@ async def test_batching_covers_the_same_range_in_fewer_requests(monkeypatch):
 async def test_a_too_large_response_shrinks_the_batch_without_splitting_ranges(
     monkeypatch,
 ):
-    """`-32020` حدُّ حجمٍ لا حدُّ مدًى: يُنصَّف العدد وتبقى المدود كما هي.
+    """`-32020` is a size limit, not a range limit: halve the count and keep
+    the ranges as they are.
 
-    وقسمة المدى هنا خطأٌ مكلف: المدود كلّها مقبولة أصلاً، فتقسيمها يهدر السقف
-    المتاح ويضاعف النداءات بلا سبب. وأكبر دفعة مقبولة صفةُ عملةٍ لا صفةُ شبكة
-    (قِيست 10 و5 و3 و2 و1 لخمس عملات Base) فالتعلّم داخل النداء لا في الملفّ.
+    Splitting the range here is an expensive mistake: all the ranges are
+    already acceptable, so splitting them wastes the available cap and
+    doubles the calls for nothing. And the largest acceptable batch is a
+    property of the token, not of the network (measured 10, 5, 3, 2, and 1
+    for five Base tokens), so the learning lives in the call, not in the
+    file.
     """
     monkeypatch.setitem(config.EVM_LOG_RANGE_HINT, NET, 100)
     monkeypatch.setitem(config.EVM_BATCH_SIZE, NET, 4)
@@ -497,16 +513,18 @@ async def test_a_too_large_response_shrinks_the_batch_without_splitting_ranges(
     assert (complete, resume) == (True, 400)
     assert [len(batch) for batch in rpc.batches] == [4, 2, 2]
     assert rpc.batches[0] == [(0, 99), (100, 199), (200, 299), (300, 399)]
-    # ولا يعود الحجم إلى الأعلى: العودة تعني رفضاً جديداً كل بضعة طلبات.
+    # And the size does not climb back up: climbing back means a fresh rejection every few requests.
     assert calls == 5
 
 
 async def test_logs_above_an_older_failed_range_are_discarded_and_reread(monkeypatch):
-    """أخطر ما تفعله الدفعة: يفشل أقدم مدًى وينجح ما بعده في نفس الردّ.
+    """The most dangerous thing batching does: the oldest range fails and
+    what follows it succeeds in the same reply.
 
-    الاحتفاظ بسجلّات المدى الأحدث يعني إمّا قراءتها ثانيةً في الدورة القادمة
-    (مضاعفة رصيد) أو تقديم نقطة الاستئناف فوق مدًى لم يُقرأ (ثغرة دائمة). فالعقد
-    أنّ كل سجلّ مُعاد كتلته أدنى من نقطة الاستئناف — ولو كلّف طلباً زائداً.
+    Keeping the newer range's logs means either reading them again next cycle
+    (doubled balances) or advancing the resume point over an unread range (a
+    permanent gap). The contract is that every returned log's block is below
+    the resume point — even at the cost of an extra request.
     """
     monkeypatch.setitem(config.EVM_LOG_RANGE_HINT, NET, 100)
     monkeypatch.setitem(config.EVM_BATCH_SIZE, NET, 4)
@@ -521,18 +539,20 @@ async def test_logs_above_an_older_failed_range_are_discarded_and_reread(monkeyp
     )
 
     assert (complete, resume) == (True, 400)
-    # سجلٌّ واحد لكلّ تحويل ولو قُرئ مرّتين، ومرتّبٌ تصاعديّاً.
+    # One log per transfer even if read twice, and in ascending order.
     assert [int(log["blockNumber"], 16) for log in logs] == [150, 250]
-    # والدليل أنّه قُرئ مرّتين فعلاً: المدى الناجح أُعيد طلبه بعد كتم أقدم منه.
+    # And the proof it really was read twice: the successful range was re-requested after an older one was throttled.
     assert rpc.ranges.count((100, 199)) == 2
     assert rpc.ranges.count((200, 299)) == 2
 
 
 async def test_first_mint_block_finds_the_creation_block_in_one_call():
-    """مرشّح بموضوعين ⇒ المِنح وحدها، وأدناها كتلةُ النشأة عمليّاً.
+    """A two-topic filter ⇒ mints alone, and their lowest block is for all
+    practical purposes the creation block.
 
-    القياس على السلسلة الحيّة: ثلاث من أربع عملات روبن‑هود سُكَّت فوق 67% من طول
-    السلسلة، فالمشي من الصفر يقرأ 27–37 مليون كتلة فارغة. والنداء 0.17 ثانية.
+    Measured on the live chain: three of four Robinhood tokens were minted
+    above 67% of the chain's length, so walking from zero reads 27–37 million
+    empty blocks. And the call takes 0.17 seconds.
     """
     seen = {}
 
@@ -566,10 +586,12 @@ async def test_first_mint_block_returns_none_when_nothing_was_minted():
 
 
 async def test_a_truncated_mint_scan_answers_unknown_not_a_higher_floor(monkeypatch):
-    """ردٌّ مقصوص لا يُقرأ أدناه: حدٌّ أدنى كاذب يعني عملةً تُرفض كلّها.
+    """A truncated reply must not be read as a floor: a false floor means a
+    token rejected wholesale.
 
-    عملة تسكّ باستمرار تبلغ سقف الـ10,000، فأدنى ما رأيناه أعلى من الحقيقة —
-    وحائزٌ استلم قبل الحدّ يظهر رصيده سالباً. فـ`None` هي الإجابة الصادقة.
+    A continuously minting token hits the 10,000 cap, so the lowest block we
+    saw is higher than the truth — and a holder who received before that
+    floor shows a negative balance. So `None` is the honest answer.
     """
     monkeypatch.setattr(config, "EVM_LOG_LIMIT", 2)
     rpc = _mock_rpc(lambda _r: httpx.Response(200, json={
@@ -583,10 +605,11 @@ async def test_a_truncated_mint_scan_answers_unknown_not_a_higher_floor(monkeypa
 
 
 async def test_a_gagged_mint_scan_raises_instead_of_answering_unknown():
-    """«لم أستطع السؤال» ليس «لا سكّ قبل هذه الكتلة».
+    """"I could not ask" is not "nothing was minted before this block".
 
-    ابتلاعُ الكتم يحوّل ثانيةً سيّئة إلى مشيٍ من genesis لكل عملة في كل دورة —
-    وهو بالضبط ما يجعل السقف ينفد قبل أوّل لقطة.
+    Swallowing a throttle turns one bad second into a walk from genesis for
+    every token on every cycle — which is exactly what makes the cap run out
+    before the first snapshot.
     """
     rpc = _mock_rpc(lambda _r: httpx.Response(429, text="rate limited"))
     try:
@@ -597,13 +620,15 @@ async def test_a_gagged_mint_scan_raises_instead_of_answering_unknown():
 
 
 # ---------------------------------------------------------------------------
-# تصنيف ردّ العقدة: مهلة تُقسَم، كتم يُنتظَر
+# ---------------------------------------------------------------------------
+# Classifying the node's reply: a timeout gets split, a throttle gets waited out
 #
-# كلا الحالتين مقيسة على أوّل دورة حيّة (2026-08-13): روبن‑هود ردّ على تعبئة من
-# الكتلة صفر بـ`-32000 log query timed out`، ثمّ كتم النداءين بعدها بـ429.
+# Both cases measured on the first live cycle (2026-08-13): Robinhood answered
+# a fill from block zero with `-32000 log query timed out`, then throttled the
+# two calls after it with 429.
 # ---------------------------------------------------------------------------
 class _Resp:
-    """ردّ HTTP مزيّف بأقلّ ما يقرأه `_call`: الحالة والنصّ وjson()."""
+    """A fake HTTP response with the bare minimum `_call` reads: status, text, and json()."""
 
     def __init__(self, status=200, payload=None, text=""):
         self.status_code = status
@@ -612,12 +637,12 @@ class _Resp:
 
     def json(self):
         if self._payload is None:
-            raise ValueError("ليس json")
+            raise ValueError("not json")
         return self._payload
 
 
 class _ScriptedHTTP:
-    """عميل httpx مزيّف: الردّ يُحسب من المدى المطلوب ورقم النداء."""
+    """A fake httpx client: the reply is computed from the requested range and the call number."""
 
     def __init__(self, fn):
         self._fn = fn
@@ -633,7 +658,7 @@ class _ScriptedHTTP:
 
 
 def _fake_rpc(fn):
-    """عميل حقيقيّ بعميل HTTP مزيّف — بلا `__init__` كي لا يُفتح مقبس أصلاً."""
+    """A real client with a fake HTTP client — bypassing `__init__` so no socket is ever opened."""
     rpc = evm_rpc.EVMRPC.__new__(evm_rpc.EVMRPC)
     rpc._urls = {NET: "http://node.invalid"}
     rpc._timeout = 1.0
@@ -650,10 +675,12 @@ def _ok(result):
 
 
 async def test_query_timeout_is_a_range_to_split_not_a_dead_end():
-    """«المدى أوسع من طاقتي» بصياغة ثانية ⇒ نفس العلاج: القسمة.
+    """"The range is wider than I can manage", phrased differently ⇒ the same
+    remedy: split it.
 
-    بلا هذا التصنيف تموت تعبئة العملة كلّها من أوّل مهلة — ووقع فعلاً في أوّل
-    دورة حيّة: 3 من 58 عملة خرجت من الدفتر.
+    Without this classification the token's whole fill dies on the first
+    timeout — and it actually happened on the first live cycle: 3 of 58
+    tokens dropped out of the ledger.
     """
     def fn(lo, hi, n):
         if hi - lo > 50:
@@ -667,12 +694,12 @@ async def test_query_timeout_is_a_range_to_split_not_a_dead_end():
 
     assert complete is True
     assert resume == 200
-    assert len(logs) == 4                     # أربعة أرباع كلٌّ منها ≤50 كتلة
-    assert calls > 4                          # والقسمة نفسها كلّفت نداءات
+    assert len(logs) == 4                     # four quarters, each ≤50 blocks
+    assert calls > 4                          # and the splitting itself cost calls
 
 
 async def test_rate_limit_waits_and_repeats_the_same_range():
-    """الكتم يُنتظَر ولا يُقسَم: نصفُ المدى يضاعف النداءات فيزيد الكتم."""
+    """A throttle is waited out, not split: half the range doubles the calls, which invites more throttling."""
     def fn(lo, hi, n):
         if n == 1:
             return _Resp(status=429, text='{"error":{"code":429}}')
@@ -684,12 +711,12 @@ async def test_rate_limit_waits_and_repeats_the_same_range():
     )
 
     assert complete is True
-    assert rpc._client.ranges == [(0, 100), (0, 100)]      # نفس المدى لا نصفه
+    assert rpc._client.ranges == [(0, 100), (0, 100)]      # the same range, not half of it
     assert len(logs) == 1
 
 
 async def test_rate_limit_inside_a_200_body_is_also_classified():
-    """بعض العقد تكتم بـ200 وكتلة `error` — التصنيف بالمعنى لا بحالة HTTP."""
+    """Some nodes throttle with a 200 and an `error` block — classification is by meaning, not by HTTP status."""
     def fn(lo, hi, n):
         if n == 1:
             return _err(429, "Too Many Requests")
@@ -705,9 +732,11 @@ async def test_rate_limit_inside_a_200_body_is_also_classified():
 
 
 async def test_revert_is_an_answer_but_rate_limit_is_not():
-    """`eth_call` يبتلع الارتداد («لا هذه الدالّة») ولا يبتلع الكتم.
+    """`eth_call` swallows the revert ("no such function") but not the
+    throttle.
 
-    ابتلاع الكتم يكتب «لا مالك لهذا العقد» — معلومةٌ كاذبة تُخزَّن كأنّها مقيسة.
+    Swallowing the throttle would write "this contract has no owner" — false
+    information stored as if it were measured.
     """
     reverting = _fake_rpc(lambda lo, hi, n: _err(3, "execution reverted"))
     assert await reverting.eth_call(NET, TOK, "0x8da5cb5b") is None
@@ -718,7 +747,7 @@ async def test_revert_is_an_answer_but_rate_limit_is_not():
 
 
 # ---------------------------------------------------------------------------
-# الدفتر
+# The ledger
 # ---------------------------------------------------------------------------
 def test_ledger_applies_signed_deltas_and_ranks_by_value(db):
     db.evm_apply_transfers(NET, TOK, {A: (300, 10), B: (100, 10)}, NOW)
@@ -744,21 +773,21 @@ def test_ledger_chunks_holder_lookup_below_sqlite_variable_limit(db):
 
 
 def test_ledger_ranks_beyond_64_bit(db):
-    """الترتيب معجميّ على نصّ محشوّ ⇒ مطابق للعدديّ فوق حدّ SQLite."""
+    """Ranking is lexicographic over zero-padded text ⇒ identical to numeric above SQLite's limit."""
     small, huge = 2 ** 63 + 1, 2 ** 200
     db.evm_apply_transfers(NET, TOK, {A: (small, 1), B: (huge, 1)}, NOW)
     assert db.evm_top_balances(NET, TOK, 2) == [(B, huge), (A, small)]
 
 
 def test_ledger_rejects_negative_regular_holder(db):
-    """السالب لعنوان عادي دليل فقد/تكرار، وليس صفراً يجوز تخزينه."""
-    with pytest.raises(Exception, match="سالب"):
+    """A negative for an ordinary address is evidence of loss/duplication, not a zero that may be stored."""
+    with pytest.raises(Exception, match="negative"):
         db.evm_apply_transfers(NET, TOK, {A: (-500, 9)}, NOW)
     assert db.evm_ledger_stats(NET, TOK)["holder_count"] == 0
 
 
 def test_ledger_allows_negative_burn_source_without_storing_it(db):
-    """عنوان الصفر يرسل عند السكّ، فسالبُه متوقع لكنه لا يصبح حائزاً."""
+    """The zero address sends on mint, so its negative is expected, but it does not become a holder."""
     db.evm_apply_transfers(
         NET, TOK, {ZERO: (-500, 9), A: (500, 9)}, NOW,
         allow_negative=(ZERO,),
@@ -767,7 +796,7 @@ def test_ledger_allows_negative_burn_source_without_storing_it(db):
 
 
 def test_ledger_first_seen_block_never_moves(db):
-    """«حائز جديد» = أوّل دخول لا آخر حركة."""
+    """"New holder" = first entry, not last movement."""
     db.evm_apply_transfers(NET, TOK, {A: (10, 100)}, NOW)
     db.evm_apply_transfers(NET, TOK, {A: (10, 500)}, NOW)
     row = db._conn.execute(
@@ -803,7 +832,7 @@ def test_ledger_excludes_burn_addresses_from_ratios(db):
 
 
 # ---------------------------------------------------------------------------
-# صفّ اللقطة
+# The snapshot row
 # ---------------------------------------------------------------------------
 def test_concentration_row_computes_tiers_from_live_supply():
     top = [(f"0x{i:040x}", 100) for i in range(20)]
@@ -836,17 +865,17 @@ def test_concentration_row_keeps_precision_at_eighteen_decimals():
 
 
 def test_concentration_row_none_when_ledger_empty():
-    """دفتر فارغ ≠ عملة بلا حائزين: لا صفّ أصفار (FR-007)."""
+    """An empty ledger ≠ a token with no holders: no row of zeros (FR-007)."""
     assert evm_layer.build_evm_concentration_row(
         {"supply": 0, "holder_count": 0}, [], TOK, NET, NOW, NOW, None,
     ) is None
 
 
 # ---------------------------------------------------------------------------
-# الدورة
+# The cycle
 # ---------------------------------------------------------------------------
 class _CycleRPC:
-    """عميل EVM مزيّف: سجلّات ثابتة تُرشَّح بالمدى والعنوان كما تفعل العقدة."""
+    """Fake EVM client: fixed logs filtered by range and address as the node does."""
 
     def __init__(self, head=1_000, logs=(), fail=(), mint=None):
         self.head = head
@@ -858,11 +887,12 @@ class _CycleRPC:
         self.mint_scans = []
 
     async def first_mint_block(self, network_id, address, head):
-        """`None` هو الافتراض هنا: «لم أعرف» ⇒ مشيٌ من genesis.
+        """`None` is the default here: "unknown" ⇒ a walk from genesis.
 
-        وهو ما يجب أن تبقى عليه بقيّة الاختبارات لأنّ بياناتها تصف سلسلةً صغيرة
-        تبدأ من الصفر، وبعضها يضع تحويلاً **قبل** السكّ كتبسيط. والمسح نفسه
-        يُختبَر بتمرير `mint=` صريحاً حيث يكون هو موضوع الاختبار.
+        And that is what the remaining tests must stay on, because their data
+        describes a small chain starting at zero, and some of them place a
+        transfer **before** the mint as a simplification. The scan itself is
+        tested by passing an explicit `mint=` where it is the subject.
         """
         self.mint_scans.append((str(network_id), address.lower(), int(head)))
         return self._mint
@@ -888,7 +918,7 @@ class _CycleRPC:
 
 
 async def test_first_cycle_seeds_cursor_then_backfills_then_snapshots(db):
-    """دورة واحدة على قاعدة فارغة: مؤشّر، فتعبئة كل التاريخ، فلقطة."""
+    """One cycle on an empty database: a cursor, then a full-history fill, then a snapshot."""
     _watch(db)
     rpc = _CycleRPC(head=1_000, logs=[_log(ZERO, A, 700, 5), _log(A, B, 200, 6)])
 
@@ -898,9 +928,9 @@ async def test_first_cycle_seeds_cursor_then_backfills_then_snapshots(db):
     assert stats["evm_backfilled"] == 1
     assert stats["evm_snapshots"] == 1
     assert stats["evm_errors"] == 0
-    # المؤشّر عند الرأس ناقص التأكيدات لا عند الرأس.
+    # The cursor sits at head minus confirmations, not at the head.
     assert db.evm_cursor(NET)["last_block"] == 1_000 - config.EVM_CONFIRMATIONS
-    # التعبئة من الكتلة صفر: الرصيد تراكم لا معدّل.
+    # The fill starts at block zero: the balance is cumulative, not averaged.
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 500), (B, 200)]
     row = db._conn.execute(
         "SELECT top1_pct, holder_count, top_accounts, network_id "
@@ -915,24 +945,24 @@ async def test_first_cycle_seeds_cursor_then_backfills_then_snapshots(db):
 
 
 async def test_second_cycle_does_not_reapply_backfilled_range(db):
-    """التطبيق **بعد** المؤشّر وحده: مدًى يُطبَّق مرّتين يضاعف كل رصيد."""
+    """Only what is **after** the cursor is applied: a range applied twice doubles every balance."""
     _watch(db)
     old = _log(ZERO, A, 700, 5)
     rpc = _CycleRPC(head=1_000, logs=[old])
     await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
 
-    rpc.head = 2_000                                  # كتل جديدة، ونفس السجلّ القديم
+    rpc.head = 2_000                                  # new blocks, and the same old log
     stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
-    assert stats["evm_backfill_due"] == 0             # التعبئة انتهت ولا تُعاد
+    assert stats["evm_backfill_due"] == 0             # the fill is finished and is not redone
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
     applied = [r for r in rpc.ranges if r[2] > 5]
-    assert applied, "الدورة الثانية يجب أن تطبّق ما بعد المؤشّر"
+    assert applied, "the second cycle must apply what is after the cursor"
 
 
 async def test_new_token_after_cursor_is_backfilled_without_live_double_apply(db):
-    """غير المعبّأة لا تدخل التطبيق الحيّ؛ وإلا تكرر المدى الحديث في backfill."""
+    """An unfilled token does not enter the live apply; otherwise the recent range would repeat in backfill."""
     db.set_evm_cursor(NET, 100, NOW, "ok")
     _watch(db)
     rpc = _CycleRPC(head=200, logs=[_log(ZERO, A, 700, 150)])
@@ -941,12 +971,12 @@ async def test_new_token_after_cursor_is_backfilled_without_live_double_apply(db
 
     assert stats["evm_backfilled"] == 1
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
-    # نداء واحد هو التعبئة. التطبيق الحي لا يسأل عملة لم يكتمل دفترها بعد.
+    # One call is the fill. The live apply does not ask a token whose ledger is not complete yet.
     assert len(rpc.ranges) == 1
 
 
 async def test_base_backfill_starts_at_contract_creation_block(db, monkeypatch):
-    """عملة Base الجديدة لا تمسح الكتل الفارغة التي سبقت إنشاء عقدها."""
+    """A new Base token does not sweep the empty blocks that preceded its contract's creation."""
     net = "8453"
     creation = 850
     _watch(db, network=net)
@@ -972,11 +1002,14 @@ async def test_base_backfill_starts_at_contract_creation_block(db, monkeypatch):
 
 
 async def test_backfill_starts_at_the_first_mint_where_there_is_no_archive(db):
-    """روبن‑هود لا تحفظ حالةً قديمة، فبديل البحث الثنائيّ نداءٌ بمرشّح السكّ.
+    """Robinhood keeps no historical state, so the alternative to the binary
+    search is a call with a mint filter.
 
-    والوفر مقيس على السلسلة الحيّة 2026-08-19: ثلاث من أربع عملات مراقَبة سُكَّت
-    فوق 67% من طول السلسلة (67.7% و88.6% و93.6%)، أي 27–37 **مليون** كتلة لا
-    تحمل تحويلاً واحداً كانت تُمشى قبل أوّل سجلّ. والنداء يجيب في 0.17 ثانية.
+    The saving was measured on the live chain 2026-08-19: three of four
+    watched tokens were minted above 67% of the chain's length (67.7%, 88.6%,
+    and 93.6%) — that is 27–37 **million** blocks carrying not one transfer
+    that used to be walked before the first log. And the call answers in 0.17
+    seconds.
     """
     mint = 700
     _watch(db)
@@ -986,18 +1019,21 @@ async def test_backfill_starts_at_the_first_mint_where_there_is_no_archive(db):
     stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
     assert stats["evm_backfilled"] == 1
-    # الحدّ الأعلى للمسح هو المؤشّر نفسه: ما فوقه ملكُ التطبيق الحيّ.
+    # The scan's upper bound is the cursor itself: what is above it belongs to the live apply.
     assert rpc.mint_scans == [(NET, TOK, 988)]
     assert rpc.ranges[0][2:] == (mint, 988)
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
 
 
 async def test_unknown_mint_block_walks_from_genesis_instead_of_guessing(db):
-    """`None` تعني «لم أعرف» لا «لا سكّ قبل هذه الكتلة» — والفرق دفترٌ صحيح.
+    """`None` means "unknown", not "nothing minted before this block" — and
+    the difference is a correct ledger.
 
-    عملة تسكّ باستمرار قد تقصّ ردّ المسح عند السقف، فيصير أدنى ما رأيناه أعلى من
-    الحقيقة. وحدٌّ أدنى أعلى من النشأة يعني حائزاً استلم قبله فيظهر رصيده سالباً،
-    وعملةٌ برصيد سالب تُرفض كلّها. فالمشي الطويل ثمنٌ مقبول، والحدّ الكاذب ليس.
+    A continuously minting token can get the scan's reply truncated at the
+    cap, making the lowest block we saw higher than the truth. A floor above
+    creation means a holder who received before it shows a negative balance,
+    and a token with a negative balance is rejected wholesale. The long walk
+    is an acceptable price; the false floor is not.
     """
     _watch(db)
     db.set_evm_cursor(NET, 988, NOW, "ok")
@@ -1011,7 +1047,7 @@ async def test_unknown_mint_block_walks_from_genesis_instead_of_guessing(db):
 
 
 async def test_empty_partial_backfill_rechecks_contract_creation(db, monkeypatch):
-    """حالة قديمة فارغة تبدأ من إنشاء العقد حتى لو حفظت نقطة صغيرة سابقاً."""
+    """An old empty state starts from contract creation even if it saved a small earlier point."""
     net = "8453"
     creation = 850
     _watch(db, network=net)
@@ -1039,7 +1075,7 @@ async def test_empty_partial_backfill_rechecks_contract_creation(db, monkeypatch
 
 
 async def test_zero_net_ledger_with_applied_transfers_keeps_saved_resume(db, monkeypatch):
-    """صافي أرصدة صفر لا يعني أن المدى السابق فارغ أو يجوز تطبيقه ثانية."""
+    """A zero net balance does not mean the previous range was empty or may be applied twice."""
     net = "8453"
     _watch(db, network=net)
     db.set_evm_cursor(net, 988, NOW, "ok")
@@ -1052,7 +1088,7 @@ async def test_zero_net_ledger_with_applied_transfers_keeps_saved_resume(db, mon
 
     class _CreationRPC(_CycleRPC):
         async def contract_creation_block(self, *_args):
-            raise AssertionError("لا يجب إعادة اكتشاف البداية بعد تطبيق تحويلات")
+            raise AssertionError("the start must not be rediscovered after transfers were applied")
 
     rpc = _CreationRPC(head=1_000)
 
@@ -1064,7 +1100,7 @@ async def test_zero_net_ledger_with_applied_transfers_keeps_saved_resume(db, mon
 async def test_apply_uses_only_common_completed_prefix_across_address_batches(
     db, monkeypatch,
 ):
-    """تأخر دفعة لا يسمح بكتابة مستقبل دفعة أخرى ثم إعادته في الدورة التالية."""
+    """One batch lagging does not allow writing another batch's future and then replaying it next cycle."""
     tok2 = "0xbbbb000000000000000000000000000000000002"
     _watch(db, TOK)
     _watch(db, tok2)
@@ -1102,7 +1138,7 @@ async def test_apply_uses_only_common_completed_prefix_across_address_batches(
 
 
 async def test_apply_rolls_back_balances_when_cursor_write_fails(db, monkeypatch):
-    """الأرصدة والمؤشر وحدة ذرية؛ فشل المؤشر لا يترك تحويلات ستُعاد."""
+    """Balances and cursor are one atomic unit; a cursor failure must not leave transfers that will be replayed."""
     _watch(db)
     db.set_evm_backfill_state(NET, TOK, "done", NOW, from_block=101, to_block=100)
     db.set_evm_cursor(NET, 100, NOW, "ok")
@@ -1181,13 +1217,13 @@ async def test_new_transfer_after_cursor_is_applied(db):
 
 
 async def test_partial_backfill_blocks_snapshot(db):
-    """لقطة عملة نصف معبَّأة رقمٌ كاذب لا رقم ناقص."""
+    """A snapshot of a half-filled token is a false number, not a partial one."""
     _watch(db)
     rpc = _CycleRPC(head=1_000, logs=[_log(ZERO, A, 700, 5)])
 
     async def _partial(network_id, addresses, from_block, to_block, topics=None,
                        max_calls=None, sleep=None, deadline=None):
-        # نصف المدى وحده قُرِئ ⇒ الاستئناف من منتصفه.
+        # Only half the range was read ⇒ resume from its midpoint.
         mid = (from_block + to_block) // 2
         return [], 1, False, mid
 
@@ -1201,11 +1237,11 @@ async def test_partial_backfill_blocks_snapshot(db):
     ).fetchone()[0] == 0
     state = db.evm_backfill_state(NET, TOK)
     assert state["status"] == "partial"
-    assert state["from_block"] > 0                    # يُستأنف لا يُعاد من الصفر
+    assert state["from_block"] > 0                    # resumed, not restarted from zero
 
 
 def test_snapshot_helper_rejects_partial_backfill(db):
-    """الحارس داخل الكاتب نفسه، لا في المنسّق وحده، يمنع لقطة دفتر ناقص."""
+    """The guard inside the writer itself, not only in the coordinator, prevents an incomplete-ledger snapshot."""
     _watch(db)
     db.set_evm_backfill_state(
         NET, TOK, "partial", NOW, from_block=100, to_block=988,
@@ -1214,7 +1250,7 @@ def test_snapshot_helper_rejects_partial_backfill(db):
     watch = db.evm_watched([NET])[0]
     stats = {"evm_snapshots": 0, "evm_snap_empty": 0}
 
-    with pytest.raises(ValueError, match="غير مكتمل"):
+    with pytest.raises(ValueError, match="incomplete"):
         evm_layer._snapshot_token(db, watch, NOW, stats)
 
     assert db._conn.execute(
@@ -1223,7 +1259,7 @@ def test_snapshot_helper_rejects_partial_backfill(db):
 
 
 async def test_completed_old_backfill_catches_up_before_done(db):
-    """عملة مستثناة من التطبيق الحي تلحق مؤشر بداية الدورة قبل اللقطة."""
+    """A token exempt from the live apply catches up to the cycle's starting cursor before the snapshot."""
     _watch(db)
     db.set_evm_cursor(NET, 200, NOW, "ok")
     db.set_evm_backfill_state(
@@ -1242,7 +1278,7 @@ async def test_completed_old_backfill_catches_up_before_done(db):
 
 
 async def test_backfill_commits_when_network_cursor_moves_concurrently(db):
-    """تقدّم مؤشر عملة مكتملة أخرى لا يلغي دفتر العملة الجزئية."""
+    """Another completed token's cursor advancing does not cancel the partial token's ledger."""
     _watch(db)
     db.set_evm_cursor(NET, 200, NOW, "ok")
     rpc = _CycleRPC(head=300, logs=[_log(ZERO, A, 700, 250)])
@@ -1271,7 +1307,7 @@ async def test_backfill_assist_supplies_its_own_timestamp_when_omitted(db):
 
 
 async def test_backfill_done_aborts_if_cursor_moves_after_catchup_check(db, monkeypatch):
-    """حركة المؤشر في نافذة التثبيت لا تترك فجوة بين backfill والتطبيق الحي."""
+    """Cursor movement inside the pinning window must not leave a gap between backfill and the live apply."""
     _watch(db)
     db.set_evm_cursor(NET, 200, NOW, "ok")
     rpc = _CycleRPC(head=300, logs=[_log(ZERO, A, 700, 150)])
@@ -1294,7 +1330,7 @@ async def test_backfill_done_aborts_if_cursor_moves_after_catchup_check(db, monk
 
 
 async def test_incomplete_apply_pulls_cursor_back(db):
-    """دفعة لم تكتمل ⇒ المؤشّر يتوقّف قبل الفجوة؛ التقدّم يفقد سجلّات للأبد."""
+    """An incomplete batch ⇒ the cursor stops before the gap; advancing forward loses logs forever."""
     _watch(db)
     rpc = _CycleRPC(head=1_000)
     await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
@@ -1309,29 +1345,30 @@ async def test_incomplete_apply_pulls_cursor_back(db):
     stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
     assert stats["evm_lagging"] == 1
-    # `resume − 1`: أوّل كتلة غير مقروءة هي (المؤشّر+1)+10 فالمؤشّر يقف قبلها.
+    # `resume − 1`: the first unread block is (cursor+1)+10, so the cursor stops just before it.
     assert db.evm_cursor(NET)["last_block"] == seeded + 10
 
 
 async def test_network_error_keeps_valid_cursor_and_records_meta(db):
     _watch(db)
     rpc = _CycleRPC(head=1_000)
-    await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)   # يبني المؤشّر
+    await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)   # builds the cursor
 
     rpc._fail = {NET}
     stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
     assert stats["evm_errors"] == 1
     cursor = db.evm_cursor(NET)
-    # المؤشر يصف آخر كتلة مطبقة فعلاً؛ خطأ قراءة الرأس لا يبطل ذلك التقدم،
-    # وكتابته `error` هنا قد تخفض حالة عامل متزامن نجح بعدنا.
+    # The cursor describes the last block actually applied; a head-read
+    # failure does not undo that progress, and writing `error` here could
+    # downgrade the state of a concurrent worker that succeeded after us.
     assert cursor["last_status"] == "ok"
     assert cursor["last_error"] is None
     assert "503" in (db.get_meta("last_error_evm") or "")
 
 
 async def test_empty_networks_tuple_touches_nothing(db, monkeypatch):
-    """قائمة فارغة تعني «لا شيء» لا «كل الشبكات»."""
+    """An empty list means "nothing", not "every network"."""
     _watch(db)
     monkeypatch.setattr(config, "EVM_NETWORKS", ())
     rpc = _CycleRPC(head=1_000)
@@ -1343,7 +1380,7 @@ async def test_empty_networks_tuple_touches_nothing(db, monkeypatch):
 
 
 async def test_solana_watch_is_never_touched(db):
-    """الشبكات منفصلة: عملة سولانا لا تدخل دفتر EVM ولا تُسأل عنه."""
+    """Networks are separate: a Solana token enters no EVM ledger and is never asked about."""
     _watch(db, "SoLmint111", network=config.SOLANA_NETWORK_ID)
     rpc = _CycleRPC(head=1_000)
 
@@ -1354,13 +1391,13 @@ async def test_solana_watch_is_never_touched(db):
 
 
 async def test_backfill_limit_error_is_recorded_and_not_retried_every_cycle(db):
-    """كتلة واحدة تفوق السقف: تُسجَّل `error` ولا تُعاد كل دقيقة."""
+    """A single block above the cap: it is recorded `error` and not retried every minute."""
     _watch(db)
     rpc = _CycleRPC(head=1_000)
 
     async def _boom(network_id, addresses, from_block, to_block, topics=None,
                     max_calls=None, sleep=None, deadline=None):
-        raise evm_rpc.EVMLogLimit("eth_getLogs: 10000 سجلّاً ⇒ السقف بلغ")
+        raise evm_rpc.EVMLogLimit("eth_getLogs: 10000 logs ⇒ limit hit")
 
     rpc.get_logs_paged = _boom
     stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
@@ -1370,18 +1407,19 @@ async def test_backfill_limit_error_is_recorded_and_not_retried_every_cycle(db):
     assert state["status"] == "error"
     assert "EVMLogLimit" in state["last_error"]
 
-    # والدورة التالية لا تعيدها ولو صحّت العقدة: العطب دائم لا عابر.
+    # And the next cycle does not retry it even if the node recovered: the break is permanent, not transient.
     del rpc.get_logs_paged
     again = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
     assert again["evm_backfill_due"] == 0
 
 
 async def test_transient_backfill_failure_is_requeued_not_buried(db):
-    """عطبٌ عابر ⇒ `retry` ويعود في الدورة التالية.
+    """A transient fault ⇒ `retry`, and it comes back next cycle.
 
-    مقيس على أوّل دورة حيّة: مهلة استعلام وكتمان 429 أخرجا 3 من 58 عملة من
-    الدفتر **إلى الأبد** حين كان كل فشل يُكتب `error`. الفرق بين الحالتين هو
-    الفرق بين ثانيةٍ سيّئة وعطبٍ لا علاج له.
+    Measured on the first live cycle: a query timeout and two 429s pushed 3
+    of 58 tokens out of the ledger **forever** when every failure was written
+    `error`. The difference between the two cases is the difference between a
+    bad second and an unfixable break.
     """
     _watch(db)
     rpc = _CycleRPC(head=1_000, logs=[_log(ZERO, A, 700, 5)])
@@ -1394,25 +1432,26 @@ async def test_transient_backfill_failure_is_requeued_not_buried(db):
     first = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
     assert first["evm_backfill_retry"] == 1
-    assert first["evm_backfill_errors"] == 0        # عابر ⇒ ليس في عدّاد الدائم
-    assert first["evm_snapshots"] == 0              # لا لقطة قبل دفتر مكتمل
+    assert first["evm_backfill_errors"] == 0        # transient ⇒ not in the permanent counter
+    assert first["evm_snapshots"] == 0              # no snapshot before a complete ledger
     state = db.evm_backfill_state(NET, TOK)
     assert state["status"] == "retry"
     assert "503" in (state["last_error"] or "")
 
-    del rpc.get_logs_paged                          # العقدة أفاقت
+    del rpc.get_logs_paged                          # the node came back to its senses
     second = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
-    assert second["evm_backfill_due"] == 1          # عادت إلى الطابور
+    assert second["evm_backfill_due"] == 1          # back in the queue
     assert second["evm_backfilled"] == 1
     assert db.evm_backfill_state(NET, TOK)["status"] == "done"
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
 
 
 async def test_retry_goes_to_the_tail_of_the_queue(db, monkeypatch):
-    """الترتيب بوقت المحاولة: من جُرِّب الآن يُجرَّب آخراً.
+    """Ordering is by attempt time: whoever was just tried goes last.
 
-    بلا هذا تحتلّ عملةٌ متعثّرة سقفَ الدورة كل دقيقة فلا تُعبَّأ الجديدات أبداً.
+    Without this, one stumbling token occupies the whole cycle cap every
+    minute and the newcomers are never filled.
     """
     monkeypatch.setattr(config, "EVM_BACKFILL_TOKENS_PER_CYCLE", 1)
     _watch(db)
@@ -1431,16 +1470,18 @@ async def test_retry_goes_to_the_tail_of_the_queue(db, monkeypatch):
     del rpc.get_logs_paged
     await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
-    # الجديدة (بلا وقت محاولة) سبقت المتعثّرة، والسقف عملةٌ واحدة.
+    # The new one (no attempt time) got ahead of the stumbling one, and the cap is one token.
     assert db.evm_backfill_state(NET, fresh)["status"] == "done"
     assert db.evm_backfill_state(NET, TOK)["status"] == "retry"
 
 
 async def test_retry_resumes_from_its_saved_block_and_never_doubles(db):
-    """`retry` يستأنف من نقطته: البدء من الصفر يضاعف كل رصيد مطبَّق سلفاً.
+    """`retry` resumes from its point: starting from zero doubles every
+    balance already applied.
 
-    نقطة الاستئناف تبقى محفوظة عند الفشل العابر (`COALESCE`)، فإعادة المدى
-    كلّه ليست إبطاءً بل **أرقاماً كاذبة**: `evm_apply_transfers` يجمع لا يستبدل.
+    The resume point stays saved on a transient failure (`COALESCE`), so
+    redoing the whole range is not a slowdown but **false numbers**:
+    `evm_apply_transfers` accumulates, it does not replace.
     """
     _watch(db)
     rpc = _CycleRPC(head=1_000, logs=[_log(ZERO, A, 700, 5)])
@@ -1453,7 +1494,7 @@ async def test_retry_resumes_from_its_saved_block_and_never_doubles(db):
     await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
     assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]
 
-    # ثمّ تعثّر عابر: الحالة `retry` والنقطة 400 محفوظة.
+    # Then a transient stumble: status `retry`, point 400 saved.
     async def _stumble(network_id, addresses, from_block, to_block, topics=None,
                        max_calls=None, sleep=None, deadline=None):
         raise evm_rpc.EVMRPCError("eth_getLogs [4663] HTTP 429")
@@ -1473,12 +1514,12 @@ async def test_retry_resumes_from_its_saved_block_and_never_doubles(db):
     rpc.get_logs_paged = _record
     await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
 
-    assert seen and seen[-1][0] == 400            # لا من الصفر
-    assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]   # ولا مضاعفة
+    assert seen and seen[-1][0] == 400            # not from zero
+    assert db.evm_top_balances(NET, TOK, 10) == [(A, 700)]   # and no doubling
 
 
 async def test_backfill_rolls_back_balances_when_state_write_fails(db, monkeypatch):
-    """حالة التعبئة ورصيدها معاملة واحدة؛ لا checkpoint يعني لا رصيد مثبت."""
+    """The fill state and its balance are one transaction; no checkpoint means no committed balance."""
     _watch(db)
     rpc = _CycleRPC(head=1_000, logs=[_log(ZERO, A, 700, 5)])
     original = db.set_evm_backfill_state
@@ -1500,15 +1541,17 @@ async def test_backfill_rolls_back_balances_when_state_write_fails(db, monkeypat
 
 
 async def test_backfill_stops_starting_tokens_when_the_budget_is_spent(db, monkeypatch):
-    """ميزانية الزمن تحمي الفترة: الأولى تُعبَّأ والبقيّة تنتظر الدورة القادمة.
+    """The time budget protects the period: the first token is filled and
+    the rest wait for the next cycle.
 
-    الطبقة السريعة على سولانا في نفس العملية، ودورةٌ من 118 ثانية (مقيسة) تكسر
-    إيقاعها الخمس‑دقائقيّ. والتأخير هنا بلا فقدان: التعبئة تُستأنف من نقطتها.
+    The fast layer runs on Solana in the same process, and a 118-second
+    cycle (measured) breaks its five-minute rhythm. And the delay here loses
+    nothing: the fill resumes from its point.
     """
     _watch(db)
     _watch(db, "0xbbbb000000000000000000000000000000000003")
     rpc = _CycleRPC(head=1_000)
-    # ميزانية منتهية سلفاً ⇒ الأولى تمضي (نداء واحد مضمون) والثانية تُؤخَّر.
+    # A budget already spent ⇒ the first proceeds (one call guaranteed) and the second is deferred.
     monkeypatch.setattr(config, "EVM_BACKFILL_BUDGET_SECONDS", -1.0)
 
     stats = await evm_layer.run_evm_cycle(rpc, db, NOW, sleep=_noop)
@@ -1518,7 +1561,7 @@ async def test_backfill_stops_starting_tokens_when_the_budget_is_spent(db, monke
     assert stats["evm_backfill_skipped"] == 1
     assert stats["evm_backfill_errors"] == 0
     assert stats["evm_backfill_retry"] == 0
-    # المؤخَّرة بلا صفّ حالة أصلاً ⇒ تتصدّر طابور الدورة القادمة.
+    # The deferred one has no state row at all ⇒ it heads the next cycle's queue.
     assert db._conn.execute(
         "SELECT COUNT(*) FROM evm_backfill_state"
     ).fetchone()[0] == 1

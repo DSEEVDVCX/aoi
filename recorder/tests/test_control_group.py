@@ -1,7 +1,8 @@
-"""اختبارات المجموعة الضابطة (الصنف السالب).
+"""Control group tests (the negative class).
 
-تثبت الخصائص التي تجعل المقارنة صالحة علمياً: الاختيار عشوائيّ لا ترتيبيّ،
-لا يلمس ما أُشير إليه، لا يُخفّض عملة مُشار إليها، ويُقسَّط على الزمن.
+They pin the properties that make the comparison scientifically valid:
+selection is random not positional, never touches signalled tokens, never
+demotes a signalled token, and is spread over time.
 """
 import math
 import os
@@ -30,16 +31,19 @@ def _cands(n, net="56"):
 
 
 def _age_all(target, n=300, nets=("56", "1399811149", "8453", "4663")):
-    """يمنح كلّ مرشّحٍ محتمل عمراً **معروفاً وقديماً** (ثلاثون يوماً).
+    """Gives every potential candidate a **known, old** age (thirty days).
 
-    موضوعُ هذا الملفّ ميكانيكا الاختيار — عشوائيّته، مزيجُ شبكاته، استبعادُ
-    المُشار إليه، شرطُ السعر — لا العمر؛ وبوّابةُ العمر تُختبر وحدها في
-    `test_control_age_gate.py`. وبلا تاريخِ إنشاءٍ يرفض الضابطُ كلَّ مرشّحٍ
-    كمجهولِ العمر، فتُقاس الميكانيكا على مجموعةٍ خالية وتنجح بلا معنى.
+    This file's subject is the selection mechanics — its randomness, its
+    network mix, the exclusion of signalled tokens, the price condition — not
+    age; the age gate is tested on its own in `test_control_age_gate.py`.
+    Without a creation date the controller rejects every candidate as
+    unknown-age, so the mechanics would be measured on an empty set and pass
+    meaninglessly.
     """
     created = str(int(datetime.fromisoformat(NOW).timestamp()) - 30 * 86400)
     names = [f"tok{i:03d}" for i in range(n)]
-    # مرشّحون بأسماءٍ صريحة في اختباراتٍ بعينها — لا يلتقطها نمطُ `tok###`.
+    # Explicit-name candidates for particular tests — not matched by the
+    # `tok###` pattern.
     names += ["control", "tokA", "tokNew", "bad", "priced", "valid",
               "base", "base0", "c1", "s1"]
     with target.batch():
@@ -74,11 +78,11 @@ def test_control_admission_is_idempotent(db):
     assert db.admit_control("c1", "56", 48, NOW) is True
     assert db.admit_control("c1", "56", 48, "2026-07-27T06:00:00+00:00") is False
     row = db._conn.execute("SELECT first_seen_at FROM watchlist").fetchone()
-    assert row["first_seen_at"] == NOW          # النافذة لا تُعاد ضبطها
+    assert row["first_seen_at"] == NOW          # the window is not reset
 
 
 def test_signal_promotes_a_control_coin_without_erasing_control_window(db):
-    """ترقية العملة لا تمحو نافذة الضابطة الأصلية من سجل المقارنة."""
+    """Promoting the token does not erase the original control window from the comparison log."""
     db.admit_control("c1", "56", 48, NOW)
     promoted = db.upsert_watch("c1", "56", "large_buy", "sig9", 48, "2026-07-27T05:00:00+00:00")
 
@@ -119,7 +123,7 @@ def test_reactivated_signal_creates_a_second_immutable_window(db):
 
 
 def test_control_never_downgrades_a_signalled_coin(db):
-    """الاتجاه المعاكس ممنوع: المُشار إليها لا تصير ضابطة أبداً."""
+    """The reverse direction is forbidden: a signalled token never becomes a control."""
     db.upsert_watch("s1", "56", "large_buy", "sig1", 48, NOW)
     assert db.admit_control("s1", "56", 48, "2026-07-27T05:00:00+00:00") is False
     row = db._conn.execute("SELECT * FROM watchlist WHERE token_address='s1'").fetchone()
@@ -128,7 +132,7 @@ def test_control_never_downgrades_a_signalled_coin(db):
 
 
 def test_sample_is_capped_per_cycle_not_taken_all_at_once(db):
-    """التقسيط يمنع أن تكون العيّنة كلّها من لحظة سوقية واحدة."""
+    """Installment admission prevents the whole sample coming from a single market moment."""
     added = recorder.admit_control_sample(db, _cands(50), NOW, rng=random.Random(0))
     assert added == config.CONTROL_PER_CYCLE
     assert db.active_watch_count(is_control=1) == config.CONTROL_PER_CYCLE
@@ -141,12 +145,12 @@ def test_sample_stops_at_target_size(db):
         if db.active_watch_count(is_control=1) >= config.CONTROL_GROUP_SIZE:
             break
     assert db.active_watch_count(is_control=1) == config.CONTROL_GROUP_SIZE
-    # بلغ الهدف → لا إدخال إضافي
+    # Target reached → no further admission
     assert recorder.admit_control_sample(db, _cands(300), NOW, rng=rng) == 0
 
 
 def test_sample_excludes_signalled_tokens_even_if_not_watched(db):
-    """عملة ورد عليها حدث إشارة لا تصلح ضابطة، ولو لم تدخل المراقبة."""
+    """A token that received a signal event is not control material, even if it never entered the watchlist."""
     db.insert_signal({
         "id": "s1", "token_address": "tok000", "network_id": "56", "ts": NOW,
         "recorded_at": NOW, "signal_type": "large_buy", "ticker": None,
@@ -177,20 +181,21 @@ def test_sample_excludes_already_known_tokens(db):
 
 
 def test_sample_is_random_not_positional(db, tmp_path):
-    """الأخذ من رأس قائمة الرواج يختار الأعلى حجماً، فيصير الفرق فرقَ حجمٍ
-    لا فرقَ إشارة. نتحقّق أنّ بذوراً مختلفة تعطي اختيارات مختلفة."""
+    """Taking from the head of the trending list picks the highest-volume
+    tokens, turning the difference into a volume difference rather than a
+    signal difference. We verify that different seeds give different picks."""
     picks = []
     for seed in range(6):
         d = RecorderDB(str(tmp_path / f"s{seed}.db"), SCHEMA)
-        _age_all(d, 80)          # قواعد خاصّة بهذا الاختبار ⇒ تعمير صريح
+        _age_all(d, 80)          # private DBs for this test ⇒ explicit filling
         recorder.admit_control_sample(d, _cands(80), NOW, rng=random.Random(seed))
         picks.append(tuple(sorted(
             r["token_address"] for r in d._conn.execute(
                 "SELECT token_address FROM watchlist"))))
         d.close()
-    assert len(set(picks)) > 1                     # ليست دائماً نفس العملات
+    assert len(set(picks)) > 1                     # not always the same tokens
     heads = {p for p in picks if p and p[0] == "tok000"}
-    assert len(heads) < len(picks)                 # ليست دائماً رأس القائمة
+    assert len(heads) < len(picks)                 # not always the list head
 
 
 def test_no_candidates_or_target_met_is_a_noop(db):

@@ -20,7 +20,7 @@ async def main():
     creds = CredentialStore(settings.credential_state_file).load()
     client = FomoClient(session_token=creds.access_token)
 
-    # 1) ترقيم الـ feed رجوعاً
+    # 1) paging the feed backwards
     print("=== FEED HISTORY (proper unwrap) ===")
     base = await client._get(settings.upstream_feed_path,
                              {"feedTypes": ["large_buy"], "limit": 5})
@@ -41,7 +41,7 @@ async def main():
                 print(f"{pname:8s}: ERR {type(e).__name__}: {str(e)[:70]}")
             await asyncio.sleep(1.2)
 
-    # 2) شموع عملة قديمة فعلاً (أطروحات 2025-08/2025-11) وقت كتابتها
+    # 2) candles of a genuinely old coin (2025-08/2025-11 theses) at their writing time
     print("=== BARS AT OLD THESIS TIME ===")
     db_uri = "file:C:/Users/rr/Desktop/aoi/recorder/recorder.db?mode=ro"
     db = sqlite3.connect(db_uri, uri=True)
@@ -50,7 +50,7 @@ async def main():
         "GROUP BY token_address ORDER BY 3 LIMIT 4"
     ).fetchall()
     for addr, net, created in olds:
-        t = int(time.mktime(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))) - 4*3600  # تقريبي UTC+4؟ لا — created UTC
+        t = int(time.mktime(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))) - 4*3600  # rough UTC+4? no — created is UTC
         body = {"symbol": f"{addr}:{net}", "resolution": "60",
                 "from": t - 3600*12, "to": t + 3600*12, "countBack": 50}
         try:

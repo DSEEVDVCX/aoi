@@ -1,15 +1,19 @@
-"""تصدير حزمة تحليل خارجيّة: كل ما يحتاجه محلّل خارجيّ ليقترح طريقة تدريب أفضل.
+"""Export an external analysis bundle: everything an outside analyst needs to
+propose a better training method.
 
-لماذا حزمة لا جدول واحد: الهدف الذي ندرّب عليه ليس عموداً في القاعدة، بل ناتج
-محاكاة صفقة (`exit_sim.simulate_trade`) تمشي على الشموع. فمن يملك الصفوف بلا شموع
-لا يستطيع إعادة بناء الهدف، ومن يملك الشموع بلا سعر الدخول لا يعرف من أين يقيس.
-الثلاثة معاً أو لا شيء.
+Why a bundle and not a single table: the target we train on is not a column in
+the database but the outcome of a trade simulation
+(`exit_sim.simulate_trade`) that walks the bars. Whoever holds the rows
+without the bars cannot rebuild the target, and whoever holds the bars without
+the entry price does not know where to measure from. All three together or
+nothing.
 
-قراءة فقط (`mode=ro`) وداخل معاملة واحدة: المسجّل والموسِّم يكتبان كل دقيقة، وبلا
-لقطة متّسقة قد تُشير `bars.csv` إلى صفوف ليست في `features.csv`.
+Read-only (`mode=ro`) inside a single transaction: the recorder and the
+labeler write every minute, and without a consistent snapshot `bars.csv`
+could point at rows that are not in `features.csv`.
 
-الاستعمال:
-    py export_dataset.py                      # إلى C:\\Users\\rr\\Desktop\\data
+Usage:
+    py export_dataset.py                      # to C:\\Users\\rr\\Desktop\\data
     py export_dataset.py --out D:\\somewhere
 """
 from __future__ import annotations
@@ -30,18 +34,18 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 DEFAULT_OUT = r"C:\Users\rr\Desktop\data"
-BAR_RESOLUTION = "5"          # الدقّة الوحيدة المكتملة؛ 1D عبر 48س شمعتان لا تنفعان
-WINDOW_H = 48                 # نافذة النتيجة
+BAR_RESOLUTION = "5"          # the only complete resolution; 1D over 48h is two bars, useless
+WINDOW_H = 48                 # outcome window
 
-# ملفّات الكود التي تصف الطريقة الحالية. لا `config.py`: يحمل مسارات وإعدادات
-# اتّصال، ولا شأن للمحلّل بها.
+# Code files that describe the current method. No `config.py`: it holds paths
+# and connection settings the analyst has no business with.
 CODE_FILES = (
-    "features.py",            # قانون النقطة الزمنية + حساب الـ147 ميزة
-    "exit_sim.py",            # تعريف الهدف الحقيقيّ (محاكاة الصفقة)
-    "train_pipeline.py",      # التدريب والتقييم الحاليّان
-    "build_training_rows.py", # كيف صار الصفّ صفّاً
-    "labeler.py",             # كيف صارت النتيجة نتيجة
-    "schema.sql",             # الشكل الكامل بتعليقاته
+    "features.py",            # the point-in-time law + the 147-feature computation
+    "exit_sim.py",            # the real target definition (trade simulation)
+    "train_pipeline.py",      # current training and evaluation
+    "build_training_rows.py", # how a row became a row
+    "labeler.py",             # how an outcome became an outcome
+    "schema.sql",             # the full shape, with its comments
 )
 
 
@@ -49,8 +53,9 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-# دليل الحزمة. القواعد هنا والأعداد في MANIFEST.json — فلا يشيخ هذا الملفّ عند
-# كل تصدير. يُكتب مع كل تشغيل حتى لا تخرج حزمة بلا قواعدها.
+# The bundle's guide. Rules live here and counts live in MANIFEST.json — so
+# this text never goes stale between exports. Written on every run so no
+# bundle ships without its rules.
 README_TEXT = """# Token-signal dataset — analysis bundle
 
 You are asked one question: **what is the best way to train a model on this data,
@@ -215,14 +220,15 @@ always match the CSVs beside it.
 
 
 def _writer(path: str):
-    fh = open(path, "w", encoding="utf-8", newline="")  # noqa: SIM115 — مصنعٌ يُرجع المقبضَ والمنادي يغلقه
-    # lineterminator صريح: بلاه يكتب \r\n على ويندوز فيتضخّم الملفّ ويربك قارئات
-    # بعض الأدوات. None يُكتب حقلاً فارغاً تلقائياً — وهذا المطلوب: الغائب ليس صفراً.
+    fh = open(path, "w", encoding="utf-8", newline="")  # noqa: SIM115 — a factory returning the handle; the caller closes it
+    # Explicit lineterminator: without it Windows writes \r\n, bloating the
+    # file and confusing some tools' readers. None values are written as empty
+    # fields automatically — which is what we want: absent is not zero.
     return fh, csv.writer(fh, lineterminator="\n")
 
 
 def export_table(con, out_dir: str, name: str, sql: str, params=()) -> dict:
-    """يصدّر نتيجة استعلام إلى CSV ويعيد إحصاء الصفوف والحجم."""
+    """Export a query's result to CSV and return row count and size."""
     path = os.path.join(out_dir, name)
     cur = con.execute(sql, params)
     cols = [d[0] for d in cur.description]
@@ -239,16 +245,17 @@ def export_table(con, out_dir: str, name: str, sql: str, params=()) -> dict:
     finally:
         fh.close()
     size = os.path.getsize(path)
-    _log(f"   {name:<22} {n:>9,} صفّاً · {size/1024/1024:.1f} MB")
+    _log(f"   {name:<22} {n:>9,} rows · {size/1024/1024:.1f} MB")
     return {"file": name, "rows": n, "bytes": size, "columns": cols}
 
 
 def export_bars(con, out_dir: str, windows: dict) -> dict:
-    """الشموع داخل نوافذ الـ48 ساعة فقط.
+    """Bars inside the 48-hour windows only.
 
-    استعلام واحد لكل عملة على مدى [أقدم دخول، أحدث دخول + 48س] ثمّ ترشيح في
-    بايثون على النوافذ الفعليّة. البديل — استعلام لكل صفّ — عشرات الآلاف من
-    الاستعلامات؛ والبديل الآخر — EXISTS مترابط على 1.4 مليون شمعة — أبطأ بمراتب.
+    One query per token over [oldest entry, newest entry + 48h], then filtering
+    in Python down to the actual windows. The alternative — one query per row —
+    is tens of thousands of queries; the other alternative — a correlated
+    EXISTS over 1.4 million bars — is orders of magnitude slower.
     """
     path = os.path.join(out_dir, "bars.csv")
     cols = ["token_address", "network_id", "resolution", "ts", "o", "h", "l", "c",
@@ -277,8 +284,8 @@ def export_bars(con, out_dir: str, windows: dict) -> dict:
     finally:
         fh.close()
     size = os.path.getsize(path)
-    _log(f"   {'bars.csv':<22} {n:>9,} شمعة · {size/1024/1024:.1f} MB "
-         f"· {tokens_with_bars:,} عملة")
+    _log(f"   {'bars.csv':<22} {n:>9,} bars · {size/1024/1024:.1f} MB "
+         f"· {tokens_with_bars:,} tokens")
     return {"file": "bars.csv", "rows": n, "bytes": size, "columns": cols,
             "resolution": BAR_RESOLUTION, "tokens_with_bars": tokens_with_bars}
 
@@ -291,9 +298,10 @@ def main() -> None:
     ap.add_argument("--out", default=DEFAULT_OUT)
     ap.add_argument(
         "--since", default=None, metavar="YYYY-MM-DD",
-        help="تصدير مركّز: إشارات من هذا التاريخ فصاعداً فقط (entry_ts). "
-             "يُستعمل لتجميع عائلات ميزات حديثة (onchain/flow) تغطيتها ضعيفة "
-             "قبل تاريخ بدء جمعها — الغائب يبقى NULL لا صفراً في الحالتين.",
+        help="Focused export: only signals from this date onward (entry_ts). "
+             "Used to gather recent feature families (onchain/flow) whose "
+             "coverage is thin before their collection start date — absent "
+             "stays NULL, not zero, in both cases.",
     )
     args = ap.parse_args()
     since_cut: int | None = None
@@ -309,29 +317,31 @@ def main() -> None:
     con = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True,
                           isolation_level=None)
     con.execute("PRAGMA busy_timeout = 30000")
-    # لقطة متّسقة واحدة لكل الملفّات (WAL يسمح بقارئ لا يعيق الكاتبين).
+    # One consistent snapshot for all files (WAL allows a reader that does not
+    # block the writers).
     con.execute("BEGIN")
     manifest: dict = {"feature_version": features.FEATURE_VERSION,
                       "window_hours": WINDOW_H, "files": []}
     live_where = "is_live = 1"
     if since_cut is not None:
-        # القيد يطبَّق على entry_ts (لحظة القرار) لا على recorded_at — وإلا
-        # تسلّلت صفوف قراراتٍ قديمة عبر أرشفةٍ متأخرة.
+        # The cutoff applies to entry_ts (the decision moment), not
+        # recorded_at — otherwise old decision rows slip in through late
+        # archiving.
         live_where += f" AND entry_ts >= {since_cut}"
         manifest["since"] = args.since
     try:
-        _log("1) صفوف التدريب (is_live=1 حصراً — البيانات الحيّة فقط)")
+        _log("1) Training rows (is_live=1 only — live data only)")
         skipped = con.execute(
             "SELECT COUNT(*) FROM training_rows WHERE COALESCE(is_live,0) <> 1"
         ).fetchone()[0]
         manifest["rows_excluded_not_live"] = skipped
         if skipped:
-            _log(f"   استُبعد {skipped:,} صفّاً غير حيّ (قيد ملزم: التدريب حيّ فقط)")
+            _log(f"   Excluded {skipped:,} non-live rows (hard rule: live-only training)")
         manifest["files"].append(export_table(
             con, out_dir, "features.csv",
             f"SELECT * FROM training_rows WHERE {live_where} ORDER BY entry_ts"))
 
-        _log("\n2) النتائج (سعر الدخول وجودة الشموع — ليست كلّها في features.csv)")
+        _log("\n2) Outcomes (entry price and bar quality — not all in features.csv)")
         manifest["files"].append(export_table(
             con, out_dir, "outcomes.csv",
             f"""SELECT o.* FROM outcomes o
@@ -340,19 +350,20 @@ def main() -> None:
                                  AND t.is_live = 1{'' if since_cut is None else f' AND t.entry_ts >= {since_cut}'})
                 ORDER BY o.entry_ts"""))
 
-        _log("\n3) الشموع داخل النوافذ")
+        _log("\n3) Bars inside the windows")
         windows: dict = {}
-        # إشارات + ضابطة. نستثني kind='activity' وحده: رجعيّ، والتدريب حيّ حصراً.
+        # Signals + control. We exclude kind='activity' alone: it is
+        # retroactive, and training is live-only.
         for tok, ts in con.execute(
             f"""SELECT token_address, entry_ts FROM training_rows
                 WHERE kind IN ('signal', 'watch') AND entry_ts IS NOT NULL
                   AND {live_where}"""
         ):
             windows.setdefault(tok, []).append((ts, ts + WINDOW_H * 3600))
-        _log(f"   {len(windows):,} عملة · {sum(len(v) for v in windows.values()):,} نافذة")
+        _log(f"   {len(windows):,} tokens · {sum(len(v) for v in windows.values()):,} windows")
         manifest["files"].append(export_bars(con, out_dir, windows))
 
-        _log("\n4) المجموعة الضابطة (kind='watch' — للمقارنة، ليست للتدريب)")
+        _log("\n4) Control group (kind='watch' — for comparison, not for training)")
         manifest["files"].append(export_table(
             con, out_dir, "control_group.csv",
             """SELECT w.token_address, w.network_id, w.first_seen_at, w.is_control,
@@ -367,12 +378,14 @@ def main() -> None:
                                 || ':' || w.first_seen_at
                 ORDER BY w.first_seen_at"""))
 
-        # ميزات الضابطة في ملفّ منفصل، لا داخل features.csv.
-        # السبب: `is_live` علم للإشارات وحدها — كل صفوف watch لها is_live=0، فلو
-        # رشّحنا features.csv بـis_live=1 (والقيد يوجبه) سقطت الضابطة كلّها.
-        # لكنّ الضابطة هي الصنف السالب الذي بلاه لا يُعرف هل الإشارة تعني شيئاً.
-        # فالحلّ ملفّ ثانٍ صريح: التدريب من الأوّل، والمقارنة من الثاني.
-        _log("\n4ب) ميزات الضابطة (نفس الـ147 ميزة، نفس قانون النقطة الزمنية)")
+        # Control features in a separate file, not inside features.csv.
+        # Reason: `is_live` is a signal-only flag — every watch row has
+        # is_live=0, so filtering features.csv by is_live=1 (which the rule
+        # requires) would drop the entire control group. But the control group
+        # is the negative class; without it there is no telling whether a
+        # signal means anything. Hence a second, explicit file: train from the
+        # first, compare from the second.
+        _log("\n4b) Control features (same 147 features, same point-in-time law)")
         manifest["files"].append(export_table(
             con, out_dir, "control_features.csv",
             f"""SELECT r.*, w.is_control, w.source AS watch_source
@@ -383,7 +396,7 @@ def main() -> None:
                 WHERE r.kind = 'watch' AND {live_where}
                 ORDER BY r.entry_ts"""))
 
-        _log("\n5) توزيعات مرجعيّة (لئلّا يعيد المحلّل التقسيم عشوائيًّا)")
+        _log("\n5) Reference distributions (so the analyst does not re-split randomly)")
         dist: dict = {}
         for label, sql in (
             ("by_split", "SELECT split, COUNT(*) FROM training_rows "
@@ -410,12 +423,13 @@ def main() -> None:
                   AND asset_class='meme' AND status='ok'"""
         ).fetchone()[0]
         manifest["main_training_set_rows"] = n_model
-        _log(f"   مجموعة التدريب الرئيسيّة (بمعايير المنظر) = {n_model:,}")
+        _log(f"   Main training set (by the spec's criteria) = {n_model:,}")
 
-        _log("\n5ب) تغطية كل ميزة (feature_coverage.csv)")
-        # ثلث الميزات فارغ في النافذة الحالية لا لخلل بل لأنّ جمع مصدرها بدأ
-        # بعد آخر نتيجة موسومة (الوسم يتأخّر 48س عن الجمع). بلا هذا الملفّ يحكم
-        # المحلّل على ميزة سليمة بأنّها ميتة.
+        _log("\n5b) Per-feature coverage (feature_coverage.csv)")
+        # A third of the features are empty in the current window not because
+        # of a defect but because their source started collecting after the
+        # last labeled outcome (labeling lags collection by 48h). Without this
+        # file the analyst pronounces a healthy feature dead.
         feat_cols = list(features.FEATURE_COLUMNS)
         sel = ", ".join(f"SUM({c} IS NOT NULL)" for c in feat_cols)
         since_clause = "" if since_cut is None else f" AND entry_ts >= {since_cut}"
@@ -448,8 +462,8 @@ def main() -> None:
         manifest["feature_coverage"] = {
             "usable_at_50pct": usable, "empty_in_main_set": empty,
             "total_features": len(feat_cols)}
-        _log(f"   {usable} ميزة صالحة (≥50%) · {empty} فارغة تماماً "
-             f"· من {len(feat_cols)}")
+        _log(f"   {usable} usable features (≥50%) · {empty} fully empty "
+             f"· of {len(feat_cols)}")
         manifest["files"].append(
             {"file": "feature_coverage.csv", "rows": len(feat_cols),
              "bytes": os.path.getsize(cov_path)})
@@ -460,7 +474,7 @@ def main() -> None:
             pass
         con.close()
 
-    _log("\n6) فصل الميزات عن الأهداف (columns.json)")
+    _log("\n6) Separating features from targets (columns.json)")
     import train_pipeline
     feat = list(features.FEATURE_COLUMNS)
     all_cols = list(features.ROW_COLUMNS)
@@ -478,11 +492,11 @@ def main() -> None:
     }
     with open(os.path.join(out_dir, "columns.json"), "w", encoding="utf-8") as fh:
         json.dump(cols_doc, fh, indent=2, ensure_ascii=False)
-    _log(f"   {len(feat)} ميزة · {len(targets)} هدف · {len(ident)} معرّف/وصفيّ")
+    _log(f"   {len(feat)} features · {len(targets)} targets · {len(ident)} identifier/meta")
     manifest["counts"] = {"features": len(feat), "targets": len(targets),
                           "identifiers": len(ident)}
 
-    _log("\n7) الكود الذي يصف الطريقة الحالية")
+    _log("\n7) The code describing the current method")
     copied = []
     for name in CODE_FILES:
         src = os.path.join(HERE, name)
@@ -491,24 +505,25 @@ def main() -> None:
             copied.append(name)
             _log(f"   code/{name}")
         else:
-            _log(f"   code/{name} — غير موجود، تُخطّى")
+            _log(f"   code/{name} — not found, skipped")
     manifest["code_files"] = copied
     manifest["export_seconds"] = round(time.time() - started, 1)
 
-    # القواعد التي تمنع الاستنتاج الخاطئ موجودة في README_TEXT أعلاه، لكنّ
-    # المالك طلب عدم إصدار README.md في حزمة التصدير (قرار 2026-08-25) —
-    # فتُحذَف إن وُجد من تصديرٍ سابق، ولا يُكتَب جديد.
-    _log("\n8) دليل القراءة (README.md) — مُعطَّل بطلب المالك")
+    # The rules that prevent wrong inference live in README_TEXT above, but the
+    # owner asked that no README.md ship in the export bundle (decision
+    # 2026-08-25) — so it is deleted if left over from a previous export, and
+    # no new one is written.
+    _log("\n8) Reading guide (README.md) — disabled at the owner's request")
     stale_readme = os.path.join(out_dir, "README.md")
     if os.path.exists(stale_readme):
         os.remove(stale_readme)
-        _log("   حُذف README.md قديم")
+        _log("   Removed stale README.md")
 
     with open(os.path.join(out_dir, "MANIFEST.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, ensure_ascii=False)
 
     total = sum(f["bytes"] for f in manifest["files"])
-    _log(f"\nتمّ في {manifest['export_seconds']}ث · "
+    _log(f"\nDone in {manifest['export_seconds']}s · "
          f"{total/1024/1024:.0f} MB · {out_dir}")
 
 

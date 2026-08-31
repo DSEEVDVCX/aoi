@@ -1,16 +1,21 @@
-"""إدارةُ مفاتيح المزوّدين من اللوحة: قراءةٌ، إضافةٌ، إيقافٌ، حذفٌ، واختبارٌ حيّ.
+"""Managing provider keys from the dashboard: read, add, suspend, delete, and live-test.
 
-هذه أوّلُ كتابةٍ تملكها اللوحة بعد أن صارت قراءةً محضة، فحدودُها مرسومةٌ بدقّة:
+This is the first write capability the dashboard has had since it became
+read-only, so its limits are drawn precisely:
 
-- الهدفُ ملفُّ `recorder/chain_keys.json` وحدَه. قاعدةُ البيانات تبقى `mode=ro`
-  كما هي — لا سطرَ كتابةٍ واحد إليها، فلا مزاحمةَ على قفل الكاتب.
-- صيغةُ الملفّ ليست معرّفةً هنا بل في `recorder/key_file.py`، ويُحمَّل بمسارٍ
-  صريح لا عبر `sys.path`: للمشروعين `config.py` بنفس الاسم، فإضافةُ مجلّد
-  المسجّل إلى المسار كانت ستجعل استيرادَ `config` رهناً بالترتيب.
-- القيمةُ لا تُعاد أبداً. ما يخرج من هنا: اسمُ الحساب، وآخرُ أربعة أحرف
-  (`key_file.tail` — خفضٌ مقصودٌ لِـ FR-013 طلبَه المستخدم للتمييز)، ومؤشّرات.
-- والقيمةُ لا تُسجَّل أبداً: رسائلُ الاختبار تُشطب منها قيمةُ المفتاح قبل
-  عرضها، لأنّ خطأ المزوّد كثيراً ما يردّ الرابطَ كاملاً وفيه المفتاح.
+- The target is the `recorder/chain_keys.json` file alone. The database stays
+  `mode=ro` as it is — not one write line to it, so no contention with the
+  writer's lock.
+- The file's format is not defined here but in `recorder/key_file.py`, and
+  it's loaded by an explicit path, not via `sys.path`: the two projects each
+  have a `config.py` with the same name, so adding the recorder's folder to
+  the path would have made the `config` import order-dependent.
+- The value is never returned. What leaves here: the account name, the last
+  four characters (`key_file.tail` — a deliberate FR-013 relaxation the user
+  requested for telling keys apart), and gauges.
+- And the value is never logged: the test messages have the key redacted
+  from them before display, because provider errors often return the full URL
+  with the key in it.
 """
 from __future__ import annotations
 
@@ -28,15 +33,15 @@ import httpx
 
 
 def _load_key_file():
-    """يحمّل `recorder/key_file.py` بمسارٍ صريح باسمٍ فريد.
+    """Loads `recorder/key_file.py` by an explicit path under a unique name.
 
-    باسمٍ فريد (`aoi_key_file`) لا `key_file`: لو استوردت اللوحةُ يوماً وحدةً
-    بنفس الاسم لم يتنازعا في `sys.modules`.
+    Under a unique name (`aoi_key_file`), not `key_file`: if the dashboard ever
+    imports a module by that name, the two won't fight over `sys.modules`.
     """
     path = os.path.join(config.RECORDER_DIR, "key_file.py")
     spec = importlib.util.spec_from_file_location("aoi_key_file", path)
-    if spec is None or spec.loader is None:  # pragma: no cover - مسارٌ مفقود
-        raise RuntimeError(f"تعذّر تحميل صيغة ملفّ المفاتيح: {path}")
+    if spec is None or spec.loader is None:  # pragma: no cover - missing path
+        raise RuntimeError(f"failed to load the key file format: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -44,27 +49,31 @@ def _load_key_file():
 
 key_file = _load_key_file()
 
-# قفلٌ لكلّ تعديل: التعديلُ قراءةٌ ثمّ كتابة، وطلبان متزامنان من نفس اللوحة
-# كانا سيقرآن نفس الحالة فيضيع أحدُ التعديلين بلا أثر.
+# One lock per modification: a modification is a read then a write, and two
+# concurrent requests from the same dashboard would have read the same state,
+# silently dropping one of the changes.
 _LOCK = threading.Lock()
 
-# نتائجُ الاختبار الحيّ — في الذاكرة لا في القاعدة ولا في الملفّ. سبب ذلك أنّ
-# نتيجةَ فحصٍ لحظيّة، وكتابتُها في القاعدة كانت ستُدخل الذيلَ في ملفٍّ يُنسخ
-# احتياطيّاً. تُفقد بإعادة تشغيل اللوحة، وهذا مقبول: يُعاد الفحص بضغطة.
+# Live probe results — in memory, not in the database or the file. The reason:
+# they're point-in-time check results, and writing them to the database would
+# have dragged the tail into a file that gets backed up. They're lost on a
+# dashboard restart, and that's acceptable: re-checking is one click.
 _PROBES: dict[tuple[str, str], dict[str, Any]] = {}
 
-# اسمُ الحساب: نصٌّ بشريّ قصير. نمنع محارف التحكّم وأقواسَ الوسوم كي لا يتحوّل
-# إلى وسمٍ في الصفحة، ونقصّه فلا يزحم السطر.
+# The account name: a short human text. We forbid control characters and tag
+# brackets so it can't become a tag in the page, and truncate it so it doesn't
+# crowd the row.
 _LABEL_MAX = 60
 _BAD_LABEL = re.compile(r"[\x00-\x1f<>]")
 
-# المفتاح: قيمةٌ واحدة بلا فراغات. الحدّان يمنعان اللصقَ الخاطئ (سطرٌ كامل من
-# ملفّ .env مثلاً) قبل أن يصير مفتاحاً ميّتاً في الحوض يُبرَّد كلَّ دورة.
+# The key: one value with no whitespace. The two bounds prevent a bad paste (a
+# whole line from a .env file, say) before it becomes a dead key in the pool
+# getting thawed every cycle.
 _KEY_MIN, _KEY_MAX = 8, 200
 
 
 class KeyStoreError(RuntimeError):
-    """طلبٌ مرفوض بسببٍ يُعرض للمستخدم كما هو."""
+    """A rejected request, with a reason shown to the user as-is."""
 
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -75,7 +84,7 @@ def _meta(provider: str) -> dict[str, Any]:
     try:
         return key_file.PROVIDERS[provider]
     except KeyError:
-        raise KeyStoreError(f"مزوّد غير معروف: {provider}", 404) from None
+        raise KeyStoreError(f"unknown provider: {provider}", 404) from None
 
 
 def _path() -> str:
@@ -83,11 +92,11 @@ def _path() -> str:
 
 
 def _env_override(provider: str) -> bool:
-    """هل يتقدّم متغيّرُ البيئة على الملفّ لهذا المزوّد؟
+    """Does the environment variable take precedence over the file for this provider?
 
-    إن كان مضبوطاً فتحريرُ الملفّ لا يفعل شيئاً: `provider_keys.read_keys`
-    يرجع من البيئة قبل أن يفتح الملفّ. فالصمتُ هنا كان سيعني «أضفتُ مفتاحاً
-    ولا يعمل» بلا سبب ظاهر.
+    If it's set, editing the file does nothing: `provider_keys.read_keys`
+    returns from the environment before ever opening the file. So silence here
+    would have meant "I added a key and it doesn't work" with no visible reason.
     """
     return bool(os.environ.get(_meta(provider)["env"], "").strip())
 
@@ -102,7 +111,7 @@ def _write(provider: str, rows: list[dict[str, Any]]) -> None:
     try:
         key_file.save_entries(_path(), meta["plural"], meta["singular"], rows)
     except (OSError, ValueError) as exc:
-        raise KeyStoreError(f"تعذّرت الكتابة: {type(exc).__name__}", 500) from exc
+        raise KeyStoreError(f"failed to write: {type(exc).__name__}", 500) from exc
 
 
 def _clean_label(label: str) -> str:
@@ -113,74 +122,80 @@ def _clean_label(label: str) -> str:
 def _clean_key(value: str) -> str:
     text = str(value or "").strip()
     if not text or any(ch.isspace() for ch in text):
-        raise KeyStoreError("المفتاح فارغ أو يحتوي فراغات — الصقه وحدَه")
+        raise KeyStoreError("The key is empty or contains spaces — paste it alone")
     if not (_KEY_MIN <= len(text) <= _KEY_MAX):
-        raise KeyStoreError(f"طول المفتاح غير معقول ({len(text)} حرفاً)")
+        raise KeyStoreError(f"Unreasonable key length ({len(text)} characters)")
     return text
 
 
 def _locate(
     provider: str, slot: int, expect_tail: str, expect_id: str = "",
 ) -> tuple[list[dict], int]:
-    """يجد سطراً بالموضع، ويتحقّق من الذيل قبل تعديله.
+    """Finds a row by slot and verifies the tail before modifying it.
 
-    الموضعُ وحده لا يكفي: بين رسمِ الصفحة وضغطِ الزرّ قد يكون الملفُّ تغيّر
-    (تحريرٌ يدويّ، أو لسانُ متصفّحٍ آخر)، فيصير الموضعُ 1 مفتاحاً آخر ويُحذف
-    السليمُ بدل المقصود. فنطابق الذيلَ الذي رُسم به السطر — وهو مقارنةٌ لا
-    إظهار: المستخدم يملكه في صفحته أصلاً.
+    The slot alone isn't enough: between rendering the page and pressing the
+    button the file may have changed (a manual edit, or another browser tab),
+    so slot 1 becomes a different key and the healthy one gets deleted
+    instead of the intended one. So we match the tail the row was rendered
+    with — a comparison, not a disclosure: the user already has it in their page.
     """
     rows = _entries(provider)
     if not 0 <= slot < len(rows):
-        raise KeyStoreError("تغيّر الملفّ — أعد تحميل الصفحة", 409)
+        raise KeyStoreError("The file changed — reload the page", 409)
     if key_file.tail(rows[slot]["key"]) != str(expect_tail or ""):
-        raise KeyStoreError("تغيّر الملفّ — أعد تحميل الصفحة", 409)
+        raise KeyStoreError("The file changed — reload the page", 409)
     if expect_id:
         if _key_id(rows[slot]["key"]) != expect_id:
-            raise KeyStoreError("تغيّر الملفّ — أعد تحميل الصفحة", 409)
+            raise KeyStoreError("The file changed — reload the page", 409)
     elif sum(key_file.tail(row["key"]) == str(expect_tail or "") for row in rows) > 1:
-        raise KeyStoreError("آخر أحرف المفتاح غير فريدة — أعد تحميل الصفحة", 409)
+        raise KeyStoreError("The key's last characters are not unique — reload the page", 409)
     return rows, slot
 
 
 def _redact(text: str, key: str) -> str:
-    """يشطب المفتاح من نصٍّ قبل عرضه. نفس درس `solana_rpc._redact`."""
+    """Redacts the key from a text before displaying it. Same lesson as `solana_rpc._redact`."""
     out = str(text)
     if key:
-        out = out.replace(key, "<محجوب>")
-    return re.sub(r"(api-key=|Bearer\s+)[^\s\"'&)>]+", r"\1<محجوب>", out)
+        out = out.replace(key, "<redacted>")
+    return re.sub(r"(api-key=|Bearer\s+)[^\s\"'&)>]+", r"\1<redacted>", out)
 
 
-# ملحٌ عشوائيّ يُولَد مرّةً لكلّ عمليّة ولا يخرج من الذاكرة.
+# A random salt generated once per process that never leaves memory.
 _ID_SALT = secrets.token_bytes(32)
 
 
 def _key_id(key: str) -> str:
-    """هويّةٌ تميّز مفتاحاً عن آخر: ثابتةٌ داخل العمليّة، بلا معنى خارجها.
+    """An identity that tells one key from another: stable within the process, meaningless outside it.
 
-    الذيلُ الرباعيّ لا يكفي هويّةً — مفتاحان ينتهيان بـ`wxyz` يجعلان `_locate`
-    يطابق الخطأ فيُحذف السليم، ونتيجةَ فحصٍ لأحدهما تُلوّن الآخر. فاحتجنا معرّفاً
-    فريداً يُرسَل مع الزرّ.
+    The four-character tail isn't enough as an identity — two keys ending in
+    `wxyz` make `_locate` match the wrong one and delete the healthy key, and
+    a probe result for one of them colors the other. So we needed a unique
+    identifier sent along with the button.
 
-    وهو **ليس** بصمةَ المفتاح: `sha256(key)` كانت ستؤدّي الوظيفةَ نفسها وتخالف
-    القاعدةَ («لا قيمة، ولا شَظيّة، ولا بصمة»)، لأنّها تصلح مِحكّاً — من يملك
-    قائمةَ مفاتيحٍ مرشَّحة يؤكّد بها أيَّها المستعمل هنا — وتصلح رابطاً يُطابق
-    نفسَ المفتاح بين نظامين. أمّا HMAC بملحٍ عشوائيٍّ فناتجُه لافتةٌ عشوائيّة:
-    لا تُشتقّ منها قيمة ولا تُطابق من خارج هذه العمليّة.
+    And it is **not** a fingerprint of the key: `sha256(key)` would have done
+    the same job while breaking the rule ("no value, no fragment, no
+    fingerprint"), because it works as a test oracle — anyone holding a list
+    of candidate keys can confirm which one is in use here — and as a link
+    matching the same key across two systems. HMAC with a random salt,
+    though, produces an opaque random token: no value can be derived from it
+    and nothing outside this process can be matched against it.
 
-    والملحُ يموت بموتِ العمليّة، فالهويّاتُ تبطل عند الإقلاع. وهذا هو الصواب لا
-    عيبٌ فيه: صفحةٌ مفتوحةٌ من قبل الإقلاع تُعاد تحميلاً بدل أن يُصدَّق زرُّها،
-    ولوحُ المفاتيح يُرسَم كلَّ دورةِ تحديثٍ فالنافذةُ ثوانٍ.
+    And the salt dies with the process, so identities are voided at boot. And
+    that is correct, not a flaw: a page opened before the boot gets reloaded
+    rather than having its button trusted, and the key panel is re-rendered
+    on every refresh cycle, so the window is seconds.
     """
     return hmac.new(_ID_SALT, key.strip().encode("utf-8"), "sha256").hexdigest()[:32]
 
 
-# --- العرض ---
+# --- Display ---
 def _pool_view(pool_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """يلمُّ حالةَ كلّ مزوّدٍ من أحواض كلّ العمليّات المالكة.
+    """Gathers each provider's state from the pools of all owning processes.
 
-    المزوّدُ قد يوجد في عمليّتين بحالتين مستقلّتين (كان GoldRush في `FomoChain`
-    و`FomoEVMReplay` كذلك)، فنجمع لا نُرجّح: موضعٌ مبرَّدٌ في إحداهما مبرَّدٌ فعلاً،
-    وذكرُ المالكِ يجعل السببَ مفهوماً بدل «مبرَّد» مجهولةِ المصدر.
+    A provider can exist in two processes with two independent states (that's
+    how GoldRush was in `FomoChain` and `FomoEVMReplay`), so we aggregate, we
+    don't pick: a slot cooled in either one is really cooled, and naming the
+    owner makes the reason understandable instead of a "cooled" with no source.
     """
     view: dict[str, dict[str, Any]] = {}
     for row in pool_rows:
@@ -190,10 +205,12 @@ def _pool_view(pool_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         state["owners"].append(row["owner"])
         if row.get("disabled"):
             state["disabled_by"].append(row["owner"])
-        # تقريرٌ متقادمٌ وصفٌ للماضي: التبريدُ والاستعمالُ حالتان لحظيّتان تنتهيان
-        # مع الدورة، فتلوينُ مفتاحٍ بعينه بهما من تقريرٍ بائتٍ كذبٌ صريح. أمّا
-        # المالكُ والتعطيلُ فوصفُ إعدادٍ لا لحظة، وكتمانُهما يقول «سليم» عن
-        # مزوّدٍ مُطفأ — وسطرُ الحوض يحمل علامةَ stale فالقارئ يرى المصدر.
+        # A stale report describes the past: cooling and in-use are momentary
+        # states that end with the cycle, so coloring a specific key with them
+        # from a stale report is an outright lie. The owner and the disabling,
+        # though, describe configuration, not a moment, and hiding them would
+        # say "healthy" about a provider that's switched off — and the pool row
+        # carries the stale flag, so the reader sees the source.
         if row.get("stale"):
             continue
         for index in row.get("blocked_index") or []:
@@ -204,7 +221,7 @@ def _pool_view(pool_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
 
 
 def rows(pool_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """أسطرُ المفاتيح للعرض: اسمُ الحساب، الذيل، والحالة. **لا قيمة**."""
+    """The key rows for display: account name, tail, and status. **No value**."""
     pools = _pool_view(pool_rows)
     out: list[dict[str, Any]] = []
     providers: list[dict[str, Any]] = []
@@ -223,8 +240,9 @@ def rows(pool_rows: list[dict[str, Any]]) -> dict[str, Any]:
             "owners": sorted(set(state.get("owners") or [])),
             "disabled_by": sorted(disabled_by),
         })
-        # موضعُ الحوض يُحسب على المفعّلة فقط وبنفس الترتيب: الحوضُ يُبنى من
-        # `read_keys` التي تُصفّي المعطّلة، فترقيمُ الملفّ كان سيُزيح الألوان.
+        # The pool slot is computed over the enabled keys only, in the same
+        # order: the pool is built by `read_keys`, which filters out the
+        # disabled, so the file's numbering would have shifted the colors.
         pool_slot = 0
         for slot, row in enumerate(entries):
             enabled = row["enabled"]
@@ -258,18 +276,18 @@ def rows(pool_rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"keys": out, "providers": providers}
 
 
-# --- التعديل ---
+# --- Modification ---
 def add(provider: str, key: str, label: str) -> dict[str, Any]:
     value = _clean_key(key)
     name = _clean_label(label)
     with _LOCK:
         if _env_override(provider):
             raise KeyStoreError(
-                f"مضبوطٌ من البيئة ({_meta(provider)['env']}) — الملفّ مُهمَل هناك", 409,
+                f"set from the environment ({_meta(provider)['env']}) — the file is ignored there", 409,
             )
         rows_now = _entries(provider)
         if any(row["key"] == value for row in rows_now):
-            raise KeyStoreError("هذا المفتاح موجود بالفعل", 409)
+            raise KeyStoreError("this key already exists", 409)
         rows_now.append({"key": value, "label": name, "enabled": True})
         _write(provider, rows_now)
     return {"ok": True, "tail": key_file.tail(value), "keys": len(rows_now)}
@@ -281,7 +299,7 @@ def set_enabled(
     with _LOCK:
         if _env_override(provider):
             raise KeyStoreError(
-                f"مضبوطٌ من البيئة ({_meta(provider)['env']}) — الملفّ مُهمَل هناك", 409,
+                f"set from the environment ({_meta(provider)['env']}) — the file is ignored there", 409,
             )
         rows_now, index = _locate(provider, slot, expect_tail, expect_id)
         rows_now[index]["enabled"] = bool(enabled)
@@ -294,7 +312,7 @@ def remove(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> d
     with _LOCK:
         if _env_override(provider):
             raise KeyStoreError(
-                f"مضبوطٌ من البيئة ({_meta(provider)['env']}) — الملفّ مُهمَل هناك", 409,
+                f"set from the environment ({_meta(provider)['env']}) — the file is ignored there", 409,
             )
         rows_now, index = _locate(provider, slot, expect_tail, expect_id)
         rows_now.pop(index)
@@ -304,38 +322,40 @@ def remove(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> d
 
 
 def _shortfall(provider: str, enabled_left: int) -> str | None:
-    """تحذيرٌ بعد الفعل لا منعٌ قبله: قد يكون الإفراغ مقصوداً.
+    """A warning after the fact, not a block before it: emptying may be intentional.
 
-    لا نمنع حذفَ آخرِ مفتاح — قد يكون المزوّد قد أُلغي حسابُه فعلاً — لكنّ
-    الأثرَ يُقال بصراحة: الطبقةُ ستتوقّف بخطأ «لا مفاتيح» كلَّ دورة.
+    We don't block deleting the last key — the provider's account may really
+    have been cancelled — but the effect is stated plainly: the layer will
+    stop with a "no keys" error on every cycle.
     """
     if enabled_left:
         return None
-    return f"لم يبقَ مفتاحٌ مفعّل لِـ {_meta(provider)['title']} — الطبقة ستتوقّف"
+    return f"No enabled key left for {_meta(provider)['title']} — the layer will stop"
 
 
-# --- الاختبار الحيّ ---
+# --- Live probe ---
 def _classify(status: int) -> tuple[str, str]:
-    """يفصل «المفتاح مرفوض» عن «الخدمة متعطّلة» — نفس تقسيم `_step_aside`.
+    """Separates "the key is rejected" from "the service is down" — the same split as `_step_aside`.
 
-    الخلطُ بينهما هو الخطأ المكلف: عرضُ نقطةٍ حمراء على مفتاحٍ سليمٍ لأنّ
-    المزوّد كان يتعثّر لحظةَ الفحص يدفع المستخدم إلى حذفِ مفتاحٍ صالح.
+    Conflating them is the costly mistake: showing a red dot on a healthy key
+    because the provider was stumbling at probe time pushes the user to delete
+    a valid key.
     """
     if status == 200:
-        return "good", "سليم"
+        return "good", "healthy"
     if status in (401, 403):
-        return "bad", f"مرفوض — HTTP {status}"
+        return "bad", f"rejected — HTTP {status}"
     if status == 402:
-        return "bad", "نفد الرصيد — HTTP 402"
+        return "bad", "out of credits — HTTP 402"
     if status == 429:
-        return "warn", "محدود مؤقّتاً — HTTP 429 (المفتاح صالح)"
+        return "warn", "temporarily rate-limited — HTTP 429 (the key is valid)"
     if status >= 500:
-        return "warn", f"الخدمة متعطّلة — HTTP {status} (ليس المفتاح)"
+        return "warn", f"the service is down — HTTP {status} (not the key)"
     return "warn", f"HTTP {status}"
 
 
 def probe(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> dict[str, Any]:
-    """نداءٌ حقيقيّ واحد بهذا المفتاح بعينه، إلى العنوان الذي يستعمله العميل."""
+    """One real call with this specific key, to the address the client uses."""
     meta = _meta(provider)
     rows_now, index = _locate(provider, slot, expect_tail, expect_id)
     value = rows_now[index]["key"]
@@ -350,7 +370,7 @@ def probe(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> di
             )
         level, detail = _classify(response.status_code)
         if level == "good":
-            # 200 لا يكفي دائماً: JSON-RPC يردّ 200 وفيه `error`.
+            # 200 isn't always enough: JSON-RPC answers 200 with an `error` inside.
             try:
                 body = response.json()
             except ValueError:
@@ -359,7 +379,7 @@ def probe(provider: str, slot: int, expect_tail: str, expect_id: str = "") -> di
                 level, detail = "bad", _redact(str(body["error"])[:120], value)
         status: int | None = response.status_code
     except httpx.TimeoutException:
-        level, detail, status = "warn", f"مهلة {config.KEY_PROBE_TIMEOUT:g}ث — لا استجابة", None
+        level, detail, status = "warn", f"timeout after {config.KEY_PROBE_TIMEOUT:g}s — no response", None
     except httpx.HTTPError as exc:
         level, detail, status = "warn", _redact(f"{type(exc).__name__}", value), None
 

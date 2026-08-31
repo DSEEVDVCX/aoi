@@ -1,7 +1,7 @@
-"""من يحتجز قفلَ الكتابة، وكم؟ — لا يكتب شيئاً.
+"""Who holds the write lock, and how often? — writes nothing.
 
-`BEGIN IMMEDIATE` يطلب قفل الكتابة ثمّ `ROLLBACK` فوراً: صفرُ بايت مكتوب،
-ومعه زمنُ الانتظار الحقيقيّ الذي يواجهه `chain_layer` كلّ دورة.
+`BEGIN IMMEDIATE` requests the write lock then `ROLLBACK`s immediately: zero bytes
+written, and the real wait time `chain_layer` faces every cycle.
 """
 import os
 import sqlite3
@@ -17,7 +17,7 @@ print("journal_mode:", con.execute("PRAGMA journal_mode").fetchone()[0])
 print("busy_timeout:", con.execute("PRAGMA busy_timeout").fetchone()[0])
 print("wal_autocheckpoint:", con.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
 
-print("\n=== محاولاتُ أخذ قفل الكتابة (12 محاولة، مهلة 1ث) ===")
+print("\n=== write-lock acquisition attempts (12 attempts, 1s timeout) ===")
 held = 0
 for i in range(12):
     t0 = time.monotonic()
@@ -29,12 +29,12 @@ for i in range(12):
         held += 1
         print(f"  {i:>2}  BUSY   {(time.monotonic()-t0)*1000:7.0f}ms  {exc}")
     time.sleep(2.0)
-print(f"\n  محتجَز في {held} من 12 عيّنة على مدى ~36 ثانية")
+print(f"\n  held in {held} of 12 samples over ~36 seconds")
 
 now = datetime.now(timezone.utc)
 ro = sqlite3.connect(f"file:{path.replace(os.sep,'/')}?mode=ro", uri=True, timeout=60)
 ro.row_factory = sqlite3.Row
-print("\n=== نبضاتُ السلسلة ===")
+print("\n=== chain heartbeats ===")
 for key in ("chain_last_run_at", "chain_last_ok_at", "evm_replay_last_run_at",
             "last_cycle_at", "labeler_last_run_at", "build_rows_last_run_at"):
     r = ro.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()

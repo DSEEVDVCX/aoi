@@ -1,8 +1,9 @@
-﻿"""اختبارات مستخرج الميزات — **حرس التسرّب أولاً**.
+﻿"""Feature extractor tests — **leak guards first**.
 
-القانون المُختبَر: كل ميزة قابلة للمعرفة عند t=0 أو قبلها. كل اختبار «تسرّب»
-أدناه يزرع بيانات **بعد** t0 ويتأكّد أنّ الصفّ لا يتغيّر — هذه الاختبارات هي
-خطّ الدفاع الوحيد ضدّ دقّة وهمية لا تُكتشف إلّا بالمال.
+The law under test: every feature must be knowable at t=0 or earlier. Each
+"leak" test below plants data **after** t0 and verifies that the row does not
+change — these tests are the only line of defense against a fake accuracy
+that nothing but money would ever expose.
 """
 import os
 
@@ -11,7 +12,7 @@ import pytest
 from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
-T0 = 1_785_000_000                     # لحظة القرار في كل الاختبارات
+T0 = 1_785_000_000                     # the decision moment in every test
 TOK, NET = "0xtok", "56"
 H = 3600
 
@@ -29,8 +30,9 @@ def _iso(epoch: int) -> str:
 
 
 def _bars(db, start, n, step=300, c=1.0, grow=0.0, tok=TOK, net=NET, res="5"):
-    """`grow` نموّ مركّب لكل شمعة (عائد ثابت) — لا خطّي، وإلّا تضاءل العائد
-    النسبيّ مع الزمن فبدت السلسلة الصاعدة «ساكنة» في آخرها."""
+    """`grow` is compound growth per bar (a constant return) — not linear,
+    otherwise the relative return decays over time and the rising series
+    reads as "flat" at its end."""
     rows = []
     for i in range(n):
         px = c * ((1 + grow) ** i)
@@ -71,25 +73,26 @@ def _signal(db, sid, epoch, **kw):
 
 
 # ---------------------------------------------------------------------------
-# حرس التسرّب — أهمّ ما في الملفّ
+# Leak guards — the heart of this file
 # ---------------------------------------------------------------------------
 def test_social_ignores_theses_after_t0(db):
     _thesis(db, T0 - 3600, "before")
     before = features.social_features(db, TOK, NET, T0)
-    _thesis(db, T0 + 60, "after")          # وصلت بعد لحظة القرار
+    _thesis(db, T0 + 60, "after")          # arrived after the decision moment
     assert features.social_features(db, TOK, NET, T0) == before
     assert before["thesis_counted"] == 1
 
 
 def test_price_history_ignores_bars_after_t0(db):
-    _bars(db, T0 - 86400, 288, c=1.0)      # يوم كامل قبل t0
+    _bars(db, T0 - 86400, 288, c=1.0)      # a full day before t0
     before = features.price_history_features(db, TOK, NET, T0)
-    _bars(db, T0 + 300, 20, c=99.0)        # انفجار بعد القرار
+    _bars(db, T0 + 300, 20, c=99.0)        # a spike after the decision
     assert features.price_history_features(db, TOK, NET, T0) == before
 
 
 def test_price_history_ignores_open_bar_at_t0(db):
-    """إغلاق شمعة بدأت قبل القرار ولم تنته بعد غير معروف عند t0."""
+    """The close of a bar that started before the decision and has not ended
+    yet is unknown at t0."""
     _bars(db, T0 - 600, 2, c=1.0)
     db.insert_bars([{
         "token_address": TOK, "network_id": NET, "resolution": "5",
@@ -136,7 +139,7 @@ def test_density_ignores_later_signals_and_self(db):
     d = features.density_features(db, TOK, NET, T0, exclude_key="s_self")
     _signal(db, "s_after", T0 + 60)
     assert features.density_features(db, TOK, NET, T0, exclude_key="s_self") == d
-    assert d["prior_signals_token"] == 1          # السابقة فقط، لا نفسها
+    assert d["prior_signals_token"] == 1          # only the prior one, not itself
 
 
 def test_creator_prior_tokens_respects_t0(db):
@@ -147,7 +150,7 @@ def test_creator_prior_tokens_respects_t0(db):
         "migrated": 1, "graduation_percent": 100.0, "twitter": "x", "telegram": None,
         "website": None, "discord": None, "token_created_at": _iso(T0 - 86400),
             "raw_json": "{}",    })
-    db.upsert_static({                       # عملة أقدم لنفس المُنشئ
+    db.upsert_static({                       # an older coin by the same creator
             "token_address": "0xold", "network_id": NET, "recorded_at": _iso(T0 - 3600), "name": "B",
         "symbol": "B", "decimals": 18, "mintable": None, "freezable": None,
         "is_scam": None, "creator_address": "0xdev", "launchpad_name": None,
@@ -156,7 +159,7 @@ def test_creator_prior_tokens_respects_t0(db):
         "token_created_at": _iso(T0 - 200_000), "raw_json": "{}"})
     s = features.static_features(db, TOK, NET, T0)
     assert s["creator_prior_tokens"] == 1
-    db.upsert_static({                       # عملة **لاحقة** لنفس المُنشئ
+    db.upsert_static({                       # a **later** coin by the same creator
         "token_address": "0xnew", "network_id": NET,
         "recorded_at": _iso(T0 - 3600), "name": "C",
         "symbol": "C", "decimals": 18, "mintable": None, "freezable": None,
@@ -168,7 +171,7 @@ def test_creator_prior_tokens_respects_t0(db):
 
 
 # ---------------------------------------------------------------------------
-# صحّة الحساب
+# Correctness of the computation
 # ---------------------------------------------------------------------------
 def test_event_features_derive_ratios_and_logs():
     f = features.event_features(
@@ -176,8 +179,8 @@ def test_event_features_derive_ratios_and_logs():
          "market_cap": 1_000_000.0, "total_volume": 60_000.0,
          "unique_traders": 12, "buyers_best_rank": 7}, T0)
     assert f["size_to_mcap"] == pytest.approx(0.01)
-    # (fv14) volume_per_trader رُفع من الميزات مع عائلته الميّتة — الحساب
-    # المتبقي يُختبر عبر أعمدته الحية فقط.
+    # (fv14) volume_per_trader was dropped from the features along with its
+    # dead family — the remaining computation is tested via its live columns only.
     assert f["rank_le_10"] == 1 and f["rank_le_50"] == 1
     assert f["log_market_cap"] > f["log_size_usd"]
 
@@ -185,12 +188,13 @@ def test_event_features_derive_ratios_and_logs():
 def test_event_features_missing_stay_none_not_zero():
     f = features.event_features({"signal_type": "large_buy"}, T0)
     assert f["size_to_mcap"] is None
-    assert f["rank_le_10"] is None          # لا رتبة ⇒ لا علم (لا صفر)
+    assert f["rank_le_10"] is None          # no rank ⇒ no flag (not zero)
 
 
-# --- عائلة صدارات المدد (v7) ---
+# --- the per-period rank family (v7) ---
 def test_period_rank_features_pass_through_and_aggregate():
-    """الرتب المفصّلة تُمرَّر، والمجمَّع يأخذ أفضلها عبر المدد كلّها."""
+    """Detailed ranks pass through, and the aggregate takes the best across
+    all periods."""
     f = features.event_features({
         "signal_type": "large_buy",
         "buyers_best_rank": 40,
@@ -202,7 +206,7 @@ def test_period_rank_features_pass_through_and_aggregate():
     }, T0)
     assert f["buyers_best_rank_24h"] == 3
     assert f["top_trader_match_count_7d"] == 2
-    assert f["best_rank_any_period"] == 3     # أفضل ما في الأربع
+    assert f["best_rank_any_period"] == 3     # the best of the four
     assert f["top_trader_periods_matched"] == 3
     assert f["top_trader_any_period"] == 1
 
@@ -219,7 +223,8 @@ def test_period_rank_features_absent_stay_none():
 
 
 def test_any_period_zero_is_measured_not_missing():
-    """قِيست الصدارات ولم يطابق أحد ⇒ 0 لا None، وأفضل رتبة تبقى غائبة."""
+    """Periods were measured and nobody matched ⇒ 0, not None, while the best
+    rank stays absent."""
     f = features.event_features({
         "signal_type": "large_buy", "top_trader_periods_matched": 0,
     }, T0)
@@ -228,7 +233,8 @@ def test_any_period_zero_is_measured_not_missing():
 
 
 def test_best_rank_any_period_ignores_missing_periods():
-    """مدّة واحدة مقيسة تكفي — min على قائمة فيها None لا يرمي ولا يفبرك."""
+    """One measured period is enough — min over a list containing None neither
+    raises nor fabricates."""
     f = features.event_features({
         "signal_type": "large_buy", "buyers_best_rank_30d": 9,
     }, T0)
@@ -236,16 +242,16 @@ def test_best_rank_any_period_ignores_missing_periods():
 
 
 def test_price_history_computes_returns_and_flatness(db):
-    _bars(db, T0 - 86400, 288, c=1.0, grow=0.0)     # مسطّح تماماً
+    _bars(db, T0 - 86400, 288, c=1.0, grow=0.0)     # perfectly flat
     f = features.price_history_features(db, TOK, NET, T0)
     assert f["ret_24h_before"] == pytest.approx(0.0)
-    assert f["flat_ratio_24h"] == pytest.approx(1.0)   # كل الشموع ساكنة
+    assert f["flat_ratio_24h"] == pytest.approx(1.0)   # every bar is flat
     assert f["bars_count_24h"] > 200
     assert f["bars_history_h"] == pytest.approx(24.0, abs=0.1)
 
 
 def test_price_history_detects_pre_signal_pump(db):
-    _bars(db, T0 - 86400, 288, c=1.0, grow=0.01)      # صعود متسارع قبل الإشارة
+    _bars(db, T0 - 86400, 288, c=1.0, grow=0.01)      # an accelerating climb before the signal
     f = features.price_history_features(db, TOK, NET, T0)
     assert f["ret_24h_before"] > 1.0
     assert f["flat_ratio_24h"] < 0.5
@@ -254,17 +260,17 @@ def test_price_history_detects_pre_signal_pump(db):
 
 def test_price_history_skips_suspect_closes(db):
     _bars(db, T0 - 3600, 12, c=1.0)
-    db.insert_bars([{                                  # إغلاق مشوّه معلَّم
+    db.insert_bars([{                                  # a flagged suspect close
         "token_address": TOK, "network_id": NET, "resolution": "5",
         "ts": T0 - 300, "o": 1.0, "h": 9e9, "l": 1.0, "c": 12_052.5,
         "h_suspect": 1, "l_suspect": 0, "c_suspect": 1, "fetched_at": "t",
     }])
     f = features.price_history_features(db, TOK, NET, T0)
-    assert f["ret_1h_before"] == pytest.approx(0.0)     # لم يُستعمل الإغلاق الفاسد
+    assert f["ret_1h_before"] == pytest.approx(0.0)     # the corrupt close was not used
 
 
 def test_social_accel_and_history(db):
-    _thesis(db, T0 - 90_000, "old", user="a")          # قبل يوم ونصف
+    _thesis(db, T0 - 90_000, "old", user="a")          # a day and a half before
     _thesis(db, T0 - 7200, "mid", user="b")
     _thesis(db, T0 - 600, "new", user="c")
     f = features.social_features(db, TOK, NET, T0)
@@ -308,7 +314,7 @@ def test_macro_features_ignore_open_hour(db):
 
 
 # ---------------------------------------------------------------------------
-# الصفّ الكامل
+# The full row
 # ---------------------------------------------------------------------------
 def _outcome(db, key="s1", kind="signal"):
     db.insert_outcome({
@@ -333,8 +339,8 @@ def test_build_training_row_has_every_declared_column(db):
     missing = [c for c in features.ROW_COLUMNS if c not in row]
     assert missing == []
     assert row["kind"] == "signal" and row["entry_ts"] == T0
-    assert row["final_return_48h"] == 0.4          # الليبل ملصوق
-    assert row["market_cap"] == 500_000.0          # الميزة من الحدث
+    assert row["final_return_48h"] == 0.4          # the label is attached
+    assert row["market_cap"] == 500_000.0          # the feature comes from the event
 
 
 def test_build_training_row_returns_none_without_source_event(db):
@@ -364,16 +370,17 @@ def test_asset_class_uses_only_event_time_observations(db):
 
 
 def test_is_live_flag_splits_on_live_start(db):
-    """الراية تفصل الحِقبتين عند LIVE_START_TS بالضبط: قبله رجعيّ، عنده/بعده حيّ.
-    هذا الفلتر هو ما يُقصي البيانات الرجعية من التدريب — كسره يعيد تسريب الحِقبة."""
+    """The flag splits the two eras exactly at LIVE_START_TS: before it retro,
+    at/after it live. This filter is what excludes retro data from training —
+    breaking it re-leaks the era."""
     cut = features.config.LIVE_START_TS
-    # رجعيّ: قبل الحدّ بثانية
+    # retro: one second before the cut
     _signal(db, "retro", cut - 1)
     _bars(db, cut - 3600, 12)
     r_retro = features.build_training_row(
         db, _outcome_at(db, "retro", cut - 1))
     assert r_retro["is_live"] == 0
-    # حيّ: عند الحدّ تماماً
+    # live: exactly at the cut
     _signal(db, "live", cut)
     r_live = features.build_training_row(db, _outcome_at(db, "live", cut))
     assert r_live["is_live"] == 1
@@ -401,23 +408,24 @@ def _outcome_at(db, key, entry_ts):
 
 
 def test_label_columns_are_never_features():
-    """حرس بنيويّ: لا عمود ليبل يتسلّل إلى قائمة الميزات."""
+    """A structural guard: no label column sneaks into the feature list."""
     assert not set(features.LABEL_COLUMNS) & set(features.FEATURE_COLUMNS)
     for banned in ("final_return", "max_gain", "max_drawdown", "is_rug", "time_to_peak"):
         assert not any(banned in c for c in features.FEATURE_COLUMNS)
 
 
 def test_num_likes_is_not_a_feature():
-    """الإعجابات ممنوعة: قيمتها وقت السحب لا وقت الكتابة (README §9)."""
+    """Likes are banned: their value is fetch-time, not write-time (README §9)."""
     assert not any("like" in c.lower() for c in features.FEATURE_COLUMNS)
 
 
 # ---------------------------------------------------------------------------
-# إصلاحات التدقيق (2026-07-30) — كلّ اختبار يمنع عودة عيب مقيس
+# Audit fixes (2026-07-30) — each test prevents the return of a measured defect
 # ---------------------------------------------------------------------------
 def test_ath_ignores_suspect_high(db):
-    """39 شمعة إغلاقها سليم وقمّتها مشوّهة كانت تعطي dist_from_ath = −0.99999997
-    على 49 صفّاً (القمّة 96,311 بدل 0.0143)."""
+    """39 bars with a sound close and a corrupt high used to give
+    dist_from_ath = −0.99999997 on 49 rows (a high of 96,311 instead of
+    0.0143)."""
     _bars(db, T0 - 3600, 12, c=1.0)
     db.insert_bars([{
         "token_address": TOK, "network_id": NET, "resolution": "5",
@@ -425,27 +433,29 @@ def test_ath_ignores_suspect_high(db):
         "h_suspect": 1, "l_suspect": 0, "c_suspect": 0, "fetched_at": "t",
     }])
     f = features.price_history_features(db, TOK, NET, T0)
-    assert f["dist_from_ath"] > -0.5          # لا −0.99999997
+    assert f["dist_from_ath"] > -0.5          # not −0.99999997
 
 
 def test_measured_zero_size_is_kept_not_nulled(db):
-    """1,640 حدثاً حجمه 0.0 فعلاً (خروج كامل): `a or b` كان يحوّله None."""
+    """1,640 events with a genuinely 0.0 size (a full exit): `a or b` used to
+    turn it into None."""
     f = features.event_features({"signal_type": "large_sell", "size_usd": 0.0}, T0)
     assert f["size_usd"] == 0.0
-    # ويقع الرجوع إلى usd_amount فقط حين الغياب الحقيقيّ
+    # and the fallback to usd_amount happens only on true absence
     f2 = features.event_features({"event_type": "swap_buy", "usd_amount": 26.7}, T0)
     assert f2["size_usd"] == 26.7
 
 
 def test_density_counts_both_sources(db):
-    """الحساب من signal_events وحده جعل 88% من الصفوف الرجعية أصفاراً بنيويّة
-    مقابل 4% للأمامية — فصار العمود دالّاً على نوع الصفّ لا على نشاط العملة."""
+    """Counting from signal_events alone made 88% of retro rows structural
+    zeros versus 4% of live ones — the column indicated row type, not coin
+    activity."""
     db.insert_activity_events([{
         "id": "a1", "event_type": "multi_user_buy", "token_address": TOK,
         "network_id": NET, "ts": _iso(T0 - 1800), "recorded_at": "t", "raw_json": "{}",
     }])
     d = features.density_features(db, TOK, NET, T0, exclude_key=None)
-    assert d["prior_signals_token"] == 1              # الحدث الرجعيّ محسوب
+    assert d["prior_signals_token"] == 1              # the retro event is counted
     assert d["global_signals_1h"] == 1
     assert d["minutes_since_prior_signal"] == pytest.approx(30.0)
 
@@ -493,7 +503,8 @@ def _social(db, epoch, total, authors, holders, replies=0):
 
 
 def test_social_snapshot_gives_true_total_and_holder_ratio(db):
-    """`token_thesis` عيّنة (سقف ~400) بينما `thesis_total` هو الحقيقة (29,595)."""
+    """`token_thesis` is a sample (cap ~400) while `thesis_total` is the truth
+    (29,595)."""
     _social(db, T0 - 600, total=29_595, authors=80, holders=20, replies=7)
     f = features.social_features(db, TOK, NET, T0)
     assert f["social_thesis_total"] == 29_595
@@ -544,10 +555,12 @@ def test_market_dense_windows_and_ratios(db):
     assert f["float_ratio"] == pytest.approx(0.6)
 
 
-# --- دمج لقطات السوق عبر المصادر (v8) ---------------------------------------
-# المصدران غير متكافئين، مقيس على 200 ألف صفّ: `verified` يحمل السعر والسيولة
-# بـ100% و**صفر%** من العدّادات، و`trending` يحملها كلّها. «أحدث صفّ» وحده كان
-# يرث فقر من صادف أن كتب أخيراً — 50% من العملات. هذه الاختبارات تحرس الإصلاح.
+# --- merging market snapshots across sources (v8) ---------------------------
+# The two sources are not equivalent, measured on 200k rows: `verified` carries
+# price and liquidity 100% of the time and **zero percent** of the counters,
+# while `trending` carries them all. Taking only "the newest row" inherited
+# poverty from whichever source happened to write last — for 50% of coins.
+# These tests guard the fix.
 def _tick(db, epoch, source, **cols):
     db.insert_tick({
         "token_address": TOK, "network_id": NET, "recorded_at": _iso(epoch),
@@ -560,38 +573,40 @@ _RICH = {"buy_count_24h": 400, "sell_count_24h": 100, "unique_buys_24h": 250,
 
 
 def test_market_merge_recovers_counters_from_older_rich_row(db):
-    """صفّ `verified` أحدث وفقير فوق صفّ `trending` أقدم وغنيّ.
+    """A newer, poor `verified` row on top of an older, rich `trending` row.
 
-    قبل الإصلاح كانت العدّادات كلّها None لأنّ الأحدث لا يحملها — وهي في الجدول.
+    Before the fix every counter was None because the newer row does not carry
+    them — while they sit in the table.
     """
     _tick(db, T0 - 3600, "trending", liquidity=10_000.0, volume_24h=1_000.0, **_RICH)
     _tick(db, T0 - 60, "verified", liquidity=50_000.0, volume_24h=150_000.0)
 
     f = features.market_features(db, TOK, NET, T0)
 
-    assert f["buy_count_24h"] == 400            # من الصفّ الأقدم
+    assert f["buy_count_24h"] == 400            # from the older row
     assert f["unique_buys_24h"] == 250
     assert f["holders"] == 900
     assert f["top10_holders_pct"] == 42.0
-    assert f["buy_sell_ratio_24h"] == pytest.approx(4.0)   # مشتقّ **بعد** الدمج
-    # السعر والسيولة من الأحدث لا من الأقدم:
+    assert f["buy_sell_ratio_24h"] == pytest.approx(4.0)   # derived **after** the merge
+    # price and liquidity come from the newer row, not the older one:
     assert f["liquidity"] == 50_000.0
     assert f["volume_to_liquidity"] == pytest.approx(3.0)
 
 
 def test_market_merge_stamps_two_ages_not_one(db):
-    """طزاجة صادقة: عدّاد عمره ساعة لا يُقرأ كأنّه ابن دقيقة."""
+    """Honest freshness: a counter an hour old is not read as one minute old."""
     _tick(db, T0 - 3600, "trending", liquidity=10_000.0, **_RICH)
     _tick(db, T0 - 60, "verified", liquidity=50_000.0)
 
     f = features.market_features(db, TOK, NET, T0)
 
-    assert f["tick_age_min"] == pytest.approx(1.0)        # أحدث صفّ
-    assert f["tick_rich_age_min"] == pytest.approx(60.0)  # مصدر العدّادات
+    assert f["tick_age_min"] == pytest.approx(1.0)        # newest row
+    assert f["tick_rich_age_min"] == pytest.approx(60.0)  # the counters' source
 
 
 def test_market_merge_rich_age_follows_newest_rich_row(db):
-    """حين يكون الأحدث غنيّاً بنفسه فالختمان يتطابقان — لا تقادُم وهميّ."""
+    """When the newest row is itself rich, the two stamps match — no fake
+    staleness."""
     _tick(db, T0 - 3600, "trending", liquidity=10_000.0, **_RICH)
     _tick(db, T0 - 120, "trending", liquidity=50_000.0, **_RICH)
 
@@ -602,7 +617,8 @@ def test_market_merge_rich_age_follows_newest_rich_row(db):
 
 
 def test_market_merge_without_any_rich_row_leaves_age_null(db):
-    """لا عدّاد في المدى ⇒ `tick_rich_age_min` = None لا صفر (FR-007)."""
+    """No counter within the range ⇒ `tick_rich_age_min` = None, not zero
+    (FR-007)."""
     _tick(db, T0 - 60, "verified", liquidity=50_000.0, volume_24h=150_000.0)
 
     f = features.market_features(db, TOK, NET, T0)
@@ -610,11 +626,12 @@ def test_market_merge_without_any_rich_row_leaves_age_null(db):
     assert f["tick_age_min"] == pytest.approx(1.0)
     assert f["tick_rich_age_min"] is None
     assert f["buy_count_24h"] is None
-    assert f["buy_sell_ratio_24h"] is None      # لا يُشتقّ من غياب
+    assert f["buy_sell_ratio_24h"] is None      # not derived from absence
 
 
 def test_market_merge_keeps_measured_zero(db):
-    """صفر مقيس ≠ غائب: `x is None` لا `x or y` — وإلّا ابتلع الأقدمُ الصفرَ."""
+    """A measured zero ≠ absent: `x is None`, not `x or y` — otherwise the
+    older row swallowed the zero."""
     _tick(db, T0 - 3600, "trending", liquidity=10_000.0,
           buy_count_24h=400, sell_count_24h=100, volume_24h=9_999.0)
     _tick(db, T0 - 60, "trending", liquidity=50_000.0,
@@ -622,14 +639,15 @@ def test_market_merge_keeps_measured_zero(db):
 
     f = features.market_features(db, TOK, NET, T0)
 
-    assert f["buy_count_24h"] == 0              # لا 400
+    assert f["buy_count_24h"] == 0              # not 400
     assert f["volume_24h"] == 0.0
-    assert f["buy_sell_ratio_24h"] is None      # قسمة على صفر ⇒ None لا inf
+    assert f["buy_sell_ratio_24h"] is None      # division by zero ⇒ None, not inf
     assert f["tick_rich_age_min"] == pytest.approx(1.0)
 
 
 def test_market_merge_fills_each_column_from_its_own_newest_row(db):
-    """الدمج عمودٌ بعمود لا صفٌّ كامل: كل عمود من أحدث صفّ يحمله هو."""
+    """The merge is column by column, not whole-row: each column comes from
+    the newest row that carries it."""
     _tick(db, T0 - 1800, "trending", holders=700, total_supply=1_000.0)
     _tick(db, T0 - 600, "verified", market_cap=500_000.0)
     _tick(db, T0 - 60, "filter", liquidity=50_000.0)
@@ -638,11 +656,12 @@ def test_market_merge_fills_each_column_from_its_own_newest_row(db):
 
     assert f["liquidity"] == 50_000.0
     assert f["holders"] == 700
-    assert f["liquidity_to_mcap"] == pytest.approx(0.1)   # من صفّين مختلفين
+    assert f["liquidity_to_mcap"] == pytest.approx(0.1)   # from two different rows
 
 
 def test_market_merge_ignores_rows_after_t0(db):
-    """قانون النقطة الزمنية يسبق الدمج: صفّ غنيّ بعد t0 لا يُستدعى لسدّ فقر."""
+    """The point-in-time law precedes the merge: a rich row after t0 is not
+    summoned to patch poverty."""
     _tick(db, T0 - 60, "verified", liquidity=50_000.0)
     before = features.market_features(db, TOK, NET, T0)
     _tick(db, T0 + 30, "trending", liquidity=99.0, **_RICH)
@@ -653,9 +672,11 @@ def test_market_merge_ignores_rows_after_t0(db):
 
 
 def test_market_merge_lookback_is_bounded(db):
-    """المدى محدود عمداً: عدّاد أقدم من نافذة البحث لا يُبعث حيّاً.
+    """The lookback is bounded on purpose: a counter older than the search
+    window is not resurrected.
 
-    12 صفّاً ≈ ثلاث دورات بمصادرها الأربعة. ما وراءها قديم بما يكفي ليكذب.
+    12 rows ≈ three cycles across their four sources. Beyond that it is old
+    enough to lie.
     """
     _tick(db, T0 - 7200, "trending", **_RICH)
     for i in range(features._TICK_MERGE_LOOKBACK):
@@ -669,7 +690,7 @@ def test_market_merge_lookback_is_bounded(db):
 
 
 def test_bar_volume_surge_before_signal(db):
-    _bars(db, T0 - 86400, 288, c=1.0)                 # حجم 10 لكل شمعة
+    _bars(db, T0 - 86400, 288, c=1.0)                 # volume 10 per bar
     db.insert_bars([{
         "token_address": TOK, "network_id": NET, "resolution": "5",
         "ts": T0 - 300, "o": 1.0, "h": 1.1, "l": 0.9, "c": 1.05, "v": 5_000.0,
@@ -678,7 +699,7 @@ def test_bar_volume_surge_before_signal(db):
     f = features.price_history_features(db, TOK, NET, T0)
     assert f["bar_vol_1h"] >= 5_000.0
     assert f["bar_vol_24h"] > f["bar_vol_1h"]
-    assert f["vol_surge_1h"] > 0.5                     # الساعة الأخيرة تطغى
+    assert f["vol_surge_1h"] > 0.5                     # the last hour dominates
     assert 0.0 <= f["up_candle_ratio_24h"] <= 1.0
 
 
@@ -691,7 +712,7 @@ def test_daily_ath_is_used_only_after_history_is_complete(db):
             "c": 5.0, "v": 1.0, "h_suspect": 0, "l_suspect": 0,
             "c_suspect": 0, "fetched_at": "t",
         },
-        {   # اليوم لم يغلق بعد t0؛ لا يجوز أن يتسرّب ATH منه
+        {   # the day has not closed by t0; no ATH may leak from it
             "token_address": TOK, "network_id": NET, "resolution": "1D",
             "ts": T0 - 12 * 3600, "o": 5.0, "h": 99.0, "l": 4.0,
             "c": 90.0, "v": 1.0, "h_suspect": 0, "l_suspect": 0,
@@ -726,11 +747,11 @@ def test_buyer_and_text_features(db):
         "token_amount": 5_000.0, "out_amount": 4_900.0, "ticker": "PEPE2é",
         "top_trader_ids_json": '["a","b","c"]', "top_trader_match_count": 1,
     }, T0)
-    assert f["price_to_avg_cost"] == pytest.approx(2.0)   # يشتري أعلى من متوسّطه
+    assert f["price_to_avg_cost"] == pytest.approx(2.0)   # buys above his average
     assert f["token_amount"] == 5_000.0
     assert f["top_traders_listed"] == 3
-    # (fv14) top_trader_match_ratio رُفع مع عائلته الميّتة؛ العدد المطلق
-    # للمطابقات يظل ميزة حية ويُختبر هو.
+    # (fv14) top_trader_match_ratio was dropped along with its dead family; the
+    # absolute match count remains a live feature and is what is tested here.
     assert f["top_trader_match_count"] == 1
     assert f["ticker_len"] == 6
     assert f["ticker_has_digit"] == 1
@@ -752,7 +773,8 @@ def test_static_name_and_decimals(db):
 
 
 def test_no_feature_column_lost_in_refactor():
-    """كل ميزة معلَنة تُنتَج فعلاً — يمنع عموداً معلَناً بلا حساب (NULL أبديّ)."""
+    """Every declared feature is actually produced — prevents a declared
+    column with no computation (eternal NULL)."""
     produced = set()
     produced |= set(features.event_features({}, T0))
     assert set(features.FEATURE_COLUMNS) >= produced
@@ -876,7 +898,7 @@ def test_incremental_builder_rejects_rows_computed_before_finalization(
 
     monkeypatch.setattr(features, "build_training_row", _finalize_during_compute)
     try:
-        with pytest.raises(StaleEVMState, match="إعادة بناء التدريب"):
+        with pytest.raises(StaleEVMState, match="training rebuild"):
             build_training_rows.build(db, False, 10, False)
     finally:
         other.close()
@@ -905,21 +927,23 @@ def test_incremental_builder_can_limit_work_to_live_independent_signals(db):
 
 
 # ---------------------------------------------------------------------------
-# اختلاف صيغ الأختمة من fomo — كشفه تقرير التغطية (token_age_h فارغاً 100%)
+# Inconsistent timestamp formats from fomo — exposed by the coverage report
+# (token_age_h empty 100% of the time)
 # ---------------------------------------------------------------------------
 def test_epoch_of_accepts_iso_and_numeric_epoch():
     assert features.epoch_of("2026-07-30T10:00:00Z") == 1785405600
     assert features.epoch_of("2026-07-30T10:00:00+00:00") == 1785405600
-    assert features.epoch_of(1784983617) == 1784983617       # epoch رقميّ
-    assert features.epoch_of("1784983617") == 1784983617     # نصّ رقميّ
-    assert features.epoch_of(1784983617000) == 1784983617    # مللي ثانية
+    assert features.epoch_of(1784983617) == 1784983617       # numeric epoch
+    assert features.epoch_of("1784983617") == 1784983617     # numeric text
+    assert features.epoch_of(1784983617000) == 1784983617    # milliseconds
     assert features.epoch_of(None) is None
     assert features.epoch_of("") is None
     assert features.epoch_of("not-a-date") is None
 
 
 def test_token_age_computed_from_numeric_created_at(db):
-    """fomo تخزّن `token_created_at` epoch رقمياً — كان يُقرأ None فيضيع العمر."""
+    """fomo stores `token_created_at` as a numeric epoch — it used to read as
+    None, so the age was lost."""
     db.upsert_static({
         "token_address": TOK, "network_id": NET,
         "recorded_at": _iso(T0 - 60), "name": "A",
@@ -927,15 +951,16 @@ def test_token_age_computed_from_numeric_created_at(db):
         "is_scam": None, "creator_address": None, "launchpad_name": None,
         "migrated": None, "graduation_percent": None, "twitter": None,
         "telegram": None, "website": None, "discord": None,
-        "token_created_at": T0 - 7200,          # رقميّ لا ISO
+        "token_created_at": T0 - 7200,          # numeric, not ISO
         "raw_json": "{}"})
     f = features.static_features(db, TOK, NET, T0)
     assert f["token_age_h"] == pytest.approx(2.0)
 
 
 def test_negative_token_age_is_dropped_not_learned(db):
-    """ختم fomo قد يخصّ إدراجاً لا إنشاءً فيسبق t0 (مقيس: −177 ساعة).
-    عمر سالب مستحيل ⇒ None لا رقم يتعلّمه النموذج."""
+    """A fomo stamp may mark listing rather than creation, so it precedes t0
+    (measured: −177 hours). A negative age is impossible ⇒ None, not a number
+    the model would learn from."""
     db.upsert_static({
         "token_address": TOK, "network_id": NET,
         "recorded_at": _iso(T0 - 60), "name": "A",
@@ -943,7 +968,7 @@ def test_negative_token_age_is_dropped_not_learned(db):
         "is_scam": None, "creator_address": None, "launchpad_name": None,
         "migrated": None, "graduation_percent": None, "twitter": None,
         "telegram": None, "website": None, "discord": None,
-        "token_created_at": T0 + 86400,          # «أُنشئت» بعد الإشارة
+        "token_created_at": T0 + 86400,          # "created" after the signal
         "raw_json": "{}"})
     assert features.static_features(db, TOK, NET, T0)["token_age_h"] is None
 
@@ -962,10 +987,11 @@ def test_creator_prior_tokens_with_numeric_timestamps(db):
 
 
 # ---------------------------------------------------------------------------
-# عائلة هـ٢ — الملكية: تركّز السلسلة + تموضع حشد المنصّة
+# Family H2 — ownership: chain concentration + platform crowd positioning
 # ---------------------------------------------------------------------------
 def _holders(db, epoch, source, tok=TOK, net=NET, **kw):
-    """صفّ حيازة. `source` داخل المفتاح الأساسي فلا يطمس مصدرٌ الآخر."""
+    """A holders row. `source` is part of the primary key, so one source
+    cannot erase the other."""
     row = {
         "token_address": tok, "network_id": net, "recorded_at": _iso(epoch),
         "watch_first_seen_at": _iso(epoch), "entry_signal_id": None,
@@ -981,7 +1007,8 @@ def _holders(db, epoch, source, tok=TOK, net=NET, **kw):
 
 
 def test_holders_ignores_measurements_after_t0(db):
-    """حرس تسرّب: قياس التركّز بعد القرار غير معروف عنده."""
+    """Leak guard: a concentration measurement after the decision is unknown
+    at it."""
     _holders(db, T0 - 600, "token_details", top10_pct=22.0, holder_count=900)
     before = features.holders_features(db, TOK, NET, T0)
     _holders(db, T0 + 600, "token_details", top10_pct=99.0, holder_count=5)
@@ -999,22 +1026,24 @@ def test_holders_uses_latest_measurement_at_or_before_t0(db):
 
 
 def test_each_source_keeps_its_own_latest_row(db):
-    """المصدران يقيسان شيئين مختلفين — أحدهما الأحدث لا يطمس الآخر."""
+    """The two sources measure two different things — one being newer does not
+    erase the other."""
     _holders(db, T0 - 3600, "token_details", top10_pct=83.24, holder_count=937)
     _holders(db, T0 - 300, "hodlers_top", platform_holders=274,
              platform_holders_listed=50, platform_underwater=50,
              platform_value_usd=7990.77, platform_median_hold_seconds=24773,
              platform_dev_holding=0)
     f = features.holders_features(db, TOK, NET, T0)
-    assert f["chain_top10_pct"] == 83.24              # لم يُطمس بصفّ الحشد
+    assert f["chain_top10_pct"] == 83.24              # not erased by the crowd row
     assert f["chain_holder_count"] == 937
     assert f["platform_holders"] == 274
     assert f["platform_value_usd"] == 7990.77
-    assert f["holders_age_min"] == pytest.approx(5.0)  # أحدث الختمين
+    assert f["holders_age_min"] == pytest.approx(5.0)  # the newer of the two stamps
 
 
 def test_platform_penetration_needs_both_sources(db):
-    """نصيب المنصّة من حائزي السلسلة اشتقاق لا يعطيه مصدر منفرد."""
+    """The platform's share of chain holders is a derivation no single source
+    provides."""
     _holders(db, T0 - 300, "hodlers_top", platform_holders=274)
     assert features.holders_features(db, TOK, NET, T0)["platform_penetration"] is None
 
@@ -1024,8 +1053,9 @@ def test_platform_penetration_needs_both_sources(db):
 
 
 def test_penetration_none_when_chain_count_absent(db):
-    """قسمة على غائب ≠ صفر — لا نفبرك نسبة (FR-007)."""
-    _holders(db, T0 - 300, "token_details", top10_pct=50.0)   # holder_count غائب
+    """Division by an absent value ≠ zero — we do not fabricate a ratio
+    (FR-007)."""
+    _holders(db, T0 - 300, "token_details", top10_pct=50.0)   # holder_count absent
     _holders(db, T0 - 300, "hodlers_top", platform_holders=100)
     f = features.holders_features(db, TOK, NET, T0)
     assert f["chain_top10_pct"] == 50.0
@@ -1043,14 +1073,15 @@ def test_underwater_ratio_and_median_hold_hours(db):
 
 
 def test_fully_underwater_crowd_is_one_not_missing(db):
-    """كل الحاملين خاسرين = 1.0 (عرض زائد محتمل) لا None."""
+    """All holders underwater = 1.0 (potential excess supply), not None."""
     _holders(db, T0 - 300, "hodlers_top", platform_holders=274,
              platform_holders_listed=49, platform_underwater=49)
     assert features.holders_features(db, TOK, NET, T0)["platform_underwater_ratio"] == 1.0
 
 
 def test_no_holders_measurement_leaves_family_null(db):
-    """الصفوف قبل إطلاق الدورة: NULL يعني «لم نقس» لا «صفر»."""
+    """Rows from before the cycle launched: NULL means "not measured", not
+    "zero"."""
     f = features.holders_features(db, TOK, NET, T0)
     assert set(f) == {
         "chain_top10_pct", "chain_holder_count", "holders_age_min",
@@ -1069,12 +1100,14 @@ def test_holders_of_other_token_do_not_leak(db):
 
 
 # ---------------------------------------------------------------------------
-# الملكية من **السلسلة** (onchain_*) — قياس لا يمرّ بـFOMO إطلاقاً
+# Ownership from the **chain** (onchain_*) — a measurement that never goes
+# through FOMO.
 #
-# كانت سولانا وحدها بنيوياً (ERC-20 بلا قائمة حائزين على السلسلة)، ومنذ إصدار
-# الميزات 12 يكتب دفتر `evm_layer` في **نفس** الجدول ⇒ الشبكتان معاً. فأكثر
-# الاختبارات هنا على شبكة سولانا، وقسمٌ في آخر القسم على EVM لأنّ عمودَي
-# `holder_count` لا يعطيهما إلّا الدفتر.
+# Solana used to be the only structural option (ERC-20 has no on-chain holder
+# list), and since feature version 12 the `evm_layer` ledger writes into the
+# **same** table ⇒ both networks together. So most tests here run on Solana,
+# with a subsection at the end on EVM because the two `holder_count` columns
+# come from the ledger alone.
 # ---------------------------------------------------------------------------
 SOLTOK, SOLNET = "SoLmint1111111111111111111111111111111111", "1399811149"
 
@@ -1093,7 +1126,7 @@ def _conc(db, epoch, tok=SOLTOK, net=SOLNET, **kw):
 
 
 def test_onchain_features_read_latest_snapshot(db):
-    _conc(db, T0 - 3600, top1_pct=5.0, top10_pct=20.0)          # أقدم
+    _conc(db, T0 - 3600, top1_pct=5.0, top10_pct=20.0)          # older
     _conc(db, T0 - 120, top1_pct=32.21, top5_pct=46.31,
           top10_pct=53.16, top20_pct=60.99, top_accounts=20)
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
@@ -1106,15 +1139,17 @@ def test_onchain_features_read_latest_snapshot(db):
 
 
 def test_onchain_snapshot_after_t0_never_leaks(db):
-    """حرس التسرّب: قياس بعد لحظة القرار لا يغيّر الصفّ."""
+    """Leak guard: a measurement after the decision moment does not change
+    the row."""
     _conc(db, T0 - 300, top1_pct=10.0, top10_pct=30.0)
     before = features.onchain_features(db, SOLTOK, SOLNET, T0)
-    _conc(db, T0 + 60, top1_pct=90.0, top10_pct=99.0)           # المستقبل
+    _conc(db, T0 + 60, top1_pct=90.0, top10_pct=99.0)           # the future
     assert features.onchain_features(db, SOLTOK, SOLNET, T0) == before
 
 
 def test_onchain_delta_over_five_minutes(db):
-    """أوّل نافذة خمس‑دقائق على حركة الحيتان: حوت يكبر 3 نقاط في 5.5 دقيقة."""
+    """The first five-minute window on whale movement: a whale grows 3 points
+    in 5.5 minutes."""
     _conc(db, T0 - 390, top1_pct=29.0, top10_pct=50.0)
     _conc(db, T0 - 60, top1_pct=32.0, top10_pct=53.5)
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
@@ -1124,17 +1159,19 @@ def test_onchain_delta_over_five_minutes(db):
 
 
 def test_onchain_delta_skips_snapshot_closer_than_four_minutes(db):
-    """لقطة قبل 240ث ليست «قبل خمس دقائق» — الاستعلام يتخطّاها إلى ما قبلها."""
-    _conc(db, T0 - 420, top1_pct=20.0)      # قبل 6 دقائق من الحاضر — المرجع
-    _conc(db, T0 - 120, top1_pct=25.0)      # قبل دقيقتين — قريبة جدّاً
-    _conc(db, T0 - 10, top1_pct=26.0)       # الحاضر
+    """A snapshot less than 240s old is not "five minutes ago" — the query
+    skips it for the one before it."""
+    _conc(db, T0 - 420, top1_pct=20.0)      # 6 minutes before now — the reference
+    _conc(db, T0 - 120, top1_pct=25.0)      # 2 minutes ago — too close
+    _conc(db, T0 - 10, top1_pct=26.0)       # the present
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
     assert f["onchain_top1_delta_5m"] == pytest.approx(6.0)      # 26 − 20
     assert f["onchain_delta_span_min"] == pytest.approx(410 / 60)
 
 
 def test_onchain_delta_none_when_previous_snapshot_too_old(db):
-    """فجوة 20 دقيقة نافذة أخرى: النِّسب الحاضرة تبقى، والفرق None لا رقم مضلّل."""
+    """A 20-minute gap is another window: the current ratios stay, and the
+    delta is None, not a misleading number."""
     _conc(db, T0 - 1260, top1_pct=10.0)
     _conc(db, T0 - 60, top1_pct=40.0)
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
@@ -1144,7 +1181,7 @@ def test_onchain_delta_none_when_previous_snapshot_too_old(db):
 
 
 def test_onchain_unchanged_concentration_is_measured_zero(db):
-    """تركّز ثابت = صفر مقيس لا «لم نقس» (FR-007)."""
+    """Unchanged concentration = a measured zero, not "not measured" (FR-007)."""
     _conc(db, T0 - 390, top1_pct=15.0, top10_pct=40.0)
     _conc(db, T0 - 60, top1_pct=15.0, top10_pct=40.0)
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
@@ -1153,7 +1190,8 @@ def test_onchain_unchanged_concentration_is_measured_zero(db):
 
 
 def test_onchain_burned_supply_keeps_row_with_null_ratios(db):
-    """معروض صفريّ: الصفّ موجود بلا نِسب — ولا يُقرأ الغياب صفراً."""
+    """Zero supply: the row exists without ratios — and absence is not read
+    as zero."""
     _conc(db, T0 - 60, supply=0.0, top_accounts=1)
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
     assert f["onchain_top1_pct"] is None
@@ -1162,15 +1200,17 @@ def test_onchain_burned_supply_keeps_row_with_null_ratios(db):
 
 
 def test_no_onchain_measurement_leaves_family_null(db):
-    """صفوف EVM وكل ما قبل إطلاق الطبقة: NULL «لا يمكن قياسه» لا صفر."""
+    """EVM rows and everything from before the layer launched: NULL means
+    "cannot be measured", not zero."""
     f = features.onchain_features(db, TOK, NET, T0)
     assert set(f) == {
         "onchain_top1_pct", "onchain_top5_pct", "onchain_top10_pct",
         "onchain_top20_pct", "onchain_top_accounts", "onchain_age_min",
         "onchain_top1_delta_5m", "onchain_top10_delta_5m",
         "onchain_delta_span_min",
-        # عمودا الدفتر (إصدار 12): يعطيهما دفتر EVM وحده — سولانا تبقى NULL
-        # فيهما لأنّ مصدرها يعيد 20 حساباً بحدّ أقصى فلا عدد حائزين مضبوط.
+        # The two ledger columns (version 12): only the EVM ledger provides
+        # them — Solana stays NULL in both because its source returns at most
+        # 20 accounts, so there is no exact holder count.
         "onchain_holder_count", "onchain_holders_delta_5m",
     }
     assert all(v is None for v in f.values())
@@ -1182,23 +1222,26 @@ def test_onchain_of_other_token_does_not_leak(db):
 
 
 def test_onchain_family_is_in_feature_columns(db):
-    """العمود الغائب من FEATURE_COLUMNS يُحسب ثم يُرمى بصمت — الحرس هنا."""
+    """A column missing from FEATURE_COLUMNS is computed then silently
+    dropped — the guard is here."""
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
     assert set(f) <= set(features.FEATURE_COLUMNS)
 
 
-# --- عمودا الدفتر: EVM وحدها (سولانا بسقف 20 حساباً فلا إجمال) ---------------
+# --- the ledger columns: EVM only (Solana caps at 20 accounts, so no total) ---
 def test_onchain_holder_count_comes_from_the_evm_ledger(db):
-    """`holder_count` مضبوط لأنّ الدفتر يعرف كل عنوان لا أعلى عشرين."""
+    """`holder_count` is exact because the ledger knows every address, not
+    just the top twenty."""
     _conc(db, T0 - 60, tok=TOK, net=NET, top1_pct=12.5, top_accounts=20,
           holder_count=1_843)
     f = features.onchain_features(db, TOK, NET, T0)
     assert f["onchain_holder_count"] == 1_843
-    assert f["onchain_top_accounts"] == 20          # الرتبة ≠ الإجمال
+    assert f["onchain_top_accounts"] == 20          # rank ≠ total
 
 
 def test_onchain_holders_delta_over_five_minutes(db):
-    """أوّل نافذة خمس‑دقائق على **عدد** الحائزين في المشروع (FOMO إيقاعها 25د)."""
+    """The first five-minute window on the project's holder **count** (FOMO's
+    cadence is 25m)."""
     _conc(db, T0 - 390, tok=TOK, net=NET, holder_count=1_800)
     _conc(db, T0 - 60, tok=TOK, net=NET, holder_count=1_843)
     f = features.onchain_features(db, TOK, NET, T0)
@@ -1207,14 +1250,16 @@ def test_onchain_holders_delta_over_five_minutes(db):
 
 
 def test_onchain_holders_delta_can_be_negative(db):
-    """خروج حائزين معلومة كدخولهم: الإشارة تُحفظ ولا تُثبَّت عند صفر."""
+    """Holders leaving is as much information as holders arriving: the sign is
+    kept, not clamped to zero."""
     _conc(db, T0 - 390, tok=TOK, net=NET, holder_count=900)
     _conc(db, T0 - 60, tok=TOK, net=NET, holder_count=870)
     assert features.onchain_features(db, TOK, NET, T0)["onchain_holders_delta_5m"] == -30
 
 
 def test_onchain_holders_delta_null_when_solana_has_no_count(db):
-    """سولانا: النِّسب تُقاس والعدد لا ⇒ العمود NULL لا صفر (FR-007)."""
+    """Solana: ratios are measured but the count is not ⇒ the column is NULL,
+    not zero (FR-007)."""
     _conc(db, T0 - 390, top1_pct=20.0)
     _conc(db, T0 - 60, top1_pct=25.0)
     f = features.onchain_features(db, SOLTOK, SOLNET, T0)
@@ -1224,10 +1269,12 @@ def test_onchain_holders_delta_null_when_solana_has_no_count(db):
 
 
 # ---------------------------------------------------------------------------
-# شكل عقد EVM وصلاحياته (onchain_contract_*) — من البايت‑كود، Base وحدها
+# EVM contract shape and authorities (onchain_contract_*) — from the bytecode,
+# Base only.
 #
-# إيقاع ساعيّ فالعمر يُقاس بالدقائق العشرات لا بالوحدات. والفرق الحرج نفس فرق
-# `evm_contract`: راية غائبة من عقد مقروء = **صفر مقيس**، وعقد لم يُفحَص = None.
+# An hourly cadence, so age is measured in tens of minutes, not units. And the
+# critical distinction is the same as `evm_contract`: a flag absent from a read
+# contract = a **measured zero**; a contract never scanned = None.
 # ---------------------------------------------------------------------------
 BASETOK, BASENET = "0xbase01", "8453"
 
@@ -1248,7 +1295,7 @@ def _contract(db, epoch, tok=BASETOK, net=BASENET, **kw):
 
 
 def test_contract_features_read_latest_scan(db):
-    _contract(db, T0 - 7_000, code_size=1, function_count=1)      # أقدم
+    _contract(db, T0 - 7_000, code_size=1, function_count=1)      # older
     _contract(db, T0 - 3_300, code_size=14_812, function_count=61,
               has_mint=1, has_limit_setter=1, is_ownership_renounced=0)
     f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
@@ -1256,13 +1303,14 @@ def test_contract_features_read_latest_scan(db):
     assert f["onchain_function_count"] == 61
     assert f["onchain_has_mint_fn"] == 1
     assert f["onchain_has_limit_setter"] == 1
-    assert f["onchain_has_pause_fn"] == 0            # مقروء وغائب = صفر مقيس
+    assert f["onchain_has_pause_fn"] == 0            # read and absent = a measured zero
     assert f["onchain_owner_renounced"] == 0
     assert f["onchain_contract_age_min"] == pytest.approx(55.0)
 
 
 def test_contract_scan_after_t0_never_leaks(db):
-    """حرس التسرّب: شطبُ الملكيّة بعد لحظة القرار لا يدخل الصفّ."""
+    """Leak guard: an ownership renunciation after the decision moment does
+    not enter the row."""
     _contract(db, T0 - 600, is_ownership_renounced=0)
     before = features.onchain_contract_features(db, BASETOK, BASENET, T0)
     _contract(db, T0 + 60, is_ownership_renounced=1)
@@ -1270,15 +1318,17 @@ def test_contract_scan_after_t0_never_leaks(db):
 
 
 def test_contract_owner_renounced_null_is_not_renounced(db):
-    """«لا دالّة مالك» ≠ «الملكيّة متروكة» — والعمود يحفظ الفرق."""
+    """"no owner function" ≠ "ownership renounced" — and the column preserves
+    the difference."""
     _contract(db, T0 - 600, owner_address=None, is_ownership_renounced=None)
     f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
     assert f["onchain_owner_renounced"] is None
-    assert f["onchain_code_size"] == 4_096          # وقد قُرِئ العقد فعلاً
+    assert f["onchain_code_size"] == 4_096          # and the contract was indeed read
 
 
 def test_contract_non_contract_address_is_a_measured_zero(db):
-    """`0x` ⇒ ليس عقداً: صفر حجم قياسٌ، وعدد الدوالّ يبقى NULL لا صفراً."""
+    """`0x` ⇒ not a contract: a zero size is a measurement, and the function
+    count stays NULL, not zero."""
     _contract(db, T0 - 600, code_size=0, code_hash=None, function_count=None,
               has_mint=None, has_pause=None, has_blacklist=None,
               has_fee_setter=None, has_limit_setter=None, has_trading_switch=None)
@@ -1289,7 +1339,8 @@ def test_contract_non_contract_address_is_a_measured_zero(db):
 
 
 def test_contract_proxy_flag_survives(db):
-    """على وكيل، كل راية خطر أدناه لا تعني شيئاً — فالعلم نفسه يجب أن يصل."""
+    """On a proxy, every danger flag below means nothing — so the flag itself
+    must come through."""
     _contract(db, T0 - 600, code_size=45, is_proxy=1,
               impl_address="0x" + "12" * 20, function_count=0)
     f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
@@ -1298,7 +1349,8 @@ def test_contract_proxy_flag_survives(db):
 
 
 def test_no_contract_scan_leaves_family_null(db):
-    """BSC وروبن‑هود (وكل ما قبل الطبقة): NULL «لم يُفحَص» لا صفر."""
+    """BSC and Robinhood (and everything from before the layer): NULL means
+    "never scanned", not zero."""
     f = features.onchain_contract_features(db, TOK, NET, T0)
     assert set(f) == {
         "onchain_code_size", "onchain_function_count", "onchain_is_proxy",
@@ -1318,18 +1370,21 @@ def test_contract_of_other_token_does_not_leak(db):
 
 
 def test_contract_family_is_in_feature_columns(db):
-    """العمود الغائب من FEATURE_COLUMNS يُحسب ثم يُرمى بصمت — الحرس هنا."""
+    """A column missing from FEATURE_COLUMNS is computed then silently
+    dropped — the guard is here."""
     _contract(db, T0 - 600)
     f = features.onchain_contract_features(db, BASETOK, BASENET, T0)
     assert set(f) <= set(features.FEATURE_COLUMNS)
 
 
 # ---------------------------------------------------------------------------
-# الصلاحيات من السلسلة (onchain_has_* / is_mutable / dev) — الطبقة البطيئة
+# Authorities from the chain (onchain_has_* / is_mutable / dev) — the slow
+# layer.
 #
-# طابور مستقلّ وإيقاع ساعيّ، فالعمر هنا يُقاس بالساعات لا بالدقائق. والفرق
-# الحرج: راية `has_*` تصير **صفراً مقيساً** حين وُجد صفّ وسلطته NULL (السلطة
-# مشطوبة فعلاً)، وتبقى None حين لا صفّ إطلاقاً (لم نقس).
+# A separate queue and an hourly cadence, so age here is measured in hours,
+# not minutes. And the critical distinction: a `has_*` flag becomes a
+# **measured zero** when a row exists with a NULL authority (the authority is
+# actually revoked), and stays None when there is no row at all (not measured).
 # ---------------------------------------------------------------------------
 def _auth(db, epoch, tok=SOLTOK, net=SOLNET, **kw):
     row = {
@@ -1347,7 +1402,7 @@ def _auth(db, epoch, tok=SOLTOK, net=SOLNET, **kw):
 
 
 def test_onchain_authority_reads_latest_row(db):
-    _auth(db, T0 - 7200, mint_authority="Old", is_mutable=1)     # أقدم
+    _auth(db, T0 - 7200, mint_authority="Old", is_mutable=1)     # older
     _auth(db, T0 - 1800, mint_authority="DevWa11et", freeze_authority="FrzAuth",
           is_mutable=1, dev_holding_pct=4.25)
     f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
@@ -1367,7 +1422,8 @@ def test_onchain_authority_row_after_t0_never_leaks(db):
 
 
 def test_onchain_revoked_authority_is_measured_zero(db):
-    """الحالة الغالبة (45 من 48): السلطة مشطوبة ⇒ صفر مقيس لا None (FR-007)."""
+    """The dominant case (45 of 48): the authority is revoked ⇒ a measured
+    zero, not None (FR-007)."""
     _auth(db, T0 - 600, is_mutable=0)
     f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
     assert f["onchain_has_mint_authority"] == 0
@@ -1376,11 +1432,12 @@ def test_onchain_revoked_authority_is_measured_zero(db):
 
 
 def test_onchain_mutable_stays_null_when_das_failed(db):
-    """عمود واحد غائب لا يُعدم بقيّة الصفّ، ولا يُقرأ «غير قابلة للتعديل»."""
+    """One absent column does not kill the rest of the row, and it is not
+    read as "not mutable"."""
     _auth(db, T0 - 600, is_mutable=None)
     f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
     assert f["onchain_is_mutable"] is None
-    assert f["onchain_has_mint_authority"] == 0       # وهذا مقيس فعلاً
+    assert f["onchain_has_mint_authority"] == 0       # and this one is truly measured
     assert f["onchain_dev_holding_pct"] is None
 
 
@@ -1391,7 +1448,7 @@ def test_onchain_legacy_token_program_flag_is_zero(db):
 
 
 def test_onchain_dev_holding_zero_survives(db):
-    """المطوّر باع كلّ شيء = معلومة، لا غياب."""
+    """The developer sold everything = information, not absence."""
     _auth(db, T0 - 600, dev_owner="Dev1", dev_holding_pct=0.0)
     f = features.onchain_authority_features(db, SOLTOK, SOLNET, T0)
     assert f["onchain_dev_holding_pct"] == 0.0
@@ -1420,7 +1477,8 @@ def test_authority_family_is_in_feature_columns(db):
 
 
 def test_authority_family_reaches_build_features(db):
-    """الدالّة قد تُحسب ولا تُوصَل إلى build_features — الحرس هنا."""
+    """The function may be computed yet never reach build_features — the guard
+    is here."""
     _auth(db, T0 - 600, mint_authority="DevWa11et", is_mutable=1)
     event = {"signal_type": "large_buy", "occurred_at": _iso(T0),
              "token_address": SOLTOK, "network_id": SOLNET}
@@ -1430,7 +1488,7 @@ def test_authority_family_reaches_build_features(db):
 
 
 # ---------------------------------------------------------------------------
-# الشرعية الخارجية — كانت في raw_json من اليوم الأوّل بلا استخراج
+# External legitimacy — it sat in raw_json from day one with no extraction
 # ---------------------------------------------------------------------------
 def _static(db, epoch=None, **kw):
     row = {
@@ -1461,7 +1519,8 @@ def test_listed_on_exchange_derived_from_count(db):
 
 
 def test_zero_exchanges_is_measured_zero_not_missing(db):
-    """«فُحص ولا منصّة» تختلف عن «لم يُفحص» — صفر حقيقيّ لا None."""
+    """"checked and no exchange" differs from "not checked" — a true zero,
+    not None."""
     _static(db, exchanges_count=0)
     f = features.static_features(db, TOK, NET, T0)
     assert f["exchanges_count"] == 0
@@ -1469,7 +1528,8 @@ def test_zero_exchanges_is_measured_zero_not_missing(db):
 
 
 def test_absent_exchange_count_stays_unknown(db):
-    """غائب ≠ صفر (FR-007): لقطة قديمة بلا العمود تبقى مجهولة لا صفراً."""
+    """Absent ≠ zero (FR-007): an old snapshot without the column stays
+    unknown, not zero."""
     _static(db, exchanges_count=None)
     f = features.static_features(db, TOK, NET, T0)
     assert f["exchanges_count"] is None
@@ -1477,13 +1537,15 @@ def test_absent_exchange_count_stays_unknown(db):
 
 
 def test_snapshot_without_cmc_id_is_measured_absence(db):
-    """لقطة موجودة بلا cmc_id = «فُحص وغير مدرج» ⇒ صفر لا مجهول."""
+    """A snapshot present without cmc_id = "checked and not listed" ⇒ zero,
+    not unknown."""
     _static(db, cmc_id=None)
     assert features.static_features(db, TOK, NET, T0)["has_cmc_id"] == 0
 
 
 def test_legitimacy_unknown_before_any_snapshot(db):
-    """بلا أي لقطة لا شيء مقيس — كل الأعلام مجهولة بما فيها الثنائيّة."""
+    """With no snapshot at all nothing is measured — every flag is unknown,
+    including the boolean ones."""
     f = features.static_features(db, TOK, NET, T0)
     for key in ("exchanges_count", "listed_on_exchange", "has_cmc_id",
                 "description_len", "has_banner"):
@@ -1491,7 +1553,7 @@ def test_legitimacy_unknown_before_any_snapshot(db):
 
 
 def test_legitimacy_snapshot_after_t0_is_invisible(db):
-    """حرس تسرّب: إدراج منصّة بعد الإشارة ليس معلوماً عندها."""
+    """Leak guard: an exchange listing after the signal is not known at it."""
     _static(db, epoch=T0 + 600, exchanges_count=8, cmc_id="1839", has_banner=1)
     f = features.static_features(db, TOK, NET, T0)
     assert f["exchanges_count"] is None

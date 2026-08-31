@@ -1,28 +1,32 @@
-"""عميل DEX Screener العام — طبقة socials فقط (القيمة المقيسة الوحيدة).
+"""Generic DEX Screener client — the socials layer only (the single measured value).
 
-جرد كامل 2026-08-29 لكل حقول استجابتهم مقابل مخزوننا من fomo: سعر/سيولة/
-حجم/تغيير/عدد صفقات/عمر pool/منصة/صور/مواقع — **كلها مكررة أو نتفوق عليها**
-(flow عندنا أعمق: 5 دقائق مع فريدين مقابل m5 مجرد عدد). القيمة الوحيدة
-المضافة فعلًا: `info.socials[]` — تغطية مقيسة 11/12 عملة نشطة (92%).
+Full inventory 2026-08-29 of every field in their response against what we
+already have from fomo: price/liquidity/volume/change/tx count/pool age/
+platform/images/websites — **all duplicated or we do better** (our flow is
+deeper: 5 minutes with two windows vs a bare m5 count). The only genuinely
+added value: `info.socials[]` — measured coverage 11/12 active tokens (92%).
 
-الدوران اللذان نبنيه فوقها:
-  1. `social_channels_dex`   — عدد قنوات التواصل عند DEX (شرعية تسويقية).
-  2. `social_match_fomo_dex` — توافق المصدرين: عملة تقول fomo لها تويتر
-     وDEX لا يرى شيئًا = نمط ملف مزوّر (إشارة نصب شائعة) والعكس صدقٌ
-     متبادل يرفع الثقة.
+The two columns we build on it:
+  1. `social_channels_dex`   — number of social channels DEX knows (marketing
+     legitimacy).
+  2. `social_match_fomo_dex` — agreement of the two sources: a token fomo
+     says has a twitter while DEX sees nothing = the forged-profile pattern
+     (a common scam signal), and the reverse is mutual honesty that raises
+     trust.
 
-القيود المقيسة: حد المعدل سخي (لم نشهد 429 في القياس) لكن النداء واحد
-لكل عملة **جديدة** فقط — تُسأل مرة عند القبول وتُخزَّن في token_static
-(ثوابت العملة تُكتب مرة)، فلا حلقة مستمرة ولا ازدواج جمع. العملات التي
-لا يجيب عنها DEX تبقى NULL (غياب لا صفر — قد لا تكون مفهرسة بعد).
+Measured constraints: the rate limit is generous (we never saw a 429 during
+measurement) but the call is made only for each **new** token — asked once at
+admission and stored in token_static (token constants are written once), so
+no continuous loop and no double collection. Tokens DEX does not answer stay
+NULL (absence, not zero — it may simply not be indexed yet).
 
-الشبكات: خريطة معرفاتنا → معرفاتهم (سولانا حساسة لحالة الأحرف).
+Networks: a map of our ids → theirs (Solana is case-sensitive).
 """
 from __future__ import annotations
 
 from typing import Any
 
-# خريطة شبكاتنا → chainId عند DEX Screener.
+# Map of our networks → DEX Screener chainId.
 NETWORK_MAP = {
     "1399811149": "solana",
     "4663": "ethereum",
@@ -36,7 +40,7 @@ _TIMEOUT = 15
 
 
 class DexScreenerClient:
-    """زبين قراءة فقط لقنوات التواصل. يُنشأ مرة لكل دورة استخدامه."""
+    """Read-only client for social channels. Created once per cycle that uses it."""
 
     def __init__(self, session: Any = None) -> None:
         self._session = session
@@ -53,10 +57,10 @@ class DexScreenerClient:
         return await self._session.get(url)
 
     async def social_channels(self, address: str, network_id: str) -> int | None:
-        """عدد قنوات التواصل لأعلى زوج سيولة، أو None إن لم تُفهرس.
+        """Number of social channels of the most liquid pair, or None if not indexed.
 
-        لا يرفع أبدًا: فشل الشبكة والغياب كلها None — الطبقة العليا
-        تخزن الغياب كما هو (غياب مقيس لا صفر).
+        Never raises: network failure and absence are both None — the layer
+        above stores the absence as-is (a measured absence, not zero).
         """
         chain = NETWORK_MAP.get(str(network_id))
         if not chain:
@@ -64,17 +68,17 @@ class DexScreenerClient:
         addr = address if str(network_id) == "1399811149" else address.lower()
         try:
             resp = await self._get(f"{_BASE}/{addr}")
-        except Exception:  # noqa: BLE001 — طبقة مساندة لا تُسقط الدورة أبدًا
+        except Exception:  # noqa: BLE001 — a supporting layer must never kill the cycle
             return None
         if getattr(resp, "status_code", None) != 200:
-            return None            # غير مفهرسة أو حد المعدل — لاحقًا
+            return None            # not indexed or rate limit — later
         try:
             pairs = resp.json().get("pairs") or []
         except Exception:  # noqa: BLE001
             return None
         if not pairs:
             return None
-        # أعلى زوج سيولة هو الزوج الرئيسي للمظهر العام للعملة.
+        # The most liquid pair is the primary pair for the token's overall profile.
         top = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
         info = top.get("info") or {}
         socials = info.get("socials")
@@ -86,6 +90,6 @@ class DexScreenerClient:
             if close is not None:
                 try:
                     await close()
-                except Exception:  # noqa: BLE001 — إغلاق لا يهم فشله
+                except Exception:  # noqa: BLE001 — a close whose failure does not matter
                     pass
             self._session = None

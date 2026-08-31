@@ -21,7 +21,7 @@ async def main():
     db_uri = "file:C:/Users/rr/Desktop/aoi/recorder/recorder.db?mode=ro"
     db = sqlite3.connect(db_uri, uri=True)
 
-    # اجمع ~200 حدثاً (4 صفحات) وقاطع معرفاتها مع signal_events
+    # collect ~200 events (4 pages) and cross their ids with signal_events
     ids_by_type = {}
     last_id = None
     for _ in range(4):
@@ -45,9 +45,9 @@ async def main():
             db.execute("SELECT COUNT(*) FROM signal_events WHERE id=?", (i,)).fetchone()[0]
             for i in ids
         )
-        print(f"  {t:16s}: {hits}/{len(ids)} موجودة في signal_events")
+        print(f"  {t:16s}: {hits}/{len(ids)} present in signal_events")
 
-    # وهل swap_buy له createdAt ضمن مدى تغطيتنا؟
+    # and does swap_buy have a createdAt within our coverage span?
     r = db.execute("SELECT MIN(ts), MAX(ts) FROM signal_events").fetchone()
     print("signal_events ts range:", r)
 

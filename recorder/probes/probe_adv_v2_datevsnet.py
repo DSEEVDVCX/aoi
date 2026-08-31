@@ -1,7 +1,7 @@
 """DECISIVE TEST: is the explanatory variable NETWORK or ENTRY DATE?
 features.py docstrings give two hard collector start dates:
-  holders_features/flow_features: "كل الصفوف قبل 2026-08-09 ستكون None هنا"
-  onchain_features (EVM in chain_concentration): "الشبكتان معاً منذ 2026-08-13"
+  holders_features/flow_features: "all rows before 2026-08-09 will be None here"
+  onchain_features (EVM in chain_concentration): "both networks together since 2026-08-13"
 The 4663/8453 model rows all have entry_ts <= 2026-08-04. So compare
 like-for-like: net 56 / Solana rows in the SAME pre-08-09 era."""
 import os, sqlite3, datetime as dt

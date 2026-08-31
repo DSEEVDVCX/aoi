@@ -1,195 +1,196 @@
-# تحليل أنماط الإشارات — 2026-08-08
+# Signal Pattern Analysis — 2026-08-08
 
-> **لقطةٌ لا مرجع.** هذا الملفّ أرقامُ يومِ صدوره وحدَه؛ القاعدة تنمو كلَّ دقيقة
-> فكلُّ عددٍ هنا أصغرُ من الواقع اليوم. أحدثُ تحليلٍ من هذا النوع، وأحدثُه لا
-> يعني الحاليَّ: أعِد التوليد بـ`py recorder/pattern_analysis.py` قبل الاستناد
-> إلى رقمٍ منه. للعتبات الملزمة: [`PLAN.md`](PLAN.md).
+> **A snapshot, not a reference.** This file holds the numbers of its publication day only; the database
+> grows every minute, so every number here is smaller than today's reality. It is the latest analysis of
+> this kind, and latest does not mean current: regenerate with `py recorder/pattern_analysis.py` before
+> relying on any number from it. For the binding thresholds: [`PLAN.md`](PLAN.md).
 
-> أُنشئ في `2026-08-08T11:52:46+00:00` من `C:\Users\rr\Desktop\aoi\recorder\recorder.db`. يغطي 4,097 إشارة مستقلة صالحة،
-> 346 عملة، من `2026-07-28T10:31:01+00:00` إلى `2026-08-06T00:35:28+00:00`.
-> العتبات مشتقة من `train` فقط، والتجزئة ثابتة بعنوان العملة لمنع انتقال العملة بين الأجزاء.
+> Created `2026-08-08T11:52:46+00:00` from `C:\Users\rr\Desktop\aoi\recorder\recorder.db`. It covers 4,097 valid independent signals,
+> 346 tokens, from `2026-07-28T10:31:01+00:00` to `2026-08-06T00:35:28+00:00`.
+> Thresholds are derived from `train` only, and the split is fixed by token address to prevent a token crossing between parts.
 
-## الخلاصة
+## Summary
 
-- **لا يوجد إثبات أن الإشارة العامة تتفوق على الضابطة.** بعد حذف التكرار بقيت
-  97 عملة بإشارة مقابل 10 ضوابط حيّة فقط. فرق وسيط عائد 48 ساعة
-  -1.3%، وفاصل الثقة
+- **There is no proof that the general signal beats the control group.** After removing duplicates, 97
+  tokens with signals remained versus only 10 live controls. The 48-hour return median difference is
+  -1.3%, with a confidence interval of
   [-8.4%,
-  +19.2%]، و`p=0.332`.
-- **أقوى نمط صعود هو استمرار الزخم:** `ret_24h_before` > 48.5% و `vol_24h_before` > 3.3%.
-  في الاختبار لمس +20% خلال 24 ساعة في **74.8%** من
-  119 إشارة على 26 عملة، مقابل
-  46.8% لكل الاختبار. استمر اتجاه التحسن في كل الأيام المؤهلة.
-- **هذا ليس نمط احتفاظ.** وسيط عائد النمط عند نهاية 48 ساعة
-  -28.2% ووسيط السحب
-  -56.5%؛ الحركة المعتادة اندفاعة ثم ارتداد/تصريف.
-- بمحاكاة محافظة: هدف +20%، وقف −30%، خروج 24 ساعة، وتكلفة دورة 2%، حقق نمط الزخم
-  الهدف في **67.2%** وضُرب بالوقف في
-  **29.4%**؛ المتوسط الصافي
-  **+1.9%** والوسيط
-  **+18.0%** على الاختبار. لكنه أعطى متوسطاً سالباً
-  في التدريب، لذلك لا يُعتمد كاستراتيجية مالية مكتملة.
-- لا يوجد نمط ثابت لصعود نهائي +20% بعد 48 ساعة. الهدوء السابق رفع احتمال مجرد
-  الإغلاق الموجب إلى 53.9%، لكن وسيط العائد كان
-  +0.6% فقط ونسبة الإغلاق فوق +20%
-  13.8%. فاصل الثقة لفرق الإغلاق الموجب عن بقية الاختبار
-  [+8.2%, +39.4%]، لكن
-  حجم العائد نفسه ضئيل، أي أن الأفضلية يرجح أن تمحوها الرسوم والانزلاق.
-- **تجربة التدريب الآلي (GBM + walk-forward) فشلت في التعميم على العملات
-  الجديدة**: AUC ≈ 0.5 على عملات لم تظهر في التدريب، ومتوسط صافٍ سالب
-  لأعلى 20% في 3 من 4 أيام اختبار. الأفضلية الظاهرة على كل الإشارات مصدرها
-  العملات المعروفة سابقاً (تكرار ناجح)، لا اكتشاف عملات جديدة. أنبوب
-  التدريب المنهجي جاهز (انظر قسم "تجربة التدريب الآلي")، ويتضمن فحص تسريب
-  إجبارياً — بعد أن كشف تسرب الهدف المشتق عن نتيجة وهمية 100% في أعلى 20%.
+  +19.2%], and `p=0.332`.
+- **The strongest upside pattern is momentum continuation:** `ret_24h_before` > 48.5% and `vol_24h_before` > 3.3%.
+  In the test set it touched +20% within 24 hours in **74.8%** of
+  119 signals across 26 tokens, versus
+  46.8% for the whole test set. The direction of improvement held on every qualifying day.
+- **This is not a holding pattern.** The pattern's median return at the end of 48 hours is
+  -28.2% and the median drawdown is
+  -56.5%; the typical move is a spike followed by a reversal/dump.
+- In a conservative simulation: +20% target, −30% stop, 24-hour exit, and 2% round-trip cost, the momentum pattern
+  hit the target in **67.2%** and was stopped out in
+  **29.4%**; the net mean was
+  **+1.9%** and the median
+  **+18.0%** on the test set. But it produced a negative mean
+  in training, so it is not adopted as a complete financial strategy.
+- No stable pattern was found for a final +20% rise after 48 hours. Prior calm raised the probability of merely
+  closing positive to 53.9%, but the median return was only
+  +0.6% and the rate of closing above +20% was
+  13.8%. The confidence interval for the positive-close difference versus the rest of the test set is
+  [+8.2%, +39.4%], but
+  the return size itself is tiny, meaning fees and slippage likely erase the edge.
+- **The machine-learning trial (GBM + walk-forward) failed to generalize to new
+  tokens**: AUC ≈ 0.5 on tokens never seen in training, and a negative net mean
+  for the top 20% on 3 of 4 test days. The apparent edge over all signals comes from
+  previously known tokens (successful repetition), not new-token discovery. The
+  systematic training pipeline is ready (see the "machine-learning trial" section), and it
+  includes a mandatory leakage check — after a derived-target leak produced a spurious 100% in the top 20%.
 
-## أنماط بلوغ +20% خلال 24 ساعة
+## Patterns for reaching +20% within 24 hours
 
-خط الأساس: train 52.3%، val
-58.4%، test 46.8%.
-عمود `صفوف/عملات` للاختبار. فاصل الثقة هو فرق النسبة عن بقية الاختبار، مع bootstrap
-على مستوى العملة لا الصف.
+Baseline: train 52.3%, val
+58.4%, test 46.8%.
+The `rows/tokens` column is for the test set. The confidence interval is the rate difference versus the rest of the
+test set, bootstrapped at the token level, not the row level.
 
-| النمط | القاعدة المثبتة من train | train | val | test | صفوف/عملات | ثبات الأيام | 95% CI للاختلاف |
+| Pattern | Rule fixed from train | train | val | test | rows/tokens | Day stability | 95% CI of the difference |
 |---|---|---:|---:|---:|---:|---:|---:|
-| زخم قوي مع تذبذب فعلي | `ret_24h_before` > 48.5% و `vol_24h_before` > 3.3% | 67.9% | 75.8% | 74.8% | 119 / 26 | + 9/9 | [+21.0%, +48.3%] |
-| عملة قديمة نسبياً | `token_age_h` > 41.3 يوم | 31.4% | 22.7% | 18.8% | 239 / 24 | − 9/9 | [-54.8%, -22.8%] |
-| دوران ضعيف قياساً بالسيولة | `volume_to_liquidity` <= 2.18 | 24.5% | 28.4% | 24.4% | 86 / 21 | − 9/9 | [-43.9%, -6.8%] |
-| تذبذب سابق ضعيف | `vol_24h_before` <= 1.7% | 28.2% | 41.4% | 23.4% | 244 / 29 | − 9/9 | [-48.7%, -11.9%] |
-| معاملات يومية قليلة | `tick_txn_24h` <= 2,535 | 35.6% | 37.5% | 21.3% | 94 / 22 | − 9/9 | [-44.1%, -12.4%] |
+| Strong momentum with realized volatility | `ret_24h_before` > 48.5% and `vol_24h_before` > 3.3% | 67.9% | 75.8% | 74.8% | 119 / 26 | + 9/9 | [+21.0%, +48.3%] |
+| Relatively old token | `token_age_h` > 41.3 days | 31.4% | 22.7% | 18.8% | 239 / 24 | − 9/9 | [-54.8%, -22.8%] |
+| Weak turnover relative to liquidity | `volume_to_liquidity` <= 2.18 | 24.5% | 28.4% | 24.4% | 86 / 21 | − 9/9 | [-43.9%, -6.8%] |
+| Weak prior volatility | `vol_24h_before` <= 1.7% | 28.2% | 41.4% | 23.4% | 244 / 29 | − 9/9 | [-48.7%, -11.9%] |
+| Few daily transactions | `tick_txn_24h` <= 2,535 | 35.6% | 37.5% | 21.3% | 94 / 22 | − 9/9 | [-44.1%, -12.4%] |
 
-التفسير العملي:
+Practical interpretation:
 
-- الزخم المرتفع مع تذبذب حقيقي هو **مرشح اندفاعة قصيرة**.
-- العمر فوق عتبة التدريب، أو ضعف دوران الحجم/السيولة، أو ضعف التذبذب، أو قلة
-  المعاملات هي **مرشحات ضوضاء منخفضة الصعود**. ليست بالضرورة انهيارات؛ كثير منها
-  يتحرك قرب الصفر، أي أن الإشارة لا تضيف حركة تستحق المخاطرة.
+- High momentum with real volatility is a **short-spike filter**.
+- Age above the training threshold, or weak volume/liquidity turnover, or weak volatility, or few
+  transactions are **low-upside noise filters**. Not necessarily collapses; many of them
+  move near zero, meaning the signal adds no movement worth the risk.
 
-## محاكاة مسار السعر للنمط الأقوى
+## Price-path simulation of the strongest pattern
 
-المحاكاة تمشي على الشموع بترتيبها. إذا لمس السعر الهدف والوقف في الشمعة نفسها
-تفترض الوقف أولاً. التكلفة المفترضة 2% للدورة، ولا يوجد نموذج مستقل لرفض التنفيذ.
+The simulation walks the candles in order. If the price touches the target and the stop within the same
+candle, it assumes the stop first. The assumed cost is 2% per round trip, and there is no separate model for
+execution rejection.
 
-| الجزء | كل الإشارات | متوسطها الصافي | نمط الزخم صفوف/عملات | هدف | وقف | متوسط النمط | وسيط النمط |
+| Part | All signals | Their net mean | Momentum pattern rows/tokens | Target | Stop | Pattern mean | Pattern median |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | train | 2905 | -0.9% | 467 / 97 | 53.5% | 43.9% | -4.7% | +18.0% |
 | val | 442 | +0.5% | 99 / 14 | 68.7% | 28.3% | +2.6% | +18.0% |
 | test | 750 | -2.8% | 119 / 26 | 67.2% | 29.4% | +1.9% | +18.0% |
 
-في اختبار العملات غير المرئية كان فاصل الثقة لتفوق متوسط النمط الصافي على بقية
-الاختبار [+0.3%,
-+11.0%]. أقصى تكلفة دورة
-يبقى عندها **متوسط الاختبار** غير سالب هي تقريباً
-3.9%، لكنها غير مستقرة: في التدريب كانت
--2.7% فقط.
+On unseen tokens, the confidence interval for the pattern's net mean outperforming the rest of the
+test set was [+0.3%,
++11.0%]. The maximum round-trip cost
+at which the **test mean** stays non-negative is roughly
+3.9%, but it is unstable: in training it was
+only -2.7%.
 
-## مسار السعر المبكر (15/30/60 دقيقة) لا يفصل القمر الحقيقي عن المزيف
+## Early price path (15/30/60 minutes) does not separate the real moonshot from the fake one
 
-تعريف القمر هنا: لمست +100% خلال 48 ساعة. القمر "الحقيقي" يغلق فوق +100%
-(197 إشارة)، والمزيف يلمسها ثم ينهار (578). السؤال: هل إبقاء السعر فوق سعر
-الدخول بعد 15/30/60 دقيقة يميزهما مبكراً؟ الجواب من `test` (خارج التدريب):
-**لا، والفارق ينعكس**.
+Definition of a moonshot here: touched +100% within 48 hours. A "real" moonshot
+closes above +100% (197 signals); a fake one touches it and then collapses (578). The question: does
+keeping the price above the entry price after 15/30/60 minutes tell them apart early? The answer from
+`test` (out of training): **no, and the difference flips**.
 
-| لحظة الفحص | حقيقي فوق الدخول | مزيف فوق الدخول | الفارق |
+| Check point | Real above entry | Fake above entry | Difference |
 |---|---:|---:|---:|
-| بعد 15 دقيقة | 58.8% | 53.1% | +5.7 نقطة |
-| بعد 30 دقيقة | 47.1% | 52.1% | −5.0 نقطة |
-| بعد 60 دقيقة | 47.1% | 54.2% | −7.1 نقطة |
+| After 15 minutes | 58.8% | 53.1% | +5.7 points |
+| After 30 minutes | 47.1% | 52.1% | −5.0 points |
+| After 60 minutes | 47.1% | 54.2% | −7.1 points |
 
-محاكاة الدخول المؤجل (شراء عند أول شمعة بعد 15/30/60 دقيقة، فقط إذا كان السعر
-فوق سعر الإشارة) لم تحسّن بلوغ +100%، بل قلّصت التقاط القمر الحقيقي:
+A delayed-entry simulation (buying at the first candle after 15/30/60 minutes, only if the price is
+above the signal price) did not improve reaching +100% — it shrank the capture of real moonshots:
 
-| الدخول | صفقات | لمس +100% | قمر حقيقي ملتقط |
+| Entry | Trades | Touched +100% | Real moonshot captured |
 |---|---:|---:|---:|
-| فوري (كل الإشارات) | 877 | 13.0% | 17/17 |
-| +60 دقيقة بشرط فوق الدخول | 378 | 9.8% | 8/17 |
-| فوري بمرشّح score≥4 | 59 | 23.7% | 3/3 |
-| +60 دقيقة بشرط فوق، score≥4 | 25 | 4.0% | 0/3 |
+| Immediate (all signals) | 877 | 13.0% | 17/17 |
+| +60 minutes, conditionally above entry | 378 | 9.8% | 8/17 |
+| Immediate with score≥4 filter | 59 | 23.7% | 3/3 |
+| +60 minutes conditional, score≥4 | 25 | 4.0% | 0/3 |
 
-السبب: شرط "فوق الدخول" يجبرك على الشراء بسعر أعلى، والقمر الحقيقي غالباً
-يتقدم باندفاعة واحدة لا يمكن اللحاق بها بعد ساعة. أي "تأكيد" بالسعر خلال
-الساعة الأولى لا يضيف معلومات خارج التدريب.
+The reason: the "above entry" condition forces you to buy at a higher price, and a real moonshot usually
+advances in a single spike that cannot be chased after an hour. Any price "confirmation" within the first
+hour adds no out-of-training information.
 
-## ما لا يصلح كدليل
+## What does not count as evidence
 
-نوع الحدث وحده لا يميز الصعود في الاختبار:
+Event type alone does not distinguish upside in the test set:
 
-| النوع | صفوف | عملات | بلغ +20% |
+| Type | Rows | Tokens | Reached +20% |
 |---|---:|---:|---:|
 | `large_buy` | 371 | 70 | 47.7% |
 | `large_sell` | 379 | 57 | 45.9% |
 
-كذلك لم يظهر تطابق متداول متصدر أو كون الصفقة أول شراء كأثر ثابت أقوى من السوق.
-والحقول التالية فارغة 100% في العينة، لذلك مُنعت من أي استنتاج:
+Likewise, a leaderboard-trader match or the trade being a first buy did not show a stable effect stronger
+than the market. And the following fields are 100% empty in the sample, so they were barred from any inference:
 `unique_traders, num_trades, minutes, price_change_pct, total_volume, volume_per_trader, are_top_traders, top_trader_match_ratio, mintable, freezable, thesis_accel, top10_holders_pct`.
 
-## تجربة التدريب الآلي (Gradient Boosting + Walk-Forward)
+## Machine-learning trial (Gradient Boosting + Walk-Forward)
 
-بنيت أنبوب تدريب كامل كأساس للنموذج النهائي: هدف من **محاكاة الخروج الفعلية**
-(جني +20% / وقف −30% / ≤24 ساعة / تكلفة 2% — الصفقة رابحة صافياً) بدل اللمس
-المجرد، تقييم **walk-forward زمني** (تدريب على كل ما قبل اليوم، اختبار يوم واحد،
-4 أيام اختبار)، 69 ميزة لحظية، و`HistGradientBoostingClassifier` بمعاملات
-اختيرت على يوم val واحد فقط.
+A full training pipeline was built as the foundation for the final model: a target from the **actual exit
+simulation** (+20% take-profit / −30% stop / ≤24 hours / 2% cost — the trade is net profitable) instead of a
+bare touch, **time-based walk-forward** evaluation (train on everything before the day, test one day,
+4 test days), 69 instantaneous features, and `HistGradientBoostingClassifier` with parameters
+chosen on a single val day only.
 
-**درس المنهجية الأهم:** عمود الهدف المشتق (`max_gain_48h >= 20%`) تسرب لاحقاً
-إلى مجموعة الميزات في مسودة التحليل، فأعطى AUC "رائع" (0.83–0.85) و100% في
-أعلى 20%. عند إزالة التسريب عاد كل شيء إلى الواقع — أي اختبار يُظهر أفضلية
-شديدة على سعر الدخول يجب فحصه فوراً بحثاً عن تسريب.
+**The most important methodological lesson:** the derived target column (`max_gain_48h >= 20%`) later
+leaked into the feature set in a draft of the analysis, producing a "great" AUC (0.83–0.85) and 100% in
+the top 20%. When the leak was removed, everything returned to reality — any test showing an extreme
+edge over the entry price must be checked immediately for leakage.
 
-**النتيجة الصادقة (بدون تسريب):**
+**The honest result (no leakage):**
 
-| اليوم | AUC (كل الإشارات) | AUC (عملات جديدة فقط) |
+| Day | AUC (all signals) | AUC (new tokens only) |
 |---|---:|---:|
 | 20667 | 0.592 | 0.610 |
 | 20668 | 0.507 | 0.474 |
 | 20669 | 0.578 | 0.422 |
 | 20670 | 0.609 | 0.646 |
 
-- على **كل الإشارات**: AUC ≈ 0.58 — أفضلية ضعيفة غير ثابتة (يوم واحد 0.51).
-- على **العملات الجديدة فقط** (لم تظهر في التدريب — الاختبار العادل لاكتشاف
-  عملات): AUC ≈ 0.54، والمتوسط الصافي لأعلى 20% سالب في 3 من 4 أيام
-  (−5.8%، −12.2%، −14.9%). **لا توجد أفضلية قابلة للتعميم.**
-- الأفضلية الضعيفة على "كل الإشارات" مصدرها العملات المعروفة سابقاً
-  (`prior_signals_token`)، وهي غير ثابتة: في يوم 20668 النموذج كان أسوأ من
-  baseline. الاعتماد عليها استراتيجية تكرار لا اكتشاف.
+- On **all signals**: AUC ≈ 0.58 — a weak, unstable edge (one day at 0.51).
+- On **new tokens only** (never seen in training — the fair test of token
+  discovery): AUC ≈ 0.54, and the net mean of the top 20% is negative on 3 of 4 days
+  (−5.8%, −12.2%, −14.9%). **There is no generalizable edge.**
+- The weak edge on "all signals" comes from previously known tokens
+  (`prior_signals_token`), and it is unstable: on day 20668 the model was worse than
+  baseline. Relying on it is a repetition strategy, not discovery.
 
-**منهجية التدريب النهائية الموصى بها (جاهزة للتطبيق فور توفر بيانات أطول):**
-walk-forward زمني + منع انتقال العملة بين الأجزاء + هدف من محاكاة الخروج +
-قياس AUC على العملات الجديدة فقط + فحص تسريب إجباري قبل أي استنتاج.
+**The recommended final training methodology (ready to apply as soon as longer data is available):**
+time-based walk-forward + preventing token crossing between parts + a target from the exit simulation +
+measuring AUC on new tokens only + a mandatory leakage check before any inference.
 
-### النتيجة النهائية لأنبوب التدريب الرسمي (`recorder/train_pipeline.py`)
+### Final result of the official training pipeline (`recorder/train_pipeline.py`)
 
-أُعيد البناء كملف دائم في المشروع بنفس المنهجية (walk-forward، 107 ميزات،
-فصل عملات، bootstrap بالعملة). النتيجة المعتمدة على أيام الاختبار الأربعة
-(2007 إشارة، 491 عملة جديدة):
+It was rebuilt as a permanent file in the project with the same methodology (walk-forward, 107 features,
+token separation, token-level bootstrap). The approved result on the four test days
+(2007 signals, 491 new tokens):
 
-- **هدف الربح الصافي** (`win_trade`): AUC العملات الجديدة = **0.555**
-  (CI 95%: 0.504–0.595) — أفضلية هامشية بالكاد تلمس الصفر.
-- **هدف لمس +20%** (`up20`): ظهر AUC مرتفع (0.71) في مسودة أولى، لكن التحقق
-  القاسي كشف أنه لا يترجم إلى ربح: أعلى 20% على العملات الجديدة أعطت متوسطاً
-  صافياً **−6.5%** مقابل −5.4% للـ baseline، وبنفس النتيجة سالبة عند كل
-  مستويات التكلفة 2–5%. أي أفضلية تُقاس على هدف مجرد (لمسة) دون محاكاة خروج
-  ليست ربحاً.
-- الأفضلية الإيجابية الوحيدة الثابتة في أي مسودة ظهرت على "كل الإشارات"
-  (شاملة المعروفة) واختفى أكثرها عند عزل العملات الجديدة — **مصدرها تكرار
-  العملات الناجحة سابقاً، لا اكتشاف عملات جديدة.**
+- **Net-profit target** (`win_trade`): new-token AUC = **0.555**
+  (95% CI: 0.504–0.595) — a marginal edge barely touching zero.
+- **Touch +20% target** (`up20`): a high AUC (0.71) appeared in an early draft, but
+  hard verification revealed it does not translate into profit: the top 20% on new tokens gave a net mean
+  of **−6.5%** versus −5.4% for the baseline, and the same negative result at every
+  cost level of 2–5%. Any edge measured on a bare target (a touch) without an exit
+  simulation is not profit.
+- The only stable positive edge in any draft appeared on "all signals"
+  (including known ones), and most of it vanished when new tokens were isolated — **its source is
+  repeating previously successful tokens, not new-token discovery.**
 
-الحكم النهائي: على هذا الحجم من البيانات، النموذج **لا يعمم** على عملات
-لم تظهر في التدريب؛ الأنبوب جاهز كأداة قبول/رفض صارمة لكل جولة تدريب قادمة،
-ومعيار القبول فيه: AUC العملات الجديدة بفاصل ثقة بالعملة يبتعد عن 0.5
-والربح الصافي موجباً بعد التكلفة.
+The final verdict: at this data volume, the model **does not generalize** to tokens
+never seen in training; the pipeline is ready as a strict accept/reject tool for every future training round,
+and its acceptance criterion is: new-token AUC with a token-level confidence interval away from 0.5
+and net profit positive after cost.
 
-## حدود الاستنتاج والخطوة التالية
+## Limits of inference and the next step
 
-- الفترة قصيرة (10 أيام) وسوق meme يغير نظامه بسرعة.
-- أُصلح `model_training_rows` بتاريخ التقرير: إشارات متزامنة (نفس العملة+الشبكة+اللحظة)
-  كانت تُحسب مرات متعددة (498 صفاً زائداً). الـ view الآن يحتفظ بأصغر `key` فقط لكل
-  (عملة، شبكة، لحظة). جميع أرقام هذا التقرير من النسخة النظيفة.
-- الضابطة الحية المؤهلة صغيرة وغير متوازنة شبكياً؛ لذلك لا يوجد حكم سببي أن الإشارة
-  نفسها تخلق أفضلية على اختيار عملة عشوائية مماثلة.
-- استُخدمت `val` لاختيار الصياغة، ثم فُحص `test` في هذا التقرير؛ **مجموعة test الحالية
-  أصبحت مستهلكة** ولا يجوز تعديل القواعد وإعادة تسميتها اختباراً مستقلاً.
-- جمّد القواعد أعلاه الآن، واجمع 7–14 يوماً جديدة، ثم اختبرها زمنياً بلا تغيير.
-  معيار قبول مقترح لنمط الزخم: ≥100 إشارة و≥30 عملة جديدة، بقاء معدل الهدف فوق
-  خط الأساس، وفاصل ثقة مجمّع بالعملة فوق الصفر، ومتوسط صافٍ موجب عند تكلفة 2–5%.
+- The period is short (10 days) and the meme market changes regime quickly.
+- `model_training_rows` was fixed as of the report date: concurrent signals (same token + network + moment)
+  were being counted multiple times (498 excess rows). The view now keeps only the smallest `key` per
+  (token, network, moment). All numbers in this report come from the clean version.
+- The qualifying live control group is small and network-unbalanced; therefore there is no causal verdict that the
+  signal itself creates an edge over picking a similar random token.
+- `val` was used to choose the formulation, then `test` was examined in this report; **the current test set
+  is now consumed** and the rules may not be modified and renamed an independent test.
+- Freeze the rules above now, collect 7–14 new days, then test them over time without changes.
+  A proposed acceptance criterion for the momentum pattern: ≥100 signals and ≥30 new tokens, the target rate staying above
+  baseline, a token-aggregated confidence interval above zero, and a positive net mean at a 2–5% cost.
 
-هذا تحليل احتمالي تاريخي، لا ضمان سعر ولا توصية استثمارية.
+This is a historical probabilistic analysis, not a price guarantee and not investment advice.

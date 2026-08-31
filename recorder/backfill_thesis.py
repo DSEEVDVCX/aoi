@@ -1,15 +1,17 @@
-"""استرجاع رجعيّ: تاريخ الأطروحات لكل عملة مراقَبة.
+"""Retro backfill: thesis history for every watched token.
 
-كل أطروحة تحمل `createdAt`، والـ endpoint يدعم ترقيم الصفحات عبر `lastId` —
-فيمكن استرجاع **العدد التاريخي**: كم أطروحة كانت موجودة لحظة الإشارة. قياساً:
-ثلاث صفحات (300 أطروحة) رجعت إلى ما قبل بدء المسجّل، فبضع صفحات تغطّي الأرشيف.
+Every thesis carries `createdAt`, and the endpoint supports pagination via
+`lastId` — so the **historical count** is recoverable: how many theses
+existed at the moment of the signal. Measured: three pages (300 theses) went
+back to before the recorder started, so a few pages cover the archive.
 
-**ما لا يُسترجع**: عدد الإعجابات والردود **لحظة الإشارة**. الـAPI يعطي العدّاد
-الحاليّ فقط ولا سجلّ تاريخياً له. لذا `token_thesis.fetched_at` مسجَّل: هو زمن
-قياس الإعجابات، ولا يجوز قراءتها كأنّها قيمة وقت الكتابة.
+**What is not recoverable**: likes and replies **at the moment of the
+signal**. The API only gives the current counter, with no historical log.
+That is why `token_thesis.fetched_at` is recorded: it is when the likes were
+measured, and it must not be read as if it were the value at write time.
 
-الاستعمال:
-    py backfill_thesis.py --pages 5          # 500 أطروحة لكل عملة كحدّ أقصى
+Usage:
+    py backfill_thesis.py --pages 5          # 500 theses per token at most
     py backfill_thesis.py --pages 5 --dry-run
 """
 from __future__ import annotations
@@ -45,10 +47,10 @@ def _arg(name: str, default: int) -> int:
 
 
 async def fetch_history(client, addr: str, net: str, max_pages: int) -> list[dict]:
-    """يرقّم الصفحات رجوعاً في الزمن ويعيد كل الأطروحات المجموعة.
+    """Pages backwards in time and returns every gathered thesis.
 
-    يتوقّف عند: نفاد الصفحات، أو صفحة بلا جديد (حماية من حلقة لا نهائية إن
-    تجاهل الخادم `lastId`)، أو بلوغ الحدّ.
+    Stops when: pages run out, a page returns nothing new (protection against
+    an infinite loop if the server ignores `lastId`), or the limit is reached.
     """
     from fomo_api.config import settings
 
@@ -69,7 +71,7 @@ async def fetch_history(client, addr: str, net: str, max_pages: int) -> list[dic
         rows = extract.extract_thesis_items(raw, addr, net, fetched_at)
         fresh = [r for r in rows if r["id"] not in seen_ids]
         if not fresh:
-            break  # الخادم يعيد الصفحة نفسها — نتوقّف بدل الدوران
+            break  # the server returns the same page — stop instead of looping
         seen_ids.update(r["id"] for r in fresh)
         out.extend(fresh)
         _total, has_next = extract.thesis_total(raw)
@@ -89,10 +91,10 @@ async def main() -> None:
         "SELECT token_address, network_id FROM watchlist "
         "GROUP BY token_address, network_id ORDER BY MIN(first_seen_at)"
     ).fetchall()
-    print(f"أزواج عملات مراقَبة: {len(targets)} · حدّ الصفحات لكل عملة: {max_pages}")
+    print(f"Watched token pairs: {len(targets)} · page limit per token: {max_pages}")
 
     if dry_run:
-        print("[معاينة] لا اتصال بالشبكة ولا كتابة.")
+        print("[preview] no network connection, no writes.")
         db.close()
         return
 
@@ -101,7 +103,7 @@ async def main() -> None:
 
     credentials = CredentialStore(config.credential_state_path()).load()
     if credentials is None or not credentials.access_token:
-        raise RuntimeError("لا يوجد اعتماد صالح — شغّل خدمة الـ api أولاً.")
+        raise RuntimeError("No valid credentials — start the api service first.")
     token = credentials.access_token
     client = FomoClient(session_token=token)
 
@@ -113,7 +115,7 @@ async def main() -> None:
                 rows = await fetch_history(client, addr, net, max_pages)
             except Exception as exc:
                 failed += 1
-                print(f"  [{i}/{len(targets)}] {addr[:14]}… فشل: {type(exc).__name__}")
+                print(f"  [{i}/{len(targets)}] {addr[:14]}… failed: {type(exc).__name__}")
                 await asyncio.sleep(_PACING)
                 continue
             total_rows += len(rows)
@@ -121,24 +123,24 @@ async def main() -> None:
                 total_added += db.insert_thesis_items(rows)
             oldest = min((r["created_at"] for r in rows), default="—")
             print(
-                f"  [{i}/{len(targets)}] {addr[:14]}… {len(rows):>4} أطروحة "
-                f"· أقدمها {str(oldest)[:19]}",
+                f"  [{i}/{len(targets)}] {addr[:14]}… {len(rows):>4} theses "
+                f"· oldest {str(oldest)[:19]}",
                 flush=True,
             )
             await asyncio.sleep(_PACING)
     finally:
         await client.aclose()
 
-    print(f"\n{'[معاينة] ' if dry_run else ''}أطروحات مجموعة: {total_rows}")
+    print(f"\n{'[preview] ' if dry_run else ''}theses gathered: {total_rows}")
     if not dry_run:
-        print(f"أُدرجت جديدة: {total_added} (المكرّر يُتجاهَل)")
+        print(f"Newly inserted: {total_added} (duplicates ignored)")
         n = db._conn.execute("SELECT COUNT(*) FROM token_thesis").fetchone()[0]
         rng = db._conn.execute(
             "SELECT MIN(created_at) lo, MAX(created_at) hi FROM token_thesis"
         ).fetchone()
-        print(f"إجمالي token_thesis: {n} · من {str(rng[0])[:19]} إلى {str(rng[1])[:19]}")
+        print(f"Total token_thesis: {n} · from {str(rng[0])[:19]} to {str(rng[1])[:19]}")
     if failed:
-        print(f"عملات فشلت: {failed}")
+        print(f"Failed tokens: {failed}")
     db.close()
 
 

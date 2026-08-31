@@ -1,25 +1,31 @@
-"""تبديلُ حساب fomo من اللوحة، ومعرفةُ هل هو محجوب.
+"""Switching the fomo account from the dashboard, and finding out whether it is blocked.
 
-هذا مسارُ الكتابة **الثاني** الذي تملكه اللوحة بعد `keystore.py`، وحدودُه هي
-حدودُه نفسها: القاعدةُ تبقى `mode=ro` بلا سطرِ كتابةٍ واحد، والهدفُ ملفٌّ واحد
-هو `api/.privy_state.json`.
+This is the dashboard's **second** write path after `keystore.py`, and its
+limits are the same: the database stays `mode=ro` with not one write line, and
+the target is a single file, `api/.privy_state.json`.
 
-ولمّا كان المكتوبُ هنا أخطرَ ممّا في مخزن المفاتيح — إنّه هويّةُ الحساب كلُّها،
-لا مفتاحَ مزوّدٍ يُستبدل بضغطة — زِيدت ثلاثةُ قيودٍ لا توجد هناك:
+And since what's written here is more dangerous than what's in the key store —
+it is the account's whole identity, not a provider key replaced with one
+click — three extra constraints were added that don't exist there:
 
-1. **نسخةٌ قبل كلِّ كتابة.** الملفُّ القديم يُنسخ إلى `.privy_state.json.bak-*`
-   قبل أن يُلمس، والاستعادةُ زرٌّ واحد. إبطالُ حسابٍ عاملٍ بلصقةٍ خاطئة كان
-   سيعني توقّفَ الجمع كلَّه بلا طريقٍ للرجوع.
-2. **الهويّةُ تُقرأ من التوكن لا من المستخدم.** لا حقلَ اسمٍ يُكتب بيدٍ: البصمةُ
-   `did:privy:…` تُستخرج من حِمل الـJWT، فلا يُخطئ أحدٌ في تسمية ما بدّل.
-3. **رفضُ الجلسة المجهولة.** Privy يكتب `privy:token` لجلسةٍ مجهولةٍ عند إقلاع
-   الـSDK قبل أيّ دخول (قِيس 2026-08-20؛ ووثيقةُ `privy_login.py` تقول غيرَ
-   ذلك وقد بطل قولُها). فلصقُ مخزنٍ قبل الدخول كان يكتب هويّةً لا تملك شيئاً،
-   ويقرأ المستخدمُ «تمّ» ثمّ يجد الجمعَ ميتاً.
+1. **A backup before every write.** The old file is copied to
+   `.privy_state.json.bak-*` before being touched, and restoring is one
+   button. Breaking a working account with a bad paste would have meant
+   stopping all collection with no way back.
+2. **The identity is read from the token, not from the user.** No name field
+   typed by hand: the `did:privy:…` fingerprint is extracted from the JWT
+   payload, so nobody mislabels what they switched.
+3. **Rejecting the anonymous session.** Privy writes `privy:token` for an
+   anonymous session when the SDK boots before any sign-in (measured
+   2026-08-20; the `privy_login.py` doc says otherwise and its claim is
+   void). So pasting a store before signing in would have written an identity
+   that owns nothing, and the user would read "done" and then find collection
+   dead.
 
-ولا تُعاد القيمةُ أبداً: ما يخرج من هنا بصمةُ الهويّة، وآخرُ أربعة أحرف من
-التوكن للتمييز، ووقتُ الانتهاء، ورموزُ حالة المِجَسّ. ولا تُسجَّل قيمةٌ في سجلٍّ
-ولا في رسالة خطأ.
+And the value is never returned: what leaves here is the identity
+fingerprint, the last four characters of the token for telling it apart, the
+expiry time, and the probe's status codes. No value is ever logged or echoed
+in an error message.
 """
 from __future__ import annotations
 
@@ -37,52 +43,58 @@ from typing import Any
 
 import config
 
-# الحقولُ الستّة التي يقرأها `CredentialStore`. `access_token` و`refresh_token`
-# و`pat` أسرار، والثلاثةُ الباقية معرّفاتُ تطبيقٍ لا سرّ فيها.
+# The six fields `CredentialStore` reads. `access_token`, `refresh_token` and
+# `pat` are secrets; the remaining three are app identifiers with no secret in them.
 _SECRET_FIELDS = ("access_token", "refresh_token", "pat")
 _PLAIN_FIELDS = ("app_id", "client_id", "ca_id")
 _FIELDS = _SECRET_FIELDS + _PLAIN_FIELDS
 
-# ونقصُ حقلٍ ليس درجةً واحدة: هذه الأربعةُ وحدَها لا بديلَ لها، والحقلانِ
-# الباقيان لهما بديل — `client_id` معرّفٌ ثابتٌ للتطبيق يضعه `api/config.py`
-# افتراضيّاً حين لا يُلتقط، و`ca_id` لا يُرسَل أصلاً إن غاب (`if ca_id`).
-# وكان الحكمُ يقول «ناقص» بالأحمر على أيٍّ منها، فأشعل اللوحةَ يوم 2026-08-20
-# على نظامٍ يجدّد توكنَه كلَّ دقيقة بلا `client_id` في الملفّ: إنذارٌ كاذبٌ
-# يُعلّم المستخدمَ أن يتجاهل الأحمر، وذلك أسوأُ من ألّا يكون هناك حكم.
+# And a missing field is not one degree: these four alone have no substitute,
+# while the other two do — `client_id` is a fixed app identifier that
+# `api/config.py` fills in by default when it isn't captured, and `ca_id`
+# isn't even sent if absent (`if ca_id`).
+# The verdict used to say "missing" in red for any of them, so on 2026-08-20 it
+# lit up the dashboard on a system that renewed its token every minute with no
+# `client_id` in the file: a false alarm that teaches the user to ignore red,
+# which is worse than having no verdict at all.
 _REQUIRED_FIELDS = ("access_token", "refresh_token", "pat", "app_id")
 
-# مفاتيحُ localStorage التي يكتبها Privy — نفسُ أسماء `credential_store.py`.
+# The localStorage keys Privy writes — the same names as `credential_store.py`.
 _LS_TOKEN = "privy:token"
 _LS_REFRESH = "privy:refresh_token"
 _LS_PAT = "privy:pat"
-# **الاسمُ الحقيقيّ `privy:caid` لا `privy:ca_id`** — قِيس على مخزنٍ حيّ
-# 2026-08-20: مفاتيحُ Privy السبعة فيه `privy:caid`، فالثابتُ الأوّل لم يطابق
-# شيئاً قطّ، و`ca_id` كان يُورَث بصمتٍ من الملفّ القديم في كلّ تبديل: أي أنّ
-# التبديلَ كان يكتب معرّفَ حسابٍ سابقٍ مع توكنِ حسابٍ جديد. والاسمان معاً
-# لأنّ `credential_store` يعرف الأوّل، ولا يُعرَف أيَّ نسخةٍ من الـSDK يقرأ
-# المستخدم — فأيُّهما وُجد أُخِذ.
+# **The real name is `privy:caid`, not `privy:ca_id`** — measured on a live
+# store 2026-08-20: Privy's seven keys in it include `privy:caid`, so the
+# first constant never matched anything, and `ca_id` was silently inherited
+# from the old file on every switch: the switch was writing a previous
+# account's identifier along with a new account's token. Both names are listed
+# because `credential_store` knows the first, and there's no telling which SDK
+# version the user has — whichever is found gets used.
 _LS_CAID = ("privy:caid", "privy:ca_id")
 _APP_ID_RE = re.compile(r"^privy:([a-z0-9]{20,30}):")
 _CLIENT_ID_RE = re.compile(r"client-[A-Za-z0-9]{10,}")
 
-# هويّةُ جلسة Privy المجهولة — تُكتب عند إقلاع الـSDK قبل أيّ دخول، فقياسُها
-# مرّتين متتاليتين (2026-08-20T00:11Z و00:14Z) أعطى الثابتَ نفسه.
+# Privy's anonymous session identity — written when the SDK boots before any
+# sign-in; measuring it twice in a row (2026-08-20T00:11Z and 00:14Z) gave the
+# same constant.
 _ANON_DID = "did:privy:cmt0phbhk00080dla83dtghph"
 
 _BAK_PREFIX = ".privy_state.json.bak-"
-_BAK_KEEP = 5          # نسخٌ محفوظة؛ ما زاد يُحذف أقدمَه أوّلاً
+_BAK_KEEP = 5          # backups kept; anything beyond that is deleted oldest-first
 
-# قفلٌ لكلّ تعديل: التبديلُ قراءةٌ فنسخٌ فكتابة، وطلبان متزامنان كانا سيتشابكا.
+# One lock per modification: a switch is read-then-copy-then-write, and two
+# concurrent requests would have tangled.
 _LOCK = threading.Lock()
 
-# نتيجةُ آخر مِجَسّ — في الذاكرة لا في القاعدة ولا في الملفّ، مثلُ `_PROBES`
-# في مخزن المفاتيح: نتيجةُ فحصٍ لحظيّة، وكتابتُها في القاعدة تُدخلها في النسخ
-# الاحتياطيّ بلا داعٍ. تُفقد بإعادة تشغيل اللوحة، ويُعاد الفحصُ بضغطة.
+# The last probe's result — in memory, not in the database or the file, like
+# `_PROBES` in the key store: a point-in-time check result, and writing it to
+# the database would drag it into backups for no reason. It's lost on a
+# dashboard restart, and re-checked with one click.
 _LAST_PROBE: dict[str, Any] = {}
 
 
 class AccountError(RuntimeError):
-    """طلبٌ مرفوض بسببٍ يُعرض للمستخدم كما هو."""
+    """A rejected request, with a reason shown to the user as-is."""
 
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
@@ -94,26 +106,27 @@ def _path() -> str:
 
 
 def _tail(value: str | None) -> str:
-    """آخرُ أربعة أحرف — للتمييز بين توكنين، وهو كلُّ ما يُعرض من القيمة.
+    """The last four characters — for telling two tokens apart; it's all that's shown of the value.
 
-    نفسُ استثناء FR-013 المسموح في `key_file.tail`: يُحسب لحظةَ الطلب ولا
-    يُكتب في سجلٍّ ولا في meta.
+    The same FR-013 exception allowed in `key_file.tail`: computed at request
+    time and never written to a log or to meta.
     """
     text = str(value or "")
     return text[-4:] if len(text) >= 8 else ""
 
 
 def _claims(token: str | None) -> dict[str, Any]:
-    """حِملُ الـJWT بلا تحقّقٍ من التوقيع — للعرض لا للتصريح.
+    """The JWT payload without signature verification — for display, not authorization.
 
-    ولا يجوز أن يُتحقّق: هذا توكنُ خدمةٍ أخرى، ولا نملك مفتاحَها، والغرضُ
-    إظهارُ الهويّة ووقت الانتهاء للمستخدم لا السماحُ بشيء.
+    And it must not be verified: this is another service's token, we don't
+    have its key, and the purpose is showing the user the identity and expiry
+    time, not allowing anything.
     """
     try:
         body = str(token).split(".")[1]
         body += "=" * (-len(body) % 4)
         data = json.loads(base64.urlsafe_b64decode(body))
-    except Exception:  # noqa: BLE001 — توكنٌ غيرُ مقروء ⇒ لا مطالبات، لا انهيار
+    except Exception:  # noqa: BLE001 — an unreadable token ⇒ no claims, no crash
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -123,7 +136,7 @@ def _did(token: str | None) -> str:
 
 
 def _expiry(token: str | None) -> dict[str, Any]:
-    """وقتُ انتهاء التوكن وهل انتهى — التوكن عمرُه ساعة، والفرقُ يفيد التشخيص."""
+    """The token's expiry time and whether it has expired — the token lives an hour, and the gap helps diagnosis."""
     exp = _claims(token).get("exp")
     if not isinstance(exp, (int, float)):
         return {"expires_at": None, "expired": None, "seconds_left": None}
@@ -137,14 +150,17 @@ def _expiry(token: str | None) -> dict[str, Any]:
 
 
 def _written_seconds_ago() -> int | None:
-    """عمرُ آخرِ كتابةٍ للملفّ بالثواني، أو None إن لم يوجد.
+    """The age of the file's last write in seconds, or None if it doesn't exist.
 
-    وهذا هو الفارقُ بين تشخيصين تُخلَط بينهما اللوحةُ وهما نقيضان: توكنٌ منتهٍ
-    وملفٌّ لم يُمسّ منذ ساعات ⇒ **لا أحدَ يجدّد** (خادمُ الـapi ميت). توكنٌ
-    منتهٍ وملفٌّ يُكتب كلَّ دقيقة ⇒ **التجديدُ يعمل ويُرفَض** (جلسةُ Privy
-    انتهت ولا تُمدَّد، ولا يُنجيها إلّا دخولٌ جديد). وقول «هل خادمُ الـapi
-    يعمل؟» في الحالة الثانية يرسل المستخدمَ إلى الجهة الخاطئة تماماً — وهو
-    ما حدث 2026-08-20: كان الخادمُ يعمل ويجدّد كلَّ 60ث ويُرفَض بصمت.
+    And this is the difference between two diagnoses the dashboard used to
+    conflate even though they're opposites: an expired token and a file
+    untouched for hours ⇒ **nobody is refreshing** (the api server is dead).
+    An expired token and a file written every minute ⇒ **the refresh works and
+    is being rejected** (the Privy session has ended and won't be extended;
+    only a new sign-in saves it). And saying "is the api server running?" in
+    the second case sends the user entirely the wrong way — which is what
+    happened on 2026-08-20: the server was running, refreshing every 60s, and
+    being silently rejected.
     """
     with contextlib.suppress(OSError):
         return max(0, int(time.time() - os.path.getmtime(_path())))
@@ -159,12 +175,12 @@ def _read() -> dict[str, Any]:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
-        raise AccountError(f"تعذّرت قراءة ملفّ الاعتماد: {type(exc).__name__}", 500) from exc
+        raise AccountError(f"failed to read the credential file: {type(exc).__name__}", 500) from exc
     return data if isinstance(data, dict) else {}
 
 
 def _backups() -> list[dict[str, Any]]:
-    """النسخُ المحفوظة، الأحدثُ أوّلاً — بالبصمة لا بالقيمة."""
+    """The saved backups, newest first — by fingerprint, not by value."""
     folder = os.path.dirname(_path())
     out: list[dict[str, Any]] = []
     with contextlib.suppress(OSError):
@@ -190,7 +206,7 @@ def _backups() -> list[dict[str, Any]]:
 
 
 def _backup_now(reason: str) -> str | None:
-    """ينسخ الملفَّ الحاليّ قبل المساس به، ويُبقي آخرَ `_BAK_KEEP` نسخاً."""
+    """Copies the current file before touching it, keeping the last `_BAK_KEEP` backups."""
     path = _path()
     if not os.path.exists(path):
         return None
@@ -201,7 +217,7 @@ def _backup_now(reason: str) -> str | None:
     try:
         shutil.copy2(path, target)
     except OSError as exc:
-        raise AccountError(f"تعذّر حفظ نسخة احتياطيّة: {type(exc).__name__}", 500) from exc
+        raise AccountError(f"failed to save a backup: {type(exc).__name__}", 500) from exc
     for old in _backups()[_BAK_KEEP:]:
         with contextlib.suppress(OSError):
             os.remove(os.path.join(os.path.dirname(path), old["name"]))
@@ -209,11 +225,11 @@ def _backup_now(reason: str) -> str | None:
 
 
 def _write(fields: dict[str, Any]) -> None:
-    """كتابةٌ ذرّيّة بنفس أسلوب `key_file.save_entries`.
+    """An atomic write, in the same style as `key_file.save_entries`.
 
-    ملفٌّ مؤقّتٌ في نفس المجلّد ثمّ `os.replace`: القارئُ إمّا يرى الملفَّ القديم
-    كاملاً أو الجديدَ كاملاً، ولا يرى نصفاً. والمسجّلُ يقرأ هذا الملفَّ كلَّ
-    دورة، فنصفُ ملفٍّ كان سيوقفه.
+    A temporary file in the same folder, then `os.replace`: the reader either
+    sees the whole old file or the whole new one, never half. And the recorder
+    reads this file every cycle, so a half-written file would have stopped it.
     """
     path = _path()
     folder = os.path.dirname(path)
@@ -222,22 +238,22 @@ def _write(fields: dict[str, Any]) -> None:
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as fh:
             json.dump(fields, fh, indent=2)
-        with contextlib.suppress(OSError):   # لا معنى لها على ويندوز
+        with contextlib.suppress(OSError):   # no-op on Windows
             os.chmod(temp, 0o600)
         os.replace(temp, path)
     except OSError as exc:
         with contextlib.suppress(OSError):
             os.remove(temp)
-        raise AccountError(f"تعذّرت الكتابة: {type(exc).__name__}", 500) from exc
+        raise AccountError(f"failed to write: {type(exc).__name__}", 500) from exc
 
 
 def _from_local_storage(dump: dict[str, Any]) -> dict[str, Any]:
-    """يستخرج الحقولَ الستّة من مخزن المتصفّح.
+    """Extracts the six fields from the browser store.
 
-    يقبل شكلين: المخزنَ الخامَ `{"privy:token": …}` كما ينسخه المستخدم من
-    الطرفيّة، والغلافَ `{"_full_localStorage": {…}}` وهو الشكلُ الذي يفهمه
-    `credential_store.from_local_storage_dump` أصلاً — قُبِل الشكلان لأنّ
-    المستخدم لا يعرف أيَّهما بيده.
+    Accepts two shapes: the raw store `{"privy:token": …}` as the user copies
+    it from the console, and the wrapper `{"_full_localStorage": {…}}`, the
+    shape `credential_store.from_local_storage_dump` already understands —
+    both are accepted because the user can't know which one they have.
     """
     inner = dump.get("_full_localStorage")
     ls = inner if isinstance(inner, dict) else dump
@@ -261,7 +277,7 @@ def _from_local_storage(dump: dict[str, Any]) -> dict[str, Any]:
 
 
 def _clean(value: Any) -> str | None:
-    """يقشّر علاماتَ التنصيص التي يضعها Privy حول قيم localStorage."""
+    """Strips the quote marks Privy puts around its localStorage values."""
     if value is None:
         return None
     text = str(value).strip()
@@ -271,7 +287,7 @@ def _clean(value: Any) -> str | None:
 
 
 def status() -> dict[str, Any]:
-    """حالةُ الحساب الحاليّ — بلا أيّ قيمةٍ سرّيّة."""
+    """The current account's status — with no secret values."""
     raw = _read()
     access = raw.get("access_token")
     present = {name: bool(raw.get(name)) for name in _FIELDS}
@@ -293,49 +309,52 @@ def status() -> dict[str, Any]:
 
 
 def _validate(fields: dict[str, Any], current_access: str | None) -> tuple[str, bool]:
-    """يرفض قبل الكتابة كلَّ ما يُنتج ملفّاً لا يعمل، ويعيد (البصمة، أهو تجديد).
+    """Rejects, before writing, anything that would produce a non-working file; returns (fingerprint, is it a refresh).
 
-    و«تجديد» = نفسُ الهويّة بتوكنٍ **أحدث**. كان هذا يُرفض 409 «لا شيء
-    ليُبدَّل»، وهو خطأ: لمّا تعطّل تجديدُ Privy في 2026-08-20 (ردّ 200 و
-    `session_update_action=ignore` بلا توكن، والقديمُ منتهٍ) كان الطريقُ
-    الوحيدُ للنجاة أن يسجّل المستخدمُ دخولاً جديداً **بنفس الحساب** ويلصق
-    مخزنَه — واللوحةُ ترفض. فمن كان محقّاً وجد باباً مغلقاً.
+    And "a refresh" = the same identity with a **newer** token. This used to be
+    rejected with 409 "nothing to switch", which was a mistake: when Privy's
+    refresh broke on 2026-08-20 (a 200 response with
+    `session_update_action=ignore` and no token, and the old one expired), the
+    only way out was for the user to sign in again **with the same account**
+    and paste their store — and the dashboard refused. Whoever was in the
+    right found a closed door.
 
-    والمقارنةُ بـ`iat` ثمّ `exp` لا بنصّ التوكن: توكنان مختلفان نصّاً قد
-    يكونان لنفس اللحظة، والأقدمُ لا يجوز أن يطمس الأحدث (لصقةٌ من نافذةٍ
-    قديمة نُسيت مفتوحة).
+    And the comparison uses `iat` then `exp`, not the token's text: two
+    textually different tokens can be for the same moment, and the older one
+    must not overwrite the newer (a paste from an old window left open).
     """
     missing = [name for name in ("access_token", "refresh_token", "pat") if not fields.get(name)]
     if missing:
         raise AccountError(
-            "المخزن ناقص: لم أجد " + "، ".join(missing)
-            + ". تأكّد أنّك نسخته من fomo.family بعد تسجيل الدخول."
+            "Store is incomplete: did not find " + ", ".join(missing)
+            + ". Make sure you copied it from fomo.family after signing in."
         )
     if not fields.get("app_id"):
         raise AccountError(
-            "لم أجد `privy:<app_id>:…` في المخزن — انسخ المخزنَ كلَّه لا سطراً منه."
+            "Did not find `privy:<app_id>:…` in the store — copy the whole store, not one line of it."
         )
     did = _did(fields["access_token"])
     if not did:
-        raise AccountError("التوكن غيرُ مقروء — ليس JWT صالحاً.")
+        raise AccountError("The token is unreadable — not a valid JWT.")
     if did == _ANON_DID:
         raise AccountError(
-            "هذه جلسةٌ مجهولة لا حساب: Privy يكتبها قبل الدخول. "
-            "سجّل دخولك في الصفحة أوّلاً ثمّ انسخ المخزن."
+            "This is an anonymous session, not an account: Privy writes it before "
+            "sign-in. Sign in on the page first, then copy the store."
         )
     if did != _did(current_access):
         return did, False
     if not _is_newer(fields["access_token"], current_access):
         raise AccountError(
-            "هذه هويّةُ الحساب الحاليّ نفسها وتوكنُها ليس أحدث — لا شيء ليُبدَّل. "
-            "إن أردت تجديد جلسةٍ متعطّلة فسجّل دخولاً جديداً ثمّ انسخ المخزن.",
+            "This is the same identity as the current account and its token is not "
+            "newer — nothing to switch. To renew a stuck session, sign in again and "
+            "then paste the store.",
             409,
         )
     return did, True
 
 
 def _is_newer(candidate: str | None, current: str | None) -> bool:
-    """أهو توكنٌ أحدثُ لنفس الحساب؟ بـ`iat` وإلّا بـ`exp`، ولا شيءَ غيرهما."""
+    """Is it a newer token for the same account? By `iat`, else by `exp`, and nothing else."""
     if not current:
         return True
     new_claims, old_claims = _claims(candidate), _claims(current)
@@ -351,14 +370,15 @@ def _is_newer(candidate: str | None, current: str | None) -> bool:
 
 
 def switch(dump: dict[str, Any]) -> dict[str, Any]:
-    """يبدّل الحساب من مخزن متصفّحٍ ملصوق، بعد نسخةٍ احتياطيّة.
+    """Switches the account from a pasted browser store, after a backup.
 
-    الدمجُ مقصود: الحقولُ الغائبةُ من اللصقة تبقى من الملفّ القديم — `client_id`
-    مثلاً قد لا يظهر في كلّ مخزن. لكنّ الأسرارَ الثلاثة تُفرض حاضرةً في
-    `_validate` قبل ذلك، فلا يخرج ملفٌّ يخلط توكنَ حسابٍ بتحديثِ آخر.
+    The merge is deliberate: fields absent from the paste stay from the old
+    file — `client_id`, for instance, may not appear in every store. But the
+    three secrets are required present by `_validate` before that, so no file
+    goes out mixing one account's token with another's update.
     """
     if not isinstance(dump, dict) or not dump:
-        raise AccountError("لم أستلم مخزناً — الصق محتوى localStorage كاملاً.")
+        raise AccountError("No store received — paste the full localStorage content.")
     fields = _from_local_storage(dump)
     with _LOCK:
         current = _read()
@@ -367,7 +387,7 @@ def switch(dump: dict[str, Any]) -> dict[str, Any]:
         merged = {name: current.get(name) for name in _FIELDS}
         merged.update({k: v for k, v in fields.items() if v})
         _write(merged)
-    _LAST_PROBE.clear()          # نتيجةُ الحساب السابق لا تصف الجديد
+    _LAST_PROBE.clear()          # the previous account's result doesn't describe the new one
     return {
         "ok": True,
         "did": did,
@@ -376,12 +396,13 @@ def switch(dump: dict[str, Any]) -> dict[str, Any]:
         "refreshed": is_refresh,
         "message": (
             (
-                "جُدّدت جلسةُ الحساب نفسِه بتوكنٍ أحدث. "
+                "The same account's session was renewed with a newer token. "
                 if is_refresh
-                else "تمّ التبديل. "
+                else "Switched. "
             )
-            + "المسجّل يقرأ الملفَّ كلَّ دورة فيلتقطه خلال دقيقة بلا إعادة "
-            "تشغيل، وخادمُ الـapi يتبنّى الهويّةَ عند تجديده."
+            + "The recorder reads the file every cycle and picks it up within a "
+            "minute with no restart, and the api server adopts the identity on "
+            "its next refresh."
         ),
     }
 
@@ -394,51 +415,56 @@ _PROBE_PATHS: tuple[tuple[str, str, dict | None], ...] = (
 
 
 def _verdict(codes: list[int | None]) -> tuple[str, str]:
-    """يفصل «الهويّةُ محجوبة» عن «المصدرُ متعثّر» — والخلطُ بينهما مكلف.
+    """Separates "the identity is blocked" from "the upstream is struggling" — conflating them is costly.
 
-    قِيس 2026-08-19: حجبُ الهويّة يردّ 403 على كلّ مسار، والمسجّل كتبه
-    «unreachable» فطُوردت الشبكةُ ساعةً وهي سليمة. فالرمزُ هو الحكم:
+    Measured 2026-08-19: an identity block returns 403 on every path, and the
+    recorder logged it as "unreachable", so the network was hunted for an hour
+    while it was fine. So the code is the verdict:
 
-    - 403 على الكلّ ⇒ الهويّةُ موقوفة، والعلاجُ حسابٌ آخر لا صبر.
-    - 401 ⇒ التوكن باطلٌ أو منتهٍ، والعلاجُ تجديدٌ لا تبديل.
-    - 5xx أو لا جواب ⇒ المصدرُ نفسه، ولا يُلمس الحساب.
+    - 403 on all ⇒ the identity is suspended, and the cure is another
+      account, not patience.
+    - 401 ⇒ the token is invalid or expired, and the cure is a refresh, not a
+      switch.
+    - 5xx or no answer ⇒ the upstream itself; the account is left alone.
     """
     live = [c for c in codes if c is not None]
     if not live:
-        return "warn", "لا جواب من المصدر — ليس الحساب"
+        return "warn", "no response from upstream — not the account"
     if all(c == 200 for c in live):
-        return "good", f"الحساب يعمل — {len(live)}/{len(live)} ردّت 200"
+        return "good", f"account works — {len(live)}/{len(live)} answered 200"
     if all(c == 403 for c in live):
-        return "bad", f"محجوب — 403 على {len(live)} مسارات؛ الهويّة موقوفة"
+        return "bad", f"blocked — 403 on {len(live)} paths; the identity is suspended"
     if any(c == 401 for c in live):
-        return "bad", "التوكن باطل أو منتهٍ — HTTP 401 (تجديد لا تبديل)"
+        return "bad", "token invalid or expired — HTTP 401 (renew, don't switch)"
     if any(c == 403 for c in live):
         forbidden = sum(1 for c in live if c == 403)
-        return "bad", f"حجبٌ جزئيّ — 403 على {forbidden} من {len(live)}"
+        return "bad", f"partial block — 403 on {forbidden} of {len(live)}"
     if all(c >= 500 for c in live):
-        return "warn", "المصدر متعثّر — 5xx وليس الحساب"
+        return "warn", "upstream struggling — 5xx, not the account"
     counts = ", ".join(f"{c}×{live.count(c)}" for c in sorted(set(live)))
-    return "warn", f"مختلط — {counts}"
+    return "warn", f"mixed — {counts}"
 
 
 def probe() -> dict[str, Any]:
-    """يضرب ثلاثةَ مساراتٍ بالتوكن الحاليّ ويعيد الرموزَ الخام.
+    """Hits three paths with the current token and returns the raw codes.
 
-    بـ`curl_cffi` لا `httpx` — بصمةُ Chrome شرطُ العبور من Cloudflare، ونداءٌ
-    عاديّ كان سيردّ صفحةَ تحدٍّ فيُقرأ «محجوب» على حسابٍ سليم.
+    With `curl_cffi`, not `httpx` — the Chrome fingerprint is the condition for
+    passing Cloudflare, and an ordinary call would have returned a challenge
+    page read as "blocked" for a healthy account.
 
-    و`/feed` مستثنًى من المِجَسّ: يشترط `feedTypes`، وبدونها يردّ 400 فيُقرأ
-    فشلاً وهو أدبُ تطبيقٍ لا منع. ثلاثةُ مساراتٍ تكفي للحكم.
+    And `/feed` is excluded from the probe: it requires `feedTypes`, and
+    without them it returns 400, which would be read as failure though it's
+    application etiquette, not denial. Three paths are enough for a verdict.
     """
     raw = _read()
     token = raw.get("access_token")
     if not token:
-        raise AccountError("لا توكن في الملفّ — لا شيء لأفحصه.")
+        raise AccountError("No token in the file — nothing to probe.")
 
     try:
         from curl_cffi.requests import Session
-    except ImportError as exc:  # pragma: no cover - المكتبةُ مثبّتةٌ مع الـapi
-        raise AccountError("curl_cffi غيرُ مثبّتة — تعذّر الفحص.", 500) from exc
+    except ImportError as exc:  # pragma: no cover - the library ships with the api
+        raise AccountError("curl_cffi is not installed — probe failed.", 500) from exc
 
     headers = {
         "authorization": f"Bearer {token}",
@@ -459,7 +485,7 @@ def probe() -> dict[str, Any]:
                 )
                 code: int | None = response.status_code
                 note = ""
-            except Exception as exc:  # noqa: BLE001 — فشلُ النقل جوابٌ أيضاً
+            except Exception as exc:  # noqa: BLE001 — a transport failure is an answer too
                 code, note = None, type(exc).__name__
             codes.append(code)
             rows.append({"method": method, "path": path, "status": code, "note": note})
@@ -478,21 +504,21 @@ def probe() -> dict[str, Any]:
 
 
 def restore(name: str) -> dict[str, Any]:
-    """يرجع إلى نسخةٍ محفوظة — لأنّ لصقةً خاطئة تُسكِت الجمعَ كلَّه."""
+    """Reverts to a saved backup — because a bad paste silences all collection."""
     safe = os.path.basename(str(name or ""))
     if not safe.startswith(_BAK_PREFIX):
-        raise AccountError("اسمُ نسخةٍ غيرُ معروف.", 404)
+        raise AccountError("Unknown backup name.", 404)
     source = os.path.join(os.path.dirname(_path()), safe)
     if not os.path.exists(source):
-        raise AccountError("النسخةُ لم تُعد موجودة.", 404)
+        raise AccountError("The backup no longer exists.", 404)
     with _LOCK:
         try:
             with open(source, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, ValueError) as exc:
-            raise AccountError(f"النسخةُ غيرُ مقروءة: {type(exc).__name__}", 500) from exc
+            raise AccountError(f"Backup unreadable: {type(exc).__name__}", 500) from exc
         if not isinstance(raw, dict) or not raw.get("access_token"):
-            raise AccountError("النسخةُ لا تحمل توكناً — لا تصلح للاستعادة.")
+            raise AccountError("The backup has no token — it can't be restored.")
         _backup_now("restore")
         _write({name: raw.get(name) for name in _FIELDS})
     _LAST_PROBE.clear()
@@ -500,5 +526,5 @@ def restore(name: str) -> dict[str, Any]:
         "ok": True,
         "did": _did(raw.get("access_token")),
         "token_tail": _tail(raw.get("access_token")),
-        "message": f"استُعيدت النسخة {safe}.",
+        "message": f"Backup {safe} restored.",
     }

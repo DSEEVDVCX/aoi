@@ -1,4 +1,4 @@
-"""اختبارات عدّاد بوابة الصعود + backoff إعادة التقييم."""
+"""Tests for the runup gate counter + re-evaluation backoff."""
 import pytest
 from db import RecorderDB
 
@@ -7,7 +7,7 @@ import recorder
 
 @pytest.fixture()
 def db(tmp_path):
-    recorder._RUNUP_STATE = {}          # تصفير الذاكرة بين الاختبارات
+    recorder._RUNUP_STATE = {}          # reset the in-memory state between tests
     value = RecorderDB(str(tmp_path / "t.db"), "schema.sql")
     yield value
     value.close()
@@ -33,7 +33,7 @@ T0 = 1_787_600_000
 
 
 def test_rejected_runup_is_counted_total(db, monkeypatch):
-    """الرفض يثبَّت تراكميًا في meta — البوابة الصامتة عمياء (اكتشاف 2026-08-28)."""
+    """Rejections are persisted cumulatively in meta — a silent gate is blind (found 2026-08-28)."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     _bars(db, "LATE1x", [1.0 + i * 0.3 for i in range(24)])   # log(8)=2.08
     stats = {"runup_rejected": 3}
@@ -41,45 +41,47 @@ def test_rejected_runup_is_counted_total(db, monkeypatch):
     assert db.get_meta("runup_rejected_total") == "3"
     stats2 = {"runup_rejected": 2}
     recorder._persist_runup_rejection(db, stats2)
-    assert db.get_meta("runup_rejected_total") == "5"          # تراكمي لا استبدال
+    assert db.get_meta("runup_rejected_total") == "5"          # cumulative, not replaced
 
 
 def test_zero_rejection_writes_nothing(db):
-    """دورة بلا رفض لا تلمس meta — لا ضجيج كتابة."""
+    """A cycle with no rejection does not touch meta — no write noise."""
     recorder._persist_runup_rejection(db, {"runup_rejected": 0})
     assert db.get_meta("runup_rejected_total") is None
 
 
 def test_runup_backoff_caches_late_verdict(db, monkeypatch):
-    """حكم «متأخر» يُخزَّن ولا يُعاد حسابه كل إشارة — backoff مثل بوابة العمر.
+    """A "late" verdict is stored and not recomputed on every signal — backoff like the age gate.
 
-    العملة الصاعدة تتلقى 5-10 إشارات يوميًا وكل واحدة كانت تعيد استعلام
-    الشموع. الآن: الحكم يُخزَّن `RUNUP_RETRY_SECONDS` ويعاد تقييمه بعدها
-    فقط (قد يهدأ الصعود فتصبح الإشارة اللاحقة مبكرة بحق).
+    A running-up coin receives 5-10 signals a day and each one used to re-query
+    the bars. Now: the verdict is stored for `RUNUP_RETRY_SECONDS` and only
+    re-evaluated after it (the runup may calm down, making a later signal
+    genuinely early).
     """
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     monkeypatch.setattr(recorder.config, "RUNUP_RETRY_SECONDS", 3600)
     _bars(db, "HOT1x", [1.0 + i * 0.3 for i in range(24)])
-    # أول حكم: يحسب ويخزن
+    # First verdict: computed and stored
     v1 = recorder.runup_verdict(db, "HOT1x", "1399811149", T0)
     assert v1 == recorder.RUNUP_LATE
     assert ("HOT1x", "1399811149") in recorder._RUNUP_STATE
-    # إشارة بعد دقيقة: من الذاكرة، بلا إعادة حساب (t0 نفسه ⇒ نفس النتيجة
-    # لكن الاستعلام لم يُنفَّذ — نتحقق بتغيير الشموع تحت الأقدام)
+    # A signal a minute later: served from memory, no recomputation (same t0 ⇒
+    # same result, but the query did not run — verified by changing the bars
+    # under its feet)
     db._conn.execute(
         "DELETE FROM token_bars WHERE token_address='HOT1x'")
     db._commit()
     v2 = recorder.runup_verdict(db, "HOT1x", "1399811149", T0 + 60)
-    assert v2 == recorder.RUNUP_LATE            # من الكاش رغم حذف الشموع
+    assert v2 == recorder.RUNUP_LATE            # from the cache despite the bars being deleted
 
 
 def test_runup_backoff_expires(db, monkeypatch):
-    """بعد RUNUP_RETRY_SECONDS يُعاد التقييم فعليًا (الصعود قد يهدأ)."""
+    """After RUNUP_RETRY_SECONDS the re-evaluation actually happens (the runup may calm down)."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     monkeypatch.setattr(recorder.config, "RUNUP_RETRY_SECONDS", 3600)
     _bars(db, "COOLx", [1.0 + i * 0.3 for i in range(24)])
     assert recorder.runup_verdict(db, "COOLx", "1399811149", T0) == recorder.RUNUP_LATE
-    # بعد ساعة+: الشموع حُذفت (لا تاريخ) ⇒ مبكرة بالتعريف = إعادة تقييم حدثت
+    # After an hour+: the bars are deleted (no history) ⇒ early by definition = a re-evaluation happened
     db._conn.execute("DELETE FROM token_bars WHERE token_address='COOLx'")
     db._commit()
     v = recorder.runup_verdict(db, "COOLx", "1399811149", T0 + 3700)
@@ -87,7 +89,7 @@ def test_runup_backoff_expires(db, monkeypatch):
 
 
 def test_ok_verdict_not_cached(db, monkeypatch):
-    """حكم «مقبول» لا يُخزَّن: الصعود يتغير سريعًا والصف التالي يستحق قياسًا طازجًا."""
+    """An "ok" verdict is not stored: runup changes fast and the next candidate deserves a fresh measurement."""
     monkeypatch.setattr(recorder.config, "MAX_PRE_SIGNAL_RUNUP", 1.5)
     monkeypatch.setattr(recorder.config, "RUNUP_RETRY_SECONDS", 3600)
     _bars(db, "OKAYx", [1.0] * 24)

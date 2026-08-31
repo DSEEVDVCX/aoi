@@ -1,19 +1,24 @@
-"""تبديلُ حساب fomo من اللوحة: ما يُرفض قبل الكتابة، وما يبقى قابلاً للرجوع.
+"""Switching the fomo account from the dashboard: what gets rejected before writing, and what stays reversible.
 
-هذا مسارُ الكتابة الثاني في اللوحة، وهدفُه ملفٌّ واحد: `api/.privy_state.json`.
-والاختباراتُ هنا تحرس ثلاثةَ أشياء لا يحرسها شيءٌ آخر:
+This is the dashboard's second write path, and its target is a single file:
+`api/.privy_state.json`. The tests here guard three things nothing else
+guards:
 
-1. **لا قيمةَ توكنٍ تخرج.** الاستجابةُ تحمل بصمةَ الهويّة وآخرَ أربعة أحرف، ولا
-   تحمل التوكن — وفحصُ التسريب يبحث عن السلسلة كاملةً في الجواب، فلو أُضيف
-   حقلٌ لاحقاً يعيدها سقط الاختبار.
-2. **لا كتابةَ بلا رجوع.** نسخةٌ تُحفظ قبل كلّ مساس، والاستعادةُ تعمل — لأنّ
-   لصقةً خاطئة تُسكِت الجمعَ كلَّه، والحسابُ القديم ليس محفوظاً في مكانٍ آخر.
-3. **الجلسةُ المجهولة تُرفض.** Privy يكتب `privy:token` قبل أيّ دخول، فلصقُ
-   مخزنٍ قبل الدخول كان يكتب هويّةً لا تملك شيئاً ويقول «تمّ».
+1. **No token value leaves.** The response carries the identity's fingerprint
+   and the last four characters, not the token — and the leak check searches
+   for the full string in the response, so if a field is added later that
+   returns it, the test falls over.
+2. **No write without a way back.** A backup is saved before any touch, and
+   restore works — because a wrong paste silences the whole collection, and
+   the old account is saved nowhere else.
+3. **The anonymous session is rejected.** Privy writes `privy:token` before
+   any sign-in, so pasting a pre-sign-in store used to write an identity that
+   owns nothing and say "done".
 
-وكلُّ اختبارٍ يلمس الملفَّ يعتمد على `isolate_live_state` (تلقائيّة في
-`conftest.py`) التي تحوّل `PRIVY_STATE_PATH` إلى المؤقّت. بلا ذلك تكتب
-الاختباراتُ فوق اعتماد التشغيل الحقيقيّ على هذا الجهاز.
+And every test that touches the file relies on `isolate_live_state`
+(automatic in `conftest.py`), which points `PRIVY_STATE_PATH` at a temporary
+one. Without it the tests would write over this machine's real running
+credential.
 """
 import base64
 import json
@@ -29,11 +34,13 @@ HOST = {"Host": "127.0.0.1:8090"}
 
 
 def jwt(sub: str, exp: int = 4102444800, iat: int | None = None) -> str:
-    """توكنٌ مزيّفٌ مقروءُ الحِمل. التوقيعُ نصٌّ حرفيّ — `account` لا يتحقّق منه
-    ولا يجوز أن يتحقّق: توكنُ خدمةٍ أخرى ولا نملك مفتاحَها.
+    """A fake token with a readable payload. The signature is literal text —
+    `account` doesn't verify it and must not: it's another service's token
+    and we don't hold its key.
 
-    و`iat` يُحذف حين لا يُطلَب لا يُصفَّر: توكناً بلا `iat` يجب أن يسقط إلى
-    مقارنةِ `exp`، وصفرٌ صريحٌ يجعله «أقدمَ من كلّ شيء» فيخفي ذلك السقوط."""
+    And `iat` is omitted when not asked for rather than zeroed: a token with
+    no `iat` must fall back to comparing `exp`, and an explicit zero would
+    make it "older than everything", hiding that fallback."""
     def part(obj: dict) -> str:
         raw = json.dumps(obj, separators=(",", ":")).encode()
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -44,10 +51,11 @@ def jwt(sub: str, exp: int = 4102444800, iat: int | None = None) -> str:
     return f"{part({'alg': 'ES256'})}.{part(claims)}.SiGnAtUrE"
 
 
-# و`iat` في ALICE مقصود: توكنُ Privy الحقيقيّ يحمله دائماً (قِيس على توكنٍ حيّ
-# 2026-08-20)، وحسابُ الملفّ هو ما يُقارَن به كلُّ لصقةٍ لاحقة. ولو تُرك بلا
-# `iat` لصار سقوطُ المقارنة إلى `exp` هو المسارَ المُختبَر في كلّ حالة، وبقي
-# المسارُ الحقيقيّ — المقارنةُ على `iat` — بلا اختبارٍ واحد.
+# And `iat` in ALICE is deliberate: a real Privy token always carries it
+# (measured on a live token 2026-08-20), and the file's account is what every
+# later paste is compared against. If it were left without `iat`, falling back
+# to the `exp` comparison would become the tested path in every case, and the
+# real path — comparing on `iat` — would have no test at all.
 ALICE = jwt("did:privy:alice00000000000000000", iat=1_700_000_000)
 BOB = jwt("did:privy:bob000000000000000000000", iat=1_700_000_000)
 ANON = jwt(account._ANON_DID)
@@ -56,7 +64,7 @@ APP_ID = "cmt0phbhk00080dla83dtghph"
 
 
 def dump(token: str, *, refresh: str = "rt-bob-9999", pat: str = "pat-bob-9999") -> dict:
-    """مخزنُ متصفّحٍ كما ينسخه المستخدم — بعلامات التنصيص التي يضعها Privy."""
+    """A browser store as the user copies it — with the quotation marks Privy puts in."""
     return {
         "privy:token": f'"{token}"',
         "privy:refresh_token": f'"{refresh}"',
@@ -68,7 +76,7 @@ def dump(token: str, *, refresh: str = "rt-bob-9999", pat: str = "pat-bob-9999")
 
 @pytest.fixture(autouse=True)
 def forget_probes():
-    """`_LAST_PROBE` ذاكرةُ عمليّة، فتُصفّى بين الاختبارات مثل `keystore._PROBES`."""
+    """`_LAST_PROBE` is process memory, so it's cleared between tests like `keystore._PROBES`."""
     account._LAST_PROBE.clear()
     yield
     account._LAST_PROBE.clear()
@@ -76,7 +84,7 @@ def forget_probes():
 
 @pytest.fixture
 def state(monkeypatch, tmp_path):
-    """ملفُّ اعتمادٍ قائمٌ لحساب ALICE، ومسارُه مؤقّت."""
+    """An existing credential file for the ALICE account, on a temporary path."""
     path = tmp_path / "privy" / ".privy_state.json"
     path.parent.mkdir()
     path.write_text(json.dumps({
@@ -93,7 +101,7 @@ def state(monkeypatch, tmp_path):
 
 @pytest.fixture
 def signed():
-    """عميلٌ يحمل الرمز وHost وOrigin — أي طلبٍ يغيّر الحالة يحتاج الثلاثة."""
+    """A client carrying the token, Host, and Origin — any request that changes state needs all three."""
     client = TestClient(dashboard_app.app)
     page = client.get("/", headers=HOST)
     token = re.search(r'const DASHBOARD_TOKEN = "([0-9a-f]{64})"', page.text).group(1)
@@ -103,7 +111,7 @@ def signed():
     return client
 
 
-# --- ما يخرج من الخادم: بصمةٌ لا قيمة ---
+# --- what leaves the server: a fingerprint, not a value ---
 
 def test_status_returns_the_identity_and_never_the_token(state, signed):
     response = signed.get("/api/fomo-account")
@@ -119,7 +127,7 @@ def test_status_returns_the_identity_and_never_the_token(state, signed):
 
 
 def test_status_on_a_missing_file_says_so_instead_of_failing(signed):
-    """الغيابُ حالةٌ صالحة: لم يُسجَّل دخولٌ بعد. و500 هنا كان يُفرغ اللوحة."""
+    """Absence is a valid state: not signed in yet. And a 500 here used to empty the dashboard."""
     body = signed.get("/api/fomo-account").json()
     assert body["exists"] is False
     assert body["did"] == ""
@@ -134,17 +142,18 @@ def test_status_names_what_is_missing_when_the_file_is_partial(state, signed):
 
 
 def test_a_field_that_has_a_fallback_is_not_reported_as_a_blocking_gap(state, signed):
-    """الملفُّ الحقيقيّ على هذا الجهاز بلا `client_id` ويجدّد توكنَه كلَّ دقيقة
-    (قِيس 2026-08-20)، لأنّ `api/config.py` يضع المعرّفَ الثابت بديلاً. فإدراجُه
-    في النقص المُعطِّل يُشعل اللوحةَ حمراءَ على نظامٍ سليم — وإنذارٌ كاذبٌ
-    يُعلّم المستخدمَ تجاهلَ الأحمر."""
+    """The real file on this machine has no `client_id` and still renews its
+    token every minute (measured 2026-08-20), because `api/config.py` puts
+    the constant identifier in as a fallback. Listing it among the blocking
+    gaps would turn the dashboard red on a healthy system — and a false
+    alarm teaches the user to ignore red."""
     raw = json.loads(state.read_text(encoding="utf-8"))
     del raw["client_id"]
     del raw["ca_id"]
     state.write_text(json.dumps(raw), encoding="utf-8")
     body = signed.get("/api/fomo-account").json()
-    assert set(body["missing"]) == {"client_id", "ca_id"}     # الحقيقةُ تبقى معروضة
-    assert body["missing_required"] == []                      # ولا إنذار
+    assert set(body["missing"]) == {"client_id", "ca_id"}     # the truth stays displayed
+    assert body["missing_required"] == []                      # and no alarm
     assert body["refreshable"] is True
 
 
@@ -165,10 +174,10 @@ def test_an_expired_token_is_reported_as_expired_not_as_absent(state, signed):
     body = signed.get("/api/fomo-account").json()
     assert body["expired"] is True
     assert body["seconds_left"] < 0
-    assert body["refreshable"] is True     # منتهٍ لكن قابلٌ للتجديد ≠ معطوب
+    assert body["refreshable"] is True     # expired but renewable ≠ broken
 
 
-# --- التبديل: ما يُرفض قبل الكتابة ---
+# --- switching: what gets rejected before writing ---
 
 def test_switch_writes_the_new_identity_and_keeps_a_backup(state, signed):
     response = signed.post("/api/fomo-account/switch", json=dump(BOB))
@@ -181,13 +190,13 @@ def test_switch_writes_the_new_identity_and_keeps_a_backup(state, signed):
     assert written["access_token"] == BOB
     assert written["refresh_token"] == "rt-bob-9999"
     assert written["pat"] == "pat-bob-9999"
-    # ما يقشّره `_clean`: لا علاماتَ تنصيصٍ تصل الملفّ، وإلّا ردّ المصدرُ 401 على
-    # توكنٍ صحيح.
+    # what `_clean` strips: no quotation marks reach the file, or the upstream
+    # answers 401 to a correct token.
     assert not written["access_token"].startswith('"')
     assert written["app_id"] == APP_ID
     assert written["ca_id"] == "ca-1234"
 
-    # النسخةُ تحمل الحسابَ القديم — وهي طريقُ الرجوع الوحيد.
+    # the backup carries the old account — it's the only way back.
     backup = json.loads((state.parent / out["backup"]).read_text(encoding="utf-8"))
     assert backup["access_token"] == ALICE
 
@@ -197,19 +206,20 @@ def test_switch_never_echoes_the_pasted_token_back(state, signed):
     assert BOB not in text
     assert "rt-bob-9999" not in text
     assert "pat-bob-9999" not in text
-    assert BOB[-4:] in text          # الذيلُ وحده، وهو استثناء FR-013 المطلوب
+    assert BOB[-4:] in text          # the tail alone — the FR-013 exception, on purpose
 
 
 def test_switch_refuses_the_anonymous_privy_session(state, signed):
-    """Privy يكتب `privy:token` عند إقلاع الـSDK قبل أيّ دخول (قِيس 2026-08-20).
+    """Privy writes `privy:token` when the SDK boots, before any sign-in (measured 2026-08-20).
 
-    وهذا أخطرُ رفضٍ في الملفّ: بلا هذا الحرس يقرأ المستخدمُ «تمّ التبديل» ثمّ
-    يجد الجمعَ ميتاً، لأنّ الهويّةَ المكتوبة لا تملك شيئاً.
+    And this is the most dangerous rejection in the file: without this guard
+    the user reads "switched" then finds the collection dead, because the
+    written identity owns nothing.
     """
     response = signed.post("/api/fomo-account/switch", json=dump(ANON))
     assert response.status_code == 400
-    assert "جلسةٌ مجهولة" in response.json()["error"]
-    # ولا يُلمس الملفّ: الرفضُ قبل النسخِ والكتابة.
+    assert "anonymous session" in response.json()["error"]
+    # and the file is untouched: the rejection happens before the backup and the write.
     assert json.loads(state.read_text(encoding="utf-8"))["access_token"] == ALICE
     assert not list(state.parent.glob(account._BAK_PREFIX + "*"))
 
@@ -221,23 +231,27 @@ def test_switch_refuses_the_same_identity(state, signed):
 
 
 def test_status_reports_how_long_ago_the_file_was_written(state, signed):
-    """عمرُ الكتابة يفرّق بين «لا أحدَ يجدّد» و«التجديدُ يعمل ويُرفَض»، وهما
-    تشخيصان متناقضان كانت اللوحةُ تعطيهما نصّاً واحداً."""
+    """The write's age tells "nobody is renewing" from "renewal runs and is
+    being rejected" — two contradictory diagnoses the dashboard used to give
+    with one text."""
     body = signed.get("/api/fomo-account").json()
     assert isinstance(body["written_seconds_ago"], int)
-    assert body["written_seconds_ago"] <= 5           # كُتب في المُهيّئ الآن
+    assert body["written_seconds_ago"] <= 5           # written in the fixture just now
 
 
 def test_status_reports_no_write_age_when_there_is_no_file(signed):
-    """لا ملفَّ ⇒ لا عمرَ. وصفرٌ هنا كان سيعني «كُتب الآن» فيقلب الحكم."""
+    """No file ⇒ no age. And a zero here would have meant "written now", flipping the verdict."""
     assert signed.get("/api/fomo-account").json()["written_seconds_ago"] is None
 
 
 def test_the_same_identity_with_a_newer_token_is_a_refresh_not_a_repeat(state, signed):
-    """لصقُ دخولٍ جديد لنفس الحساب هو طريقُ النجاة حين يتعطّل تجديدُ Privy.
+    """Pasting a fresh sign-in for the same account is the way out when
+    Privy's renewal breaks.
 
-    وكان يُرفض 409 «لا شيء ليُبدَّل»، فمن تعطّلت جلستُه وسجّل دخولاً جديداً
-    بنفس حسابه وجد البابَ مغلقاً — والحالةُ ليست نظريّة: حدثت 2026-08-20.
+    It used to be rejected with 409 "nothing to switch", so whoever's session
+    broke, signed in again with the same account, and pasted their store
+    found a closed door — and the case isn't theoretical: it happened
+    2026-08-20.
     """
     fresh = jwt("did:privy:alice00000000000000000", iat=1_800_000_000)
     response = signed.post("/api/fomo-account/switch", json=dump(fresh))
@@ -246,14 +260,15 @@ def test_the_same_identity_with_a_newer_token_is_a_refresh_not_a_repeat(state, s
     assert body["refreshed"] is True
     assert body["did"] == "did:privy:alice00000000000000000"
     assert json.loads(state.read_text(encoding="utf-8"))["access_token"] == fresh
-    assert fresh not in response.text          # البصمةُ تخرج، لا القيمة
+    assert fresh not in response.text          # the fingerprint leaves, not the value
     backups = list(state.parent.glob(account._BAK_PREFIX + "*"))
     assert len(backups) == 1 and backups[0].name.endswith("-refresh")
 
 
 def test_a_refresh_of_the_same_identity_still_keeps_the_old_file(state, signed):
-    """التجديدُ يمسّ نفسَ الملفّ، فنسخةُ الرجوع فيه ألزمُ لا أخفّ: لصقةٌ من
-    نافذةٍ خاطئة تُسكِت الجمعَ كلَّه ولا نسخةَ للاعتماد القديم في مكانٍ آخر."""
+    """The renewal touches the same file, so a way-back backup there is more
+    required, not less: a paste from a wrong window silences the whole
+    collection and there's no copy of the old credential anywhere else."""
     signed.post(
         "/api/fomo-account/switch",
         json=dump(jwt("did:privy:alice00000000000000000", iat=1_800_000_000)),
@@ -264,7 +279,7 @@ def test_a_refresh_of_the_same_identity_still_keeps_the_old_file(state, signed):
 
 
 def test_an_older_token_of_the_same_identity_cannot_overwrite_the_newer_one(state, signed):
-    """نافذةٌ قديمةٌ نُسيت مفتوحةً تحمل توكناً منتهياً — ولصقُها كان سيطمس العامل."""
+    """An old window left open carries an expired token — and pasting it would have wiped out the worker."""
     state.write_text(json.dumps({
         "access_token": jwt("did:privy:alice00000000000000000", iat=1_800_000_000),
         "refresh_token": "rt-alice-0002",
@@ -276,14 +291,15 @@ def test_an_older_token_of_the_same_identity_cannot_overwrite_the_newer_one(stat
     stale = jwt("did:privy:alice00000000000000000", iat=1_700_000_000)
     response = signed.post("/api/fomo-account/switch", json=dump(stale))
     assert response.status_code == 409
-    assert "ليس أحدث" in response.json()["error"]
+    assert "not newer" in response.json()["error"]
     assert json.loads(state.read_text(encoding="utf-8"))["refresh_token"] == "rt-alice-0002"
     assert not list(state.parent.glob(account._BAK_PREFIX + "*"))
 
 
 def test_the_same_identity_falls_back_to_exp_when_no_iat_is_issued(state, signed):
-    """لا كلَّ من يصدر الـJWT يضع `iat`. فحين يغيب تبقى المقارنةُ على `exp`
-    بدل أن تسقط إلى «ليس أحدث» وتردّ 409 على تجديدٍ صحيح."""
+    """Not everyone issuing a JWT puts in `iat`. When it's absent the
+    comparison stays on `exp` instead of falling to "not newer" and
+    answering 409 to a correct renewal."""
     no_iat = jwt("did:privy:alice00000000000000000", exp=4102444800)
     state.write_text(json.dumps({
         "access_token": no_iat,
@@ -310,8 +326,9 @@ def test_switch_refuses_a_partial_store_by_name(state, signed):
 
 
 def test_switch_refuses_a_store_with_no_app_id(state, signed):
-    """`app_id` يُستخرج من اسم مفتاحٍ في المخزن، ومن نسخ سطراً واحداً فقده —
-    وبلا `app_id` لا تجديدَ: يموت الحساب بعد ساعة بلا سببٍ ظاهر."""
+    """`app_id` is extracted from a key's name in the store, and whoever
+    copies a single line loses it — and without `app_id` there's no renewal:
+    the account dies after an hour with no visible cause."""
     bare = {k: v for k, v in dump(BOB).items() if ":state" not in k}
     response = signed.post("/api/fomo-account/switch", json=bare)
     assert response.status_code == 400
@@ -325,7 +342,7 @@ def test_switch_refuses_an_unreadable_token(state, signed):
 
 
 def test_switch_accepts_the_full_local_storage_wrapper(state, signed):
-    """الشكلُ الذي يفهمه `credential_store` أصلاً — المستخدمُ لا يعرف أيّهما بيده."""
+    """The shape `credential_store` understands in the first place — the user doesn't know which one they're holding."""
     response = signed.post(
         "/api/fomo-account/switch", json={"_full_localStorage": dump(BOB)},
     )
@@ -334,10 +351,12 @@ def test_switch_accepts_the_full_local_storage_wrapper(state, signed):
 
 
 def test_switch_keeps_old_fields_the_paste_does_not_carry(state, signed):
-    """`client_id` لا يظهر في كلّ مخزن، وهو **شرطٌ** لتجديد Privy (بدونه 400).
+    """`client_id` doesn't appear in every store, and it's a **requirement**
+    for Privy's renewal (without it, 400).
 
-    فالدمجُ لا الاستبدال: ما لم تحمله اللصقةُ يبقى من الملفّ القديم، لأنّ
-    `client_id` معرّفُ تطبيقٍ ثابت لا سرَّ حساب.
+    So merge, don't replace: what the paste doesn't carry stays from the old
+    file, because `client_id` is a constant app identifier, not an account
+    secret.
     """
     without_state = {k: v for k, v in dump(BOB).items() if ":state" not in k}
     without_state[f"privy:{APP_ID}:x"] = '"{}"'
@@ -353,7 +372,7 @@ def test_switch_refuses_a_body_that_is_not_a_store(state, signed):
     assert json.loads(state.read_text(encoding="utf-8"))["access_token"] == ALICE
 
 
-# --- الرجوع ---
+# --- the way back ---
 
 def test_restore_brings_the_previous_account_back(state, signed):
     name = signed.post("/api/fomo-account/switch", json=dump(BOB)).json()["backup"]
@@ -365,7 +384,7 @@ def test_restore_brings_the_previous_account_back(state, signed):
 
 
 def test_restore_backs_up_first_so_the_switch_is_not_lost(state, signed):
-    """الاستعادةُ نفسُها كتابة، ومن استعاد بالخطأ يحتاج طريقَ رجوعٍ أيضاً."""
+    """Restore is itself a write, and whoever restores by mistake needs a way back too."""
     first = signed.post("/api/fomo-account/switch", json=dump(BOB)).json()["backup"]
     signed.post("/api/fomo-account/restore", json={"name": first})
     saved = [b["did"] for b in signed.get("/api/fomo-account").json()["backups"]]
@@ -373,7 +392,7 @@ def test_restore_backs_up_first_so_the_switch_is_not_lost(state, signed):
 
 
 def test_restore_refuses_a_path_outside_the_backup_set(state, signed):
-    """`..` واسمٌ بلا البادئة: لا تُقرأ ملفّاتٌ أخرى ولا تُكتب فوق الاعتماد."""
+    """`..` and a name without the prefix: no other files are read and nothing is written over the credential."""
     for name in ("../../../etc/passwd", ".privy_state.json", "", "bak-2026"):
         response = signed.post("/api/fomo-account/restore", json={"name": name})
         assert response.status_code == 404, name
@@ -389,7 +408,7 @@ def test_restore_refuses_a_backup_with_no_token(state, signed):
 
 
 def test_backups_are_pruned_to_the_keep_limit(state, signed):
-    """النسخُ لا تتراكم بلا حدّ، وأقدمُها يُحذف أوّلاً."""
+    """Backups don't pile up without limit, and the oldest is deleted first."""
     for i in range(account._BAK_KEEP + 3):
         token = jwt(f"did:privy:acct{i:020d}")
         signed.post(
@@ -398,20 +417,21 @@ def test_backups_are_pruned_to_the_keep_limit(state, signed):
     assert len(list(state.parent.glob(account._BAK_PREFIX + "*"))) <= account._BAK_KEEP
 
 
-# --- المِجَسّ: يفصل «الهويّةُ محجوبة» عن «المصدرُ متعثّر» ---
+# --- the probe: separating "the identity is blocked" from "the upstream is struggling" ---
 
 @pytest.mark.parametrize(("codes", "level", "needle"), [
-    ([200, 200, 200], "good", "يعمل"),
-    ([403, 403, 403], "bad", "محجوب"),
+    ([200, 200, 200], "good", "works"),
+    ([403, 403, 403], "bad", "blocked"),
     ([401, 200, 200], "bad", "401"),
-    ([403, 200, 200], "bad", "جزئيّ"),
-    ([503, 502, 500], "warn", "متعثّر"),
-    ([None, None, None], "warn", "لا جواب"),
-    ([200, 404, 500], "warn", "مختلط"),
+    ([403, 200, 200], "bad", "partial"),
+    ([503, 502, 500], "warn", "struggling"),
+    ([None, None, None], "warn", "no response"),
+    ([200, 404, 500], "warn", "mixed"),
 ])
 def test_the_verdict_separates_a_blocked_identity_from_a_sick_upstream(codes, level, needle):
-    """قِيس 2026-08-19: الحجبُ 403 على كلّ مسار، والمسجّل كتبه «غيرُ متاح»
-    فطُوردت الشبكةُ ساعةً وهي سليمة. فالرمزُ هو الحكم لا نصُّ الخطأ."""
+    """Measured 2026-08-19: a block is 403 on every path, and the recorder
+    logged it as "unreachable", so the network was hunted for an hour while
+    it was fine. The code is the verdict, not the error text."""
     got_level, detail = account._verdict(codes)
     assert got_level == level
     assert needle in detail
@@ -444,12 +464,12 @@ def test_probe_reports_each_path_and_caches_the_result(state, signed, monkeypatc
     assert body["level"] == "bad"
     assert [r["status"] for r in body["rows"]] == [403, 403, 403]
     assert ALICE not in response.text
-    # ويُخزَّن في الذاكرة كي تعرضه البطاقةُ بعد التحديث بلا نداءٍ ثانٍ.
+    # and it's cached in memory so the card can show it after a refresh with no second call.
     assert signed.get("/api/fomo-account").json()["last_probe"]["level"] == "bad"
 
 
 def test_probe_reads_a_transport_failure_as_no_answer_not_as_a_block(state, signed, monkeypatch):
-    """انقطاعُ الشبكة ليس حجباً — والخلطُ يدفع المستخدمَ إلى تبديل حسابٍ سليم."""
+    """A network outage is not a block — and conflating them pushes the user toward switching a healthy account."""
     class Dead:
         def __init__(self, *args, **kwargs):
             pass
@@ -469,43 +489,45 @@ def test_probe_reads_a_transport_failure_as_no_answer_not_as_a_block(state, sign
     monkeypatch.setattr("curl_cffi.requests.Session", Dead)
     body = signed.post("/api/fomo-account/probe", json={}).json()
     assert body["level"] == "warn"
-    assert "لا جواب" in body["detail"]
+    assert "no response" in body["detail"]
     assert all(r["status"] is None for r in body["rows"])
 
 
 def test_probe_without_a_token_says_so_instead_of_calling_out(signed):
     response = signed.post("/api/fomo-account/probe", json={})
     assert response.status_code == 400
-    assert "لا توكن" in response.json()["error"]
+    assert "No token" in response.json()["error"]
 
 
 def test_switch_clears_a_probe_verdict_from_the_previous_account(state, signed):
-    """نتيجةُ الحساب السابق لا تصف الجديد، وبقاؤها معروضةً بعد التبديل كان
-    يقول «محجوب» عن حسابٍ لم يُفحص بعد."""
-    account._LAST_PROBE.update({"level": "bad", "detail": "محجوب", "rows": []})
+    """The previous account's result doesn't describe the new one, and
+    leaving it displayed after a switch used to say "blocked" about an
+    account that hasn't been probed."""
+    account._LAST_PROBE.update({"level": "bad", "detail": "blocked", "rows": []})
     signed.post("/api/fomo-account/switch", json=dump(BOB))
     assert signed.get("/api/fomo-account").json()["last_probe"] is None
 
 
-# --- الحراس: نفسُ حرسِ المفاتيح، وأشدُّ حاجةً إليه ---
+# --- the guards: the key panel's own guards, and needed here even more ---
 
 def test_every_write_path_needs_the_csrf_token(state):
-    """بلا رمز: 403 قبل التوجيه. صفحةٌ خارجيّة لا تبدّل حسابَ مصدر البيانات."""
+    """Without the token: 403 before routing. An external page must not switch the data source's account."""
     client = TestClient(dashboard_app.app)
     for path in ("switch", "restore", "probe"):
         response = client.post(f"/api/fomo-account/{path}", json={}, headers=HOST)
         assert response.status_code == 403
-        assert "رمز حماية اللوحة" in response.json()["error"]
+        assert "dashboard token" in response.json()["error"]
     assert json.loads(state.read_text(encoding="utf-8"))["access_token"] == ALICE
 
 
 def test_the_paste_path_accepts_a_body_larger_than_the_default_cap(state, signed):
-    """مخزنُ متصفّحٍ حقيقيّ يتجاوز 8KB بسهولة — وكان يُرفض بـ«الطلب كبير جداً»
-    فيقرأ المستخدمُ رفضاً لا يفهم سببه. والسقفُ لهذا المسار وحده."""
+    """A real browser store passes 8KB easily — and it used to be rejected
+    with "request too large", so the user read a rejection whose cause they
+    couldn't understand. And the cap is for this path alone."""
     padded = dump(BOB)
     padded["privy:noise"] = '"' + "x" * 20000 + '"'
     assert signed.post("/api/fomo-account/switch", json=padded).status_code == 200
-    # وليس مرفوعاً عن غيره:
+    # and it's not raised for everyone else:
     fat = {"provider": "helius", "key": "k" * 9000, "label": "x"}
     assert signed.post("/api/provider-keys/add", json=fat).status_code == 413
 

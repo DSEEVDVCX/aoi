@@ -1,21 +1,25 @@
-"""تسخينُ ذاكرة اللوحة عند الإقلاع — أوّلُ زائرٍ لا يدفع ثمن البرودة.
+"""Warm the dashboard cache at boot — the first visitor doesn't pay the cold cost.
 
-المشكلة المقيسة (2026-08-29): `serve_dashboard.py` يُقلع بذاكرة `cache.MEMO`
-فارغة، فأوّلُ من يفتح الصفحة ينتظر الحساب البارد للمسارات الثقيلة الثلاثة
-(3.4 ثانية للشبكات، 1.7 للتوسيم، 1.0 للأعداد — مقيسة على القاعدة الحيّة)،
-لأنّ الصفحة تُطلق طلباتها الخمسة عشر متوازيةً وتنتظر أبطأها قبل رسم أيّ شيء.
+The measured problem (2026-08-29): `serve_dashboard.py` boots with an empty
+`cache.MEMO`, so whoever opens the page first waits for the cold computation of
+the three heavy paths (3.4 seconds for networks, 1.7 for labeling, 1.0 for
+counts — measured on the live database), because the page fires its fifteen
+requests in parallel and waits for the slowest one before rendering anything.
 
-والحلُّ جاهزٌ في `cache.py` منذ البداية: دالةُ `warm()` موثّقةٌ «للاستدعاء من
-خيطٍ خلفيّ عند الإقلاع» لكن لا أحد يستدعيها. هذا الملفُ هو ذلك الاستدعاء.
+The fix has been sitting in `cache.py` since the beginning: the `warm()` function
+is documented "to be called from a background thread at boot" but nobody calls
+it. This file is that call.
 
-عقدُّ التسخين:
-- **خيطٌ واحدٌ خفيّ (daemon)** يُشعَل بعد بدء الاستماع، لا يمنع انطفاء العمليّة.
-- **الترتيبُ بالثقل**: الأبطأ أوّلاً — من يفتح الصفحةَ قبل اكتمال التسخين ينتظر
-  أطولَ مسارٍ بلا قيمة، فكلُّ ثانيةٍ تُقتطع من مقدّمة الخيط تُقتطع من انتظاره.
-- **الفشلُ لا يوقف**: مفتاحٌ يفشل يُسجَّل ويُمرَّر — التسخينُ مساعاةٌ لا شرطُ
-  إقلاع، والقاعدةُ قد تكون مشغولةً بالمسجّل لحظة الإقلاع.
-- **لا كتابة ولا مساس بالقاعدة**: `warm()` يمرّ بنفس `get()` — قراءةٌ بـmode=ro
-  كما كلّ اللوحة.
+The warmup contract:
+- **One daemon thread**, started after listening begins; it never blocks process exit.
+- **Order by weight**: slowest first — whoever opens the page before warmup
+  finishes waits on the longest path for nothing, so every second cut from the
+  front of the thread is cut from their wait.
+- **Failure never stops it**: a key that fails is logged and skipped — warmup is
+  a courtesy, not a boot requirement, and the database may be busy with the
+  recorder at boot time.
+- **No writes, no touching the database**: `warm()` goes through the same
+  `get()` — a read in mode=ro like everything else in the dashboard.
 """
 from __future__ import annotations
 
@@ -26,17 +30,18 @@ from typing import Any
 import cache
 import config
 
-# المفاتيح الثقيلة بالترتيب: أثقلُها أوّلاً (أزمنة مقيسة 2026-08-29).
-# أضِف هنا كلَّ مفتاح `_cached` جديدٍ ثقيل — `test_every_heavy_key_is_covered`
-# في test_warmup.py يفحص أنّ القائمة لا تنحرف.
+# The heavy keys in order: heaviest first (times measured 2026-08-29).
+# Add every new heavy `_cached` key here — `test_every_heavy_key_is_covered`
+# in test_warmup.py checks that this list doesn't drift.
 HEAVY_KEYS: tuple[tuple[str, float], ...] = (
     ("network_summary", config.NETWORK_SUMMARY_TTL_SECONDS),
     ("labeling", config.LABELING_TTL_SECONDS),
     ("table_counts", config.TABLE_COUNTS_TTL_SECONDS),
 )
 
-# `ticks_summary` مسارٌ عامّ يكلّف 1.5 ثانية لكن الصفحة لا تناديه اليوم؛ لا يُسخَّن
-# عمداً — تسخينُ ما لا يُعرض إهدارٌ لقرصٍ يتنافسُ عليه المسجّل.
+# `ticks_summary` is a public path that costs 1.5 seconds but the page doesn't
+# call it today; deliberately not warmed — warming what isn't displayed wastes
+# disk the recorder competes for.
 
 _ComputeFor = Callable[[str], Callable[[], Any]]
 
@@ -44,17 +49,20 @@ _ComputeFor = Callable[[str], Callable[[], Any]]
 def warm_heavy_keys(
     memo: cache.TTLMemo, compute_for: _ComputeFor
 ) -> dict[str, bool]:
-    """يسخّن المفاتيح الثقيلة **بالتوازي** ويعيد خريطة {مفتاح: نجح؟}.
+    """Warms the heavy keys **in parallel** and returns a {key: succeeded?} map.
 
-    `compute_for` يحوّل اسمَ المفتاح إلى callable بلا معامِلات يفتح اتصاله
-    بنفسه — نفس عقد `cache.TTLMemo.get`. الاستثناءُ من مفتاحٍ يُلتقط ويُمرَّر
-    (القيمةُ False في الخريطة) فلا يقتل خيط التسخين قبل البقيّة.
+    `compute_for` turns a key name into a zero-argument callable that opens its
+    own connection — the same contract as `cache.TTLMemo.get`. An exception from
+    a key is caught and passed over (the False value in the map), so it never
+    kills the warmup thread before the rest are done.
 
-    ولماذا التوازي بعد أن كان الترتيب تتابعيًا؟ المقيس (2026-08-29): من يفتح
-    الصفحةَ في أوّل ثواني الإقلاع ينتظر **مجموعَ** المفاتيح السابقة له —
-    `labeling` كان يُجاب بعد 3.4+1.5 ثانية من الشبكات والتوسيم معًا. القراءُ
-    في SQLite لا يتنازعون أقفالًا (كلُّ اتصالٍ mode=ro)، فالتوازيُّ يجعل كلَّ
-    مسارٍ جاهزًا خلال زمنه الخاص، وأسوأَ انتظارٍ ممكن = أبطأُ مفتاحٍ واحد.
+    And why parallel after the order used to be sequential? Measured
+    (2026-08-29): whoever opens the page in the first seconds of boot waits for
+    the **sum** of the keys ahead of theirs — `labeling` used to be answered
+    after 3.4+1.5 seconds of networks and labeling combined. Readers in SQLite
+    don't contend on locks (every connection is mode=ro), so parallelism gets
+    each path ready within its own time, and the worst possible wait = the
+    single slowest key.
     """
     done: dict[str, bool] = {}
     threads: list[threading.Thread] = []
@@ -75,7 +83,7 @@ def warm_heavy_keys(
 
 
 def _dao_compute(key: str) -> Callable[[], Any]:
-    """يبني دالة الحساب البارد للمفتاح — نفس نداءات المسارات في app.py."""
+    """Builds the cold-compute function for a key — the same calls the paths in app.py make."""
     import dao
 
     def _compute() -> Any:
@@ -95,14 +103,14 @@ def _dao_compute(key: str) -> Callable[[], Any]:
                 )
             if key == "table_counts":
                 return dao.table_counts(conn)
-            raise KeyError(f"مفتاح تسخين غير معروف: {key}")
+            raise KeyError(f"unknown warmup key: {key}")
         finally:
             conn.close()
 
     return _compute
 
 
-# قابلٌ للاستبدال في الاختبارات (test_warmup_thread_is_daemon_and_runs_after_start)
+# Replaceable in tests (test_warmup_thread_is_daemon_and_runs_after_start)
 def _spawn_background(run: Callable[[], None]) -> threading.Thread:
     thread = threading.Thread(target=run, daemon=True, name="dashboard-warmup")
     thread.start()
@@ -110,7 +118,7 @@ def _spawn_background(run: Callable[[], None]) -> threading.Thread:
 
 
 def start_warmup_thread(memo: cache.TTLMemo | None = None) -> threading.Thread:
-    """يشعل خيط التسخين ويعيد الخيط. فشلُ تسخينٍ يُسجَّل ولا يُرفع."""
+    """Starts the warmup thread and returns it. A warmup failure is logged, not raised."""
     target_memo = memo if memo is not None else cache.MEMO
 
     def _run() -> None:

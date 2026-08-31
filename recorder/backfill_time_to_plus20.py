@@ -1,14 +1,15 @@
-"""تعبئة رجعية لـ time_to_plus20_min عبر خدمة — لا SQL يدوي.
+"""Backfills time_to_plus20_min through the service layer — no hand-written SQL.
 
-`time_to_plus20_min` وُلد 2026-08-28 والتوسيم idempotent فلا يلمس النتائج
-القديمة. العمود يحتاج الشموع (أول إغلاق ≥ +20% بعد الدخول) — تُقرأ من
-`token_bars` المخزنة بلا شبكة، بنفس منطق `compute_labels` الحيّ فلا ينجرف
-تعريفان. يُقصر على النتائج ok ذات سعر دخول — والنتائج بلا شموع تبقى NULL
-(غياب لا صفر).
+`time_to_plus20_min` was born 2026-08-28 and labeling is idempotent, so it
+never touches old results. The column needs bars (first close >= +20% after
+entry) — read from stored `token_bars` without network, using the same logic
+as the live `compute_labels` so the two definitions cannot drift. Restricted
+to ok outcomes that have an entry price — outcomes without bars stay NULL
+(absence, not zero).
 
-الاستعمال:
-    python backfill_time_to_plus20.py            # تشخيص
-    python backfill_time_to_plus20.py --apply    # تنفيذ
+Usage:
+    python backfill_time_to_plus20.py            # diagnosis
+    python backfill_time_to_plus20.py --apply    # execute
 """
 from __future__ import annotations
 
@@ -41,7 +42,7 @@ def main() -> int:
         ).fetchall()
         if args.limit:
             rows = rows[: args.limit]
-        print(f"نتائج قابلة للتعبئة: {len(rows):,}")
+        print(f"Outcomes that can be filled: {len(rows):,}")
 
         filled = 0
         no_bars = 0
@@ -63,10 +64,11 @@ def main() -> int:
                 None,
             )
             if hit is None:
-                # لم تبلغ +20% أبدًا: قيمة صادقة هي NULL (لم يحدث) —
-                # نتركها NULL ولا نكتب ما لا نهاية. السحب يفصل "لم يحدث"
-                # عن "حدث في الدقيقة X" بقراءة NULL نفسها، وهو مقبول:
-                # غياب الحدث = لا سنارة، وهذا هو المعنى.
+                # Never reached +20%: the honest value is NULL (never
+                # happened) — we leave it NULL rather than writing infinity.
+                # The pull separates "never happened" from "happened at
+                # minute X" by reading the same NULL, which is acceptable:
+                # absence of the event = no flag, and that is the meaning.
                 continue
             filled += 1
             if args.apply:
@@ -78,13 +80,13 @@ def main() -> int:
             if done % 20000 == 0:
                 if args.apply:
                     db._commit()
-                print(f"  progress: {done:,} (سُدّ {filled:,})", flush=True)
+                print(f"  progress: {done:,} (filled {filled:,})", flush=True)
         if args.apply:
             db._commit()
-        print(f"سُدّ: {filled:,} | بلا شموع: {no_bars:,} | لم تبلغ +20%: "
+        print(f"Filled: {filled:,} | no bars: {no_bars:,} | never reached +20%: "
               f"{len(rows) - filled - no_bars:,}")
         if not args.apply:
-            print("\nتشخيص فقط — مرّر --apply للتنفيذ.")
+            print("\nDiagnosis only — pass --apply to execute.")
         return 0
     finally:
         db.close()

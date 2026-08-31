@@ -1,4 +1,4 @@
-"""اختبارات شرائح filterTokens بالتناوب (FILTER_TOKENS_STRIDE)."""
+"""Tests for filterTokens request slicing by stride (FILTER_TOKENS_STRIDE)."""
 
 import pytest
 from db import RecorderDB
@@ -7,7 +7,7 @@ import recorder
 
 
 class _FilterClient:
-    """يجيب filterTokens بعنصر لكل عنوان مطلوب، ويعدّ النداءات."""
+    """Answers filterTokens with one item per requested address, and counts the calls."""
 
     def __init__(self):
         self.calls: list[list[str]] = []
@@ -45,7 +45,8 @@ def _watch(db: RecorderDB, n: int) -> set[tuple[str, str]]:
 
 
 async def test_stride_two_halves_requests(db, monkeypatch):
-    """stride=2: كل دورة تطلب نصف العناوين فقط، والعملة تُقاس كل دورتين."""
+    """stride=2: each cycle requests only half the addresses; a token is
+    measured every other cycle."""
     monkeypatch.setattr(recorder.config, "FILTER_TOKENS_STRIDE", 2)
     watched = _watch(db, 10)
     client = _FilterClient()
@@ -56,16 +57,16 @@ async def test_stride_two_halves_requests(db, monkeypatch):
         client, db, "2026-08-25T01:01:00+00:00", watched, set())
 
     total1 = sum(len(c) for c in client.calls)
-    assert s1["filter_requested"] <= 5            # نصف العشرة أو أقل
+    assert s1["filter_requested"] <= 5            # half of ten or fewer
     assert s2["filter_requested"] <= 5
-    # الاتحاد عبر الدورتين يغطي كل العناوين — لا عملة سقطت
+    # the union across both cycles covers every address — no token dropped
     asked = {sym.split(":")[0] for c in client.calls for sym in c}
     assert asked == {f"tok{i:03d}" for i in range(10)}
     assert total1 + sum(len(c) for c in client.calls) >= 10
 
 
 async def test_stride_one_is_legacy_behavior(db, monkeypatch):
-    """stride=1: كل الدورة تطلب كل العناوين كما كان."""
+    """stride=1: every cycle requests all addresses, as before."""
     monkeypatch.setattr(recorder.config, "FILTER_TOKENS_STRIDE", 1)
     watched = _watch(db, 6)
     client = _FilterClient()
@@ -75,11 +76,11 @@ async def test_stride_one_is_legacy_behavior(db, monkeypatch):
 
 
 async def test_empty_slice_costs_no_call(db, monkeypatch):
-    """شريحة فارغة (لا شيء في دورتها) لا تكلّف نداءً أصلاً."""
+    """An empty slice (nothing in its turn) costs no call at all."""
     monkeypatch.setattr(recorder.config, "FILTER_TOKENS_STRIDE", 3)
     watched = _watch(db, 3)
     client = _FilterClient()
-    # ثلاث دورات متتالية: كل دورة تأخذ ثلثاً — المجموع 3 نداءات لا 9
+    # three consecutive cycles: each takes a third — 3 calls total, not 9
     for minute in range(3):
         await recorder.run_filter_tokens_cycle(
             client, db, f"2026-08-25T01:0{minute}:00+00:00", watched, set())

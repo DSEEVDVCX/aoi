@@ -1,8 +1,9 @@
-"""يجعل حزمة dashboard قابلة للاستيراد في الاختبارات دون تثبيت، ويعزلها عن داتا التشغيل.
+"""Makes the dashboard package importable in tests without installation, and isolates it from live data.
 
-يضيف مجلّد dashboard/ (الأب) إلى sys.path حتى تعمل `import dao` و`import config`
-كما يستوردها كود اللوحة نفسه (استيراد مسطّح، لا حزمة) — نفس نمط recorder/tests.
-بدونه كانت اختبارات اللوحة تفشل في التجميع أصلاً عند تشغيل pytest من جذر المشروع.
+It adds the dashboard/ folder (the parent) to sys.path so that `import dao` and
+`import config` work the same way the dashboard's own code imports them (flat
+import, not a package) — the same pattern as recorder/tests. Without it the
+dashboard's tests failed to even collect when pytest ran from the project root.
 """
 import os
 import sqlite3
@@ -14,29 +15,32 @@ DASHBOARD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if DASHBOARD_DIR not in sys.path:
     sys.path.insert(0, DASHBOARD_DIR)
 
-import config  # noqa: E402 — بعد إضافة المسار، وإلّا لا يُوجَد
+import config  # noqa: E402 — after the path is added, or it isn't found
 
 
 @pytest.fixture(autouse=True)
 def isolate_live_state(tmp_path, monkeypatch):
-    """يحوّل مسارَي القاعدة وملفِّ المفاتيح إلى المؤقّت في **كلّ** اختبار.
+    """Points the database and key-file paths at a temporary one in **every** test.
 
-    `_with_conn` يفتح `config.DB_PATH` عند كلّ طلب، فاختبارٌ ينادي مساراً يقرأ
-    القاعدة كان يقرأ `recorder.db` الحقيقيّة. محلياً هي موجودةٌ فيمرّ الاختبار
-    وهو معلَّقٌ بداتا حيّة بلا أن يقول، وعلى الخادم غائبةٌ (مُستثناة من git)
-    فسقطت تسعةُ اختباراتٍ للوحة المفاتيح بـ
-    `sqlite3.OperationalError: unable to open database file` في أوّل مرّةٍ
-    شغّل فيها الخادمُ اختباراتِ اللوحة فعلاً.
+    `_with_conn` opens `config.DB_PATH` on every request, so any test calling a
+    path that reads the database was reading the real `recorder.db`. Locally it
+    exists, so the test passed — silently pegged to live data; on the server it
+    was absent (excluded from git), so nine key-panel tests fell over with
+    `sqlite3.OperationalError: unable to open database file` the first time the
+    server actually ran the dashboard's tests.
 
-    والحرسُ تلقائيٌّ لا اختياريّ عن قصد: النسيانُ هنا لا يُرى — الاختبارُ يمرّ.
-    وهو في ملفّ المفاتيح أخطرُ منه في القاعدة: القاعدةُ تُفتح للقراءة فقط، أمّا
-    `/api/provider-keys/{add,delete}` فيكتب، واختبارٌ نسي العزل يحذف مفتاحاً
-    عاملاً من ملفّ التشغيل. (لهذا تبقى `keys_file`: هذه تضمن العزل، وتلك تزرع
-    محتوىً وتصفّي الفحوص والبيئة.)
+    And the guard is automatic, not opt-in on purpose: forgetting it here is
+    invisible — the test passes. It is more dangerous for the key file than for
+    the database: the database is opened read-only, while
+    `/api/provider-keys/{add,delete}` writes, and a test that forgot the
+    isolation would delete a working key from the live file. (That's why
+    `keys_file` stays: this one guarantees isolation, that one seeds content
+    and clears probes and the environment.)
 
-    وفيه جدولُ `meta` وحده لأنّه كلُّ ما تقرأه `dao.provider_keys`؛ ومن احتاج
-    جدولاً آخر يبني قاعدتَه كـ`db` في `test_app_cache.py` — يكفي أن يضبط
-    `config.DB_PATH` بعد هذا فيغلبه.
+    And it holds the `meta` table alone because that's all `dao.provider_keys`
+    reads; whoever needs another table builds their own database like `db` in
+    `test_app_cache.py` — it's enough to set `config.DB_PATH` after this one to
+    override it.
     """
     path = tmp_path / "isolated.db"
     conn = sqlite3.connect(path)
@@ -44,13 +48,14 @@ def isolate_live_state(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setattr(config, "DB_PATH", str(path))
-    # غيرُ موجودٍ عن قصد: الغيابُ حالةٌ صالحةٌ يجب أن تُحتمَل، ولا يصحّ أن يكون
-    # البديلُ الصامتُ هو ملفَّ الأسرار الحقيقيّ.
+    # absent on purpose: absence is a valid state that must be tolerated, and
+    # the silent fallback must not be the real secrets file.
     monkeypatch.setattr(config, "CHAIN_KEYS_PATH", str(tmp_path / "isolated_keys.json"))
-    # وملفُّ اعتماد Privy معه ولنفس السبب حرفيّاً، بل أشدّ: `keystore` يحذف
-    # مفتاحاً واحداً، أمّا `account.switch` فيكتب هويّةَ الحساب كلَّها فوق
-    # `api/.privy_state.json` — واختبارٌ نسي العزل كان يُسكت الجمعَ كلَّه على
-    # هذا الجهاز، والاختبارُ يمرّ. غيرُ موجودٍ عن قصد كذلك: الغيابُ حالةٌ
-    # صالحةٌ يجب أن تُحتمَل (لم يُسجَّل دخولٌ بعد).
+    # And the Privy credential file with it, for literally the same reason —
+    # stronger, even: `keystore` deletes one key, but `account.switch` writes
+    # the whole account identity over `api/.privy_state.json` — and a test that
+    # forgot the isolation would have silenced the whole collection on this
+    # machine, while the test passed. Absent on purpose here too: absence is a
+    # valid state that must be tolerated (not signed in yet).
     monkeypatch.setattr(config, "PRIVY_STATE_PATH", str(tmp_path / "isolated_privy.json"))
     return path

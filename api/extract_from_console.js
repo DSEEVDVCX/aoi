@@ -1,13 +1,14 @@
 // ============================================================================
-//  استخراج أسرار fomo.family — الصقه في Console المتصفح (F12) بعد تسجيل الدخول
+//  Extract fomo.family secrets — paste it into the browser Console (F12) after signing in
 // ============================================================================
-//  الخطوات:
-//   1) افتح https://fomo.family في Chrome العادي وسجّل الدخول بشكل طبيعي.
-//   2) اضغط F12  ->  تبويب Console.
-//   3) الصق كل هذا الملف واضغط Enter.
-//   4) سيُنزَّل ملف باسم  privy_state.json  — انقله إلى مجلد  api/  ثم شغّل:
+//  Steps:
+//   1) Open https://fomo.family in ordinary Chrome and sign in normally.
+//   2) Press F12  ->  the Console tab.
+//   3) Paste this whole file and press Enter.
+//   4) A file named privy_state.json will be downloaded — move it to the api/
+//      folder, then run:
 //        python import_privy_state.py privy_state.json
-//  لا يوجد أي تشغيل آلي، لذا Google لا تحظرك.
+//  There is no automation of any kind, so Google doesn't block you.
 // ============================================================================
 (() => {
   const ls = window.localStorage;
@@ -33,7 +34,7 @@
   };
 
   if (!creds.refresh_token) {
-    console.error("لم أجد privy:refresh_token — تأكّد أنك سجّلت الدخول فعلاً في fomo.family.");
+    console.error("Did not find privy:refresh_token — make sure you are actually signed in to fomo.family.");
     return;
   }
 
@@ -44,7 +45,7 @@
   document.body.appendChild(a);
   a.click();
   a.remove();
-  console.log("%c[OK] تم تنزيل privy_state.json — انقله إلى مجلد api/ وشغّل import_privy_state.py",
+  console.log("%c[OK] privy_state.json downloaded — move it to the api/ folder and run import_privy_state.py",
     "color:#0a0;font-weight:bold");
-  console.log("الحقول الملتقطة:", Object.keys(creds).filter((k) => creds[k]).join(", "));
+  console.log("Captured fields:", Object.keys(creds).filter((k) => creds[k]).join(", "));
 })();

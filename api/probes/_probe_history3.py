@@ -21,7 +21,7 @@ async def main():
     creds = CredentialStore(settings.credential_state_file).load()
     client = FomoClient(session_token=creds.access_token)
 
-    # 1) أعمق: كم يوماً نرجع؟ (15 صفحة × 50)
+    # 1) deeper: how many days back? (15 pages × 50)
     print("=== DEEP WALK ===")
     last_id, oldest_seen = None, None
     total = 0
@@ -50,7 +50,7 @@ async def main():
             break
         await asyncio.sleep(1.5)
 
-    # 2) حقول الحدث: swap_buy و multi_user_buy
+    # 2) event fields: swap_buy and multi_user_buy
     print("=== EVENT FIELD SHAPES ===")
     env = await client._get(settings.upstream_alerts_path, {"limit": 50, "threshold": 0})
     ro, items = ro_items(env)

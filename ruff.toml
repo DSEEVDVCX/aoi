@@ -1,42 +1,52 @@
-# قواعدُ recorder/ و dashboard/. قبل هذا الملفّ لم يكن لهما ضبطٌ أصلاً — لا
-# pyproject في الجذر ولا ruff.toml — فكان `ruff check` يطبّق افتراضاتِ الأداة،
-# وهي تتغيّر بتغيّر نسختها: 0.15.22 تعطي صفراً، و0.16.3 تعطي 211 مخالفةً على
-# الشيفرة نفسها بلا أن يتغيّر فيها سطر. أي أنّ معنى هذا الفحص كان يختاره إصدارُ
-# ruff لا نحن، وترقيةٌ صامتةٌ تكفي لتصبيغ اللوحة بالأحمر.
+# Rules for recorder/ and dashboard/. Before this file they had no configuration
+# at all — no pyproject at the root and no ruff.toml — so `ruff check` applied
+# the tool's defaults, which change with its version: 0.15.22 gives zero
+# violations and 0.16.3 gives 211 on the same code without a single line
+# changing. In other words, the meaning of this check was chosen by the ruff
+# release, not by us, and a silent upgrade is enough to paint the dashboard red.
 #
-# والمجموعةُ الآن هي مجموعةُ `api/pyproject.toml` نفسُها (E,F,I,UP,B,SIM,RUF)
-# وفوقها BLE، فيصير للمستودَع معيارٌ واحدٌ لا معياران. وكانت هنا مجموعةٌ أضيقُ
-# (E4,E7,E9,F) حُجّتُها أنّ الرفعَ يمسّ 440 مخالفةً منها 49 من I001 في ملفّاتٍ
-# تكتب `sys.path.insert` قبل استيراد `db`/`config`، وإعادةُ ترتيبها خطرٌ لا يظهر
-# إلّا عند إعادة تشغيل مهمّةٍ طويلة. والقياسُ أسقط الحُجّة: لا ملفَّ واحدَ من
-# ملفّات I001 يكتب `sys.path.insert` أصلاً، وإصلاحُ isort في ruff يرتّب داخل
-# الكتلة المتّصلة ولا ينقل استيراداً فوق جملةٍ تنفيذيّة، فالنقلُ الخطِرُ ليس مما
-# تفعله الأداة. وبعد استثناءِ ما دونه صارت المخالفاتُ 133 لا 440.
+# The rule set is now the same as `api/pyproject.toml`'s (E,F,I,UP,B,SIM,RUF)
+# plus BLE, so the repository has one standard, not two. A narrower set used to
+# live here (E4,E7,E9,F), justified by the upgrade touching 440 violations, 49
+# of them I001 in files that write `sys.path.insert` before importing
+# `db`/`config`, where reordering is a risk that only shows up when a
+# long-running task restarts. Measurement killed the argument: not one I001
+# file writes `sys.path.insert` in the first place, and ruff's isort fix
+# reorders within the contiguous block and never moves an import above an
+# executable statement, so the dangerous move is not something the tool does.
+# After exempting the files below, violations dropped to 133 from 440.
 #
-# والمستثنى ثلاثةُ أنواعٍ لا نوعٌ واحد:
+# The ignores are three kinds, not one:
 #
-#   E501: الطولُ هنا 100 كما في api/، لكنّ العربيّةَ تُحسَب بالمحارف لا بالعرض
-#         المرئيّ فتُقاس التعليقاتُ أطولَ مما تُرى.
+#   E501: line length here is 100 as in api/, but Arabic gets counted by
+#         characters, not visual width, so comments measure longer than they
+#         look. (No longer applicable after the English translation; kept
+#         harmless.)
 #
-#   RUF001/002/003: تَعُدّ الحروفَ العربيّةَ نفسَها «محارفَ ملتبسة» — نحو 170
-#         مخالفةً في تعليقاتٍ ونصوصٍ عربيّةٍ مقصودة. القاعدةُ تحرس لغةً واحدةً
-#         وهذا المستودَع يكتب تعليقاتَه بلغتين.
+#   RUF001/002/003: they count Arabic letters themselves as "ambiguous
+#         characters" — around 170 violations in deliberately Arabic comments
+#         and strings. The rule guards a single language, and this repository
+#         used to write its comments in two. (Kept harmless after the English
+#         translation.)
 #
-#   SIM105: تطلب `contextlib.suppress` بدلاً من `try/except/pass`. والثمانيةُ
-#         والعشرونَ موضعاً كلُّها استثناءاتٌ ضيّقةٌ مسمّاةٌ أصلاً
-#         (`except (AttributeError, OSError)`) لا `except Exception`، فالقاعدةُ
-#         تبيع أسلوباً لا أماناً؛ وتحويلُها يزيد استيراداً في عشرة ملفّاتٍ
-#         ويُبطئ مساراً يُنفَّذ كلَّ دورة، بلا فارقٍ في السلوك.
+#   SIM105: asks for `contextlib.suppress` instead of `try/except/pass`. All
+#         28 sites are already narrow named exceptions
+#         (`except (AttributeError, OSError)`), not `except Exception`, so the
+#         rule sells style, not safety; converting them adds an import in ten
+#         files and slows a path that runs every cycle, with no behavioral
+#         difference.
 #
-# وBLE مُضافةٌ فوق مجموعة api/ لأنّ الشيفرةَ تطلبها بنفسها: في الشجرة أحدَ عشرَ
-# `# noqa: BLE001` بأسبابٍ مكتوبةٍ («عملةٌ واحدةٌ لا تُسقط الدورة»)، فهي مكتوبةٌ
-# على معيارٍ يرى الاستثناءَ العريض. وبإسقاط BLE تنقلب تلك الأسبابُ إلى RUF100
-# «noqa غير مستعمَل» فيُطلب حذفُها: القياسُ أعطى 207 مخالفةً بلا BLE و161 معها،
-# أي أنّ الحرسَ الأشدَّ هو الأقلُّ ضجيجاً هنا. وكلُّ موضعٍ عريضٍ باقٍ صار مُعلَّلاً
-# بجانبه؛ والجديدُ غيرُ المُعلَّل يسقط في الفحص.
+# BLE is added on top of the api/ set because the code asks for it itself:
+# there are eleven `# noqa: BLE001` in the tree with written reasons ("one
+# coin must not take down the cycle"), so they are written against a standard
+# that sees broad exceptions. Dropping BLE flips those reasons into RUF100
+# "unused noqa" and demands their removal: measurement gave 207 violations
+# without BLE and 161 with it — the stricter guard is the quieter one here.
+# Every remaining broad site is annotated beside it; a new unannotated one
+# fails the check.
 #
-# ولا يمسّ هذا الملفُّ api/: ruff يأخذ أقربَ ضبطٍ إلى الملفّ، و`api/pyproject.toml`
-# أقربُ إلى ملفّاتها من جذر المستودَع.
+# This file does not affect api/: ruff takes the configuration nearest the
+# file, and `api/pyproject.toml` is nearer to its files than the repo root.
 line-length = 100
 target-version = "py311"
 
@@ -44,16 +54,18 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 ignore = ["E501", "RUF001", "RUF002", "RUF003", "SIM105"]
 
-# استثناءٌ **مؤقّت** لا دائم. هذه الملفّات فيها عملٌ غيرُ مُلتزَمٍ لوكيلٍ آخرَ
-# يعمل الآن (آخرُ كتابةٍ فيها كانت بعد آخرِ التزامٍ لي)، وفيها 24 مخالفةً
-# موجودةً في النسخة المُلتزَمة أصلاً — قِستُها في مرآةٍ من HEAD فكانت 24 نفسَها،
-# أي أنّ تعديلاتِه لم تُدخل مخالفةً واحدة. ولم أُصلحها لأنّ إصلاحَها يقتضي
-# الكتابةَ في ملفٍّ مفتوحٍ عند غيري: تُفقَد إحدى الكتابتين، ولأنّ الالتزامَ بها
-# يحمل عملَه الناقصَ في التزامٍ باسمي.
+# A **temporary** exception, not a permanent one. These files carry uncommitted
+# work by another agent running right now (their last write came after my last
+# commit), and they hold 24 violations that already exist in the committed
+# version — measured in a worktree of HEAD, also exactly 24 — so that agent's
+# edits introduced not one violation. They were left unfixed because fixing
+# them means writing to a file someone else has open: one of the two writes is
+# lost, and committing them would carry their unfinished work under my name.
 #
-# فمَن التزم ذلك العملَ: احذف سطرَه من هنا وأصلح مخالفاتِه — القاعدةُ مكتوبةٌ
-# بجانبها فالعملُ معروفُ الحجم. وبقاءُ السطر يعني ملفّاً يمرّ الفحصَ بلا أن
-# يُفحَص، وهو بالضبط العطبُ الذي كتبتُ هذا الملفَّ لأمنعه.
+# Whoever commits that work: delete its line here and fix its violations — the
+# rule is written beside each one, so the work's size is known. A line
+# remaining here means a file that passes the check without being checked,
+# which is exactly the defect this file was written to prevent.
 [lint.per-file-ignores]
 "dashboard/tests/test_app_guards.py" = ["I001", "RUF100"]
 "dashboard/tests/test_dao.py" = ["I001"]
@@ -65,10 +77,12 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003", "SIM105"]
 "recorder/run_evm_replay.py" = ["I001"]
 "recorder/tests/test_evm_replay.py" = ["I001"]
 "recorder/tests/test_run_evm_replay.py" = ["RUF100"]
-# أرشيفُ سكربتات التشخيص الميدانيّة (295 سكربت probe_* نُقلت هنا 2026-08-29 من
-# جذر recorder/ بعد انتهاء مهمّاتها). هذه قياساتٌ خُطّت لسؤالٍ واحدٍ ثم انتهت —
-# ليست شيفرةَ إنتاجٍ ولا تُستورَد: أرشيفٌ يُقرأ للتاريخ لا ليُشغَّل. إصلاحُ
-# 691 مخالفةً فيها (E401/I001 في الغالب) يُدخل ضجيجاً في سجلٍّ يريد أن يبقى
-# كما كُتب يوم القياس. مَن يُحيي سكربتاً منها: انسخه إلى recorder/ وأصلحه هناك.
+# The archive of field-diagnostic scripts (295 probe_* files moved here on
+# 2026-08-29 from recorder/'s root after their tasks ended). These are
+# measurements written for one question and then finished — not production code
+# and never imported: an archive read for history, not to be run. Fixing 691
+# violations in it (mostly E401/I001) would inject noise into a record that
+# should stay as written on measurement day. Whoever revives one of these
+# scripts: copy it to recorder/ and fix it there.
 "recorder/probes/*" = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
 

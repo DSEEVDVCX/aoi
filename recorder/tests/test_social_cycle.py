@@ -1,4 +1,4 @@
-"""اختبارات حلقة الطبقة الاجتماعية (بلا شبكة)."""
+"""Tests of the social-layer cycle (no network)."""
 import os
 from datetime import datetime, timedelta
 
@@ -66,7 +66,8 @@ async def test_social_cycle_writes_a_snapshot_per_token(db):
 
 
 async def test_social_cycle_archives_individual_thesis_items(db):
-    """اللقطة الحيّة تحفظ العناصر الفردية اللازمة لميزات الزمن عند t0."""
+    """The live snapshot keeps the individual items needed for time features
+    at t0."""
     _watch(db, "tokA")
 
     stats = await recorder.run_social_cycle(_SocialClient(), db, NOW, sleep=_noop)
@@ -83,7 +84,7 @@ async def test_social_cycle_archives_individual_thesis_items(db):
 
 
 def test_thesis_extractor_sanitizes_lone_unicode_surrogates():
-    """نصّ التعليق الشاذ لا يجب أن يوقف إدراج دفعة الأطروحات."""
+    """A malformed comment text must not sink the thesis batch insert."""
     raw = _envelope(1)
     raw["responseObject"]["items"][0]["comment"]["comment"] = "bad\ud83dtext"
 
@@ -97,11 +98,11 @@ async def test_social_request_carries_token_and_network(db):
     client = _SocialClient()
     await recorder.run_social_cycle(client, db, NOW, sleep=_noop)
     assert client.calls[0]["tokenAddress"] == "tokA"
-    assert client.calls[0]["networkId"] == 56          # رقميّ لا نصّيّ
+    assert client.calls[0]["networkId"] == 56          # numeric, not text
 
 
 async def test_silent_token_is_recorded_as_empty_not_skipped(db):
-    """الصمت إشارة — نسجّل الصفر ولا نتخطّى العملة."""
+    """Silence is a signal — we record the zero and do not skip the token."""
     _watch(db, "tokA")
     client = _SocialClient(replies={"tokA": {"responseObject": {"items": []}}})
 
@@ -115,7 +116,8 @@ async def test_silent_token_is_recorded_as_empty_not_skipped(db):
 
 
 async def test_silent_token_is_still_refetched_later(db):
-    """بخلاف الشموع، الصمت المتكرّر لا يُستبعد: تغيّره هو المطلوب."""
+    """Unlike bars, repeated silence is not excluded: its change is what we
+    want."""
     _watch(db, "tokA")
     client = _SocialClient(replies={"tokA": {"responseObject": {"items": []}}})
     for k in range(3):
@@ -149,7 +151,7 @@ async def test_social_slice_is_capped_and_respects_refresh_window(db):
 
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     await recorder.run_social_cycle(client, db, soon, sleep=_noop)
-    # الأربعة الأولى ما تزال طازجة → تُختار الباقية فقط
+    # the first four are still fresh → only the rest get picked
     assert len(client.calls) == config.SOCIAL_PER_CYCLE + 3
 
 
@@ -166,7 +168,8 @@ def test_social_error_retry_window_is_shorter_than_success_window(db):
     assert [row["token_address"] for row in due] == ["error-token"]
 
 async def test_social_builds_a_time_series_per_token(db):
-    """سلسلة زمنية: الفرق بين لقطتين يعطي تسارع الزخم لا مستواه فقط."""
+    """A time series: the difference between two snapshots gives momentum
+    acceleration, not just its level."""
     _watch(db, "tokA")
     client = _SocialClient(replies={"tokA": _envelope(2)})
     await recorder.run_social_cycle(client, db, NOW, sleep=_noop)

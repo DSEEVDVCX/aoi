@@ -1,24 +1,29 @@
-"""سحب شموع أحداث النشاط الرجعية (activity_events) لتوسيمها.
+"""Fetch bars for retro activity_events so they can be labeled.
 
-لكل عملة في activity_events نسحب شموع 5 دقائق عبر getBarsNew حول أزمنة أحداثها
-([ts − ساعة, ts + 48س + هامش]) فتصير قابلة للتوسيم بـ compute_labels نفسها.
+For each token in activity_events we fetch 5-minute bars via getBarsNew around
+its event times ([ts − 1 hour, ts + 48h + margin]), making them labelable with
+the same compute_labels.
 
-**العناقيد الزمنية**: أحداث العملة الواحدة تُجمَّع في نوافذ مدمجة (حدثان تتقاطع
-نافذتاهما = سحب واحد) ثمّ تُقطَّع إلى ≤72 ساعة للنداء (سقف 900 شمعة = 75 ساعة).
-عملة بأحداث متفرّقة على 9 أشهر لا تُسحب كامل الفترة — فقط حول أحداثها.
+**Time clusters**: one token's events are grouped into merged windows (two
+events whose windows intersect = one fetch), then split into ≤72-hour chunks per
+call (900-bar cap = 75 hours). A token with scattered events over 9 months is
+not fetched for the whole span — only around its events.
 
-**تآكل OHLCV مقصود القياس**: عملة بلا سلسلة عند fomo (ميّتة/مُتآكلة) تُوسَم
-no_data وتُستبعد بعد MAX_ATTEMPTS — نسبتها هي **انحياز البقاء في الرجعيّ**،
-تُقرأ في التقرير لا تُخفى. الموسِّم لا يوسم حدثاً إلّا بعد status='ok' لعملته
-(بوّابة activities_pending_label)، فلا no_entry أبديّ قبل وصول الشموع.
+**OHLCV decay is a measured property**: a token with no price series at fomo
+(dead/decayed) is labeled no_data and excluded after MAX_ATTEMPTS — its share
+is the **survivorship bias of the retro set**, read in the report, not hidden.
+The labeler never labels an event until its token reaches status='ok' (the
+activities_pending_label gate), so there is no eternal no_entry before bars
+arrive.
 
-قابل للاستئناف: المكتمل (ok) يُتخطّى، والخطأ/no_data يُعاد حتى السقف. الموسِّم
-العامل كل 15 دقيقة يلتقط ما اكتمل تلقائياً.
+Resumable: completed (ok) tokens are skipped; error/no_data tokens are retried
+up to the cap. The labeler running every 15 minutes picks up completions
+automatically.
 
-الاستعمال:
-    py backfill_activity_bars.py                 # كل العملات (قابل للاستئناف)
-    py backfill_activity_bars.py --max-calls 200 # سقف نداءات لهذه الجولة
-    py backfill_activity_bars.py --dry-run       # تقرير الحجم بلا شبكة ولا كتابة
+Usage:
+    py backfill_activity_bars.py                 # all tokens (resumable)
+    py backfill_activity_bars.py --max-calls 200 # call cap for this round
+    py backfill_activity_bars.py --dry-run       # size report, no network, no writes
 """
 from __future__ import annotations
 
@@ -35,7 +40,7 @@ import config  # noqa: E402
 import extract  # noqa: E402
 from db import RecorderDB, utcnow_iso  # noqa: E402
 
-from recorder import _fetch_bars_raw  # noqa: E402  (نفس جسم الطلب المؤكَّد حيّاً)
+from recorder import _fetch_bars_raw  # noqa: E402  (same request body confirmed live)
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -44,16 +49,17 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 _PACING = 1.5
-_CHUNK_SECONDS = 72 * 3600          # دون سقف 900 شمعة (75س) بهامش
-_PRE_EVENT_SECONDS = 3600           # ساعة سياق قبل الحدث (شمعة الدخول عند/بعد ts)
+_CHUNK_SECONDS = 72 * 3600          # below the 900-bar cap (75h), with margin
+_PRE_EVENT_SECONDS = 3600           # one hour of context before the event (entry bar at/after ts)
 _MAX_ATTEMPTS = config.BARS_MAX_NO_DATA_ATTEMPTS
 
 
 def event_clusters(ts_epochs: list[int], window_h: int, margin_s: int) -> list[tuple[int, int]]:
-    """أزمنة أحداث مرتّبة تصاعدياً (epoch) → نوافذ سحب مدمجة [from, to].
+    """Ascending event times (epoch) → merged fetch windows [from, to].
 
-    حدثان فاصلهما ≤ (نافذة 48س + الهامش) تتقاطع نافذتاهما ⇒ سحب واحد. غير ذلك
-    يبدأ عنقوداً جديداً. كل نافذة = [أوّل حدث − ساعة, آخر حدث + 48س + هامش].
+    Two events ≤ (48h window + margin) apart have intersecting windows ⇒ one
+    fetch. Otherwise a new cluster starts. Each window = [first event − 1 hour,
+    last event + 48h + margin].
     """
     if not ts_epochs:
         return []
@@ -89,7 +95,7 @@ def _load_client():
 
     creds = CredentialStore(config.credential_state_path()).load()
     if creds is None or not creds.access_token:
-        raise RuntimeError("لا يوجد اعتماد صالح — شغّل خدمة الـ api أولاً.")
+        raise RuntimeError("No valid credential — start the api service first.")
     return FomoClient(session_token=creds.access_token)
 
 
@@ -139,7 +145,7 @@ async def run(
                     )
                     candles += db.insert_bars(rows)
                     got_data = got_data or bool(rows)
-                except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الجولة
+                except Exception as exc:  # noqa: BLE001 — one token must not sink the round
                     failed = True
                     db.set_meta(
                         "last_error_activity_bars",
@@ -172,12 +178,12 @@ async def main() -> None:
         except (IndexError, ValueError):
             pass
     if dry:
-        # بلا عميل ولا شبكة: تقرير الحجم فقط
+        # no client, no network: size report only
         stats = await run(None, db, max_calls=max_calls, dry_run=True)  # type: ignore[arg-type]
         total = db.activity_count()
-        print(f"أحداث: {total} · عملات ستُعالج هذه الجولة: {stats['tokens_done']}"
-              f" (مكتملة: {stats['skipped_ok']} · ميّتة: {stats['skipped_dead']})")
-        print(f"نداءات مقدّرة: {stats['calls']} ≈ {stats['calls'] * 2.2 / 60:.0f} دقيقة بلُطف {_PACING}ث")
+        print(f"events: {total} · tokens to process this round: {stats['tokens_done']}"
+              f" (done: {stats['skipped_ok']} · dead: {stats['skipped_dead']})")
+        print(f"estimated calls: {stats['calls']} ≈ {stats['calls'] * 2.2 / 60:.0f} minutes at {_PACING}s pacing")
         db.close()
         return
     client = _load_client()

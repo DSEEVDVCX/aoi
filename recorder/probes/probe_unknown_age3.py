@@ -1,18 +1,20 @@
-"""هل عملات «العمر المجهول» حديثةٌ فعلاً وقت أوّل استرجاع؟ — قياس مستقلّ.
+"""Are "unknown age" coins actually young at their first retrieval? — an independent measurement.
 
-المشكلة: 177 عملة لا صفَّ ثوابت لها إطلاقاً، فلا عمرَ عندنا ولا في أي خام
-أرشفناه (خام الإشارة يحمل وقت الصفقة لا وقت العملة، وخام tokenDetails لا يحمل
-تاريخ إنشاء أصلاً). فنقيس العمر من مصدر مستقلّ: **تاريخ الأسعار**.
+The problem: 177 coins have no constants row at all, so we have no age — neither do we
+have it in any raw data we archived (signal raw carries the trade time, not the coin's
+age, and tokenDetails raw carries no creation date at all). So we measure age from an
+independent source: **price history**.
 
-المرساة **أوّل لحظة استرجعنا فيها بيانات العملة** لا الآن: نطلب شموعاً ساعيّة
-تنتهي عند أوّل استرجاع وتبدأ قبله بخمسة أيّام. فإن وُجدت شمعة قبل أوّل استرجاع
-بيومين أو أكثر ⇒ العملة كانت ≥ يومين **في تلك اللحظة**. سؤال «كم عمرها اليوم»
-لا يُطرح إطلاقاً.
+The anchor is **the first moment we retrieved the coin's data**, not now: we request
+hourly candles ending at first retrieval and starting five days before it. If a candle
+exists two days or more before first retrieval ⇒ the coin was ≥ 2 days old **at that
+moment**. The question "how old is it today" is never asked.
 
-المعايرة أوّلاً على عملات عمرُها معروف: لو أعاد المنبع شموعاً عند حدّ النافذة
-لعملة نعرف أنّها كانت قديمة، فغيابُ الشموع دليلُ حداثةٍ لا دليلُ نقصٍ في الأرشيف.
+Calibration first on coins with a known age: if the upstream returns candles at the
+window floor for a coin we know was old, then the absence of candles is evidence of
+youth, not of a gap in the archive.
 
-قراءة فقط من القاعدة (mode=ro)؛ نداءات getBarsNew وحدها تخرج للشبكة.
+Read-only from the database (mode=ro); only getBarsNew calls go out to the network.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ import config
 import recorder
 
 LOOKBACK_DAYS = 5
-RESOLUTION = "60"          # ساعيّة: 5 أيّام = 120 شمعة، تحت سقف 900
+RESOLUTION = "60"          # hourly: 5 days = 120 candles, under the 900 cap
 YOUNG_DAYS = 2.0
 PACING = 0.35
 
@@ -76,7 +78,7 @@ def epoch(iso: str) -> int:
 
 
 async def first_candle(client, tok: str, net: str, anchor_ts: int) -> tuple[str, int | None]:
-    """يعيد (الحالة، ختم أوّل شمعة) لنافذة تنتهي عند أوّل استرجاع."""
+    """Returns (status, first-candle timestamp) for a window ending at first retrieval."""
     from fomo_api.config import settings
 
     body = {
@@ -95,9 +97,10 @@ async def first_candle(client, tok: str, net: str, anchor_ts: int) -> tuple[str,
 
 
 def classify(anchor_ts: int, first_ts: int | None, floor_ts: int) -> tuple[str, float | None]:
-    """حكمٌ من عمر أوّل شمعة. `countBack` يعيد تاريخاً أعمق من النافذة أحياناً،
-    فالعمر المقيس هو العمر الحقيقيّ لا حدَّ النافذة — والمعايرة تشهد (15.69 مقابل
-    15.7 يوماً). فالحكم على العمر نفسه، ووسمُ `at_floor` للشفافيّة فقط."""
+    """A verdict from the first candle's age. `countBack` sometimes returns history deeper
+    than the window, so the measured age is the true age, not the window floor — and
+    calibration attests to it (15.69 versus 15.7 days). The verdict is on age itself;
+    the `at_floor` flag is for transparency only."""
     if first_ts is None:
         return "no_history", None
     age_days = (anchor_ts - first_ts) / 86400.0
@@ -151,7 +154,7 @@ async def run(n_known: int, n_unknown: int) -> None:
 
     known = con.execute(KNOWN).fetchall()
     unknown = con.execute(UNKNOWN).fetchall()
-    # عيّنة موزّعة على المدى الزمنيّ كلّه لا أوّلها (خطوة ثابتة، بلا عشوائيّة)
+    # a sample spread over the whole time range, not just its head (fixed stride, no randomness)
     def spread(rows, k):
         if k >= len(rows):
             return list(rows)
@@ -179,8 +182,8 @@ async def run(n_known: int, n_unknown: int) -> None:
         if k:
             print(f"  {v:12} {k:3}  ({100.0*k/tot:.1f}%)")
 
-    # معدّل الحداثة الأساسيّ لكلّ العملات معروفة العمر — من القاعدة بلا شبكة،
-    # والمرساة نفسها (أوّل استرجاع) لا الآن. هو المرجع الذي تُقاس عليه المجهولة.
+    # baseline youth rate over all known-age coins — from the database, no network,
+    # and the same anchor (first retrieval), not now. This is the reference the unknowns are measured against.
     base_young = base_tot = 0
     for r in known:
         a = anchor(r["tok"], r["net"])

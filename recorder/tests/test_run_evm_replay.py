@@ -13,7 +13,8 @@ class _DB:
         self.meta[key] = str(value)
 
     def note_error(self, key, value):
-        """نفس عقد `db.note_error`: يكتب ويعيد نجاحاً، ولا يرفع أبداً."""
+        """Same contract as `db.note_error`: writes and returns success,
+        never raises."""
         self.meta[key] = str(value)
         return True
 
@@ -22,12 +23,12 @@ class _DB:
 
 
 class _LockedDB(_DB):
-    """قاعدةٌ مقفلة: كل كتابة دفتريّة تفشل بهدوء."""
+    """A locked database: every bookkeeping write fails quietly."""
 
     def note_error(self, _key, _value):
         return False
 
-    def set_meta(self, key, value):  # noqa: ARG002 — لو نادى أحدٌ الطريق العاري
+    def set_meta(self, key, value):  # noqa: ARG002 — if anyone ever calls the bare path
         raise RuntimeError("database is locked")
 
 
@@ -134,14 +135,17 @@ async def test_cycle_runs_live_backfill_before_historical_replay(monkeypatch):
 
 
 def test_monad_is_collected_live_but_not_replayed():
-    """مونادْ تُجمَع حيّاً ولا تُعاد تاريخيّاً — وهذا فرقٌ مقصود لا سهو.
+    """Monad is collected live but never replayed — a deliberate difference,
+    not an oversight.
 
-    الإعادة التاريخيّة تمشي دفتر كل عملة من نشأتها، وسجلّ المراقبة يحمل صفر عملة
-    مونادْ نشطة (مقابل 49 روبن‑هود و23 Base و35 BSC) وثلاثاً خاملة. ومع ذلك أخذت
-    مونادْ ثلث دورات الإعادة و2,950 نداءً مقابل **صفر** لقطة، تسجّل
-    `كتل 38963051→38963050` أي مدًى مقلوباً = لا تقدّم. فالحياة تبقى: عملة جديدة
-    قد تظهر غداً وتُجمَع من لحظتها. والإعادة تنتظر أن توجد عملة تستحقّها، ورجوعها
-    سطرٌ في `config`.
+    Historical replay walks each token's ledger from genesis, and the
+    watchlist holds zero active Monad tokens (versus 49 Robinhood, 23 Base,
+    and 35 BSC) plus three idle ones. Yet Monad took a third of the replay
+    cycles and 2,950 calls for **zero** snapshots, logging
+    `blocks 38963051→38963050` — an inverted range = no progress. So live
+    capture stays: a new token may appear tomorrow and be collected from its
+    first moment. And replay waits until a token exists that deserves it;
+    bringing it back is one line in `config`.
     """
     assert {"4663", "8453", "143"} <= set(config.EVM_NETWORKS)
     assert config.EVM_RPC_URLS["143"].startswith("https://")
@@ -167,25 +171,29 @@ def test_live_assist_prioritizes_unstarted_then_nearest_completion():
 
 
 def test_worked_counts_live_assist_stats_not_just_replay_keys():
-    """العطبُ الأصليّ: فرعُ المساعدة يعيد `evm_backfill_*` ولا `tokens` أصلاً،
-    فشرطُ `tokens or errors` أسكت السجلَّ أربع ساعات والعامل يعمل."""
+    """The original failure: the assist branch returns `evm_backfill_*` and
+    no `tokens` at all, so a `tokens or errors` condition kept the log
+    silent for four hours while the worker ran."""
     assert run_evm_replay._worked({"evm_backfill_due": 3, "evm_backfilled": 1})
     assert run_evm_replay._worked({"tokens": 1})
     assert run_evm_replay._worked({"errors": 1})
 
 
 def test_worked_ignores_labels_and_timing_so_idle_stays_idle():
-    """اسمُ الشبكة والزمنُ حاضران في كل دورة؛ لو عُدّا عملاً لصار السطر دائماً."""
+    """The network's name and the time are present in every cycle; if they
+    counted as work, the line would always be there."""
     assert not run_evm_replay._worked({
         "tokens": 0, "written": 0, "errors": 0, "network": "8453",
         "networks": 3, "refused_networks": 1, "seconds": 12.4,
     })
-    # `isinstance(True, int)` صحيحٌ في بايثون ⇒ العلمُ المنطقيّ يُستثنى صراحةً.
+    # `isinstance(True, int)` is true in Python ⇒ booleans are excluded
+    # explicitly.
     assert not run_evm_replay._worked({"skipped_all": True, "tokens": 0})
 
 
 async def test_cycle_stamps_last_ok_only_when_no_errors(monkeypatch):
-    """ختمُ «آخر نجاح» للإعادة من كاتبه — لا من المسجّل (حدُّ تقادم اللوحة)."""
+    """The "last success" stamp for replay comes from its own writer — not
+    the recorder (the dashboard's staleness bound)."""
     monkeypatch.setattr(config, "EVM_REPLAY_NETWORKS", ("8453",))
     monkeypatch.setattr(config, "EVM_REPLAY_TOKENS_PER_CYCLE", 1)
     _patch_live_evm(monkeypatch)
@@ -208,7 +216,8 @@ async def test_cycle_stamps_last_ok_only_when_no_errors(monkeypatch):
 
 
 async def test_cycle_survives_a_locked_database_at_stamp_time(monkeypatch):
-    """القفلُ عند الختم لا يُسقط دورةً كُتبت صفوفُها فعلاً — ولا يكذب «تعثّرت»."""
+    """A lock at stamp time must not fail a cycle whose rows were already
+    written — and must not lie that it "crashed"."""
     monkeypatch.setattr(config, "EVM_REPLAY_NETWORKS", ("8453",))
     monkeypatch.setattr(config, "EVM_REPLAY_TOKENS_PER_CYCLE", 1)
     _patch_live_evm(monkeypatch)

@@ -1,16 +1,18 @@
 #!/usr/bin/env pwsh
-# يشغّل كل مجموعات الاختبار الثلاث + lint + mypy strict، بلا تعديل تلقائي.
-# سابقاً كان يشغّل api/ وحدها، فبقيت اختبارات recorder/ و dashboard/ خارج التغطية
-# (واختبارات اللوحة كانت معطّلة أصلاً لغياب conftest يضيف مسارها).
+# Runs all three test suites + lint + mypy strict, with no auto-fixing.
+# It previously ran api/ alone, leaving recorder/ and dashboard/ tests outside
+# coverage (and the dashboard tests were disabled outright for lack of a
+# conftest adding their path).
 $ErrorActionPreference = "Continue"
 $root = $PSScriptRoot
 $failed = @()
 
-# اختيارُ المفسّر: `pythonLocation` أوّلاً لأنّ `setup-python` يضبطه في CI وفيه
-# ثُبِّتت الحِزم. أمّا `py` فمُشغّلٌ يحلّ إلى أحدث نسخةٍ **مسجَّلة** — وهي 3.14
-# على `windows-latest` لا 3.11 التي نصّبها العمل. بذلك مرّت ثلاثُ دفعاتٍ حمراء
-# (2026-08-11 مرّتين، و2026-08-17) بلا أن يُشغَّل اختبارٌ واحد. محلياً `py` هو
-# 3.11 نفسه فبقيت العلّةُ غيرَ مرئيّة إلّا على الخادم.
+# Interpreter choice: `pythonLocation` first because `setup-python` sets it in
+# CI and the packages were installed into it. `py` is a launcher that resolves
+# to the newest **registered** version — 3.14 on `windows-latest`, not the 3.11
+# the workflow installed. Three red batches went through that way (2026-08-11
+# twice, and 2026-08-17) with not a single test executed. Locally `py` is the
+# same 3.11, so the defect stayed invisible except on the server.
 $pythonLocation = $env:pythonLocation
 if ($pythonLocation -and (Test-Path -LiteralPath (Join-Path $pythonLocation "python.exe"))) {
     $python = Join-Path $pythonLocation "python.exe"
@@ -20,22 +22,27 @@ if ($pythonLocation -and (Test-Path -LiteralPath (Join-Path $pythonLocation "pyt
     $python = $pythonCommand.Source
 }
 
-# فحصٌ مُسبَق يقول أيَّ مفسّرٍ نستعمل. بلا هذا يُطبع "No module named pytest"
-# ستَّ مرّاتٍ ثمّ "FAILED: api, recorder, dashboard, lint…, mypy" — وهو نصٌّ
-# يُقرأ كفشلِ ثمانمئة اختبارٍ لا كمفسّرٍ خطأ، فيضيع البحثُ في المكان الخطأ.
+# A pre-check that says which interpreter we are using. Without it, "No module
+# named pytest" prints six times followed by "FAILED: api, recorder, dashboard,
+# lint..., mypy" — text that reads like eight hundred failing tests rather than
+# a wrong interpreter, sending the search to the wrong place.
 #
-# ونصوصُ المخرَج هنا ASCII وحدها، والعربيّةُ في التعليقات فقط. السببُ أنّ
-# PowerShell 5.1 يقرأ ملفَّ .ps1 بلا BOM بترميز النظام لا UTF-8، فبايتُ الشرطة
-# الطويلة (E2 80 94) يصير 0x94 أي علامةَ اقتباسٍ ذكيّةً يقبلها المحلّل خاتمةً
-# للنصّ، ثمّ تفتح الشدّةُ (D9 91 → 0x91) نصّاً لا يُغلق: خطأُ تحليلٍ يُسقط الملفَّ
-# كلَّه قبل أن يُشغَّل اختبارٌ واحد. والتعليقُ محصَّنٌ منه لأنّه يُلفظ إلى آخر
-# السطر بلا نظرٍ في الاقتباس. (وضعُ BOM يحلّها أيضاً لكنّه بايتٌ خفيّ يُسقطه أيُّ
-# محرّرٍ فيعود العطبُ صامتاً، ويُفسد سطرَ shebang أعلاه.)
+# Output strings here are ASCII only. The reason: PowerShell 5.1 reads a .ps1
+# without BOM in the system codepage, not UTF-8, so the em-dash byte pair
+# (E2 80 94) becomes 0x94 — a smart quote the parser accepts as a string
+# terminator — and an Arabic letter with a high byte opens a string that never
+# closes: a parse error that drops the whole file before a single test runs.
+# Comments are immune because they are lexed to end-of-line without regard for
+# quotes. (A BOM would fix it too, but it is an invisible byte any editor can
+# drop, silently reintroducing the defect, and it breaks the shebang line
+# above.)
 #
-# والنسخُ مطبوعةٌ معه لأنّ الفارقَ بين جهازك والخادم هو ما أعمى هذا الفحص: نفسُ
-# الالتزامِ أخضرُ هنا وأحمرُ هناك، والرسالةُ لا تقول إنّ الأداةَ اختلفت. وهي
-# مثبَّتةٌ بالضبط في `requirements-dev.txt`، فاختلافُ هذا السطر عن سطر الخادم
-# يعني أنّ بيئتَك قديمةٌ لا أنّ الشيفرةَ عطبت: أعِد التنصيب.
+# The versions are printed alongside because the difference between your
+# machine and the server is what blinded this check: the same commit green
+# here and red there, with the message never saying the tools differed. They
+# are pinned exactly in `requirements-dev.txt`, so this line differing from
+# the server's means your environment is stale, not that the code broke:
+# reinstall.
 Write-Output "python: $python"
 & $python -c "import sys, pytest, ruff, mypy; from importlib.metadata import version as v; print('deps ok on Python ' + sys.version.split()[0] + ' | pytest ' + v('pytest') + ' | pytest-asyncio ' + v('pytest-asyncio') + ' | ruff ' + v('ruff') + ' | mypy ' + v('mypy'))"
 if ($LASTEXITCODE -ne 0) {
@@ -51,9 +58,9 @@ function Invoke-Suite($name, $dir, $paths) {
     if ($LASTEXITCODE -ne 0) { $script:failed += $name }
 }
 
-# api: يُشغَّل من api/ ليلتقط pyproject (testpaths, asyncio_mode)
+# api: run from api/ so it picks up pyproject (testpaths, asyncio_mode)
 Invoke-Suite "api"       "$root\api"       "tests/"
-# recorder و dashboard: استيراد مسطّح، كلٌّ من مجلّده
+# recorder and dashboard: flat imports, each from its own folder
 Invoke-Suite "recorder"  "$root\recorder"  "tests/"
 Invoke-Suite "dashboard" "$root\dashboard" "tests/"
 
@@ -62,14 +69,15 @@ Set-Location -LiteralPath "$root\api"
 & $python -m ruff check src/ tests/
 if ($LASTEXITCODE -ne 0) { $failed += "lint(api)" }
 
-# اختباراتُ recorder/dashboard تُفحَص كاختبارات api: استثناؤها كان يخبّئ
-# ثلاثةَ عشرَ مخالفةً لا يراها أحد، بلا مقابلٍ يستحقّ.
+# recorder/dashboard tests are linted like api tests: exempting them was hiding
+# thirteen violations nobody saw, for no benefit worth having.
 Set-Location -LiteralPath $root
 & $python -m ruff check recorder/ dashboard/
 if ($LASTEXITCODE -ne 0) { $failed += "lint(recorder/dashboard)" }
 
-# رسمُ أجزاء اللوحة جافاسكربت لا يمسّه pytest: الأداتان تستخرجان الدوالّ من
-# الصفحة نفسها وتشغّلانها على حمولاتٍ خبيثة وحالات التشغيل. تُتخطّيان بلا node.
+# The dashboard's JavaScript rendering is not covered by pytest: both tools
+# extract the functions from the page itself and run them on hostile payloads
+# and operating states. Both are skipped when node is absent.
 Write-Output "`n=== PAGE (node) ==="
 if (Get-Command node -ErrorAction SilentlyContinue) {
     & node "$root\dashboard\tools\check_key_render.mjs"

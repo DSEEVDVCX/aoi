@@ -111,17 +111,17 @@ for name, w in (
     print(f"  {name:<24} {dict(r)}")
 
 # --- 8. is the flag actually reachable as 0-with-no-bars at all, or only via
-#        the early return? count rows where flag=0 and EVERY family-د col NULL
-print("\n=== 8. flag=0 rows with the entire family-د NULL ===")
+#        the early return? count rows where flag=0 and EVERY family-D col NULL
+print("\n=== 8. flag=0 rows with the entire family-D NULL ===")
 cols = ["ret_1h_before","ret_4h_before","ret_24h_before","ret_7d_before",
         "vol_24h_before","flat_ratio_24h","up_candle_ratio_24h","dist_from_ath",
         "ath_history_days","bars_history_h","bars_count_24h","bar_vol_1h",
         "bar_vol_24h","vol_surge_1h"]
 cond = " AND ".join(f"{c} IS NULL" for c in cols)
 r = con.execute(f"SELECT COUNT(*) n FROM training_rows WHERE {POP} AND ath_history_complete=0 AND {cond}").fetchone()
-print("  flag=0 with all 14 family-د cols NULL:", r["n"])
+print("  flag=0 with all 14 family-D cols NULL:", r["n"])
 r = con.execute(f"SELECT COUNT(*) n FROM training_rows WHERE {POP} AND {cond}").fetchone()
-print("  population rows with all 14 family-د cols NULL (any flag):", r["n"])
+print("  population rows with all 14 family-D cols NULL (any flag):", r["n"])
 r = con.execute(f"SELECT COUNT(*) n FROM training_rows WHERE {POP} AND {cond} AND ath_history_complete IS NULL").fetchone()
 print("     ...of which flag IS NULL:", r["n"])
 

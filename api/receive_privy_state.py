@@ -37,7 +37,7 @@ SNIPPET = (
     "const v=localStorage.getItem(k)||'';const cm=v.match(/client-[A-Za-z0-9]{20,}/);if(cm&&!c)c=cm[0];}"
     "return{access_token:g('privy:token'),refresh_token:g('privy:refresh_token'),pat:g('privy:pat'),"
     "app_id:a,client_id:c,ca_id:g('privy:caid')};})())}).then(r=>r.text()).then(t=>console.log('%c'+t,"
-    "'color:#0a0;font-weight:bold')).catch(e=>console.error('فشل الإرسال للخادم المحلي:',e));"
+    "'color:#0a0;font-weight:bold')).catch(e=>console.error('Sending to the local server failed:',e));"
 )
 
 
@@ -65,8 +65,8 @@ class _Handler(BaseHTTPRequestHandler):
             body = {}
         _received.update(body if isinstance(body, dict) else {})
         ok = bool(_received.get("refresh_token"))
-        msg = ("[OK] استُلمت الأسرار — عُد إلى الطرفية، يكمل الإعداد تلقائياً."
-               if ok else "لم أجد refresh_token — تأكّد أنك سجّلت الدخول في fomo.family.")
+        msg = ("[OK] Secrets received — go back to the terminal, setup completes automatically."
+               if ok else "Did not find refresh_token — make sure you are signed in to fomo.family.")
         payload = msg.encode("utf-8")
         self.send_response(200 if ok else 400)
         self._cors()
@@ -81,15 +81,15 @@ class _Handler(BaseHTTPRequestHandler):
 def _wait_for_creds() -> dict:
     server = HTTPServer(("127.0.0.1", PORT), _Handler)
     print("=" * 72, flush=True)
-    print(f">>> خادم محلي يعمل على http://127.0.0.1:{PORT} (لا يخرج شيء من جهازك).", flush=True)
-    print(">>> الخطوات:", flush=True)
-    print("    1) افتح https://fomo.family في متصفحك العادي وسجّل الدخول.", flush=True)
-    print("    2) اضغط F12 ثم تبويب Console.", flush=True)
-    print("    3) الصق السطر التالي كاملاً واضغط Enter:", flush=True)
+    print(f">>> Local server running at http://127.0.0.1:{PORT} (nothing leaves your machine).", flush=True)
+    print(">>> Steps:", flush=True)
+    print("    1) Open https://fomo.family in your normal browser and sign in.", flush=True)
+    print("    2) Press F12, then the Console tab.", flush=True)
+    print("    3) Paste the following line whole and press Enter:", flush=True)
     print("-" * 72, flush=True)
     print(SNIPPET, flush=True)
     print("-" * 72, flush=True)
-    print(">>> بانتظار استلام الأسرار من متصفحك...", flush=True)
+    print(">>> Waiting to receive the secrets from your browser...", flush=True)
     while not _received.get("refresh_token"):
         server.handle_request()
     server.server_close()
@@ -115,7 +115,7 @@ async def main() -> None:
     )
     store = CredentialStore(settings.credential_state_file)
     store.save(creds)
-    print(f"\n>>> حُفظت بيانات الاعتماد في {store.path} | قابلة للتجديد: {creds.is_refreshable()}", flush=True)
+    print(f"\n>>> Credentials saved to {store.path} | refreshable: {creds.is_refreshable()}", flush=True)
 
     from fomo_api.auth.token_refresher import _call_privy_refresh
 
@@ -127,9 +127,9 @@ async def main() -> None:
         )
         store.save(StoredCredentials(access_token=r.get("access"), refresh_token=r.get("refresh"), pat=r.get("pat")))
         access = r.get("access")
-        print(">>> [OK] تجديد بلا متصفح نجح — النظام سيجدّد نفسه تلقائياً من الآن.", flush=True)
+        print(">>> [OK] Browserless refresh succeeded — the system renews itself automatically from now on.", flush=True)
     except Exception as exc:
-        print(f">>> تحذير: التجديد الفوري فشل ({exc})؛ سيُستخدم الرمز الملتقط.", flush=True)
+        print(f">>> Warning: the immediate refresh failed ({exc}); the captured token will be used.", flush=True)
         access = creds.access_token
 
     from fomo_api.clients.fomo_client import FomoClient
@@ -139,12 +139,12 @@ async def main() -> None:
         lb = await client.get_leaderboard(page=1, page_size=5, period="all")
         traders = lb["traders"] if isinstance(lb, dict) else lb.traders
         total = lb["total_items"] if isinstance(lb, dict) else lb.total_items
-        print(f">>> بيانات حيّة: {total} متداولاً في المتصدّرين", flush=True)
+        print(f">>> Live data: {total} traders on the leaderboard", flush=True)
         for t in (traders[:3] if isinstance(traders, list) else traders):
             print(f"      @{t['handle'] if isinstance(t, dict) else t.handle}", flush=True)
-        print(">>> اكتمل الإعداد. شغّل الخادم وسيعمل الاستخراج تلقائياً بلا تدخّل.", flush=True)
+        print(">>> Setup complete. Start the server and extraction runs automatically with no intervention.", flush=True)
     except Exception as exc:
-        print(f">>> فشل القراءة الحيّة ({type(exc).__name__}): الرمز غير صالح أو منتهٍ. أعد المحاولة.", flush=True)
+        print(f">>> Live read failed ({type(exc).__name__}): the token is invalid or expired. Try again.", flush=True)
     finally:
         await client.aclose()
 

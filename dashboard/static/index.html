@@ -1,16 +1,18 @@
 <!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>لوحة المسجّل — Fomo Recorder</title>
+<title>Recorder Dashboard — Fomo Recorder</title>
 <style>
 /* ---------------------------------------------------------------------------
-   نظام الألوان. القيم مأخوذة من لوحة تمّ التحقّق منها آلياً (validate_palette):
-   الفئوية على السطح الداكن #141416 والفاتح #fbfbf9 تجتاز كل البوابات
-   (فصل عمى الألوان، أرضية الرؤية الطبيعية، التباين). لا تُبدّل لوناً بالحدس —
-   أعِد تشغيل المدقّق. ألوان الحالة (جيّد/تحذير/حرج) محجوزة ولا تُستعمل كسلسلة،
-   وتُشفَع دائماً بعلامة ونصّ فلا يحمل اللون المعنى وحده.
+   Color system. Values come from an automatically validated palette
+   (validate_palette): the categorical ones pass every gate (color-blindness
+   separation, normal-vision floor, contrast) on both the dark surface #141416
+   and the light #fbfbf9. Don't swap a color on intuition — re-run the checker.
+   The status colors (good/warn/critical) are reserved, never used as a series,
+   and always paired with a sign and text so color never carries the meaning
+   alone.
 --------------------------------------------------------------------------- */
 :root {
   color-scheme: dark;
@@ -22,7 +24,7 @@
   --ink: #ffffff;
   --ink-2: #c3c2b7;
   --muted: #8b8a84;
-  /* فئوية — الترتيب ثابت: اللون يتبع نوع الإشارة لا رتبتها */
+  /* categorical — the order is fixed: color follows the signal type, not its rank */
   --s1: #3987e5;   /* multi_user_buy  */
   --s2: #d95926;   /* large_buy       */
   --s3: #199e70;   /* multi_user_sell */
@@ -53,7 +55,7 @@
 }
 
 * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-/* أشرطةُ تمريرٍ بلون السطح: رقيقةٌ لا تقتطع من المحتوى */
+/* scrollbars tinted with the surface color: thin, and they take nothing from the content */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 5px; border: 2px solid var(--page); }
@@ -66,7 +68,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* --- هيكل التطبيق والتنقّل --- */
+/* --- app shell and navigation --- */
 .app-shell { min-width: 0; min-height: 100vh; }
 .sidebar {
   position: fixed; inset-block: 0; inset-inline-start: 0; z-index: 30;
@@ -75,7 +77,7 @@ body {
 }
 .side-brand { padding: 22px 20px 18px; border-bottom: 1px solid var(--line); }
 .side-brand strong { display: block; font-size: 16px; font-weight: 680; }
-/* مربّعُ هويةٍ صغيرٌ بلون التمييز — نفسُه الذي يعلّم المساحة النشطة */
+/* a small identity square in the accent color — the same one that marks the active view */
 .side-brand strong::before {
   content: ""; display: inline-block; width: 9px; height: 9px;
   border-radius: 3px; background: var(--s1);
@@ -101,7 +103,7 @@ body {
   border: 1px solid var(--line); flex: none;
 }
 .nav-link[aria-current="page"] .nav-icon { color: var(--s1); border-color: var(--s1); }
-/* مؤشّرُ «أنت هنا»: شريطٌ جانبيٌّ للمساحة النشطة يظهر ويتلاشى بنعومة */
+/* "you are here" indicator: a side bar for the active view that fades in and out smoothly */
 .nav-link::before {
   content: ""; position: absolute; inset-inline-start: 5px; top: 24%; bottom: 24%;
   width: 3px; border-radius: 2px; background: var(--s1);
@@ -110,7 +112,7 @@ body {
 .nav-link[aria-current="page"]::before { opacity: 1; }
 .nav-link:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
 .side-foot { margin-top: auto; padding: 14px 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; display: flex; align-items: center; gap: 7px; }
-/* نقطةُ الحقبة الحيّة بجانب «قراءة فقط»: نبضٌ هادئٌ يجمع لغة النقاط */
+/* the live dot next to "read-only": a calm pulse that speaks the same language as the dots */
 .side-foot::before {
   content: ""; width: 7px; height: 7px; border-radius: 50%; flex: none;
   background: var(--good); animation: pulse 3s ease-in-out infinite;
@@ -131,7 +133,7 @@ body {
 .workspace main[data-active-view="overview"] .grid2 { display: grid; }
 .page-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
 .page-head h1 { margin: 0; font-size: 22px; font-weight: 660; }
-/* خطُّ تمييزٍ قصيرٌ تحت عنوان المساحة — يظهر مع تبديل المساحة */
+/* a short accent line under the view title — appears as the view switches */
 .page-head h1::after {
   content: ""; display: block; width: 34px; height: 3px; border-radius: 2px;
   background: var(--s1); margin-top: 7px; opacity: .85;
@@ -143,7 +145,7 @@ body {
   background: var(--surface-2); border: 1px solid var(--line);
 }
 .network-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-/* سطرُ الطزاجة يمتدّ على العرض كلّه: هو وصفٌ للشبكات جميعاً لا بطاقةَ شبكة. */
+/* the freshness line spans the full width: it describes all the networks, not one network card. */
 .network-note { grid-column: 1 / -1; font-size: 11px; color: var(--muted); padding: 0 2px; }
 .network-note.warn { color: var(--warn); }
 .network-item { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
@@ -185,11 +187,11 @@ body {
   .coverage-row { grid-template-columns: 70px minmax(48px, 1fr) 72px; gap: 6px; }
 }
 
-/* --- شريط علوي --- */
+/* --- top bar --- */
 .topbar {
   position: sticky; top: 0; z-index: 20;
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  /* زجاجٌ خفيف: المحتوى يمرّ تحته بضبابيّةٍ بدل قطعٍ مصمت */
+  /* light glass: content passes under it blurred, instead of a solid cut */
   padding: 12px 22px;
   background: color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: blur(10px);
@@ -211,7 +213,7 @@ body {
 .dot.off  { background: var(--crit); }
 .dot.on.live { animation: pulse 2.4s ease-in-out infinite, ping 2.4s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
-/* هالةٌ خفيفةٌ تنبض خلف النقطة الحيّة — إشارةُ «يعمل الآن» أوضح من الوميض وحده */
+/* a soft halo pulsing behind the live dot — "running now" reads more clearly than blink alone */
 @keyframes ping {
   0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 45%, transparent); }
   70%  { box-shadow: 0 0 0 6px transparent; }
@@ -230,9 +232,9 @@ body {
 .btn[aria-pressed="true"] { color: var(--ink); border-color: var(--muted); }
 
 main { padding: 22px; max-width: 1320px; margin: 0 auto; }
-.stale { opacity: .55; transition: opacity .2s; }   /* تحديث جارٍ: لا وميض هيكل */
+.stale { opacity: .55; transition: opacity .2s; }   /* refresh in progress: no skeleton flash */
 
-/* --- بطاقات --- */
+/* --- cards --- */
 .card {
   background: var(--surface); border: 1px solid var(--line);
   border-radius: 7px; box-shadow: var(--shadow); margin-bottom: 18px;
@@ -254,12 +256,12 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 .card > .body { padding: 18px; }
 .card > .body.flush { padding: 0; }
 
-/* --- شبكة النظرة العامة --- */
+/* --- overview grid --- */
 .overview { display: grid; grid-template-columns: minmax(210px, 1fr) 3fr; gap: 18px; margin-bottom: 18px; }
 @media (max-width: 900px) { .overview { grid-template-columns: 1fr } }
 .hero { display: flex; flex-direction: column; justify-content: center; gap: 2px; }
 .hero .label { color: var(--muted); font-size: 12.5px; }
-/* أرقام كبيرة: أرقام متناسبة لا tabular — الأخيرة تجعل 121 يبدو مفكّكاً */
+/* big numbers: proportional figures, not tabular — the latter makes 121 look disjointed */
 .hero .value { font-size: 52px; font-weight: 620; letter-spacing: -.03em; line-height: 1.05; }
 .hero .delta { font-size: 12.5px; color: var(--ink-2); }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 1px; background: var(--line); border-radius: 7px; overflow: hidden; }
@@ -268,7 +270,7 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 .tile .l { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
 .tile .v { font-size: 21px; font-weight: 600; letter-spacing: -.02em; }
 .tile .d { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
-/* خطٌّ تحت الرقم يربط البلاطة بلون التمييز عند المرور عليها */
+/* a line under the number ties the tile to the accent color on hover */
 .tile .v { position: relative; display: inline-block; }
 .tile .v::after {
   content: ""; position: absolute; inset-inline: 0; bottom: -3px; height: 2px;
@@ -279,7 +281,7 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 .tile:hover .v::after { transform: scaleX(1); }
 @media (prefers-reduced-motion: reduce) { .tile .v::after { transition: none; } }
 
-/* --- شارات --- */
+/* --- badges --- */
 .badge {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 1px 8px; border-radius: 6px; font-size: 11.5px; font-weight: 550;
@@ -291,11 +293,11 @@ main { padding: 22px; max-width: 1320px; margin: 0 auto; }
 .badge.bad  { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, transparent); }
 .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 
-/* --- جداول --- */
+/* --- tables --- */
 .tablewrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td {
-  padding: 9px 16px; text-align: right; border-bottom: 1px solid var(--line);
+  padding: 9px 16px; text-align: start; border-bottom: 1px solid var(--line);
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
 th { color: var(--muted); font-weight: 600; font-size: 11.5px; letter-spacing: .01em; }
@@ -304,7 +306,7 @@ tbody tr { transition: background-color .12s ease; }
 tbody tr:hover td { background: var(--surface-2); }
 .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11.5px; color: var(--muted); }
 
-/* --- روابط خارجية إلى fomo.family --- */
+/* --- external links to fomo.family --- */
 a.ext { color: inherit; text-decoration: none; border-bottom: 1px solid transparent; }
 a.ext:hover { color: var(--s1); border-bottom-color: color-mix(in srgb, var(--s1) 45%, transparent); }
 a.ext:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 3px; }
@@ -315,25 +317,25 @@ a.ext:hover .ico, a.ext:focus-visible .ico { opacity: .75; }
 .up { color: var(--up); } .down { color: var(--down); }
 .empty { padding: 26px 18px; color: var(--muted); text-align: center; }
 
-/* --- مقياس (meter) --- */
+/* --- meter --- */
 .meter { height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; min-width: 60px; }
 .meter > i { display: block; height: 100%; border-radius: 3px; background: var(--s1); }
-/* تعبئةٌ تنزلق عند الرسم الأول — إحساسُ «القيمة تصل» بدل قفزةٍ صامتة */
+/* the fill slides in on first paint — a sense of "the value arriving" instead of a silent jump */
 .meter > i { animation: meter-in .5s ease-out; transform-origin: inline-start; }
 @keyframes meter-in { from { transform: scaleX(0); } }
 @media (prefers-reduced-motion: reduce) { .meter > i { animation: none; } }
 
-/* --- رسوم --- */
-.chart { direction: ltr; }          /* السلاسل الزمنية تسير يساراً→يميناً */
+/* --- charts --- */
+.chart { direction: ltr; }          /* time series run left-to-right */
 .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
 .legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); }
 .legend .key { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 .axis { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
-.gridline { stroke: var(--grid); stroke-width: 1; }        /* خطّ شعري مصمت، لا متقطّع */
+.gridline { stroke: var(--grid); stroke-width: 1; }        /* a hairline solid, not dashed */
 .baseline { stroke: var(--line); stroke-width: 1; }
 
-/* --- تلميح --- */
+/* --- tooltip --- */
 #tip {
   position: fixed; z-index: 60; pointer-events: none; opacity: 0;
   transition: opacity .1s; background: var(--surface); color: var(--ink);
@@ -348,19 +350,19 @@ a.ext:hover .ico, a.ext:focus-visible .ico { opacity: .75; }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr } }
-/* --- شريط الحصيلة --- */
+/* --- summary bar --- */
 .summary { display: flex; flex-wrap: wrap; gap: 0; border-bottom: 1px solid var(--line); }
 .summary .cell { padding: 12px 18px; border-inline-start: 1px solid var(--line); flex: 1 1 auto; min-width: 130px; }
 .summary .cell:first-child { border-inline-start: none; }
 .summary .cell .l { color: var(--muted); font-size: 11.5px; margin-bottom: 2px; }
 .summary .cell .v { font-size: 19px; font-weight: 600; letter-spacing: -.015em; }
 .summary .cell .d { color: var(--muted); font-size: 11px; margin-top: 1px; }
-/* شريط نسبة الرابح/الخاسر — الفصل بفجوة 2px بلون السطح لا بحدّ مرسوم */
+/* winner/loser ratio bar — separation by a 2px gap in the surface color, not a drawn border */
 .split { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin-top: 6px; gap: 2px; background: var(--surface-2); }
 .split i { display: block; height: 100%; }
 .opennote { padding: 8px 18px; color: var(--muted); font-size: 11.5px; border-bottom: 1px solid var(--line); background: var(--surface-2); }
 
-/* --- ترويسة قابلة للترتيب --- */
+/* --- sortable header --- */
 th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
 th.sortable:hover { color: var(--ink); }
 th.sortable .arrow { opacity: .35; margin-inline-start: 3px; }
@@ -371,9 +373,9 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .errline:last-child { border-bottom: none; }
 .errline.resolved { opacity: .5; }
 
-/* --- مفاتيح المزوّدين --- */
-/* نموذجُ الإضافة مكتوبٌ في HTML لا يُولَّد بـJS: اللوحة تُعيد الرسم كل 10ث،
-   ورسمُ الحقل من جديد كان سيمحو مفتاحاً نصفَ ملصوق أثناء الكتابة. */
+/* --- provider keys --- */
+/* the add form is written in HTML, not generated by JS: the panel re-renders every
+   10s, and re-drawing the field would have wiped a half-pasted key mid-typing. */
 .keyform { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .keyform select, .keyform input {
   font: inherit; font-size: 12.5px; padding: 6px 10px; border-radius: 7px;
@@ -394,9 +396,9 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .keybtn.danger:hover:not(:disabled) { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 55%, var(--line)); }
 .keymsg { font-size: 12px; }
 .keymsg.bad { color: var(--crit); } .keymsg.good { color: var(--good); } .keymsg.warn { color: var(--warn); }
-/* النقطة: دائرةٌ لا مربّع — «أمامه نقطة خضراء» كما طُلبت، وبحدٍّ لتُرى على
-   أيّ خلفيّة. والحالةُ ليست لوناً وحده: بجانبها نصٌّ يقول السبب، فمن لا يميّز
-   الأحمر من الأخضر يقرأه. */
+/* the dot: a circle, not a square — "a green dot next to it" as requested, with a
+   border so it shows on any background. And the state is not color alone: text
+   beside it states the reason, so someone who can't tell red from green reads it. */
 .keydot { width: 9px; height: 9px; border-radius: 50%; flex: none; display: inline-block;
   border: 1px solid color-mix(in srgb, var(--ink) 22%, transparent); }
 .keydot.good { background: var(--good); } .keydot.bad { background: var(--crit); }
@@ -409,11 +411,12 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .keyhead { padding: 8px 18px; border-bottom: 1px solid var(--line);
   background: var(--surface-2); font-size: 12px; color: var(--muted); }
 
-/* --- حسابُ fomo --- */
-/* التبديلُ في `details` مطويّ: أخطرُ ما تكتبه اللوحة، فلا يُفتح حقلُه بالخطأ.
-   ولا حالةَ فتحٍ تُدار بـJS — العنصرُ يحفظها بنفسه، فإعادةُ الرسم كلَّ عشر
-   ثوانٍ لا تُغلقه على مستخدمٍ في منتصف اللصق (ولذلك هو **خارج** الحاوية
-   التي تُعاد كتابتها، مثلَ نموذج إضافة المفتاح تماماً). */
+/* --- the fomo account --- */
+/* switching stays collapsed in a `details`: it's the most dangerous thing the
+   dashboard writes, so its field must not open by accident. And no open state
+   is managed by JS — the element keeps it itself, so the re-render every ten
+   seconds doesn't close it on a user mid-paste (that's why it sits **outside**
+   the container that gets rewritten, exactly like the add-key form). */
 .acctswitch { border-top: 1px solid var(--line); font-size: 12.5px; }
 .acctswitch > summary { padding: 9px 18px; cursor: pointer; color: var(--ink-2); }
 .acctswitch > summary:hover { color: var(--ink); }
@@ -421,7 +424,8 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 .acctbody { padding: 12px 18px 14px; display: flex; flex-direction: column; gap: 10px; }
 .acctnote { margin: 0; color: var(--muted); line-height: 1.7; }
 .acctrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-/* السطرُ يُقرأ يساراً-يميناً وهو شفرة: `dir=ltr` وإلّا قُرئ مبعثراً فنُسخ خطأً. */
+/* the line reads left-to-right and it is code: `dir=ltr`, or it would render
+   scrambled and get copied wrong. */
 .acctsnip { direction: ltr; text-align: left; unicode-bidi: isolate; flex: 1 1 260px;
   min-width: 0; overflow-x: auto; white-space: nowrap; padding: 7px 9px; border-radius: 7px;
   background: var(--surface-2); border: 1px solid var(--line); font-size: 11.5px; }
@@ -439,47 +443,47 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 </head>
 <body>
 <div class="app-shell">
-<aside class="sidebar" aria-label="التنقّل الرئيسي">
-  <div class="side-brand"><strong>Fomo Recorder</strong><span>مركز المراقبة والتحليل</span></div>
-  <div class="nav-label">مساحات العمل</div>
+<aside class="sidebar" aria-label="Main navigation">
+  <div class="side-brand"><strong>Fomo Recorder</strong><span>Monitoring &amp; analysis center</span></div>
+  <div class="nav-label">Workspaces</div>
   <nav class="nav">
-    <a class="nav-link" href="#overview" data-view-link="overview" aria-current="page"><span class="nav-icon">01</span>نظرة عامة</a>
-    <a class="nav-link" href="#signals" data-view-link="signals"><span class="nav-icon">02</span>الإشارات</a>
-    <a class="nav-link" href="#watchlist" data-view-link="watchlist"><span class="nav-icon">03</span>المراقبة</a>
-    <a class="nav-link" href="#performance" data-view-link="performance"><span class="nav-icon">04</span>الأداء</a>
-    <a class="nav-link" href="#health" data-view-link="health"><span class="nav-icon">05</span>صحة البيانات</a>
-    <a class="nav-link" href="#networks" data-view-link="networks"><span class="nav-icon">06</span>الشبكات</a>
-    <a class="nav-link" href="#labeling" data-view-link="labeling"><span class="nav-icon">07</span>التوسيم والنتائج</a>
+    <a class="nav-link" href="#overview" data-view-link="overview" aria-current="page"><span class="nav-icon">01</span>Overview</a>
+    <a class="nav-link" href="#signals" data-view-link="signals"><span class="nav-icon">02</span>Signals</a>
+    <a class="nav-link" href="#watchlist" data-view-link="watchlist"><span class="nav-icon">03</span>Watchlist</a>
+    <a class="nav-link" href="#performance" data-view-link="performance"><span class="nav-icon">04</span>Performance</a>
+    <a class="nav-link" href="#health" data-view-link="health"><span class="nav-icon">05</span>Data health</a>
+    <a class="nav-link" href="#networks" data-view-link="networks"><span class="nav-icon">06</span>Networks</a>
+    <a class="nav-link" href="#labeling" data-view-link="labeling"><span class="nav-icon">07</span>Labeling &amp; outcomes</a>
   </nav>
-  <div class="side-foot">قراءة فقط · تحديث تلقائي كل 10 ثوانٍ</div>
+  <div class="side-foot">Read-only · auto-refresh every 10s</div>
 </aside>
 <div class="workspace">
 <div class="topbar">
   <div class="brand">
-    <h1>لوحة المسجّل</h1>
+    <h1>Recorder dashboard</h1>
     <span class="sub">fomo.family</span>
   </div>
-  <span class="status"><span id="rec-dot" class="dot"></span><span id="rec-txt">المسجّل…</span></span>
-  <span class="status"><span id="lbl-dot" class="dot"></span><span id="lbl-txt">الموسِّم…</span></span>
-  <span class="status"><span id="api-dot" class="dot"></span><span id="api-txt">الـ API…</span></span>
+  <span class="status"><span id="rec-dot" class="dot"></span><span id="rec-txt">Recorder…</span></span>
+  <span class="status"><span id="lbl-dot" class="dot"></span><span id="lbl-txt">Labeler…</span></span>
+  <span class="status"><span id="api-dot" class="dot"></span><span id="api-txt">API…</span></span>
   <span class="spacer"></span>
   <span class="meta" id="updated">—</span>
-  <button class="btn" id="pause" aria-pressed="false" title="إيقاف/استئناف التحديث التلقائي">إيقاف مؤقّت</button>
-  <button class="btn" id="theme" title="تبديل السمة">◐</button>
+  <button class="btn" id="pause" aria-pressed="false" title="Pause/resume auto-refresh">Pause</button>
+  <button class="btn" id="theme" title="Toggle theme">◐</button>
 </div>
 
 <main data-active-view="overview">
   <div id="alert"></div>
   <div class="page-head">
-    <div><h1 id="page-title">نظرة عامة</h1><p id="page-description">حالة الالتقاط الحالية ونبض مصادر البيانات.</p></div>
-    <span class="page-kicker" id="page-kicker">آخر 24 ساعة</span>
+    <div><h1 id="page-title">Overview</h1><p id="page-description">Current capture state and the pulse of the data sources.</p></div>
+    <span class="page-kicker" id="page-kicker">Last 24 hours</span>
   </div>
 
-  <!-- نظرة عامة: رقم رئيسي واحد + بطاقات -->
+  <!-- overview: one headline number + tiles -->
   <div class="overview" data-view-section="overview">
     <div class="card" style="margin:0">
       <div class="body hero">
-        <div class="label">إشارات مسجّلة</div>
+        <div class="label">Recorded signals</div>
         <div class="value" id="hero-value">—</div>
         <div class="delta" id="hero-delta">—</div>
         <div class="chart" id="hero-spark" style="margin-top:10px"></div>
@@ -488,18 +492,18 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="tiles" id="tiles"></div>
   </div>
 
-  <!-- الرسم الأهمّ: هل الإشارة تنفع؟ -->
+  <!-- the most important chart: is the signal any good? -->
   <div class="card" data-view-section="performance">
     <header>
-      <h2>أداء الإشارات منذ الدخول</h2>
-      <span class="note">اضغط عنوان أي عمود للترتيب — يشمل كل العملات لا المعروضة فقط</span>
+      <h2>Signal performance since entry</h2>
+      <span class="note">Click any column header to sort — covers all coins, not just the displayed ones</span>
       <span class="spacer"></span>
-      <label class="note" for="perf-limit">عرض</label>
+      <label class="note" for="perf-limit">Show</label>
       <select class="btn" id="perf-limit">
         <option value="12">12</option><option value="25">25</option>
-        <option value="50">50</option><option value="100">الكل</option>
+        <option value="50">50</option><option value="100">All</option>
       </select>
-      <button class="btn" data-toggle="perf" aria-pressed="false">عرض كجدول</button>
+      <button class="btn" data-toggle="perf" aria-pressed="false">Show as table</button>
     </header>
     <div id="perf-summary"></div>
     <div class="body flush" id="perf"></div>
@@ -508,10 +512,10 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
   <div class="grid2" data-view-section="overview">
     <div class="card">
       <header>
-        <h2>تدفّق الإشارات</h2>
-        <span class="note">آخر 24 ساعة</span>
+        <h2>Signal flow</h2>
+        <span class="note">Last 24 hours</span>
         <span class="spacer"></span>
-        <button class="btn" data-toggle="timeline" aria-pressed="false">عرض كجدول</button>
+        <button class="btn" data-toggle="timeline" aria-pressed="false">Show as table</button>
       </header>
       <div class="body" id="timeline"></div>
     </div>
@@ -519,14 +523,14 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
   </div>
 
   <div class="card" data-view-section="health">
-    <header><h2>صحّة الجمع</h2></header>
+    <header><h2>Collection health</h2></header>
     <div class="body" id="health"></div>
   </div>
 
   <div class="card" data-view-section="performance">
     <header>
-      <h2>الإشارة مقابل المجموعة الضابطة</h2>
-      <span class="note">هل الإشارة تتفوّق على عملات دخلت بالاختيار العشوائي؟</span>
+      <h2>Signal vs control group</h2>
+      <span class="note">Does the signal beat coins that entered by random selection?</span>
     </header>
     <div class="body" id="control-progress" aria-live="polite"></div>
     <div class="body flush" id="comparison"></div>
@@ -534,36 +538,37 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 
   <div class="card" data-view-section="watchlist">
     <header>
-      <h2>قائمة المراقبة</h2>
-      <span class="note">نافذة 48 ساعة لكل عملة</span>
+      <h2>Watchlist</h2>
+      <span class="note">A 48-hour window per coin</span>
     </header>
     <div class="body flush tablewrap" id="watchlist"></div>
   </div>
 
   <div class="card" data-view-section="signals">
-    <header><h2>أحدث الإشارات</h2></header>
+    <header><h2>Latest signals</h2></header>
     <div class="body flush tablewrap" id="signals"></div>
   </div>
 
   <div class="card" data-view-section="health">
-    <header><h2>الأخطاء حسب المصدر</h2></header>
+    <header><h2>Errors by source</h2></header>
     <div class="body flush" id="errors"></div>
   </div>
 
   <div class="card" data-view-section="health">
     <header>
-      <h2>مفاتيح المزوّدين الخارجيّين</h2>
-      <span class="note">اسم الحساب وآخر 4 أحرف فقط — القيمة لا تُعرض ولا تُسجَّل</span>
+      <h2>External provider keys</h2>
+      <span class="note">Account name and last 4 characters only — the value is neither displayed nor logged</span>
     </header>
     <form class="body keyform" id="key-add" autocomplete="off">
-      <select id="key-provider" aria-label="المزوّد"></select>
-      <input id="key-label" type="text" maxlength="60" aria-label="اسم الحساب الذي جُلب منه المفتاح"
-             placeholder="اسم الحساب (مثلاً: الحساب الرئيسي)">
-      <!-- password + new-password: كي لا يعرض المتصفّح القيمة على الشاشة ولا
-           يحفظها في مدير كلمات المرور ولا يقترحها في حقلٍ آخر لاحقاً. -->
+      <select id="key-provider" aria-label="Provider"></select>
+      <input id="key-label" type="text" maxlength="60" aria-label="Account name the key was taken from"
+             placeholder="Account name (e.g. main account)">
+      <!-- password + new-password: so the browser neither shows the value on
+           screen, nor saves it in the password manager, nor suggests it in
+           another field later. -->
       <input id="key-value" type="password" autocomplete="new-password" spellcheck="false"
-             aria-label="قيمة المفتاح" placeholder="المفتاح — يُخزَّن في recorder/chain_keys.json">
-      <button type="submit" class="keybtn go">إضافة</button>
+             aria-label="Key value" placeholder="The key — stored in recorder/chain_keys.json">
+      <button type="submit" class="keybtn go">Add</button>
       <span class="keymsg" id="key-msg" role="status" aria-live="polite"></span>
     </form>
     <div class="body flush" id="provider-keys"></div>
@@ -571,30 +576,31 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 
   <div class="card" data-view-section="health">
     <header>
-      <h2>حساب fomo — مصدر البيانات</h2>
-      <span class="note">بصمة الهويّة وآخر 4 أحرف فقط — التوكن لا يُعرض ولا يُسجَّل</span>
+      <h2>fomo account — the data source</h2>
+      <span class="note">Identity fingerprint and last 4 characters only — the token is neither displayed nor logged</span>
     </header>
     <div class="body flush" id="fomo-account"></div>
-    <!-- التبديل مطويٌّ عن قصد: هويّةُ الحساب أخطرُ ما تكتبه اللوحة، فلا يُفتح
-         حقلُها إلّا بقصد. و`details` بلا JS ولا حالةٍ تُدار. -->
+    <!-- switching is collapsed on purpose: the account identity is the most
+         dangerous thing the dashboard writes, so its field opens only
+         deliberately. And `details` needs no JS and no managed state. -->
     <details class="acctswitch">
-      <summary>تبديل الحساب</summary>
+      <summary>Switch account</summary>
       <div class="acctbody">
         <p class="acctnote">
-          سجّل دخولك بالحساب الآخر في <span class="mono">fomo.family</span>، ثمّ افتح
-          طرفيّة المتصفّح (F12 ← Console) والصق هذا السطر — ينسخ مفاتيح Privy وحدَها
-          إلى الحافظة، لا مخزنك كلَّه:
+          Sign in with the other account on <span class="mono">fomo.family</span>, then open
+          the browser console (F12 → Console) and paste this line — it copies the Privy
+          keys alone to the clipboard, not your whole store:
         </p>
         <div class="acctrow">
           <code class="mono acctsnip" id="acct-snippet">copy(JSON.stringify(Object.fromEntries(Object.entries(localStorage).filter(([k])=&gt;k.startsWith('privy:')))))</code>
-          <button class="keybtn" id="acct-copy" type="button">انسخ السطر</button>
+          <button class="keybtn" id="acct-copy" type="button">Copy the line</button>
         </div>
         <form id="acct-form" autocomplete="off">
           <textarea id="acct-dump" rows="4" spellcheck="false" autocomplete="off"
-                    aria-label="مخزن Privy المنسوخ"
-                    placeholder='الصق هنا: {"privy:token":"…","privy:refresh_token":"…","privy:pat":"…"}'></textarea>
+                    aria-label="Copied Privy store"
+                    placeholder='Paste here: {"privy:token":"…","privy:refresh_token":"…","privy:pat":"…"}'></textarea>
           <div class="acctrow">
-            <button type="submit" class="keybtn go">بدّل الحساب</button>
+            <button type="submit" class="keybtn go">Switch account</button>
             <span class="keymsg" id="acct-msg" role="status" aria-live="polite"></span>
           </div>
         </form>
@@ -602,11 +608,11 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     </details>
   </div>
 
-  <!-- التوسيم والنتائج: ما أنتجه الخط بعد اكتمال النوافذ (48 ساعة) -->
+  <!-- labeling and outcomes: what the pipeline produced once the (48-hour) windows close -->
   <section data-view-section="labeling" hidden>
     <div class="card">
       <header>
-        <h2>بوابة المرحلة الأولى — نضج المجموعة الضابطة</h2>
+        <h2>Stage-one gate — control group maturity</h2>
         <span class="note" id="labeling-cache-note"></span>
       </header>
       <div class="body" id="labeling-gate"></div>
@@ -615,15 +621,15 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
     <div class="grid2">
       <div class="card">
         <header>
-          <h2>حصيلة الإشارات الموسومة</h2>
-          <span class="note">نوافذ 48 ساعة مكتملة — نتائج نهائية لا مراكز مفتوحة</span>
+          <h2>Labeled signal outcomes</h2>
+          <span class="note">Completed 48-hour windows — final results, not open positions</span>
         </header>
         <div class="body" id="labeling-signal"></div>
       </div>
       <div class="card">
         <header>
-          <h2>حصيلة الضابطة الموسومة</h2>
-          <span class="note">نفس الكون، دخول بالاختيار العشوائي لا بالإشارة</span>
+          <h2>Labeled control outcomes</h2>
+          <span class="note">Same universe, entered by random selection rather than by signal</span>
         </header>
         <div class="body" id="labeling-control"></div>
       </div>
@@ -631,24 +637,24 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 
     <div class="card">
       <header>
-        <h2>التوسيم اليومي</h2>
-        <span class="note">كل الأنواع — آخر 14 يومًا</span>
+        <h2>Daily labeling</h2>
+        <span class="note">All kinds — last 14 days</span>
       </header>
       <div class="body" id="labeling-days"></div>
     </div>
 
     <div class="card">
       <header>
-        <h2>صفوف التدريب</h2>
-        <span class="note">جاهزية النمذجة — التدريب المعتمد ينتظر البوابة</span>
+        <h2>Training rows</h2>
+        <span class="note">Modeling readiness — approved training waits for the gate</span>
       </header>
       <div class="body" id="labeling-training"></div>
     </div>
 
     <div class="card">
       <header>
-        <h2>حصيلة التوسيم حسب النوع والحالة</h2>
-        <span class="note">أين ذهبت كل عيّنة ولماذا</span>
+        <h2>Labeling outcomes by kind and status</h2>
+        <span class="note">Where every sample went, and why</span>
       </header>
       <div class="body flush tablewrap" id="labeling-status"></div>
     </div>
@@ -656,7 +662,7 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 
   <section data-view-section="networks" hidden>
     <div class="network-grid" id="network-summary">
-      <div class="card"><div class="body empty">جارٍ تحميل ملخص الشبكات…</div></div>
+      <div class="card"><div class="body empty">Loading network summary…</div></div>
     </div>
   </section>
 </main>
@@ -668,28 +674,32 @@ th.sortable[aria-sort] .arrow { opacity: 1; }
 <script>
 "use strict";
 const REFRESH_MS = 10000;
-/* اللوحاتُ الثقيلة تُطلب كلَّ سادس تحديث (دقيقة) لا كلَّ عشر ثوانٍ: أرقامُها
-   تاريخيّة تُعرض مضغوطةً، والخادمُ يخزّنها مؤقّتاً بعُمر 60–120 ثانية أصلاً
-   (`cache.py`) — فسؤالُها ستَّ مرّاتٍ في الدقيقة يُعيد الجوابَ نفسَه ستّاً.
-   وبين الطلبين تُعاد آخرُ حمولةٍ من `heavy` فلا تفرغ لوحةٌ ولا تُرسم فارغة. */
+/* Heavy panels are requested on every sixth refresh (a minute), not every ten
+   seconds: their numbers are historical, displayed compressed, and the server
+   already caches them with a 60–120s lifetime (`cache.py`) — so asking six
+   times a minute returns the same answer six times. Between requests the last
+   `heavy` payload is reused, so no panel empties or renders blank. */
 const HEAVY_EVERY = 6;
 const DASHBOARD_TOKEN = "__DASHBOARD_TOKEN__";
 let dashboardToken = DASHBOARD_TOKEN;
 
-/* ألوان السلاسل تُقرأ من CSS فتتبع السمة تلقائياً. اللون يتبع **نوع الإشارة**
-   لا ترتيبها — وإلّا أعادت الفلترة طلاء السلاسل الباقية وضلّل القارئ. */
+/* Series colors are read from CSS, so they follow the theme automatically. The
+   color follows the **signal type**, not its rank — otherwise filtering would
+   repaint the remaining series and mislead the reader. */
 const TYPE_META = {
-  multi_user_buy:  { css: "--s1", label: "شراء متعدّد" },
-  large_buy:       { css: "--s2", label: "شراء كبير" },
-  multi_user_sell: { css: "--s3", label: "بيع متعدّد" },
+  multi_user_buy:  { css: "--s1", label: "Multi-buy" },
+  large_buy:       { css: "--s2", label: "Large buy" },
+  multi_user_sell: { css: "--s3", label: "Multi-sell" },
 };
-/* ---------- روابط fomo.family ----------
-   مسار صفحة العملة `/tokens/:chain/:tokenAddress` حيث `:chain` **اسم مختصر لا
-   معرّف رقميّ**: كود الموقع يقرأه كمفتاح في خريطة (`chain ? map[chain] : undefined`).
-   الخريطة أدناه منسوخة حرفياً من حزمة الموقع (chains-*.js):
+/* ---------- fomo.family links ----------
+   The coin page route is `/tokens/:chain/:tokenAddress` where `:chain` is a
+   **short slug, not a numeric id**: the site's code reads it as a key in a map
+   (`chain ? map[chain] : undefined`). The map below is copied verbatim from the
+   site's bundle (chains-*.js):
        se = {solana:1399811149, base:8453, monad:143, bnb:56,
              ethereum:1, hyperliquid:1337, robinhood:4663}
-   شبكة غير معروفة ⇒ **لا رابط** بدل رابط مُخمَّن يقود إلى صفحة معطوبة. */
+   An unknown network ⇒ **no link**, rather than a guessed link leading to a
+   broken page. */
 const CHAIN_SLUG = {
   "1399811149": "solana", "8453": "base", "143": "monad",
   "56": "bnb", "1": "ethereum", "1337": "hyperliquid", "4663": "robinhood",
@@ -705,18 +715,18 @@ function fomoUserUrl(handle) {
   return handle ? `${FOMO}/u/${encodeURIComponent(handle)}` : null;
 }
 
-/** نصّ مرتبط بصفحة fomo، أو النصّ وحده إن تعذّر بناء الرابط. */
+/** Text linked to the fomo page, or the text alone if the link can't be built. */
 function extLink(url, html, title) {
   if (!url) return html;
   return `<a class="ext" href="${esc(url)}" target="_blank" rel="noopener noreferrer"
-    title="${esc(title || "فتح في fomo.family")}">${html}<span class="ico" aria-hidden="true">↗</span></a>`;
+    title="${esc(title || "open on fomo.family")}">${html}<span class="ico" aria-hidden="true">↗</span></a>`;
 }
 
 const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const typeColor = (t) => cssVar(TYPE_META[t]?.css || "--muted");
 const typeLabel = (t) => TYPE_META[t]?.label || t;
 
-/* ---------- أدوات ---------- */
+/* ---------- utilities ---------- */
 const esc = (s) => s == null ? "—" : String(s).replace(/[&<>"']/g,
   c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 
@@ -732,7 +742,7 @@ function compact(n) {
   if (a >= 1e4) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
   return num(n);
 }
-/* أسعار العملات الصغيرة تحتاج أرقاماً معنوية لا منازل عشرية ثابتة */
+/* small coin prices need significant digits, not fixed decimal places */
 function price(p) {
   if (p == null || !isFinite(p)) return "—";
   if (p === 0) return "0";
@@ -743,7 +753,7 @@ function pct(v, { sign = true, digits = 1 } = {}) {
   if (v == null || !isFinite(v)) return "—";
   return (sign && v > 0 ? "+" : "") + v.toFixed(digits) + "%";
 }
-/* الاتجاه يُشفَع بعلامة ونصّ، فلا يحمل اللون المعنى وحده */
+/* direction is paired with a sign and text, so color never carries the meaning alone */
 function signed(v, digits = 1) {
   if (v == null || !isFinite(v)) return `<span class="num">—</span>`;
   const cls = v > 0 ? "up" : v < 0 ? "down" : "";
@@ -751,13 +761,14 @@ function signed(v, digits = 1) {
 }
 const shortAddr = (a) => !a ? "—" : (a.length > 14 ? a.slice(0, 6) + "…" + a.slice(-4) : a);
 
-/** مدّةٌ بالثواني إلى نصٍّ عربيّ. مفصولةٌ عن `ago` لأنّ بعضَ ما نعرضه يأتي
-    مدّةً محسوبةً في الخادم لا وقتاً مطلقاً، وسلّمُ الوحدات يجب أن يكون واحداً. */
+/** A duration in seconds, as text. Separate from `ago` because some of what we
+    display arrives as a duration computed on the server, not an absolute time,
+    and the unit ladder must be one. */
 function dur(s) {
-  if (s < 60) return Math.round(s) + " ث";
-  if (s < 3600) return Math.round(s / 60) + " د";
-  if (s < 86400) return Math.round(s / 3600) + " س";
-  return Math.round(s / 86400) + " ي";
+  if (s < 60) return Math.round(s) + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  if (s < 86400) return Math.round(s / 3600) + "h";
+  return Math.round(s / 86400) + "d";
 }
 
 function ago(iso) {
@@ -766,25 +777,26 @@ function ago(iso) {
   if (isNaN(t)) return esc(iso);
   return dur(Math.max(0, (Date.now() - t) / 1000));
 }
-// «أوّل التقاط» ≠ «بداية الدورة». `watchlist.first_seen_at` يُكتب فوقه عند كل
-// إعادة قبول بعد انتهاء النافذة، فعملة مُلتقطة منذ 7 أيام كانت تبدو عمرها 22
-// ساعة. العمر الحقيقي من `watch_windows` (سجلّ لا يُكتب فوقه)، وعمر الدورة
-// يبقى مذكوراً بعده حين يختلفان — الرقمان مختلفان المعنى وكلاهما مطلوب.
+// "First catch" ≠ "cycle start". `watchlist.first_seen_at` gets overwritten on
+// every re-admission after the window closes, so a coin first caught 7 days ago
+// used to look 22 hours old. The true age comes from `watch_windows` (a log
+// that is never overwritten), and the cycle age stays mentioned after it when
+// the two differ — the two numbers mean different things and both are needed.
 function firstCatch(w) {
   const ever = w.first_ever_at || w.first_seen_at;
   const cycle = w.first_seen_at;
   const same = !cycle || !ever || Math.abs(Date.parse(cycle) - Date.parse(ever)) < 60000;
   if (same) return ago(ever);
-  return `${ago(ever)} <span class="meta">(دورة ${ago(cycle)})</span>`;
+  return `${ago(ever)} <span class="meta">(cycle ${ago(cycle)})</span>`;
 }
 
 function remaining(iso) {
   const t = Date.parse(iso);
   if (isNaN(t)) return { txt: "—", frac: 0 };
   const s = (t - Date.now()) / 1000;
-  if (s <= 0) return { txt: "انتهى", frac: 0 };
+  if (s <= 0) return { txt: "closed", frac: 0 };
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-  return { txt: `${h}س ${m}د`, frac: Math.max(0, Math.min(1, s / (48 * 3600))) };
+  return { txt: `${h}h ${m}m`, frac: Math.max(0, Math.min(1, s / (48 * 3600))) };
 }
 
 async function getJSON(url) {
@@ -806,11 +818,11 @@ async function refreshDashboardToken() {
     cache: "no-store",
     headers: { Accept: "text/html" },
   });
-  if (!response.ok) throw new Error(`تعذّر تحديث رمز حماية اللوحة (${response.status})`);
+  if (!response.ok) throw new Error(`failed to refresh the dashboard security token (${response.status})`);
   const html = await response.text();
   const match = html.match(/(?:const|let) dashboardToken = "([0-9a-f]{64})"/i)
     || html.match(/const DASHBOARD_TOKEN = "([0-9a-f]{64})"/);
-  if (!match) throw new Error("لم يُعثر على رمز حماية جديد");
+  if (!match) throw new Error("no new security token found");
   dashboardToken = match[1];
 }
 
@@ -823,7 +835,7 @@ async function postJSON(url, payload, retried = false) {
   });
   const data = await response.json().catch(() => ({}));
   if (response.status === 403 && !retried &&
-      String(data.error || "").includes("رمز حماية اللوحة")) {
+      String(data.error || "").includes("dashboard token")) {
     await refreshDashboardToken();
     return postJSON(url, payload, true);
   }
@@ -831,7 +843,7 @@ async function postJSON(url, payload, retried = false) {
   return data;
 }
 
-/* ---------- تلميح مشترك ---------- */
+/* ---------- shared tooltip ---------- */
 const tip = document.getElementById("tip");
 function showTip(evt, html) {
   tip.innerHTML = html;
@@ -846,7 +858,7 @@ function showTip(evt, html) {
 const hideTip = () => { tip.style.opacity = "0"; };
 addEventListener("scroll", hideTip, { passive: true });
 
-/* ---------- رسوم SVG (بلا أي مكتبة خارجية) ---------- */
+/* ---------- SVG charts (no external library) ---------- */
 const NS = "http://www.w3.org/2000/svg";
 const el = (n, attrs = {}) => {
   const e = document.createElementNS(NS, n);
@@ -854,7 +866,7 @@ const el = (n, attrs = {}) => {
   return e;
 };
 
-/** خطّ صغير بلا محاور — يرافق رقماً، لا يحلّ محلّه. */
+/** A tiny axisless line — it accompanies a number, it doesn't replace it. */
 function sparkline(values, { w = 240, h = 44, color = "var(--s1)" } = {}) {
   const svg = el("svg", { viewBox: `0 0 ${w} ${h}`, role: "img", preserveAspectRatio: "none" });
   if (!values || values.length < 2) return svg;
@@ -873,16 +885,17 @@ function sparkline(values, { w = 240, h = 44, color = "var(--s1)" } = {}) {
 }
 
 /**
- * أعمدة مكدّسة: الإشارات لكل ساعة حسب النوع.
- * مواصفات مفروضة: سُمك العمود ≤24px، طرف علويّ مستدير 4px وقاعدة مربّعة،
- * فجوة 2px بلون السطح بين المقاطع (الفصل بالفراغ لا بحدّ مرسوم).
+ * Stacked columns: signals per hour by type.
+ * Imposed spec: column width ≤24px, a 4px rounded top with a square base, and
+ * a 2px surface-colored gap between segments (separation by space, not a
+ * drawn border).
  */
 function stackedColumns(data, { height = 190 } = {}) {
   const box = document.createElement("div");
   box.className = "chart";
   const { hours, types, series } = data;
   if (!hours.length || !types.length) {
-    box.innerHTML = `<div class="empty">لا إشارات في هذه المدّة.</div>`;
+    box.innerHTML = `<div class="empty">No signals in this period.</div>`;
     return box;
   }
   const W = 720, H = height, m = { t: 10, r: 8, b: 22, l: 34 };
@@ -896,9 +909,9 @@ function stackedColumns(data, { height = 190 } = {}) {
   const y = (v) => m.t + ph - (v / top) * ph;
 
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
-  // append() يعيد undefined — لا تُسلسل .textContent عليه
+  // append() returns undefined — don't chain .textContent onto it
   const title = el("title", {});
-  title.textContent = "الإشارات لكل ساعة حسب النوع";
+  title.textContent = "Signals per hour by type";
   svg.append(title);
 
   for (let g = 0; g <= top; g += step) {
@@ -916,7 +929,7 @@ function stackedColumns(data, { height = 190 } = {}) {
       const v = series[t][i] || 0;
       if (!v) return;
       const y0 = y(acc), y1 = y(acc + v);
-      // فجوة 2px تفصل المقاطع، وتُقتطع فقط إن كان المقطع يحتملها
+      // a 2px gap separates segments, deducted only if the segment can afford it
       const gap = acc > 0 ? 2 : 0;
       const hgt = Math.max(1, y0 - y1 - gap);
       const isTop = acc + v >= totals[i] - 1e-9;
@@ -927,17 +940,17 @@ function stackedColumns(data, { height = 190 } = {}) {
       parts.push({ t, v });
       acc += v;
     });
-    // منطقة التقاط عريضة: الهدف أكبر من العمود نفسه
+    // a wide hit area: the target is bigger than the column itself
     const hit = el("rect", { x: m.l + band * i, y: m.t, width: band, height: ph, fill: "transparent" });
     hit.style.cursor = "crosshair";
-    const label = new Date(hIso + "Z").toLocaleString("ar-EG", { hour: "2-digit", day: "numeric", month: "short" });
+    const label = new Date(hIso + "Z").toLocaleString("en-US", { hour: "2-digit", day: "numeric", month: "short" });
     hit.addEventListener("mousemove", (e) => showTip(e, tipHtml(label, parts, totals[i])));
     hit.addEventListener("mouseleave", hideTip);
     svg.append(hit);
 
     if (i % Math.ceil(hours.length / 6) === 0) {
       const tx = el("text", { x: cx, y: H - 6, class: "axis", "text-anchor": "middle" });
-      tx.textContent = new Date(hIso + "Z").toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+      tx.textContent = new Date(hIso + "Z").toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
       svg.append(tx);
     }
   });
@@ -949,11 +962,11 @@ function stackedColumns(data, { height = 190 } = {}) {
     const rows = parts.map(p =>
       `<div class="r"><span class="k"><i class="key" style="background:${typeColor(p.t)}"></i>${esc(typeLabel(p.t))}</span><span class="v">${p.v}</span></div>`
     ).join("");
-    return `<div class="t">${esc(label)}</div>${rows}<div class="r" style="margin-top:5px;border-top:1px solid var(--line);padding-top:5px"><span class="k">المجموع</span><span class="v">${total}</span></div>`;
+    return `<div class="t">${esc(label)}</div>${rows}<div class="r" style="margin-top:5px;border-top:1px solid var(--line);padding-top:5px"><span class="k">Total</span><span class="v">${total}</span></div>`;
   }
 }
 
-/** مسار مستطيل بطرف علويّ مستدير وقاعدة مربّعة (ينمو من خطّ أساس واحد). */
+/** A rectangle path with a rounded top and a square base (grows from one baseline). */
 function roundedTop(x, y, w, h, r) {
   r = Math.max(0, Math.min(r, w / 2, h));
   return `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h} Z`;
@@ -963,46 +976,49 @@ function niceStep(max) {
   return Math.max(1, [1, 2, 5, 10].find(m => m * mag >= raw) * mag);
 }
 
-/* ---------- عرض الحالة ---------- */
+/* ---------- status display ---------- */
 function renderStatus(st) {
   const dot = document.getElementById("rec-dot"), txt = document.getElementById("rec-txt");
   if (st.alive) {
-    // تجمّد الـ feed المصدر لا يعني توقّف المسجّل — ولا يجوز خلطهما: الأرشيف
-    // في الحالتين "بلا إشارات"، والفرق بين سوق هادئ ومصدر منقطع حاسم.
+    // a frozen upstream feed doesn't mean the recorder stopped — and the two
+    // must not be conflated: the archive says "no signals" in both cases, and
+    // the difference between a quiet market and a dead source is decisive.
     if (st.feed_stale) {
-      // نذكر الواقعة لا الحكم: 17 دقيقة قد تكون سوقاً هادئاً وقد تكون انقطاعاً،
-      // والتمييز للقارئ. الادّعاء بـ"متجمّد" عند 15 دقيقة إنذار كاذب متكرّر.
+      // state the event, not the verdict: 17 quiet minutes may be a calm market
+      // or an outage, and telling them apart is the reader's job. Claiming
+      // "frozen" at 15 minutes would be a recurring false alarm.
       dot.className = "dot warn";
-      txt.textContent = `المسجّل يعمل · آخر حدث في الـ feed قبل ${ago(st.last_feed_event_at)}`;
+      txt.textContent = `Recorder running · last feed event ${ago(st.last_feed_event_at)} ago`;
     } else {
       dot.className = "dot on live";
-      txt.textContent = `المسجّل يعمل · ${num(st.cycles_total)} دورة`;
+      txt.textContent = `Recorder running · ${num(st.cycles_total)} cycles`;
     }
   } else {
     dot.className = "dot off";
     const s = st.seconds_since_last_cycle;
-    txt.textContent = "المسجّل متوقّف" + (s != null ? ` · آخر دورة قبل ${ago(st.last_cycle_at)}` : "");
+    txt.textContent = "Recorder stopped" + (s != null ? ` · last cycle ${ago(st.last_cycle_at)} ago` : "");
   }
   renderLabeler(st);
 }
 function renderLabeler(st) {
-  // موت الموسِّم صامت تماماً (لا أخطاء ولا انهيار دورات) بينما تتوقّف النتائج
-  // عن التراكم — لا ينكشف إلّا بمؤشّر مستقل كهذا.
+  // the labeler dies completely silently (no errors, no cycle crashes) while
+  // outcomes stop accumulating — nothing exposes it except an independent
+  // indicator like this one.
   const dot = document.getElementById("lbl-dot"), txt = document.getElementById("lbl-txt");
   if (st.labeler_stale) {
     dot.className = "dot off";
-    txt.textContent = "الموسِّم متوقّف" +
-      (st.labeler_last_run_at ? ` · آخر دورة قبل ${ago(st.labeler_last_run_at)}` : " · لم يعمل بعد");
+    txt.textContent = "Labeler stopped" +
+      (st.labeler_last_run_at ? ` · last run ${ago(st.labeler_last_run_at)} ago` : " · never ran");
   } else {
     dot.className = "dot on";
-    txt.textContent = `الموسِّم يعمل · قبل ${ago(st.labeler_last_run_at)}`;
+    txt.textContent = `Labeler running · ${ago(st.labeler_last_run_at)} ago`;
   }
 }
 function renderApi(h) {
   const dot = document.getElementById("api-dot"), txt = document.getElementById("api-txt");
-  if (h.connected && !h.degraded) { dot.className = "dot on"; txt.textContent = `الـ API متصل · ${h.latency_ms ?? "?"}ms`; }
-  else if (h.connected) { dot.className = "dot warn"; txt.textContent = `الـ API معطوب (${esc(h.status ?? h.http_status)})`; }
-  else { dot.className = "dot off"; txt.textContent = `الـ API منقطع${h.detail ? " · " + esc(h.detail) : ""}`; }
+  if (h.connected && !h.degraded) { dot.className = "dot on"; txt.textContent = `API connected · ${h.latency_ms ?? "?"}ms`; }
+  else if (h.connected) { dot.className = "dot warn"; txt.textContent = `API degraded (${esc(h.status ?? h.http_status)})`; }
+  else { dot.className = "dot off"; txt.textContent = `API disconnected${h.detail ? " · " + esc(h.detail) : ""}`; }
 }
 
 function renderHero(counts, timeline) {
@@ -1012,7 +1028,7 @@ function renderHero(counts, timeline) {
     : [];
   const last24 = series.reduce((a, b) => a + b, 0);
   document.getElementById("hero-delta").textContent =
-    series.length ? `${num(last24)} إشارة في آخر 24 ساعة` : "لا بيانات بعد";
+    series.length ? `${num(last24)} signals in the last 24 hours` : "No data yet";
   const host = document.getElementById("hero-spark");
   host.replaceChildren(sparkline(series, { w: 240, h: 40 }));
 }
@@ -1024,38 +1040,38 @@ function renderTiles(st, counts, bars, storage, api, labeling) {
   const paused = st.evm_admission_paused_networks || [];
   const admissionText = Object.keys(admission).length
     ? Object.entries(admission).map(([network, state]) =>
-        `${network}: ${state.percent}%${state.paused ? " متوقف" : " متاح"}`
+        `${network}: ${state.percent}%${state.paused ? " paused" : " available"}`
       ).join(" · ")
-    : "لا توجد حالة per-network بعد";
+    : "No per-network state yet";
   const admissionDetail = paused.length
-    ? `متوقف: ${paused.join(", ")}`
-    : "كل شبكة تقاس بميزانية RPC مستقلة";
+    ? `Paused: ${paused.join(", ")}`
+    : "Every network is measured with its own RPC budget";
   const items = [
-    { l: "عملات مراقَبة", v: num(st.active_watch_count), d: "نافذة 48 ساعة" },
-    { l: "تغطية الشموع", v: bars.coverage_pct != null ? bars.coverage_pct + "%" : "—",
-      d: `${num(bars.with_bars)} من ${num(bars.active)} لها سلسلة سعرية` },
-    { l: "شموع OHLCV", v: compact(bars.candles), d: "مصدر التوسيم" },
-    { l: "لقطات سوق", v: compact(counts.market_ticks), d: "من trending/verified" },
-    { l: "نتائج موسومة", v: num(counts.outcomes), d: "نوافذ 48 ساعة مكتملة" },
-    { l: "حجم القاعدة", v: size, d: storage.disk_warning
-      ? `⚠ متبقّي ${storage.disk_free_gb} GB فقط`
-      : storage.mb_per_day != null ? `+${storage.mb_per_day} MB/يوم` : "—" },
-    { l: "زمن الـ API", v: api.latency_ms != null ? api.latency_ms + " ms" : "—",
-      d: st.cycle_crashes ? `${st.cycle_crashes} انهيار دورة` : "بلا انهيارات" },
-    { l: "قبول EVM حسب الشبكة", v: admissionText, d: admissionDetail },
+    { l: "Watched coins", v: num(st.active_watch_count), d: "48-hour window" },
+    { l: "Candle coverage", v: bars.coverage_pct != null ? bars.coverage_pct + "%" : "—",
+      d: `${num(bars.with_bars)} of ${num(bars.active)} have a price series` },
+    { l: "OHLCV candles", v: compact(bars.candles), d: "The labeling source" },
+    { l: "Market snapshots", v: compact(counts.market_ticks), d: "From trending/verified" },
+    { l: "Labeled outcomes", v: num(counts.outcomes), d: "Completed 48-hour windows" },
+    { l: "Database size", v: size, d: storage.disk_warning
+      ? `⚠ only ${storage.disk_free_gb} GB left`
+      : storage.mb_per_day != null ? `+${storage.mb_per_day} MB/day` : "—" },
+    { l: "API latency", v: api.latency_ms != null ? api.latency_ms + " ms" : "—",
+      d: st.cycle_crashes ? `${st.cycle_crashes} cycle crashes` : "No crashes" },
+    { l: "EVM admission by network", v: admissionText, d: admissionDetail },
   ];
-  // بوابة المرحلة الأولى في النظرة العامة — من بيانات التوسيم المخزَّنة مؤقّتاً
+  // the stage-one gate in the overview — from the cached labeling data
   if (labeling && labeling.gate) {
     const g = labeling.gate;
-    const gateD = labeling.last_labeled_at ? `آخر توسيم ${ago(labeling.last_labeled_at)}` : "لم يُوسَّم بعد";
+    const gateD = labeling.last_labeled_at ? `last labeled ${ago(labeling.last_labeled_at)} ago` : "not labeled yet";
     items.push({
-      l: "بوابة المرحلة الأولى",
+      l: "Stage-one gate",
       v: `${num(g.completed)} / ${num(g.decision_target)}`,
       d: g.decision_ready
-        ? "✓ مفتوحة — القرار متاح"
+        ? "✓ open — the decision is available"
         : g.eta
-          ? `${num(g.remaining)} متبقّي · ~${num(g.eta.days)} يوم (${num(g.avg_per_day)}/يوم)`
-          : `${num(g.remaining)} متبقّي · ${gateD}`,
+          ? `${num(g.remaining)} left · ~${num(g.eta.days)} days (${num(g.avg_per_day)}/day)`
+          : `${num(g.remaining)} left · ${gateD}`,
     });
   }
   document.getElementById("tiles").innerHTML = items.map(i =>
@@ -1063,21 +1079,22 @@ function renderTiles(st, counts, bars, storage, api, labeling) {
   ).join("");
 }
 
-/* --- أداء الإشارات: أشرطة أفقية + sparkline لكل صفّ --- */
+/* --- signal performance: horizontal bars + a sparkline per row --- */
 const asTable = { perf: false, timeline: false };
-/* حالة الترتيب تُرسل إلى الخادم: الترتيب يجب أن يجري على المجموعة كاملة قبل
-   الاقتطاع، وإلّا أعطى العكسُ «أفضل N مقلوبة» لا الأسوأ فعلاً. */
+/* Sort state is sent to the server: sorting must run over the full set before
+   truncation, or descending order would give "the top N inverted", not the
+   actual worst. */
 const perfSort = { key: "peak_pct", dir: "desc" };
 let perfLimit = 12;
 
 const PERF_COLS = [
-  { key: "symbol",        label: "العملة" },
-  { key: null,            label: "النوع" },
-  { key: "peak_pct",      label: "أعلى ارتفاع بعد الإشارة", width: "30%" },
-  { key: "change_pct",    label: "الآن" },
-  { key: "from_peak_pct", label: "من القمّة" },
-  { key: null,            label: "المسار" },
-  { key: "first_seen_at", label: "دخول" },
+  { key: "symbol",        label: "Coin" },
+  { key: null,            label: "Type" },
+  { key: "peak_pct",      label: "Peak gain after signal", width: "30%" },
+  { key: "change_pct",    label: "Now" },
+  { key: "from_peak_pct", label: "From peak" },
+  { key: null,            label: "Path" },
+  { key: "first_seen_at", label: "Entry" },
 ];
 
 function sortableTh(c) {
@@ -1086,14 +1103,14 @@ function sortableTh(c) {
   const arrow = active ? (perfSort.dir === "desc" ? "▼" : "▲") : "↕";
   return `<th class="sortable" data-sort="${c.key}"${c.width ? ` style="width:${c.width}"` : ""}
     ${active ? `aria-sort="${perfSort.dir === "desc" ? "descending" : "ascending"}"` : ""}
-    title="ترتيب حسب ${esc(c.label)}">${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
+    title="Sort by ${esc(c.label)}">${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
 }
 
 function renderPerf(rows) {
   const host = document.getElementById("perf");
   if (!rows.length) {
-    host.innerHTML = `<div class="empty">لا عملة مراقَبة لها سلسلة سعرية بعد.<br>
-      <span class="mono">تُسحب الشموع بالتناوب — انتظر اكتمال المسح.</span></div>`;
+    host.innerHTML = `<div class="empty">No watched coin has a price series yet.<br>
+      <span class="mono">Candles are pulled in rotation — wait for the sweep to finish.</span></div>`;
     return;
   }
   if (asTable.perf) { host.innerHTML = perfTable(rows); bindSortHeaders(host); return; }
@@ -1103,7 +1120,7 @@ function renderPerf(rows) {
     <thead><tr>${PERF_COLS.map(sortableTh).join("")}</tr></thead>
     <tbody>${rows.map(r => perfRow(r, max)).join("")}</tbody></table></div>`;
 
-  // sparklines تُحقن بعد بناء الجدول (SVG لا يُبنى بالنصّ هنا)
+  // sparklines are injected after the table is built (SVG isn't built from text here)
   host.querySelectorAll("[data-spark]").forEach((cell) => {
     const r = rows[Number(cell.dataset.spark)];
     const rising = (r.change_pct ?? 0) >= 0;
@@ -1118,7 +1135,7 @@ function bindSortHeaders(host) {
   host.querySelectorAll("th.sortable").forEach((th) => {
     th.addEventListener("click", () => {
       const key = th.dataset.sort;
-      // نفس العمود يقلب الاتجاه؛ عمود جديد يبدأ تنازلياً (الأكبر أوّلاً)
+      // the same column flips direction; a new column starts descending (biggest first)
       if (perfSort.key === key) perfSort.dir = perfSort.dir === "desc" ? "asc" : "desc";
       else { perfSort.key = key; perfSort.dir = "desc"; }
       refreshPerf();
@@ -1126,7 +1143,7 @@ function bindSortHeaders(host) {
   });
 }
 
-/** يعيد جلب لوحة الأداء وحدها (ترتيب/حدّ) دون انتظار الدورة التالية. */
+/** Re-fetches the performance panel alone (sort/limit) without waiting for the next cycle. */
 async function refreshPerf() {
   try {
     const p = await getJSON(
@@ -1142,23 +1159,23 @@ async function refreshPerf() {
   }
 }
 
-/** حصيلة الأرباح والخسائر — محسوبة على كل العملات لا على الشريحة المعروضة. */
+/** The profit-and-loss tally — computed over all coins, not the displayed slice. */
 function renderPerfSummary(s) {
   const host = document.getElementById("perf-summary");
   if (!s || !s.count) { host.innerHTML = ""; return; }
   const winPct = s.win_rate_pct ?? 0;
   const cells = [
-    { l: "رابحة / خاسرة", v: `${num(s.winners)} / ${num(s.losers)}`,
-      d: `${pct(winPct, { sign: false })} نسبة الرابح`, split: true },
-    { l: "متوسّط العائد", v: signed(s.avg_pct), d: "بوزن متساوٍ لكل إشارة" },
-    { l: "الوسيط", v: signed(s.median_pct), d: "أمتن أمام القيم الشاذّة" },
-    { l: "مجموع الأرباح", v: signed(s.gross_gain_pct), d: `من ${num(s.winners)} عملة` },
-    { l: "مجموع الخسائر", v: signed(s.gross_loss_pct), d: `من ${num(s.losers)} عملة` },
-    { l: "الصافي", v: signed(s.net_pct), d: `عبر ${num(s.count)} عملة` },
-    { l: "الأفضل", v: signed(s.best?.change_pct),
+    { l: "Winners / losers", v: `${num(s.winners)} / ${num(s.losers)}`,
+      d: `${pct(winPct, { sign: false })} win rate`, split: true },
+    { l: "Mean return", v: signed(s.avg_pct), d: "Equal weight per signal" },
+    { l: "Median", v: signed(s.median_pct), d: "Sturdier against outliers" },
+    { l: "Gross gains", v: signed(s.gross_gain_pct), d: `Across ${num(s.winners)} coins` },
+    { l: "Gross losses", v: signed(s.gross_loss_pct), d: `Across ${num(s.losers)} coins` },
+    { l: "Net", v: signed(s.net_pct), d: `Across ${num(s.count)} coins` },
+    { l: "Best", v: signed(s.best?.change_pct),
       d: extLink(fomoTokenUrl(s.best?.token_address, s.best?.network_id),
                  esc(s.best?.symbol || shortAddr(s.best?.token_address))) },
-    { l: "الأسوأ", v: signed(s.worst?.change_pct),
+    { l: "Worst", v: signed(s.worst?.change_pct),
       d: extLink(fomoTokenUrl(s.worst?.token_address, s.worst?.network_id),
                  esc(s.worst?.symbol || shortAddr(s.worst?.token_address))) },
   ];
@@ -1173,9 +1190,10 @@ function renderPerfSummary(s) {
           </div>` : `<div class="d">${c.d}</div>`}
       </div>`).join("")}</div>
     <div class="opennote">
-      هذه <b>مراكز مفتوحة في نافذة جارية</b>، لا نتائج محقّقة: تُقاس بالسعر الآن
-      مقابل سعر الدخول، ولم تُكمل أي إشارة نافذة الـ48 ساعة بعد. «أعلى ارتفاع»
-      لا يُحقَّق إلّا ببيع في لحظة القمّة.
+      These are <b>open positions in a running window</b>, not realized results:
+      measured at the current price against the entry price, and no signal has
+      completed its 48-hour window yet. A "peak gain" is realized only by
+      selling at the exact moment of the peak.
     </div>`;
 }
 
@@ -1187,7 +1205,7 @@ function perfRow(r, max) {
   return `<tr>
     <td>${extLink(url, `<b>${esc(r.symbol || shortAddr(r.token_address))}</b>
         <div class="mono">${esc(shortAddr(r.token_address))}</div>`,
-        `فتح ${r.symbol || "العملة"} في fomo.family`)}</td>
+        `Open ${r.symbol || "the coin"} on fomo.family`)}</td>
     <td><span class="badge"><i class="key" style="background:${typeColor(r.source)}"></i>${esc(typeLabel(r.source))}</span></td>
     <td>
       <div style="display:flex;align-items:center;gap:9px">
@@ -1204,13 +1222,13 @@ function perfRow(r, max) {
   </tr>`;
 }
 
-/* جدول مكافئ لكل رسم — القيمة لا تُحجب خلف تلميح */
+/* an equivalent table for every chart — the value isn't hidden behind a tooltip */
 const PERF_TABLE_COLS = [
-  { key: "symbol", label: "العملة" }, { key: null, label: "النوع" },
-  { key: "entry_px", label: "سعر الدخول" }, { key: "last_px", label: "السعر الآن" },
-  { key: null, label: "القمّة" }, { key: "peak_pct", label: "أعلى ارتفاع" },
-  { key: "change_pct", label: "التغيّر" }, { key: "from_peak_pct", label: "من القمّة" },
-  { key: "candles", label: "شموع" },
+  { key: "symbol", label: "Coin" }, { key: null, label: "Type" },
+  { key: "entry_px", label: "Entry price" }, { key: "last_px", label: "Price now" },
+  { key: null, label: "Peak" }, { key: "peak_pct", label: "Peak gain" },
+  { key: "change_pct", label: "Change" }, { key: "from_peak_pct", label: "From peak" },
+  { key: "candles", label: "Candles" },
 ];
 
 function perfTable(rows) {
@@ -1233,11 +1251,11 @@ function perfTable(rows) {
 function renderTimeline(data) {
   const host = document.getElementById("timeline");
   host.replaceChildren();
-  if (!data.types.length) { host.innerHTML = `<div class="empty">لا إشارات في آخر 24 ساعة.</div>`; return; }
+  if (!data.types.length) { host.innerHTML = `<div class="empty">No signals in the last 24 hours.</div>`; return; }
 
   if (asTable.timeline) {
     const totals = data.types.map(t => ({ t, n: data.series[t].reduce((a, b) => a + b, 0) }));
-    host.innerHTML = `<table><thead><tr><th>النوع</th><th>عدد (24س)</th><th>الذروة/ساعة</th></tr></thead>
+    host.innerHTML = `<table><thead><tr><th>Type</th><th>Count (24h)</th><th>Peak/hour</th></tr></thead>
       <tbody>${totals.map(x => `<tr>
         <td><span class="badge"><i class="key" style="background:${typeColor(x.t)}"></i>${esc(typeLabel(x.t))}</span></td>
         <td class="num">${num(x.n)}</td>
@@ -1245,7 +1263,7 @@ function renderTimeline(data) {
     return;
   }
 
-  // وسيلة إيضاح حاضرة دائماً لسلسلتين فأكثر — الهوية لا تُترك للّون وحده
+  // a legend always present for two or more series — identity is never left to color alone
   const legend = document.createElement("div");
   legend.className = "legend";
   legend.style.marginBottom = "12px";
@@ -1255,7 +1273,7 @@ function renderTimeline(data) {
   host.append(legend, stackedColumns(data));
 }
 
-/** مقارنة الإشارة بالضابطة — السؤال الذي لا تجيبه بقيّة اللوحة. */
+/** Signal vs control — the question the rest of the dashboard doesn't answer. */
 function renderComparison(cmp) {
   const host = document.getElementById("comparison");
   if (!cmp) { host.innerHTML = ""; return; }
@@ -1263,30 +1281,30 @@ function renderComparison(cmp) {
 
   if (!c.count) {
     host.innerHTML = `<div class="empty">
-      المجموعة الضابطة تُبنى تدريجياً — لا عملة ضابطة لها سلسلة سعرية بعد.<br>
-      <span class="mono">تُضاف بضع عملات في كل دورة عمداً، حتى لا تكون العيّنة
-      كلّها من لحظة سوقية واحدة؛ ثمّ ينتظر دورها في مسح الشموع.</span>
+      The control group is built gradually — no control coin has a price series yet.<br>
+      <span class="mono">A few coins are added every cycle on purpose, so the sample
+      isn't all from one market moment; each then waits its turn in the candle sweep.</span>
     </div>`;
     return;
   }
 
   const rows = [
-    ["نسبة الرابح", "win_rate_pct", true],
-    ["متوسّط العائد", "avg_pct", false],
-    ["الوسيط", "median_pct", false],
-    ["متوسّط أعلى ارتفاع", "avg_peak_pct", false],
+    ["Win rate", "win_rate_pct", true],
+    ["Mean return", "avg_pct", false],
+    ["Median", "median_pct", false],
+    ["Mean peak gain", "avg_peak_pct", false],
   ];
   host.innerHTML = `
     ${sufficient ? "" : `<div class="opennote">
-      العيّنة ما تزال صغيرة (إشارة ${num(s.count)} · ضابطة ${num(c.count)}).
-      <b>لا تُقرأ الفروق أدناه كنتيجة بعد</b> — تحتاج ≥20 لكل جانب على الأقلّ،
-      ونافذة 48 ساعة مكتملة.</div>`}
+      The sample is still small (signal ${num(s.count)} · control ${num(c.count)}).
+      <b>Don't read the differences below as a result yet</b> — they need at least
+      ≥20 on each side, and a completed 48-hour window.</div>`}
     <div class="tablewrap"><table>
       <thead><tr>
-        <th>المقياس</th>
-        <th>الإشارة (${num(s.count)})</th>
-        <th>الضابطة (${num(c.count)})</th>
-        <th>الفرق</th>
+        <th>Metric</th>
+        <th>Signal (${num(s.count)})</th>
+        <th>Control (${num(c.count)})</th>
+        <th>Difference</th>
       </tr></thead>
       <tbody>${rows.map(([label, key, plain]) => {
         const sv = s[key], cv = c[key], dv = d[key];
@@ -1300,8 +1318,9 @@ function renderComparison(cmp) {
       }).join("")}</tbody>
     </table></div>
     <div class="opennote">
-      الضابطة = عملات من نفس كون trending/verified دخلت <b>بالاختيار العشوائي لا
-      بإشارة</b>، وتُسجَّل بنفس النافذة والطريقة. «الفرق» موجب يعني تفوّق الإشارة.
+      Control = coins from the same trending/verified universe that entered <b>by
+      random selection, not by signal</b>, recorded with the same window and method.
+      A positive "difference" means the signal is winning.
     </div>`;
 }
 
@@ -1311,33 +1330,34 @@ function renderControlProgress(p) {
   const preliminaryColor = p.preliminary_ready ? "var(--good)" : "var(--s2)";
   const decisionColor = p.decision_ready ? "var(--good)" : "var(--muted)";
   const state = p.decision_ready
-    ? `<span class="badge good">✓ جاهزة لقرار المرحلة 1</span>`
+    ? `<span class="badge good">✓ Ready for the stage-1 decision</span>`
     : p.preliminary_ready
-      ? `<span class="badge warn">فحص أولي متاح · القرار عند ${num(p.decision_target)}</span>`
-      : `<span class="badge warn">جمع الضابطة v${p.design_version ?? 3} جارٍ</span>`;
+      ? `<span class="badge warn">Preliminary check available · decision at ${num(p.decision_target)}</span>`
+      : `<span class="badge warn">Control collection v${p.design_version ?? 3} in progress</span>`;
   host.innerHTML = `
     <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
       <span style="font-size:30px;font-weight:620;letter-spacing:-.02em" class="num">${num(p.completed)}</span>
-      <span style="color:var(--muted);font-size:13px">ضابطة مكتملة من ${num(p.preliminary_target)} للفحص الأولي</span>
+      <span style="color:var(--muted);font-size:13px">completed controls out of ${num(p.preliminary_target)} for the preliminary check</span>
       ${state}
     </div>
     <div style="margin-top:12px">
       <div style="display:flex;justify-content:space-between;gap:12px;font-size:11.5px;color:var(--muted)">
-        <span>الفحص الأولي: ${num(p.completed)} / ${num(p.preliminary_target)}</span>
-        <span>${p.preliminary_ready ? "اكتمل" : `متبقّي ${num(p.preliminary_remaining)}`}</span>
+        <span>Preliminary check: ${num(p.completed)} / ${num(p.preliminary_target)}</span>
+        <span>${p.preliminary_ready ? "complete" : `${num(p.preliminary_remaining)} left`}</span>
       </div>
       <div class="meter" style="height:8px;margin-top:5px"><i style="width:${p.preliminary_pct}%;background:${preliminaryColor}"></i></div>
     </div>
     <div style="margin-top:11px">
       <div style="display:flex;justify-content:space-between;gap:12px;font-size:11.5px;color:var(--muted)">
-        <span>القرار الأساسي: ${num(p.completed)} / ${num(p.decision_target)}</span>
-        <span>${p.decision_ready ? "اكتمل" : `متبقّي ${num(p.decision_remaining)}`}</span>
+        <span>Core decision: ${num(p.completed)} / ${num(p.decision_target)}</span>
+        <span>${p.decision_ready ? "complete" : `${num(p.decision_remaining)} left`}</span>
       </div>
       <div class="meter" style="height:6px;margin-top:5px"><i style="width:${p.decision_pct}%;background:${decisionColor}"></i></div>
     </div>
     <div style="color:var(--muted);font-size:11.5px;margin-top:9px">
-      تُحسب فقط نوافذ <span class="mono">v${p.design_version ?? 3}</span> المكتملة 48 ساعة وذات
-      <span class="mono">status=ok</span>. بلوغ 100 يسمح بفحص أولي، وليس اعتماد التدريب النهائي.
+      Only <span class="mono">v${p.design_version ?? 3}</span> windows that completed 48 hours with
+      <span class="mono">status=ok</span> are counted. Reaching 100 allows a preliminary
+      check, not the final training approval.
     </div>`;
 }
 
@@ -1345,9 +1365,10 @@ function renderHealth(bars, storage, st) {
   const cov = bars.coverage_pct ?? 0;
   const sev = cov >= 90 ? "good" : cov >= 60 ? "warn" : "bad";
   const sevColor = cov >= 90 ? "var(--good)" : cov >= 60 ? "var(--warn)" : "var(--crit)";
-  // `errors_total` عدّاد مدى الحياة لا يُصفَّر أبداً، فنسبته إلى عدد الدورات
-  // ليست "صحّة حاليّة" — كانت تعرض 40% بينما المسجّل يعمل بصفر أخطاء منذ ساعات.
-  // الصادق: عدّاد تراكميّ موسوم بوضوح + حالة آخر دورة (وهي المؤشّر الحيّ).
+  // `errors_total` is a lifetime counter that is never reset, so its ratio to
+  // the cycle count isn't "current health" — it used to show 40% while the
+  // recorder had been running error-free for hours. The honest display: a
+  // clearly labeled cumulative counter + the last cycle's state (the live one).
   const lastErrs = (() => {
     const m = /'errors':\s*(\d+)/.exec(st.last_cycle_stats || "");
     return m ? Number(m[1]) : null;
@@ -1355,38 +1376,38 @@ function renderHealth(bars, storage, st) {
   document.getElementById("health").innerHTML = `
     <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px">
       <span style="font-size:30px;font-weight:620;letter-spacing:-.02em">${cov}%</span>
-      <span class="badge ${sev}">${cov >= 90 ? "✓ تغطية شبه كاملة" : cov >= 60 ? "⚠ المسح جارٍ" : "✕ تغطية ناقصة"}</span>
+      <span class="badge ${sev}">${cov >= 90 ? "✓ near-full coverage" : cov >= 60 ? "⚠ sweep in progress" : "✕ poor coverage"}</span>
     </div>
     <div class="meter" style="height:8px"><i style="width:${cov}%;background:${sevColor}"></i></div>
     <div style="color:var(--muted);font-size:12px;margin-top:7px">
-      ${num(bars.with_bars)} عملة لها سلسلة سعرية · ${num(bars.pending)} بانتظار الدور ·
-      ${num(bars.no_data)} بلا بيانات لدى fomo
+      ${num(bars.with_bars)} coins with a price series · ${num(bars.pending)} waiting their turn ·
+      ${num(bars.no_data)} with no data at fomo
     </div>
     <table style="margin-top:16px">
       <tbody>
-        <tr><td style="padding-inline-start:0">آخر دورة</td>
+        <tr><td style="padding-inline-start:0">Last cycle</td>
             <td style="text-align:left;padding-inline-end:0">${
               lastErrs == null ? "—"
-              : lastErrs === 0 ? `<span class="badge good">✓ بلا أخطاء</span>`
-              : `<span class="badge bad">✕ ${num(lastErrs)} خطأ</span>`}</td></tr>
-        <tr><td style="padding-inline-start:0">أخطاء تراكمية
-              <span class="mono" style="font-size:10.5px">(منذ أوّل تشغيل، لا تُصفَّر)</span></td>
+              : lastErrs === 0 ? `<span class="badge good">✓ no errors</span>`
+              : `<span class="badge bad">✕ ${num(lastErrs)} errors</span>`}</td></tr>
+        <tr><td style="padding-inline-start:0">Cumulative errors
+              <span class="mono" style="font-size:10.5px">(since first run, never reset)</span></td>
             <td style="text-align:left;padding-inline-end:0" class="num">${num(st.errors_total)}</td></tr>
-        <tr><td style="padding-inline-start:0">حجم الأرشيف</td>
+        <tr><td style="padding-inline-start:0">Archive size</td>
             <td style="text-align:left;padding-inline-end:0" class="mono">${storage.mb ?? "—"} MB · ${esc(storage.raw_encoding)}</td></tr>
-        <tr><td style="padding-inline-start:0">مدى الأرشيف</td>
-            <td style="text-align:left;padding-inline-end:0" class="mono">${storage.span_days ?? "—"} يوم</td></tr>
-        <tr><td style="padding-inline-start:0">مساحة القرص المتبقية</td>
+        <tr><td style="padding-inline-start:0">Archive span</td>
+            <td style="text-align:left;padding-inline-end:0" class="mono">${storage.span_days ?? "—"} days</td></tr>
+        <tr><td style="padding-inline-start:0">Disk space left</td>
             <td style="text-align:left;padding-inline-end:0">${
               storage.disk_warning
               ? `<span class="badge bad">✕ ${storage.disk_free_gb ?? "—"} GB</span>`
               : `<span class="badge good">✓ ${storage.disk_free_gb ?? "—"} GB</span>`}</td></tr>
-        <tr><td style="padding-inline-start:0">آخر نسخة احتياطية</td>
+        <tr><td style="padding-inline-start:0">Last backup</td>
             <td style="text-align:left;padding-inline-end:0">${
-              !storage.backup_configured ? `<span class="badge bad">✕ غير مهيأة</span>`
-              : storage.backup_warning ? `<span class="badge bad">✕ ${storage.latest_backup ? `منذ ${storage.backup_age_hours}س` : "لا توجد"}</span>`
-              : `<span class="badge good">✓ منذ ${storage.backup_age_hours}س</span>`}</td></tr>
-        <tr><td style="padding-inline-start:0;border-bottom:none">انهيارات الدورة</td>
+              !storage.backup_configured ? `<span class="badge bad">✕ not configured</span>`
+              : storage.backup_warning ? `<span class="badge bad">✕ ${storage.latest_backup ? `${storage.backup_age_hours}h ago` : "none"}</span>`
+              : `<span class="badge good">✓ ${storage.backup_age_hours}h ago</span>`}</td></tr>
+        <tr><td style="padding-inline-start:0;border-bottom:none">Cycle crashes</td>
             <td style="text-align:left;padding-inline-end:0;border-bottom:none" class="num">${num(st.cycle_crashes)}</td></tr>
       </tbody>
     </table>`;
@@ -1394,9 +1415,9 @@ function renderHealth(bars, storage, st) {
 
 function renderWatchlist(rows) {
   const host = document.getElementById("watchlist");
-  if (!rows.length) { host.innerHTML = `<div class="empty">لا عملات مراقَبة نشطة.</div>`; return; }
+  if (!rows.length) { host.innerHTML = `<div class="empty">No active watched coins.</div>`; return; }
   host.innerHTML = `<table><thead><tr>
-      <th>العنوان</th><th>المصدر</th><th>أوّل التقاط</th><th style="width:22%">المتبقّي من 48 ساعة</th><th>لقطات</th>
+      <th>Address</th><th>Source</th><th>First catch</th><th style="width:22%">Remaining of 48 hours</th><th>Snapshots</th>
     </tr></thead><tbody>${rows.map(w => {
       const r = remaining(w.watch_until);
       const low = r.frac < 0.15;
@@ -1415,25 +1436,25 @@ function renderWatchlist(rows) {
 
 function renderSignals(rows) {
   const host = document.getElementById("signals");
-  if (!rows.length) { host.innerHTML = `<div class="empty">لا إشارات بعد.</div>`; return; }
+  if (!rows.length) { host.innerHTML = `<div class="empty">No signals yet.</div>`; return; }
   host.innerHTML = `<table><thead><tr>
-      <th>الوقت</th><th>النوع</th><th>الرمز</th><th>العنوان</th>
-      <th>السعر</th><th>القيمة السوقية</th><th>المشتري</th><th>مطابقة الصدارة</th>
+      <th>Time</th><th>Type</th><th>Ticker</th><th>Address</th>
+      <th>Price</th><th>Market cap</th><th>Buyer</th><th>Leaderboard match</th>
     </tr></thead><tbody>${rows.map(s => {
       const strong = (s.top_trader_match_count > 0) || (s.buyers_best_rank != null && s.buyers_best_rank <= 50);
       const tag = strong
-        ? `<span class="badge good">★ متصدّر${s.buyers_best_rank != null ? " #" + s.buyers_best_rank : ""}</span>`
+        ? `<span class="badge good">★ top trader${s.buyers_best_rank != null ? " #" + s.buyers_best_rank : ""}</span>`
         : `<span class="mono">—</span>`;
       const url = fomoTokenUrl(s.token_address, s.network_id);
       return `<tr>
         <td>${ago(s.recorded_at)}</td>
         <td><span class="badge"><i class="key" style="background:${typeColor(s.signal_type)}"></i>${esc(typeLabel(s.signal_type))}</span></td>
-        <td>${extLink(url, `<b>${esc(s.ticker)}</b>`, `فتح ${s.ticker || "العملة"} في fomo.family`)}</td>
+        <td>${extLink(url, `<b>${esc(s.ticker)}</b>`, `Open ${s.ticker || "the coin"} on fomo.family`)}</td>
         <td class="mono">${extLink(url, esc(shortAddr(s.token_address)))}</td>
         <td class="mono">${price(s.price_usd)}</td>
         <td class="num">${s.market_cap != null ? "$" + compact(s.market_cap) : "—"}</td>
         <td>${extLink(fomoUserUrl(s.buyer_handle), esc(s.buyer_handle),
-              s.buyer_handle ? `فتح صفحة ${s.buyer_handle}` : "")}</td>
+              s.buyer_handle ? `Open ${s.buyer_handle}'s page` : "")}</td>
         <td>${tag}</td></tr>`;
     }).join("")}</tbody></table>`;
 }
@@ -1445,28 +1466,30 @@ function renderErrors(rows) {
   let html = active.length
     ? active.map(r => `<div class="errline"><span class="badge bad">✕ ${esc(r.source)}</span>
         <span class="mono" style="margin-inline-start:8px">${esc(r.last_error)}</span></div>`).join("")
-    : `<div class="errline"><span class="badge good">✓ سليم</span>
-        <span style="margin-inline-start:8px;color:var(--muted)">كل المصادر تعمل بلا أخطاء حاليّة.</span></div>`;
-  // أخطاء أقدم من آخر نجاحٍ **لمصدرها**: سياق تاريخي لا إنذار قائم. والختم
-  // مذكور لأنّ «تعافى» بلا «متى» لا يُميَّز من «حدُّ التقادم معطّل».
-  html += healed.map(r => `<div class="errline resolved"><span class="badge good">✓ تعافى</span>
+    : `<div class="errline"><span class="badge good">✓ healthy</span>
+        <span style="margin-inline-start:8px;color:var(--muted)">All sources are running with no current errors.</span></div>`;
+  // errors older than the last success **for their own source**: historical
+  // context, not a standing alarm. And the stamp is mentioned because
+  // "recovered" without "when" can't be told apart from "staleness limit off".
+  html += healed.map(r => `<div class="errline resolved"><span class="badge good">✓ recovered</span>
       <span class="mono" style="margin-inline-start:8px">${esc(r.source)} — ${esc(r.last_error)}</span>
-      ${r.ok_at ? `<span style="margin-inline-start:8px;color:var(--muted)">نجح قبل ${ago(r.ok_at)}</span>` : ""}</div>`).join("");
+      ${r.ok_at ? `<span style="margin-inline-start:8px;color:var(--muted)">succeeded ${ago(r.ok_at)} ago</span>` : ""}</div>`).join("");
   host.innerHTML = html;
 }
 
-/* مفاتيح المزوّدين: نقطةٌ لكلّ مفتاح، واسمُ الحساب الذي جُلب منه، وآخرُ 4 أحرف.
-   **لا قيمة**: الخادم لا يرسلها أصلاً، فلا شيء يُشطب هنا. واللونُ يجمع ثلاثة
-   مصادر: الملفّ (مفعّل؟) وحالةُ العمّال (مبرَّد الآن؟) والفحصُ الحيّ (اختبر
-   الآن) — أخضرُ بحالةِ عمّالٍ وحدها يعني «لم يُرفض بعد» لا «مُجرَّب». */
+/* Provider keys: a dot per key, the account name it was taken from, and the
+   last 4 characters. **No value**: the server never sends it, so nothing is
+   masked here. And the color combines three sources: the file (enabled?), the
+   workers' state (cooling right now?), and the live probe (tested now) — green
+   from the workers' state alone means "not rejected yet", not "tested". */
 function keyStateText(r) {
-  if (!r.enabled) return "موقوف مؤقّتاً — في الملفّ ولا يُنادى به";
-  if (r.env) return "مضبوط من البيئة — تحرير الملفّ لا يؤثّر";
-  if (r.provider_disabled) return "مزوّدٌ معطَّل لبقيّة عمر العمليّة (نفاد رصيد)";
-  if (r.cooled_by.length) return `مبرَّد الآن في ${r.cooled_by.join(" و")} — رُفض قبل قليل`;
-  if (r.probe) return `فحص: ${r.probe.detail}`;
-  if (r.in_use) return "مستعمل الآن ولم يُرفض";
-  return "مفعَّل — لم يُختبر بعد";
+  if (!r.enabled) return "disabled — in the file but never called";
+  if (r.env) return "set from the environment — editing the file has no effect";
+  if (r.provider_disabled) return "provider disabled for the rest of the process lifetime (out of credits)";
+  if (r.cooled_by.length) return `cooling right now in ${r.cooled_by.join(" and ")} — rejected a moment ago`;
+  if (r.probe) return `probe: ${r.probe.detail}`;
+  if (r.in_use) return "in use now and not rejected";
+  return "enabled — not tested yet";
 }
 
 function renderProviderKeys(data) {
@@ -1479,76 +1502,77 @@ function renderProviderKeys(data) {
 
   let html = "";
   if (!keys.length) {
-    html += `<div class="errline"><span class="badge warn">؟ لا مفاتيح</span>
-      <span style="margin-inline-start:8px;color:var(--muted)">لا مفتاح في
-      <span class="mono">recorder/chain_keys.json</span> — أضِف واحداً بالأعلى.</span></div>`;
+    html += `<div class="errline"><span class="badge warn">? No keys</span>
+      <span style="margin-inline-start:8px;color:var(--muted)">No key in
+      <span class="mono">recorder/chain_keys.json</span> — add one above.</span></div>`;
   }
-  // تجميعٌ بالمزوّد: ترويسةٌ تقول العدد ومَن يستعمله، ثمّ أسطرُه.
+  // grouped by provider: a header stating the count and who uses it, then its rows.
   for (const p of providers) {
     const mine = keys.filter(k => k.provider === p.provider);
     if (!mine.length) continue;
-    const owners = p.owners.length ? p.owners.join(" · ") : "لا عمليّة ختمت حالتها بعد";
+    const owners = p.owners.length ? p.owners.join(" · ") : "no process has stamped its state yet";
     const few = p.enabled < min;
-    html += `<div class="keyhead">${esc(p.title)} — ${p.enabled} مفعّل من ${p.keys}
-      ${few ? `<span style="color:var(--warn)">· أقلّ من ${min}: لا بديل عند الرفض</span>` : ""}
+    html += `<div class="keyhead">${esc(p.title)} — ${p.enabled} enabled of ${p.keys}
+      ${few ? `<span style="color:var(--warn)">· fewer than ${min}: no fallback on rejection</span>` : ""}
       <span class="mono" style="margin-inline-start:6px">${esc(owners)}</span>
       ${p.env ? `<span style="color:var(--warn);margin-inline-start:6px">·
-        <span class="mono">${esc(p.env_name)}</span> مضبوط في البيئة ⇒ يتقدّم على الملفّ</span>` : ""}</div>`;
+        <span class="mono">${esc(p.env_name)}</span> set in the environment ⇒ takes precedence over the file</span>` : ""}</div>`;
     html += mine.map(r => {
-      const label = r.label ? esc(r.label) : `<span style="color:var(--muted)">بلا اسم حساب</span>`;
+      const label = r.label ? esc(r.label) : `<span style="color:var(--muted)">no account name</span>`;
       const tail = r.tail ? `<span class="mono">…${esc(r.tail)}</span>`
-        : `<span class="mono" title="مفتاحٌ قصير: إظهار ذيله يكشف جزءاً معتبَراً منه">…</span>`;
+        : `<span class="mono" title="a short key: showing its tail would reveal a meaningful part of it">…</span>`;
       const act = `data-provider="${esc(r.provider)}" data-slot="${r.slot}" data-tail="${esc(r.tail)}" data-key-id="${esc(r.key_id)}"`;
       return `<div class="keyrow${r.enabled ? "" : " off"}">
         <span class="keydot ${r.level}" title="${esc(keyStateText(r))}"></span>
         <span>${label}</span>
         ${tail}
-        ${r.in_use ? `<span class="badge">مستعمل</span>` : ""}
+        ${r.in_use ? `<span class="badge">in use</span>` : ""}
         <span class="grow" style="color:var(--muted)">${esc(keyStateText(r))}
           ${r.probe ? `<span class="mono">(${ago(r.probe.at)})</span>` : ""}</span>
-        <button class="keybtn" data-act="test" ${act}>اختبر الآن</button>
+        <button class="keybtn" data-act="test" ${act}>Test now</button>
         <button class="keybtn" data-act="toggle" ${act} data-enable="${r.enabled ? 0 : 1}">
-          ${r.enabled ? "أوقف" : "شغّل"}</button>
-        <button class="keybtn danger" data-act="delete" ${act}>حذف</button>
+          ${r.enabled ? "Disable" : "Enable"}</button>
+        <button class="keybtn danger" data-act="delete" ${act}>Delete</button>
       </div>`;
     }).join("");
   }
 
-  // حالةُ الأحواض كما ختمتها كلّ عمليّة: تبقى لأنّها تجيب سؤالاً آخر — «هل
-  // العمليّة المالكة حيّة وتدوّر فعلاً؟» لا «هل هذا المفتاح صالح؟».
+  // the pools' state as each process stamped it: it stays because it answers a
+  // different question — "is the owning process alive and actually rotating?"
+  // not "is this key valid?".
   html += pools.map(r => {
     const mark = r.level === "bad" ? "✕" : r.level === "warn" ? "!" : "✓";
-    const why = r.disabled ? "معطَّل — نفد رصيد كل المفاتيح"
-      : !r.keys ? "لا مفاتيح على القرص"
-      : !r.available ? `كل المفاتيح مبرَّدة الآن (${r.keys})`
-      : r.blocked ? `${r.blocked} من ${r.keys} مبرَّد الآن`
-      : r.keys < min ? "مفتاح واحد — لا بديل عند الرفض"
-      : `${r.keys} مفاتيح، كلّها متاحة`;
+    const why = r.disabled ? "disabled — every key is out of credits"
+      : !r.keys ? "no keys on disk"
+      : !r.available ? `all keys cooling right now (${r.keys})`
+      : r.blocked ? `${r.blocked} of ${r.keys} cooling right now`
+      : r.keys < min ? "one key — no fallback on rejection"
+      : `${r.keys} keys, all available`;
     return `<div class="errline${r.stale ? " resolved" : ""}">
       <span class="badge ${r.level}">${mark} ${esc(r.provider)}</span>
       <span style="margin-inline-start:8px">${esc(why)}</span>
       <span class="mono" style="margin-inline-start:8px;color:var(--muted)">
-        ${esc(r.owner)} · مستعمل #${r.index + 1} · تدوير ${num(r.rotations)}
-        ${r.stale ? "· تقريرٌ متجمّد" : ""} · ${ago(r.at)}</span>
+        ${esc(r.owner)} · in use #${r.index + 1} · rotations ${num(r.rotations)}
+        ${r.stale ? "· frozen report" : ""} · ${ago(r.at)}</span>
     </div>`;
   }).join("");
 
   if (!pools.length) {
-    html += `<div class="errline resolved"><span class="badge warn">؟ لا تقرير أحواض</span>
-      <span style="margin-inline-start:8px;color:var(--muted)">لم تختم أي عمليّة حالة أحواضها بعد —
-      تظهر بعد أوّل دورة من <span class="mono">FomoChain</span> و<span class="mono">FomoEVMReplay</span>.</span></div>`;
+    html += `<div class="errline resolved"><span class="badge warn">? No pool report</span>
+      <span style="margin-inline-start:8px;color:var(--muted)">No process has stamped its pool state yet —
+      it appears after the first cycle of <span class="mono">FomoChain</span> and <span class="mono">FomoEVMReplay</span>.</span></div>`;
   }
   host.innerHTML = html;
 }
 
-/* ---------- إدارة المفاتيح: النموذج والأزرار ---------- */
+/* ---------- key management: the form and the buttons ---------- */
 const keyMsg = document.getElementById("key-msg");
 function showKeyMsg(text, level) {
   keyMsg.textContent = text || "";
   keyMsg.className = "keymsg" + (level ? " " + level : "");
 }
 
-/** يملأ قائمة المزوّدين مرّة واحدة: إعادةُ بنائها كانت تُلغي اختيار المستخدم. */
+/** Fills the provider list once: rebuilding it used to reset the user's selection. */
 function fillKeyProviders(providers) {
   const select = document.getElementById("key-provider");
   if (select.options.length || !providers.length) return;
@@ -1556,7 +1580,7 @@ function fillKeyProviders(providers) {
     .map(p => `<option value="${esc(p.provider)}">${esc(p.title)}</option>`).join("");
 }
 
-/** يجلب لوحة المفاتيح وحدَها: أسرعُ من دورةٍ كاملة، والنتيجة تُرى فوراً. */
+/** Fetches the key panel alone: faster than a full cycle, and the result shows immediately. */
 async function refreshKeys() {
   renderProviderKeys(await getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }));
 }
@@ -1566,29 +1590,30 @@ document.getElementById("key-add").addEventListener("submit", async (event) => {
   const value = document.getElementById("key-value");
   const label = document.getElementById("key-label");
   const provider = document.getElementById("key-provider").value;
-  if (!value.value.trim()) { showKeyMsg("الصق المفتاح أوّلاً", "bad"); return; }
-  showKeyMsg("جارٍ الإضافة…", "");
+  if (!value.value.trim()) { showKeyMsg("Paste the key first", "bad"); return; }
+  showKeyMsg("Adding…", "");
   try {
     const out = await postJSON("/api/provider-keys/add",
       { provider, key: value.value, label: label.value });
-    // يُفرَغ الحقل فوراً عند النجاح: المفتاح مخزَّنٌ الآن، وبقاؤه على الشاشة
-    // خطرٌ بلا فائدة (لقطةُ شاشة، شخصٌ يمرّ، صفحةٌ منسيّة مفتوحة).
+    // the field is cleared immediately on success: the key is stored now, and
+    // leaving it on screen is risk with no benefit (a screenshot, someone
+    // passing by, a forgotten open tab).
     value.value = ""; label.value = "";
-    showKeyMsg(`أُضيف …${out.tail} — يدخل الدورة التالية بلا إعادة تشغيل`, "good");
+    showKeyMsg(`Added …${out.tail} — it joins the next cycle with no restart`, "good");
     await refreshKeys();
   } catch (err) {
     showKeyMsg(err.message, "bad");
   }
 });
 
-// تفويضٌ على الحاوية لا مستمعٌ لكلّ زرّ: اللوحة تُعاد رسمها كل 10ث، فمستمعو
-// الأزرار القديمة يُرمَون مع عقدها.
+// delegation on the container, not a listener per button: the panel re-renders
+// every 10s, so old button listeners get thrown away with their nodes.
 document.getElementById("provider-keys").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
   const { act, provider, slot, tail, keyId, enable } = button.dataset;
   const body = { provider, slot: Number(slot), tail, key_id: keyId };
-  if (act === "delete" && !confirm(`حذف نهائيّ لمفتاح ${provider} (…${tail}). لا تراجع — متأكّد؟`)) return;
+  if (act === "delete" && !confirm(`Permanently delete the ${provider} key (…${tail}). No undo — are you sure?`)) return;
   button.disabled = true;
   const original = button.textContent;
   button.textContent = "…";
@@ -1598,11 +1623,11 @@ document.getElementById("provider-keys").addEventListener("click", async (event)
       showKeyMsg(`…${tail}: ${out.detail}`, out.level === "good" ? "good" : out.level);
     } else if (act === "toggle") {
       const out = await postJSON("/api/provider-keys/toggle", { ...body, enabled: enable === "1" });
-      showKeyMsg(out.warning || (out.enabled ? "أُعيد تشغيله" : "أُوقف مؤقّتاً — لا يزال في الملفّ"),
+      showKeyMsg(out.warning || (out.enabled ? "Re-enabled" : "Disabled — still in the file"),
         out.warning ? "warn" : "good");
     } else if (act === "delete") {
       const out = await postJSON("/api/provider-keys/delete", body);
-      showKeyMsg(out.warning || `حُذف …${tail}`, out.warning ? "warn" : "good");
+      showKeyMsg(out.warning || `Deleted …${tail}`, out.warning ? "warn" : "good");
     }
     await refreshKeys();
   } catch (err) {
@@ -1612,10 +1637,11 @@ document.getElementById("provider-keys").addEventListener("click", async (event)
   }
 });
 
-/* ---------- حسابُ fomo: الحالةُ والفحصُ والتبديل ---------- */
-/* لا قيمةَ توكنٍ تمرّ من هنا في أيّ اتّجاه: الخادمُ يعيد بصمةَ الهويّة وآخرَ
-   أربعة أحرف، وما يُلصق في الحقل يُرسل مرّةً ثمّ يُمحى — لا `console.log` له
-   ولا بقاءٌ على الشاشة بعد النجاح. */
+/* ---------- the fomo account: state, probe, and switching ---------- */
+/* No token value passes through here in either direction: the server returns
+   the identity fingerprint and the last four characters, and what gets pasted
+   into the field is sent once then wiped — no `console.log` of it, and nothing
+   stays on screen after success. */
 
 const acctMsg = document.getElementById("acct-msg");
 function showAcctMsg(text, level) {
@@ -1623,56 +1649,60 @@ function showAcctMsg(text, level) {
   acctMsg.className = "keymsg" + (level ? " " + level : "");
 }
 
-/** عمرُ التوكن الباقي — للأمام لا للخلف، فـ`ago` تصفّر كلَّ ما هو مستقبل. */
+/** The token's remaining lifetime — forward-looking, not backward, since `ago` zeroes anything in the future. */
 function acctLeft(seconds) {
   if (seconds == null) return "—";
   const s = Math.abs(seconds);
-  const txt = s < 60 ? Math.round(s) + " ث"
-    : s < 3600 ? Math.round(s / 60) + " د"
-    : Math.round(s / 3600) + " س";
-  return seconds <= 0 ? `انتهى قبل ${txt}` : `يبقى ${txt}`;
+  const txt = s < 60 ? Math.round(s) + "s"
+    : s < 3600 ? Math.round(s / 60) + "m"
+    : Math.round(s / 3600) + "h";
+  return seconds <= 0 ? `expired ${txt} ago` : `${txt} left`;
 }
 
-/** حكمُ حالة الملفّ نفسه — منفصلٌ عن حكم المِجَسّ: هذا يقول «الملفّ صالح»
-    والمِجَسُّ يقول «المصدر يقبله»، وهما سؤالان لا واحد. */
+/** The verdict on the store file itself — separate from the probe's verdict:
+    this one says "the file is valid" and the probe says "the source accepts
+    it", and those are two questions, not one. */
 function acctState(d) {
-  if (!d.exists) return { level: "bad", text: "لا ملفّ اعتماد — لم يُسجَّل دخولٌ بعد" };
-  // الأحمرُ للنقص المُعطِّل فقط. أمّا ما له بديل (`client_id` من إعداد الخادم،
-  // و`ca_id` لا يُرسَل إن غاب) فيُذكر ولا يُنذر — انظر `_REQUIRED_FIELDS`.
+  if (!d.exists) return { level: "bad", text: "No credential file — not signed in yet" };
+  // red is for a blocking omission only. What has a fallback (`client_id` from
+  // the server's settings, and `ca_id` isn't sent when absent) is mentioned
+  // without alarming — see `_REQUIRED_FIELDS`.
   const blocking = d.missing_required || d.missing;
-  if (blocking.length) return { level: "bad", text: "ناقص: " + blocking.join("، ") };
+  if (blocking.length) return { level: "bad", text: "Missing: " + blocking.join(", ") };
   if (d.did && d.did === d.anon_did) {
-    return { level: "bad", text: "جلسةٌ مجهولة لا حساب — Privy يكتبها قبل الدخول" };
+    return { level: "bad", text: "An anonymous session, not an account — Privy writes it before sign-in" };
   }
-  if (!d.did) return { level: "warn", text: "التوكن غيرُ مقروء — ليس JWT" };
+  if (!d.did) return { level: "warn", text: "The token isn't readable — not a JWT" };
   if (d.expired) {
     if (!d.refreshable) {
-      return { level: "bad", text: "منتهٍ ولا يمكن تجديده (لا refresh_token أو pat)" };
+      return { level: "bad", text: "Expired and can't be renewed (no refresh_token or pat)" };
     }
-    // منتهٍ و«يمكن تجديده» حالتان متناقضتان يفرّق بينهما عمرُ آخر كتابة، وكان
-    // النصُّ واحداً لهما فأرسل المستخدمَ إلى الجهة الخاطئة يوم 2026-08-20:
-    // الخادمُ كان يعمل ويجدّد كلَّ 60ث ويُرفَض بصمت، واللوحةُ تسأله «هل
-    // خادمُ الـapi يعمل؟». والحدُّ 180ث = ثلاثةُ أضعاف دورةِ التجديد (60ث):
-    // ضعفٌ واحد يجعل تأخّرَ دورةٍ عابرة تشخيصاً كاذباً.
+    // "expired" and "renewable" are two contradictory states told apart by the
+    // age of the last write; the text used to be one for both and sent the
+    // user to the wrong place on 2026-08-20: the server was running, renewing
+    // every 60s, and being silently rejected, while the dashboard asked "is
+    // the api server running?". The 180s bound = three times the renewal cycle
+    // (60s): a single doubling would make a passing cycle delay a false
+    // diagnosis.
     const age = d.written_seconds_ago;
     if (age !== null && age !== undefined && age <= 180) {
       return {
         level: "bad",
-        text: "التجديدُ يعمل ويُرفَض — جلسةُ Privy انتهت. سجّل دخولاً جديداً وبدّل الحساب",
+        text: "Renewal is running and being rejected — the Privy session has ended. Sign in again and switch the account",
       };
     }
     return {
       level: "warn",
       text: age === null || age === undefined
-        ? "التوكن منتهٍ ولم يُجدَّد — هل خادمُ الـapi يعمل؟"
-        : `التوكن منتهٍ ولم يُمَسَّ الملفُّ منذ ${dur(age)} — خادمُ الـapi لا يجدّد`,
+        ? "The token is expired and wasn't renewed — is the api server running?"
+        : `The token is expired and the file hasn't been touched for ${dur(age)} — the api server isn't renewing`,
     };
   }
   const spare = (d.missing || []).filter((f) => !blocking.includes(f));
   if (spare.length) {
-    return { level: "good", text: `التوكن سارٍ. ${spare.join("، ")} غيرُ مُلتقط وله بديل` };
+    return { level: "good", text: `The token is valid. ${spare.join(", ")} not captured and has a fallback` };
   }
-  return { level: "good", text: "ملفٌّ كامل والتوكن سارٍ" };
+  return { level: "good", text: "Complete file and a valid token" };
 }
 
 function renderFomoAccount(data) {
@@ -1682,16 +1712,17 @@ function renderFomoAccount(data) {
 
   let html = `<div class="keyrow">
     <span class="keydot ${state.level}" title="${esc(state.text)}"></span>
-    <span class="mono">${d.did ? esc(d.did) : "بلا هويّة"}</span>
-    ${d.token_tail ? `<span class="mono" title="آخر 4 أحرف — للتمييز فقط">…${esc(d.token_tail)}</span>` : ""}
+    <span class="mono">${d.did ? esc(d.did) : "no identity"}</span>
+    ${d.token_tail ? `<span class="mono" title="Last 4 characters — for distinguishing only">…${esc(d.token_tail)}</span>` : ""}
     <span class="grow" style="color:var(--muted)">${esc(state.text)}
       ${d.exists && d.expires_at ? `<span class="mono">(${esc(acctLeft(d.seconds_left))})</span>` : ""}</span>
-    <button class="keybtn" data-act="probe">افحص الآن</button>
+    <button class="keybtn" data-act="probe">Probe now</button>
   </div>`;
 
-  // نتيجةُ المِجَسّ: الرموزُ الخام معروضةٌ لا مُلخَّصة. حجبُ الهويّة كتبه
-  // المسجّل «المصدرُ غيرُ متاح» فطُوردت الشبكةُ ساعةً وهي سليمة؛ ورقمُ 403
-  // بجانب مساره يقطع ذلك في نظرة.
+  // the probe's result: raw codes displayed, not summarized. Masking the
+  // identity once made the recorder log "source unavailable" and a healthy
+  // network got chased for an hour; a 403 next to its path settles that at a
+  // glance.
   const p = d.last_probe;
   if (p) {
     html += `<div class="keyrow">
@@ -1699,72 +1730,74 @@ function renderFomoAccount(data) {
         ${p.level === "good" ? "✓" : p.level === "bad" ? "✕" : "!"} ${esc(p.detail)}</span>
       <span class="grow acctprobe">${(p.rows || []).map(r =>
         `<span><span class="mono">${esc(r.method)} ${esc(r.path)}</span> →
-          <span class="mono">${r.status == null ? esc(r.note || "لا جواب") : r.status}</span></span>`
+          <span class="mono">${r.status == null ? esc(r.note || "no response") : r.status}</span></span>`
       ).join("")}</span>
       <span class="mono" style="color:var(--muted)">${ago(p.at)}</span>
     </div>`;
   } else if (d.exists) {
     html += `<div class="keyrow off"><span class="keydot off"></span>
-      <span class="grow" style="color:var(--muted)">لم يُفحص في هذه الجلسة — الفحصُ نداءٌ حقيقيّ
-      إلى المصدر، فلا يجري تلقائياً مع كلّ تحديث.</span></div>`;
+      <span class="grow" style="color:var(--muted)">Not probed in this session — a probe is a real
+      call to the source, so it doesn't run automatically on every refresh.</span></div>`;
   }
 
-  // النسخُ: مخرجُ الطوارئ من لصقةٍ خاطئة. تُعرض بالبصمة لا بالقيمة.
+  // Backups: the emergency exit from a bad paste. Shown by fingerprint, not by value.
   for (const b of d.backups || []) {
     html += `<div class="keyrow off">
       <span class="keydot off"></span>
-      <span class="mono">${b.did ? esc(b.did) : "بصمةٌ غيرُ مقروءة"}</span>
-      <span class="grow" style="color:var(--muted)">نسخةٌ محفوظة
+      <span class="mono">${b.did ? esc(b.did) : "unreadable fingerprint"}</span>
+      <span class="grow" style="color:var(--muted)">saved backup
         <span class="mono">${esc(b.name.replace(".privy_state.json.bak-", ""))}</span> · ${ago(b.saved_at)}</span>
-      <button class="keybtn" data-act="restore" data-name="${esc(b.name)}">استعِد</button>
+      <button class="keybtn" data-act="restore" data-name="${esc(b.name)}">Restore</button>
     </div>`;
   }
   host.innerHTML = html;
 }
 
-/** يجلب بطاقةَ الحساب وحدَها — بلا مِجَسّ، فهذا مسارُ قراءةٍ محلّيّ رخيص. */
+/** Fetches the account card alone — no probe, since this is a cheap local read. */
 async function refreshAccount() {
   renderFomoAccount(await getOptionalJSON("/api/fomo-account", null));
 }
 
 document.getElementById("acct-copy").addEventListener("click", async (event) => {
-  // النصُّ من `textContent` لا من ثابتٍ في JS: نسخةٌ واحدة لا نسختان تتباعدان.
+  // the text comes from `textContent`, not a constant in JS: one copy, not two that drift apart.
   const text = document.getElementById("acct-snippet").textContent.trim();
   const button = event.currentTarget;
   try {
     await navigator.clipboard.writeText(text);
-    button.textContent = "نُسخ ✓";
+    button.textContent = "Copied ✓";
   } catch {
-    // 127.0.0.1 سياقٌ آمن فالحافظةُ متاحة، لكنّ المتصفّح قد يرفض بلا تفاعلٍ
-    // موثوق ⇒ نُظلّل السطر ليُنسخ بـCtrl+C بدل رسالة فشلٍ بلا مخرج.
+    // 127.0.0.1 is a secure context so the clipboard is available, but the
+    // browser may refuse without a trusted interaction ⇒ we select the line so
+    // it can be copied with Ctrl+C, instead of a failure message with no way out.
     const range = document.createRange();
     range.selectNodeContents(document.getElementById("acct-snippet"));
     const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
-    button.textContent = "ظُلِّل — Ctrl+C";
+    button.textContent = "Selected — Ctrl+C";
   }
-  setTimeout(() => { button.textContent = "انسخ السطر"; }, 2500);
+  setTimeout(() => { button.textContent = "Copy the line"; }, 2500);
 });
 
 document.getElementById("acct-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const field = document.getElementById("acct-dump");
   const raw = field.value.trim();
-  if (!raw) { showAcctMsg("الصق مخزن Privy أوّلاً", "bad"); return; }
+  if (!raw) { showAcctMsg("Paste the Privy store first", "bad"); return; }
   let dump;
   try {
     dump = JSON.parse(raw);
   } catch {
-    showAcctMsg("ما لُصق ليس JSON — استعمل السطر أعلاه، فهو يُخرجه جاهزاً", "bad");
+    showAcctMsg("What was pasted isn't JSON — use the line above, it produces it ready-made", "bad");
     return;
   }
-  if (!confirm("تبديلُ حساب fomo يغيّر مصدرَ البيانات كلَّه. تُحفظ نسخةٌ قبل الكتابة. متابعة؟")) return;
-  showAcctMsg("جارٍ التبديل…", "");
+  if (!confirm("Switching the fomo account changes the whole data source. A backup is saved before writing. Continue?")) return;
+  showAcctMsg("Switching…", "");
   try {
     const out = await postJSON("/api/fomo-account/switch", dump);
-    // يُفرَغ الحقل فوراً عند النجاح: فيه توكنُ حسابٍ حقيقيّ، وبقاؤه على الشاشة
-    // خطرٌ بلا فائدة — نفسُ حكم حقل المفتاح.
+    // the field is cleared immediately on success: it holds a real account's
+    // token, and leaving it on screen is risk with no benefit — same verdict
+    // as the key field.
     field.value = "";
-    showAcctMsg(`تمّ: ${out.did} (…${out.token_tail}). ${out.message}`, "good");
+    showAcctMsg(`Done: ${out.did} (…${out.token_tail}). ${out.message}`, "good");
     await refreshAccount();
   } catch (err) {
     showAcctMsg(err.message, "bad");
@@ -1775,7 +1808,7 @@ document.getElementById("fomo-account").addEventListener("click", async (event) 
   const button = event.target.closest("button[data-act]");
   if (!button) return;
   const { act, name } = button.dataset;
-  if (act === "restore" && !confirm(`استعادةُ ${name} تُحلّ محلَّ الحساب الحاليّ. متابعة؟`)) return;
+  if (act === "restore" && !confirm(`Restoring ${name} replaces the current account. Continue?`)) return;
   button.disabled = true;
   const original = button.textContent;
   button.textContent = "…";
@@ -1801,7 +1834,7 @@ const NETWORK_META = {
   "8453": { name: "Base", source: "Public RPC + FOMO" },
   "4663": { name: "Robinhood Chain", source: "Public RPC + FOMO" },
   "1": { name: "Ethereum", source: "Market feed" },
-  "143": { name: "Monad", source: "Public RPC حيّ + FOMO" },
+  "143": { name: "Monad", source: "Live public RPC + FOMO" },
   "1337": { name: "Hyperliquid", source: "Market feed" },
 };
 
@@ -1812,21 +1845,23 @@ function coveragePct(value, total) {
 function renderNetworks(rows, cacheMeta) {
   const host = document.getElementById("network-summary");
   if (!rows.length) {
-    host.innerHTML = `<div class="card"><div class="body empty">لا توجد بيانات شبكات بعد.</div></div>`;
+    host.innerHTML = `<div class="card"><div class="body empty">No network data yet.</div></div>`;
     return;
   }
-  /* الأمانةُ في العرض: أعدادُ التغطية مخزَّنةٌ مؤقّتاً وقد تتأخّر دقيقتين، أمّا
-     «آخر سوق» فيُحسب حيّاً في كلّ طلب. عرضُ الاثنين بلا تمييزٍ يقرأ كأنّ الكلَّ
-     لحظيّ — ورقمٌ يُظنّ لحظيّاً وهو ليس كذلك أسوأُ من رقمٍ يقول عمرَه. */
+  /* Honesty in display: the coverage counts are cached and may lag two minutes
+     behind, while "last market" is computed live on every request. Showing both
+     without distinction reads as if everything is current — and a number
+     believed to be live when it isn't is worse than a number that states its
+     age. */
   const note = cacheMeta
-    ? `<div class="network-note${cacheMeta.error ? " warn" : ""}">أعدادُ التغطية محسوبةٌ منذ
-         ${ago(cacheMeta.computed_at)} (تُجدَّد كلّ ${num(Math.round(cacheMeta.ttl_seconds))} ثانية) ·
-         «آخر سوق» حيٌّ في كلّ تحديث${cacheMeta.error ? ` · تعذّر التجديد: ${esc(cacheMeta.error)}` : ""}</div>`
+    ? `<div class="network-note${cacheMeta.error ? " warn" : ""}">Coverage counts computed
+         ${ago(cacheMeta.computed_at)} ago (renewed every ${num(Math.round(cacheMeta.ttl_seconds))} seconds) ·
+         "last market" is live on every refresh${cacheMeta.error ? ` · renewal failed: ${esc(cacheMeta.error)}` : ""}</div>`
     : "";
   host.innerHTML = note + rows.map(row => {
     const meta = NETWORK_META[String(row.network_id)] || {
-      name: `شبكة ${row.network_id}`,
-      source: "مصدر غير مصنّف",
+      name: `Network ${row.network_id}`,
+      source: "Unclassified source",
     };
      const activeTotal = row.active_watches || 0;
      const historicalTotal = row.historical_watches || 0;
@@ -1851,55 +1886,56 @@ function renderNetworks(rows, cacheMeta) {
        ? row.historical_concentration_rows
        : row.concentration_rows;
      const coverage = [
-       { label: "Top 1 · سلسلة", value: values.top1, available: directAvailable },
-       { label: "Top 5 · سلسلة", value: values.top5, available: directAvailable },
-       { label: "Top 10 · سلسلة", value: values.top10, available: directAvailable },
-       { label: "Top 20 · سلسلة", value: values.top20, available: directAvailable },
+       { label: "Top 1 · chain", value: values.top1, available: directAvailable },
+       { label: "Top 5 · chain", value: values.top5, available: directAvailable },
+       { label: "Top 10 · chain", value: values.top10, available: directAvailable },
+       { label: "Top 20 · chain", value: values.top20, available: directAvailable },
       { label: "Top 10 · FOMO", value: row.details_top10_rows, available: detailsAvailable },
-      { label: "عدد الحائزين", value: row.details_holder_rows, available: detailsAvailable },
+      { label: "Holder count", value: row.details_holder_rows, available: detailsAvailable },
     ];
      const noCoverage = total === 0;
-     const stateLabel = noCoverage ? "لا مراقبات" : directAvailable ? (historicalMode ? "تركيز تاريخي" : "تركيز كامل") : detailsAvailable ? "Top 10 + حائزون" : "بيانات سوق";
+     const stateLabel = noCoverage ? "No watches" : directAvailable ? (historicalMode ? "Historical concentration" : "Full concentration") : detailsAvailable ? "Top 10 + holders" : "Market data";
      return `<article class="network-item">
       <header><div><h3>${esc(meta.name)}</h3><span class="meta">${esc(meta.source)} · ID ${esc(row.network_id)}</span></div>
          <span class="badge ${noCoverage ? "" : directAvailable ? "good" : detailsAvailable ? "warn" : "bad"}">${stateLabel}</span></header>
       <div class="network-metrics">
-         <div class="network-metric"><span>مراقبة نشطة</span><strong>${num(row.active_watches)}</strong></div>
-         <div class="network-metric"><span>لقطات سوق</span><strong>${compact(row.tick_rows)}</strong></div>
-         <div class="network-metric"><span>لقطات تركّز</span><strong>${compact(concentrationTotal)}</strong></div>
+         <div class="network-metric"><span>Active watches</span><strong>${num(row.active_watches)}</strong></div>
+         <div class="network-metric"><span>Market snapshots</span><strong>${compact(row.tick_rows)}</strong></div>
+         <div class="network-metric"><span>Concentration snapshots</span><strong>${compact(concentrationTotal)}</strong></div>
       </div>
       <div class="coverage-list">${coverage.map(metric => {
         const p = metric.available ? coveragePct(metric.value || 0, total) : 0;
-         const value = metric.available ? `${num(metric.value)} من ${num(total)}` : "غير متاح";
+         const value = metric.available ? `${num(metric.value)} of ${num(total)}` : "unavailable";
         return `<div class="coverage-row"><span>${esc(metric.label)}</span><div class="meter"><i style="width:${p}%;background:${p >= 95 ? "var(--good)" : p ? "var(--s1)" : "var(--muted)"}"></i></div><span class="value">${value}</span></div>`;
       }).join("")}
-       <div class="meta">مراقبات تاريخية: ${num(historicalTotal)} · آخر سوق: ${ago(row.latest_tick)} · FOMO: ${ago(row.latest_details)} · تركّز كامل: ${ago(row.latest_concentration)}</div></div>
+       <div class="meta">Historical watches: ${num(historicalTotal)} · last market: ${ago(row.latest_tick)} ago · FOMO: ${ago(row.latest_details)} ago · full concentration: ${ago(row.latest_concentration)} ago</div></div>
     </article>`;
   }).join("");
 }
 
-/* ---------- التوسيم والنتائج (outcomes/training_rows) ---------- */
-/* النتائج هنا **نهائية** (نوافذ 48 ساعة مكتملة) — على خلاف صفحة الأداء التي
-   تعرض مراكز مفتوحة في نافذة جارية. الخلط بين الاثنين يقرأ «كأنّ الإشارة
-   رابحة دائمًا» لأنّ القمّة لا تتحقّق إلّا ببيعٍ في لحظتها. */
+/* ---------- labeling and outcomes (outcomes/training_rows) ---------- */
+/* The outcomes here are **final** (completed 48-hour windows) — unlike the
+   performance page, which shows open positions in a running window. Mixing the
+   two reads as if "the signal always wins", because a peak is realized only by
+   selling at that exact moment. */
 
 const KIND_LABEL = {
-  watch: "قرار مراقبة",
-  signal: "حدث إشارة",
-  activity: "نشاط",
+  watch: "Watch decision",
+  signal: "Signal event",
+  activity: "Activity",
 };
 const OUTCOME_STATUS_LABEL = {
-  ok: "سليمة",
-  no_entry: "بلا سعر دخول",
-  no_bars: "بلا شموع",
-  incomplete: "ناقصة",
+  ok: "Healthy",
+  no_entry: "No entry price",
+  no_bars: "No candles",
+  incomplete: "Incomplete",
 };
 
-/** وسيطُ نسبةٍ من القيم الكسريّة — القياس في العميل لا في SQL. */
+/** A median percentage of fractional values — measured in the client, not in SQL. */
 function renderLabeling(data) {
   if (!data || data.live === false) {
     document.getElementById("labeling-gate").innerHTML =
-      `<div class="empty">لا جدول نتائج بعد — الموسِّم لم يوسّم أيّ نافذة.</div>`;
+      `<div class="empty">No outcomes table yet — the labeler hasn't labeled any window.</div>`;
     return;
   }
   paintLabelingGate(data);
@@ -1909,11 +1945,11 @@ function renderLabeling(data) {
   paintLabelingTraining(data.training || {});
   paintLabelingStatus(data.status_counts || [], data.exclusions || []);
 
-  // طزاجة الملخّص المخزَّن — نفس لغة الشفافيّة في صفحة الشبكات
+  // freshness of the cached summary — the same transparency language as the networks page
   const note = document.getElementById("labeling-cache-note");
   const m = data.cache;
   note.textContent = m
-    ? `الأرقام محسوبة منذ ${ago(m.computed_at)} (تُحدَّث كل ${num(Math.round(m.ttl_seconds))} ث) · آخر توسيم ${ago(data.last_labeled_at)}${m.error ? ` · تعذّر التجديد: ${m.error}` : ""}`
+    ? `Numbers computed ${ago(m.computed_at)} ago (updated every ${num(Math.round(m.ttl_seconds))}s) · last labeled ${ago(data.last_labeled_at)} ago${m.error ? ` · renewal failed: ${m.error}` : ""}`
     : "";
 }
 
@@ -1924,64 +1960,64 @@ function paintLabelingGate(d) {
   const c = d.control || {};
   const pctDone = Math.min(100, (g.completed / g.decision_target) * 100);
   const etaText = g.decision_ready
-    ? "البوابة مفتوحة — قرار المرحلة الأولى متاح"
+    ? "The gate is open — the stage-one decision is available"
     : g.eta
-      ? `بمعدّل ${num(g.avg_per_day)} ضابطة/يوم · متوقّع خلال ${num(g.eta.days)} يوم`
+      ? `at ${num(g.avg_per_day)} controls/day · expected within ${num(g.eta.days)} days`
       : g.avg_per_day
-        ? `متبقّي ${num(g.remaining)} · بمعدّل ${num(g.avg_per_day)}/يوم`
-        : `متبقّي ${num(g.remaining)}`;
+        ? `${num(g.remaining)} left · at ${num(g.avg_per_day)}/day`
+        : `${num(g.remaining)} left`;
 
   const etaBadge = g.decision_ready
-    ? `<span class="badge good">✓ جاهزة</span>`
+    ? `<span class="badge good">✓ ready</span>`
     : g.preliminary_ready
-      ? `<span class="badge warn">فحص أولي متاح</span>`
-      : `<span class="badge warn">جمع الضابطة جارٍ</span>`;
+      ? `<span class="badge warn">Preliminary check available</span>`
+      : `<span class="badge warn">Control collection in progress</span>`;
 
   host.innerHTML = `
     <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
       <span style="font-size:38px;font-weight:640;letter-spacing:-.02em" class="num">${num(g.completed)}</span>
-      <span style="color:var(--muted);font-size:14px">من ${num(g.decision_target)} ضابطة v${d.design_version ?? 3} مكتملة النافذة</span>
+      <span style="color:var(--muted);font-size:14px">of ${num(g.decision_target)} controls v${d.design_version ?? 3} with a completed window</span>
       ${etaBadge}
     </div>
     <div class="meter" style="height:10px;margin-top:12px"><i style="width:${pctDone}%;background:${g.decision_ready ? "var(--good)" : "var(--s1)"}"></i></div>
     <div style="display:flex;justify-content:space-between;gap:12px;font-size:11.5px;color:var(--muted);margin-top:5px">
-      <span>الفحص الأولي ${num(g.preliminary_target)} ${g.preliminary_ready ? "✓" : ""}</span>
+      <span>Preliminary check ${num(g.preliminary_target)} ${g.preliminary_ready ? "✓" : ""}</span>
       <span>${esc(etaText)}</span>
     </div>
     <div class="opennote" style="margin-top:14px">
-      لا تدريب معتمد قبل البلوغ — بوابة ملزمة في <span class="mono">docs/PLAN.md</span>.
-      المجموعة الصالحة: <span class="mono">kind=watch · status=ok · analysis_eligible=1 · v${d.design_version ?? 3}+</span>.
-      الإشارة ${num(s.count ?? 0)} نافذة مقابل ${num(c.count ?? 0)} للضابطة.
+      No approved training before the target is reached — a binding gate in <span class="mono">docs/PLAN.md</span>.
+      The valid set: <span class="mono">kind=watch · status=ok · analysis_eligible=1 · v${d.design_version ?? 3}+</span>.
+      The signal has ${num(s.count ?? 0)} windows versus ${num(c.count ?? 0)} for the control.
     </div>`;
 }
 
-/** حصيلة مجموعة (إشارة أو ضابطة) — الأرقام النهائية بلا قيد «مفتوح». */
+/** A group's tally (signal or control) — final numbers, with no "open" caveat. */
 function paintLabelingGroup(hostId, g, kind) {
   const host = document.getElementById(hostId);
   if (!g || !g.count) {
-    host.innerHTML = `<div class="empty">${kind === "control" ? "لا ضابطة موسومة بعد." : "لا إشارات موسومة بعد."}</div>`;
+    host.innerHTML = `<div class="empty">${kind === "control" ? "No labeled controls yet." : "No labeled signals yet."}</div>`;
     return;
   }
   const explPct = g.explosive_pct ?? 0;
   const cells = [
-    { l: "نوافذ موسومة", v: num(g.count) },
-    { l: "منفجرة (is_explosive)", v: `${num(g.explosive)} · ${pct(explPct, { sign: false })}` },
-    { l: "متوسط العائد النهائي", v: signed(g.avg_return_pct) },
-    { l: "وسيط العائد", v: signed(g.median_return_pct) },
-    { l: "متوسط أعلى ارتفاع", v: signed(g.avg_gain_pct) },
+    { l: "Labeled windows", v: num(g.count) },
+    { l: "Explosive (is_explosive)", v: `${num(g.explosive)} · ${pct(explPct, { sign: false })}` },
+    { l: "Mean final return", v: signed(g.avg_return_pct) },
+    { l: "Median return", v: signed(g.median_return_pct) },
+    { l: "Mean peak gain", v: signed(g.avg_gain_pct) },
   ];
   host.innerHTML = `
     <div class="summary" style="border-bottom:none">
       ${cells.map(cel => `<div class="cell"><div class="l">${esc(cel.l)}</div><div class="v">${cel.v}</div></div>`).join("")}
     </div>
-    <div class="opennote">المنفجرة = قمّة ≥ +100% خلال 48س ونصفها (+50%) خلال أول 24س. العائد النهائي = سعر إغلاق نهاية النافذة مقابل الدخول.</div>`;
+    <div class="opennote">Explosive = a peak ≥ +100% within 48h and half of it (+50%) within the first 24h. The final return = the window's closing price against the entry.</div>`;
 }
 
-/** أعمدة التوسيم اليومي — نفس مواصفات رسم الإشارات مع لوحات ألوان الأنواع. */
+/** Daily labeling columns — the same chart spec as the signals chart, with the type palette. */
 function paintLabelingDays(days) {
   const host = document.getElementById("labeling-days");
   if (!days.length) {
-    host.innerHTML = `<div class="empty">لا توسيم بعد.</div>`;
+    host.innerHTML = `<div class="empty">No labeling yet.</div>`;
     return;
   }
   const W = 720, H = 170, m = { t: 10, r: 8, b: 24, l: 40 };
@@ -1995,7 +2031,7 @@ function paintLabelingDays(days) {
 
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
   const title = el("title", {});
-  title.textContent = "النوافذ الموسومة لكل يوم";
+  title.textContent = "Labeled windows per day";
   svg.append(title);
 
   for (let gv = 0; gv <= top; gv += step) {
@@ -2014,7 +2050,7 @@ function paintLabelingDays(days) {
     const hit = el("rect", { x: m.l + band * i, y: m.t, width: band, height: ph, fill: "transparent" });
     hit.style.cursor = "crosshair";
     hit.addEventListener("mousemove", (e) => showTip(e,
-      `<div class="t">${esc(d.day)}</div><div class="r"><span class="k">نوافذ موسومة</span><span class="v">${num(d.count)}</span></div>`));
+      `<div class="t">${esc(d.day)}</div><div class="r"><span class="k">Labeled windows</span><span class="v">${num(d.count)}</span></div>`));
     hit.addEventListener("mouseleave", hideTip);
     svg.append(hit);
     if (i % Math.ceil(days.length / 7) === 0 || i === days.length - 1) {
@@ -2029,13 +2065,13 @@ function paintLabelingDays(days) {
   box.append(svg);
   host.replaceChildren(box);
   host.insertAdjacentHTML("beforeend",
-    `<div class="opennote" style="margin-top:10px">اليومان الأخيران لم تكتمل نوافذهما بعد — الأرقام تنقص لا تزيد.</div>`);
+    `<div class="opennote" style="margin-top:10px">The last two days haven't had their windows complete yet — their numbers only go down, never up.</div>`);
 }
 
 function paintLabelingTraining(t) {
   const host = document.getElementById("labeling-training");
   if (!t.available) {
-    host.innerHTML = `<div class="empty">لا صفوف تدريب بعد — الباني يعمل كل ساعة.</div>`;
+    host.innerHTML = `<div class="empty">No training rows yet — the builder runs every hour.</div>`;
     return;
   }
   const cur = t.current || {};
@@ -2043,9 +2079,9 @@ function paintLabelingTraining(t) {
   const splitCells = ["train", "val", "test"].map(sp => {
     const s = cur.splits?.[sp] || { count: 0, explosive: 0 };
     return `<div class="cell">
-      <div class="l">${sp === "train" ? "تدريب" : sp === "val" ? "تحقّق" : "اختبار"}</div>
+      <div class="l">${sp === "train" ? "Train" : sp === "val" ? "Validation" : "Test"}</div>
       <div class="v">${num(s.count)}</div>
-      <div class="d">${s.count ? `${num(s.explosive)} منفجرة` : "—"}</div>
+      <div class="d">${s.count ? `${num(s.explosive)} explosive` : "—"}</div>
     </div>`;
   }).join("");
   const versionsRows = (t.versions || []).map(v => `
@@ -2059,46 +2095,48 @@ function paintLabelingTraining(t) {
   host.innerHTML = `
     <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <span style="font-size:26px;font-weight:640" class="num">${num(cur.total ?? 0)}</span>
-      <span style="color:var(--muted);font-size:13px">صفًّا في الإصدار الحاليّ fv${cur.feature_version ?? "—"}</span>
+      <span style="color:var(--muted);font-size:13px">rows in the current version fv${cur.feature_version ?? "—"}</span>
       ${cur.building
-        ? `<span class="badge warn">قيد البناء</span>`
-        : `<span class="badge">مكتمل</span>`}
-      ${curExplosivePct != null ? `<span class="badge">${pct(curExplosivePct, { sign: false })} منفجرة</span>` : ""}
+        ? `<span class="badge warn">Building</span>`
+        : `<span class="badge">Complete</span>`}
+      ${curExplosivePct != null ? `<span class="badge">${pct(curExplosivePct, { sign: false })} explosive</span>` : ""}
     </div>
     <div class="summary" style="border-bottom:none">${splitCells}</div>
     <div class="tablewrap"><table>
-      <thead><tr><th>الإصدار</th><th>الصفوف</th><th>المنفجرة</th><th>النسبة</th><th>آخر بناء</th></tr></thead>
+      <thead><tr><th>Version</th><th>Rows</th><th>Explosive</th><th>Share</th><th>Last build</th></tr></thead>
       <tbody>${versionsRows}</tbody></table></div>
     <div class="opennote">
-      «قيد البناء» = الإصدار الأعلى لم يكتمل رجوعُه التاريخيّ بعد؛ نسبته تنقص
-      لا تزيد حتى اكتماله. التدريب المعتمد يبقى محجوزًا خلف بوابة ${num(500)}.
+      "Building" = the highest version hasn't finished its historical backfill yet; its
+      share only goes down, never up, until it completes. Approved training stays
+      reserved behind the gate of ${num(500)}.
     </div>`;
 }
 
 function paintLabelingStatus(counts, exclusions) {
   const host = document.getElementById("labeling-status");
   if (!counts.length) {
-    host.innerHTML = `<div class="empty">لا نتائج بعد.</div>`;
+    host.innerHTML = `<div class="empty">No outcomes yet.</div>`;
     return;
   }
   const total = counts.reduce((a, c) => a + c.count, 0);
   const statusLabel = (s) => OUTCOME_STATUS_LABEL[s] || s;
   const kindLabel = (k) => KIND_LABEL[k] || k;
-  // أسبابُ الاستبعاد مجمّعةٌ بالحالة: قد يتشارك سطران سببًا واحدًا (فُرقا
-  // بالنوع فقط)، وقد يجمع سطرٌ واحدٌ أسبابًا عدة. والسببُ «—» يعني أنّ
-  // المسجّل لم يسجّل سببًا — ونصٌّ عربيٌّ أوضحُ من شرطةٍ تُقرأ نقصًا.
+  // Exclusion reasons grouped by status: two rows may share one reason (they
+  // differ only by kind), and one row may gather several reasons. And a "—"
+  // reason means the recorder recorded no reason — and a text label is clearer
+  // than a dash that reads as a missing value.
   const reasonsByStatus = new Map();
   for (const e of exclusions) {
     const list = reasonsByStatus.get(e.status) || [];
-    const label = e.reason === "—" ? "بدون سببٍ مسجّل" : e.reason;
+    const label = e.reason === "—" ? "no recorded reason" : e.reason;
     list.push(`${esc(label)} (${num(e.count)})`);
     reasonsByStatus.set(e.status, list);
   }
   host.innerHTML = `<table>
-    <thead><tr><th>النوع</th><th>الحالة</th><th>العدد</th><th>النسبة</th><th>الاستبعاد</th></tr></thead>
+    <thead><tr><th>Kind</th><th>Status</th><th>Count</th><th>Share</th><th>Exclusion</th></tr></thead>
     <tbody>${counts.map(c => {
       const reason = c.status === "ok"
-        ? `<span class="badge good">✓ دخلت التحليل</span>`
+        ? `<span class="badge good">✓ entered the analysis</span>`
         : (reasonsByStatus.get(c.status) || ["—"]).join(" · ");
       return `<tr>
         <td>${esc(kindLabel(c.kind))}</td>
@@ -2109,20 +2147,20 @@ function paintLabelingStatus(counts, exclusions) {
       </tr>`;
     }).join("")}</tbody></table>
     ${exclusions.length ? `<div class="opennote">
-      <b>أسباب الاستبعاد:</b> ${exclusions.map(e => {
-        const label = e.reason === "—" ? "بدون سببٍ مسجّل" : e.reason;
+      <b>Exclusion reasons:</b> ${exclusions.map(e => {
+        const label = e.reason === "—" ? "no recorded reason" : e.reason;
         return `${esc(label)} (${num(e.count)})`;
       }).join(" · ")}</div>` : ""}`;
 }
 
 const VIEW_META = {
-  overview: ["نظرة عامة", "حالة الالتقاط الحالية ونبض مصادر البيانات.", "آخر 24 ساعة"],
-  signals: ["الإشارات", "آخر الإشارات المسجلة مع سياق السوق والمتداولين.", "الأحدث أولاً"],
-  watchlist: ["قائمة المراقبة", "العملات النشطة والوقت المتبقي لكل نافذة.", "نافذة 48 ساعة"],
-  performance: ["أداء الإشارات", "الحركة منذ لحظة الدخول والمقارنة مع الضابطة.", "تحليل جاري"],
-  health: ["صحة البيانات", "تغطية الشموع، أخطاء المصادر، وحالة الأرشيف.", "مراقبة تشغيلية"],
-  networks: ["الشبكات", "تغطية السوق وقياسات الحائزين والتركيز حسب الشبكة.", "تغطية فعلية"],
-  labeling: ["التوسيم والنتائج", "النتائج النهائية بعد 48 ساعة وصفوف التدريب وبوابة المرحلة الأولى.", "نتائج نهائية"],
+  overview: ["Overview", "Current capture state and the pulse of the data sources.", "Last 24 hours"],
+  signals: ["Signals", "The latest recorded signals with market and trader context.", "Newest first"],
+  watchlist: ["Watchlist", "Active coins and the time remaining on each window.", "48-hour window"],
+  performance: ["Signal performance", "Movement since the moment of entry, compared with the control.", "Live analysis"],
+  health: ["Data health", "Candle coverage, source errors, and archive state.", "Operational monitoring"],
+  networks: ["Networks", "Market coverage and holder and concentration measurements per network.", "Actual coverage"],
+  labeling: ["Labeling & outcomes", "Final outcomes after 48 hours, training rows, and the stage-one gate.", "Final outcomes"],
 };
 
 function setActiveView() {
@@ -2147,14 +2185,16 @@ function setActiveView() {
   window.scrollTo({ top: 0, behavior: "instant" });
 }
 
-/* ---------- الحلقة ---------- */
+/* ---------- the loop ---------- */
 let paused = false, inflight = false;
-/* آخرُ حمولةٍ للّوحات الثقيلة، وعدّادُ الدورات الذي يقرّر متى تُطلب مجدّداً.
-   `null` تعني «لم تُجلب بعد» ⇒ تُطلب في الدورة القادمة أيّاً كان العدّاد. */
+/* The last payload of the heavy panels, and the cycle counter that decides when
+   to request them again. `null` means "not fetched yet" ⇒ requested on the next
+   cycle regardless of the counter. */
 let heavyTick = 0;
 const heavy = { counts: null, networks: null, labeling: null };
 
-/** ينفّذ رسم لوحة واحدة معزولاً؛ الفشل يُبلَّغ في مكانها ولا يوقف البقيّة. */
+/** Renders one panel in isolation; a failure is reported in its place and
+    doesn't stop the rest. */
 function paint(id, fn) {
   try {
     fn();
@@ -2162,7 +2202,7 @@ function paint(id, fn) {
     console.error("render failed:", id, err);
     const host = document.getElementById(id);
     if (host) {
-      host.innerHTML = `<div class="empty">تعذّر عرض هذه اللوحة —
+      host.innerHTML = `<div class="empty">This panel failed to render —
         <span class="mono">${esc(err.message)}</span></div>`;
     }
   }
@@ -2172,11 +2212,13 @@ async function tick() {
   if (paused || inflight) return;
   inflight = true;
   const main = document.querySelector("main");
-  const slow = setTimeout(() => main.classList.add("stale"), 400);   // بلا وميض هيكل
+  const slow = setTimeout(() => main.classList.add("stale"), 400);   // no skeleton flash
   try {
-    // اللوحاتُ الثقيلة: تُطلب أوّلَ مرّة ثم كلَّ HEAVY_EVERY، وتُستعاد من `heavy`
-    // بينهما. الشرطُ على وجودِ الحمولة أيضاً لا على العدّاد وحده — فطلبٌ فاشل في
-    // الدورة السادسة كان سيُبقي اللوحةَ فارغةً دقيقةً كاملة قبل المحاولة الثانية.
+    // Heavy panels: requested the first time, then every HEAVY_EVERY, and
+    // restored from `heavy` in between. The condition is on the payload's
+    // existence too, not the counter alone — a failed request on the sixth
+    // cycle would have left the panel empty for a full minute before the
+    // second attempt.
     const wantHeavy = (heavyTick % HEAVY_EVERY === 0) || heavy.counts === null;
     heavyTick += 1;
     const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys,
@@ -2195,7 +2237,8 @@ async function tick() {
       wantHeavy
         ? getOptionalJSON("/api/networks", heavy.networks || { networks: [] })
         : heavy.networks,
-      // اختياريّ: صفحةٌ محمَّلة قبل تحديث الخادم لا تفقد بقيّة اللوحات لأجل هذه.
+      // optional: a page loaded before a server update doesn't lose the rest of
+      // its panels for the sake of this one.
       getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }),
       getOptionalJSON("/api/fomo-account", null),
       wantHeavy
@@ -2207,8 +2250,9 @@ async function tick() {
     heavy.labeling = labeling;
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
 
-    // كل لوحة تُرسم مستقلّة: عطبٌ في واحدة يُفرغ تلك وحدها لا اللوحة كلّها.
-    // (بلا هذا العزل، خطأ واحد في رسم الأعمدة أفرغ أربع لوحات دفعةً واحدة.)
+    // every panel renders independently: a fault in one empties that one alone,
+    // not the whole dashboard. (Without this isolation, one error in the column
+    // chart emptied four panels at once.)
     paint("hero",      () => renderHero(cnt, tl));
     paint("tiles",     () => renderTiles(st, cnt, bars, storage, api, labeling));
     paint("perf",         () => renderPerf(rows));
@@ -2230,10 +2274,10 @@ async function tick() {
 
     document.getElementById("alert").innerHTML = "";
     document.getElementById("updated").textContent =
-      "آخر تحديث " + new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      "Updated " + new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch (e) {
     document.getElementById("alert").innerHTML =
-      `<div class="banner">تعذّر تحديث اللوحة: <span class="mono">${esc(e.message)}</span> — يُعاد المحاولة تلقائياً.</div>`;
+      `<div class="banner">Failed to refresh the dashboard: <span class="mono">${esc(e.message)}</span> — retrying automatically.</div>`;
   } finally {
     clearTimeout(slow);
     main.classList.remove("stale");
@@ -2242,13 +2286,13 @@ async function tick() {
 }
 const lastRows = { perf: [], tl: null };
 
-/* أزرار عرض الجدول: كل رسم له مكافئ جدوليّ */
+/* table-view buttons: every chart has a table equivalent */
 document.querySelectorAll("[data-toggle]").forEach(btn => {
   btn.addEventListener("click", () => {
     const k = btn.dataset.toggle;
     asTable[k] = !asTable[k];
     btn.setAttribute("aria-pressed", String(asTable[k]));
-    btn.textContent = asTable[k] ? "عرض كرسم" : "عرض كجدول";
+    btn.textContent = asTable[k] ? "Show as chart" : "Show as table";
     if (k === "perf") renderPerf(lastRows.perf);
     if (k === "timeline" && lastRows.tl) renderTimeline(lastRows.tl);
   });
@@ -2262,7 +2306,7 @@ document.getElementById("perf-limit").addEventListener("change", (e) => {
 document.getElementById("pause").addEventListener("click", (e) => {
   paused = !paused;
   e.target.setAttribute("aria-pressed", String(paused));
-  e.target.textContent = paused ? "استئناف" : "إيقاف مؤقّت";
+  e.target.textContent = paused ? "Resume" : "Pause";
   if (!paused) tick();
 });
 
@@ -2271,7 +2315,7 @@ document.getElementById("theme").addEventListener("click", () => {
   const next = cur === "light" ? "dark" : cur === "dark" ? "" : "light";
   if (next) document.documentElement.setAttribute("data-theme", next);
   else document.documentElement.removeAttribute("data-theme");
-  // الرسوم تقرأ ألوانها من CSS، فتُعاد بناؤها لتلتقط السمة الجديدة
+  // charts read their colors from CSS, so they're rebuilt to pick up the new theme
   renderPerf(lastRows.perf);
   if (lastRows.tl) renderTimeline(lastRows.tl);
 });

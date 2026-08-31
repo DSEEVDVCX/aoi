@@ -20,7 +20,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import config  # noqa: E402
-import evm_replay  # noqa: E402 — قائمةُ الحالات النهائيّة واحدة لا نسخة
+import evm_replay  # noqa: E402 — the final-status list lives in one place, not a copy
 from db import RecorderDB, decode_raw, utcnow_iso  # noqa: E402
 
 COHORT_META_KEY = "evm_repair_cohort"
@@ -40,10 +40,10 @@ def validated_networks(
     allowed = allowed_networks()
     refused = sorted(set(nets) - allowed)
     if refused:
-        raise ValueError(f"شبكات EVM غير مسموح بها: {', '.join(refused)}")
+        raise ValueError(f"disallowed EVM networks: {', '.join(refused)}")
     if require_all and set(nets) != allowed:
         raise ValueError(
-            "يجب إصلاح مجموعة شبكات EVM كاملة في عملية واحدة: "
+            "the full EVM network set must be repaired in one operation: "
             + ", ".join(sorted(allowed))
         )
     return nets
@@ -285,11 +285,13 @@ def finalize_training(db: RecorderDB, networks: Sequence[str]) -> int:
     state = inspect(db, nets)
     if state["active_pending"]:
         raise RuntimeError(
-            f"لا يمكن إنهاء الإصلاح: {state['active_pending']} دفتر EVM نشط غير مكتمل"
+            f"cannot finalize the repair: {state['active_pending']} "
+            f"incomplete active EVM ledgers"
         )
     if state["replay_pending"]:
         raise RuntimeError(
-            f"لا يمكن إنهاء الإصلاح: {state['replay_pending']} إعادة EVM غير مكتملة"
+            f"cannot finalize the repair: {state['replay_pending']} "
+            f"incomplete EVM replays"
         )
     if not nets:
         return 0
@@ -325,7 +327,8 @@ def finalize_training(db: RecorderDB, networks: Sequence[str]) -> int:
 def wait_and_finalize(
     db: RecorderDB, networks: Sequence[str], interval_seconds: int,
 ) -> None:
-    """انتظر اكتمال السلسلة، ثم دع البنّاء المجدول يعيد التدريب تدريجياً."""
+    """Wait for the chain to finish, then let the scheduled builder rebuild
+    training incrementally."""
     while True:
         state = inspect(db, networks)
         print(f"waiting: {state}", flush=True)

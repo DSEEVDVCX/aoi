@@ -1,9 +1,10 @@
-"""اختبارات كاش الصدارة بعد تحويله إلى الخام (بلا شبكة).
+"""Tests of the leaderboard cache after its move to raw (no network).
 
-يثبت العقد الذي تبنى عليه الأرشفة: الرتبة تُشتقّ من الموضع (الخام بلا حقل
-rank)، والمغلّف الخام الكامل يُحتفَظ به في `last_raw` ليؤرشفه المسجّل في
-snapshots كل ساعة — بلا ذلك يضيع مسار كل متصدّر إلى الأبد. الفشل يبقي
-الخريطة والخام القديمين (لا يمسحهما).
+Locks in the contract the archival is built on: rank is derived from position
+(the raw has no rank field), and the full raw envelope is kept in `last_raw`
+for the recorder to archive hourly in snapshots — without it every trader's
+path is lost forever. Failure keeps the old map and old raw (it does not wipe
+them).
 """
 
 from leaderboard_cache import LeaderboardCache
@@ -16,7 +17,7 @@ RAW = {
         "leaderboard": [
             {"id": "trader_A", "userHandle": "alice", "totalPnL": 999.0},
             {"id": "trader_B", "userHandle": "bob"},
-            {"userHandle": "no_id"},          # بلا id → لا يدخل الخريطة
+            {"userHandle": "no_id"},          # no id → not in the map
             {"id": "trader_C", "userHandle": "carol"},
         ]
     },
@@ -24,7 +25,7 @@ RAW = {
 
 
 class _RawClient:
-    """عميل وهمي يعيد مغلّفاً خاماً مُعدّاً أو يرمي حسب الطلب."""
+    """Fake client that returns a prepared raw envelope or raises on demand."""
 
     def __init__(self, data=RAW, boom=False):
         self._data = data
@@ -41,14 +42,15 @@ class _RawClient:
 async def test_refresh_builds_lookup_from_raw_position():
     lb = LeaderboardCache(_RawClient(), size=200, refresh_seconds=3600)
     assert await lb.refresh(now_mono=100.0) is True
-    # الرتبة = الموضع 1-based (كما في _map_leaderboard): C رابعة رغم الثالث الفارغ
+    # Rank = 1-based position (as in _map_leaderboard): C is 4th despite the
+    # empty third
     assert lb.lookup == {"trader_A": 1, "trader_B": 2, "trader_C": 4}
 
 
 async def test_refresh_keeps_full_raw_for_archival():
     lb = LeaderboardCache(_RawClient(), size=200, refresh_seconds=3600)
     await lb.refresh(now_mono=100.0)
-    assert lb.last_raw is RAW   # المغلّف كاملاً لا قائمة مُعيَّنة
+    assert lb.last_raw is RAW   # the whole envelope, not a projected list
 
 
 async def test_refresh_passes_configured_limit():
@@ -65,8 +67,8 @@ async def test_failure_keeps_old_lookup_and_raw():
 
     lb.set_client(_RawClient(boom=True))
     assert await lb.refresh(now_mono=4000.0) is False
-    assert lb.lookup == old_lookup        # الخريطة القديمة بقيت
-    assert lb.last_raw is old_raw         # الخام القديم بقي
+    assert lb.lookup == old_lookup        # the old map stayed
+    assert lb.last_raw is old_raw         # the old raw stayed
 
 
 async def test_malformed_envelope_returns_false_and_keeps_state():
@@ -84,20 +86,21 @@ async def test_none_envelope_returns_false():
 async def test_staleness_drives_maybe_refresh():
     client = _RawClient()
     lb = LeaderboardCache(client, size=200, refresh_seconds=3600)
-    assert await lb.maybe_refresh(now_mono=100.0) is True    # أوّل مرّة: قديم دائماً
-    assert await lb.maybe_refresh(now_mono=200.0) is False   # طازج — لا نداء
+    assert await lb.maybe_refresh(now_mono=100.0) is True    # first time: always stale
+    assert await lb.maybe_refresh(now_mono=200.0) is False   # fresh — no call
     assert len(client.calls) == 1
-    assert await lb.maybe_refresh(now_mono=100.0 + 3601) is True  # حان التحديث
+    assert await lb.maybe_refresh(now_mono=100.0 + 3601) is True  # time to refresh
     assert len(client.calls) == 2
 
 
-# --- المدد الأربع: 50 لكل صدارة، والاتّحاد يضاعف التغطية ---
+# --- the four periods: 50 per leaderboard, the union multiplies coverage ---
 def _raw(ids):
     return {"responseObject": {"leaderboard": [{"id": i} for i in ids]}}
 
 
 class _PeriodClient:
-    """عميل يعيد قائمة مختلفة لكل مسار (وقد يفشل في مسار محدّد)."""
+    """A client returning a different list per path (and optionally failing on a
+    given path)."""
 
     def __init__(self, by_path, boom_paths=()):
         self._by_path = by_path
@@ -121,7 +124,8 @@ _PERIODS = ("all", "24h", "7d", "30d")
 
 
 async def test_four_periods_kept_separate():
-    """كل مدّة خريطتها: رتبة B هي 2 في totalPnL و1 في 24h — لا دمج."""
+    """Each period gets its own map: B's rank is 2 in totalPnL and 1 in 24h —
+    no merging."""
     lb = LeaderboardCache(
         _PeriodClient(_PATHS), 200, 3600, periods=_PERIODS
     )
@@ -130,12 +134,13 @@ async def test_four_periods_kept_separate():
     assert lb.lookups["24h"] == {"B": 1, "C": 2}
     assert lb.lookups["7d"] == {"D": 1}
     assert lb.lookups["30d"] == {"E": 1}
-    # `lookup` تبقى المدّة الأساسيّة (العقد القديم محفوظ)
+    # `lookup` stays the base period (the old contract is preserved)
     assert lb.lookup == {"A": 1, "B": 2}
 
 
 async def test_union_widens_coverage_beyond_the_fifty():
-    """جوهر التوسيع: الاتّحاد يطابق متداولين لا تعرفهم الصدارة الأساسيّة."""
+    """The point of the expansion: the union matches traders the base
+    leaderboard does not know."""
     lb = LeaderboardCache(_PeriodClient(_PATHS), 200, 3600, periods=_PERIODS)
     await lb.refresh(now_mono=100.0)
     union = {t for lut in lb.lookups.values() for t in lut}
@@ -146,39 +151,40 @@ async def test_union_widens_coverage_beyond_the_fifty():
 async def test_one_failing_period_does_not_sink_the_rest():
     client = _PeriodClient(_PATHS, boom_paths=["/v2/leaderboard/7d"])
     lb = LeaderboardCache(client, 200, 3600, periods=_PERIODS)
-    assert await lb.refresh(now_mono=100.0) is True   # نجاح جزئيّ = نجاح
+    assert await lb.refresh(now_mono=100.0) is True   # partial success = success
     assert lb.lookups["24h"] == {"B": 1, "C": 2}
-    assert lb.lookups["7d"] == {}                    # فارغة لا مفبركة
+    assert lb.lookups["7d"] == {}                    # empty, not fabricated
     assert lb.failed_periods() == ("7d",)
-    assert not lb.is_stale(200.0)                    # الختم تحدّث فلا حلقة محاولات
+    assert not lb.is_stale(200.0)                    # the stamp updated, so no retry loop
 
 
 async def test_all_periods_failing_returns_false():
     client = _PeriodClient(_PATHS, boom_paths=list(_PATHS))
     lb = LeaderboardCache(client, 200, 3600, periods=_PERIODS)
     assert await lb.refresh(now_mono=100.0) is False
-    assert lb.is_stale(200.0)                        # لم نُحمّل شيئاً ⇒ نُعيد المحاولة
+    assert lb.is_stale(200.0)                        # nothing loaded ⇒ retry
 
 
 async def test_failed_period_keeps_previous_lookup():
-    """مدّة نجحت ثمّ فشلت: خريطتها القديمة تبقى — لا مسح — لكنّ الفشل يُبلَّغ."""
+    """A period that succeeded then failed: its old map stays — not wiped —
+    but the failure is reported."""
     lb = LeaderboardCache(_PeriodClient(_PATHS), 200, 3600, periods=_PERIODS)
     await lb.refresh(now_mono=100.0)
     lb.set_client(_PeriodClient(_PATHS, boom_paths=["/v2/leaderboard/24h"]))
     await lb.refresh(now_mono=4000.0)
-    assert lb.lookups["24h"] == {"B": 1, "C": 2}      # نطابق بها، فلا نمسحها
-    assert lb.failed_periods() == ("24h",)            # لكنّها بايتة: لا تصمت
+    assert lb.lookups["24h"] == {"B": 1, "C": 2}      # we still match with it, so not wiped
+    assert lb.failed_periods() == ("24h",)            # but it is rotten: not silent
 
 
 async def test_stale_raw_is_not_rearchived_under_a_new_timestamp():
-    """ساعةٌ تفشل فيها مدّة لا تعيد ختم مغلّفها القديم — وإلّا صار في الأرشيف
-    صدارةٌ لم نجلبها في ذلك الوقت قطّ."""
+    """An hour where a period fails must not re-stamp its old envelope —
+    otherwise the archive holds a leaderboard we never fetched at that time."""
     lb = LeaderboardCache(_PeriodClient(_PATHS), 200, 3600, periods=_PERIODS)
     await lb.refresh(now_mono=100.0)
     assert set(lb.raw_by_period) == set(_PERIODS)
     lb.set_client(_PeriodClient(_PATHS, boom_paths=["/v2/leaderboard/24h"]))
     await lb.refresh(now_mono=4000.0)
-    assert "24h" not in lb.raw_by_period               # لا يُؤرشف الطازج الكاذب
+    assert "24h" not in lb.raw_by_period               # the fake fresh is not archived
     assert lb.raw_seen_by_period["24h"] is _PATHS["/v2/leaderboard/24h"]
 
 
@@ -191,7 +197,8 @@ async def test_each_period_archived_under_its_own_source():
 
 
 async def test_periods_are_paced():
-    """فاصل بين نداءات المدد — لُطف مع المصدر، ثلاث نومات لأربع مدد."""
+    """A pause between period calls — kindness to the source: three naps for
+    four periods."""
     naps: list[float] = []
 
     async def _sleep(sec):
@@ -206,7 +213,7 @@ async def test_periods_are_paced():
 
 
 async def test_single_period_default_is_backward_compatible():
-    """الاستدعاء القديم (بلا periods) يبقى على المدّة الأساسيّة وحدها."""
+    """The old call form (no periods) stays on the base period alone."""
     client = _PeriodClient(_PATHS)
     lb = LeaderboardCache(client, 200, 3600)
     await lb.refresh(now_mono=100.0)
@@ -214,9 +221,9 @@ async def test_single_period_default_is_backward_compatible():
     assert lb.lookups == {"all": {"A": 1, "B": 2}}
 
 
-# --- refresh_leaderboard: أرشفة الخام + تسجيل الفشل (مستوى الدورة) ---
+# --- refresh_leaderboard: raw archival + failure recording (cycle level) ---
 class _StubLB:
-    """كاش وهمي بحالة مُعدّة سلفاً — بلا شبكة."""
+    """A fake cache with a pre-set state — no network."""
 
     def __init__(self, stale, refreshed, raw=None, raw_by_period=None, failed=()):
         self._stale = stale
@@ -259,7 +266,8 @@ async def test_refresh_leaderboard_archives_raw_on_success():
 
 
 async def test_refresh_leaderboard_failure_is_recorded_not_silent():
-    """تحديث مستحقّ فشل ⇒ الخريطة تبقى قديمة — يجب أن يُرى في meta لا أن يصمت."""
+    """A due refresh that failed ⇒ the map stays old — it must be visible in
+    meta, not silent."""
     db = _StubDB()
     lb = _StubLB(stale=True, refreshed=False)
     await recorder.refresh_leaderboard(lb, db, 100.0, "t")
@@ -275,7 +283,8 @@ async def test_refresh_leaderboard_fresh_cache_does_nothing():
 
 
 async def test_refresh_leaderboard_archives_each_period_separately():
-    """خام كل مدّة بمصدر مستقلّ — دمجها في مصدر واحد يخلط أربع قوائم."""
+    """Each period's raw under its own source — merging into one source mixes
+    four lists."""
     db = _StubDB()
     lb = _StubLB(
         stale=True, refreshed=True,
@@ -289,7 +298,7 @@ async def test_refresh_leaderboard_archives_each_period_separately():
 
 
 async def test_refresh_leaderboard_partial_failure_is_visible():
-    """نجاح جزئيّ لا يُفشل الدورة لكنّه لا يصمت أيضاً."""
+    """Partial success does not fail the cycle, but it is not silent either."""
     db = _StubDB()
     lb = _StubLB(
         stale=True, refreshed=True, raw_by_period={"all": {"a": 1}}, failed=("30d",)

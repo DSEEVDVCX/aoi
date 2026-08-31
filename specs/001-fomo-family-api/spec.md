@@ -6,7 +6,7 @@
 
 **Status**: Draft
 
-**Input**: User description: "اريد انشاء api لهذا الموقع لانه لا يوفره fomo.family" (I want to create an API for this site because it does not provide one — fomo.family)
+**Input**: User description: "I want to create an API for this site because it does not provide one — fomo.family" (original request was in Arabic)
 
 ## User Scenarios & Testing *(mandatory)*
 

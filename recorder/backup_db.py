@@ -30,7 +30,7 @@ def default_backup_dir() -> Path:
     configured = os.environ.get("AOI_BACKUP_DIR")
     if configured:
         return Path(configured).expanduser()
-    onedrive = os.environ.get("OneDrive")  # noqa: SIM112 — اسمُه في ويندوز بهذا الرسم لا بالكبير
+    onedrive = os.environ.get("OneDrive")  # noqa: SIM112 — this is its exact casing on Windows
     if onedrive:
         return Path(onedrive) / "aoi-backups"
     raise RuntimeError(

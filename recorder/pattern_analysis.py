@@ -62,7 +62,7 @@ class PatternSpec:
 PATTERN_SPECS: tuple[PatternSpec, ...] = (
     PatternSpec(
         "momentum_spike",
-        "زخم قوي مع تذبذب فعلي",
+        "strong momentum with real volatility",
         "higher",
         (
             QuantileCondition("ret_24h_before", ">", 0.80),
@@ -71,25 +71,25 @@ PATTERN_SPECS: tuple[PatternSpec, ...] = (
     ),
     PatternSpec(
         "old_token",
-        "عملة قديمة نسبياً",
+        "a relatively old coin",
         "lower",
         (QuantileCondition("token_age_h", ">", 0.70),),
     ),
     PatternSpec(
         "low_turnover",
-        "دوران ضعيف قياساً بالسيولة",
+        "weak turnover relative to liquidity",
         "lower",
         (QuantileCondition("volume_to_liquidity", "<=", 0.20),),
     ),
     PatternSpec(
         "low_volatility",
-        "تذبذب سابق ضعيف",
+        "weak prior volatility",
         "lower",
         (QuantileCondition("vol_24h_before", "<=", 0.30),),
     ),
     PatternSpec(
         "low_transactions",
-        "معاملات يومية قليلة",
+        "few daily transactions",
         "lower",
         (QuantileCondition("tick_txn_24h", "<=", 0.20),),
     ),
@@ -97,7 +97,7 @@ PATTERN_SPECS: tuple[PatternSpec, ...] = (
 
 CALM_FINISH_SPEC = PatternSpec(
     "calm_finish",
-    "هدوء سابق",
+    "prior calm",
     "higher",
     (QuantileCondition("vol_24h_before", "<=", 0.40),),
 )
@@ -436,7 +436,7 @@ def _condition_text(condition: dict[str, Any]) -> str:
     if feature in {"ret_24h_before", "vol_24h_before"}:
         rendered = _pct(value)
     elif feature == "token_age_h":
-        rendered = f"{value / 24:.1f} يوم"
+        rendered = f"{value / 24:.1f}d"
     elif feature == "tick_txn_24h":
         rendered = f"{value:,.0f}"
     else:
@@ -445,7 +445,7 @@ def _condition_text(condition: dict[str, Any]) -> str:
 
 
 def _rule_text(pattern: dict[str, Any]) -> str:
-    return " و ".join(_condition_text(condition) for condition in pattern["conditions"])
+    return " and ".join(_condition_text(condition) for condition in pattern["conditions"])
 
 
 def render_markdown(
@@ -513,97 +513,114 @@ def render_markdown(
             f"{_pct(float(group['up20'].mean()))} |"
         )
 
-    return f"""# تحليل أنماط الإشارات — {datetime.now(UTC).date().isoformat()}
+    return f"""# Signal pattern analysis — {datetime.now(UTC).date().isoformat()}
 
-> أُنشئ في `{generated}` من `{db_path}`. يغطي {len(frame):,} إشارة مستقلة صالحة،
-> {frame.groupby(['token_address', 'network_id'], dropna=False).ngroups} عملة، من `{start}` إلى `{end}`.
-> العتبات مشتقة من `train` فقط، والتجزئة ثابتة بعنوان العملة لمنع انتقال العملة بين الأجزاء.
+> Generated at `{generated}` from `{db_path}`. It covers {len(frame):,} valid
+> independent signals, {frame.groupby(['token_address', 'network_id'], dropna=False).ngroups} coins,
+> from `{start}` to `{end}`.
+> Thresholds are derived from `train` only, and the split is fixed by token address
+> to keep coins from crossing splits.
 
-## الخلاصة
+## Summary
 
-- **لا يوجد إثبات أن الإشارة العامة تتفوق على الضابطة.** بعد حذف التكرار بقيت
-  {signal['n']} عملة بإشارة مقابل {control['n']} ضوابط حيّة فقط. فرق وسيط عائد 48 ساعة
-  {_pct(phase1['median_difference']['estimate'], signed=True)}، وفاصل الثقة
+- **There is no proof that the general signal beats the control arm.** After
+  deduplication, {signal['n']} coins with a signal remained versus only
+  {control['n']} live controls. The 48h return median difference is
+  {_pct(phase1['median_difference']['estimate'], signed=True)}, with a confidence
+  interval of
   [{_pct(phase1['median_difference']['low'], signed=True)},
-  {_pct(phase1['median_difference']['high'], signed=True)}]، و`p={phase1['mann_whitney']['p_greater']:.3f}`.
-- **أقوى نمط صعود هو استمرار الزخم:** {_rule_text(patterns['momentum_spike'])}.
-  في الاختبار لمس +20% خلال 24 ساعة في **{_pct(momentum_test['up20_rate'])}** من
-  {momentum_test['rows']} إشارة على {momentum_test['tokens']} عملة، مقابل
-  {_pct(test_base['up20_rate'])} لكل الاختبار. استمر اتجاه التحسن في كل الأيام المؤهلة.
-- **هذا ليس نمط احتفاظ.** وسيط عائد النمط عند نهاية 48 ساعة
-  {_pct(momentum_test['median_final_return'], signed=True)} ووسيط السحب
-  {_pct(momentum_test['median_drawdown_48h'], signed=True)}؛ الحركة المعتادة اندفاعة ثم ارتداد/تصريف.
-- بمحاكاة محافظة: هدف +20%، وقف −30%، خروج 24 ساعة، وتكلفة دورة 2%، حقق نمط الزخم
-  الهدف في **{_pct(test_exit['target_rate'])}** وضُرب بالوقف في
-  **{_pct(test_exit['stop_rate'])}**؛ المتوسط الصافي
-  **{_pct(test_exit['mean_net'], signed=True)}** والوسيط
-  **{_pct(test_exit['median_net'], signed=True)}** على الاختبار. لكنه أعطى متوسطاً سالباً
-  في التدريب، لذلك لا يُعتمد كاستراتيجية مالية مكتملة.
-- لا يوجد نمط ثابت لصعود نهائي +20% بعد 48 ساعة. الهدوء السابق رفع احتمال مجرد
-  الإغلاق الموجب إلى {_pct(calm_test['final_win_rate'])}، لكن وسيط العائد كان
-  {_pct(calm_test['median_final_return'], signed=True)} فقط ونسبة الإغلاق فوق +20%
-  {_pct(calm_test['final20_rate'])}. فاصل الثقة لفرق الإغلاق الموجب عن بقية الاختبار
-  [{_pct(calm_ci['low'], signed=True)}, {_pct(calm_ci['high'], signed=True)}]، لكن
-  حجم العائد نفسه ضئيل، أي أن الأفضلية يرجح أن تمحوها الرسوم والانزلاق.
+  {_pct(phase1['median_difference']['high'], signed=True)}], and `p={phase1['mann_whitney']['p_greater']:.3f}`.
+- **The strongest up-pattern is momentum continuation:** {_rule_text(patterns['momentum_spike'])}.
+  In the test split it touched +20% within 24 hours in **{_pct(momentum_test['up20_rate'])}** of
+  {momentum_test['rows']} signals across {momentum_test['tokens']} coins, versus
+  {_pct(test_base['up20_rate'])} for the whole test split. The improvement held its
+  direction on every eligible day.
+- **This is not a hold pattern.** The pattern's median return at the end of 48 hours is
+  {_pct(momentum_test['median_final_return'], signed=True)} and its median drawdown
+  {_pct(momentum_test['median_drawdown_48h'], signed=True)}; the typical move is a burst
+  followed by a reversal/distribution.
+- Under a conservative simulation — target +20%, stop −30%, 24-hour exit, and a 2%
+  round-trip cost — the momentum pattern hit the target in
+  **{_pct(test_exit['target_rate'])}** and was stopped out in
+  **{_pct(test_exit['stop_rate'])}**; the net mean is
+  **{_pct(test_exit['mean_net'], signed=True)}** and the median
+  **{_pct(test_exit['median_net'], signed=True)}** on the test split. But it gave a
+  negative mean on train, so it is not relied on as a complete financial strategy.
+- There is no stable pattern for a final +20% after 48 hours. Prior calm raised the
+  probability of merely closing positive to {_pct(calm_test['final_win_rate'])}, but the
+  median return was only {_pct(calm_test['median_final_return'], signed=True)} and the
+  share closing above +20% is {_pct(calm_test['final20_rate'])}. The confidence interval
+  for the positive-close difference from the rest of the test split is
+  [{_pct(calm_ci['low'], signed=True)}, {_pct(calm_ci['high'], signed=True)}], but the
+  size of the return itself is tiny — meaning fees and slippage most likely erase the edge.
 
-## أنماط بلوغ +20% خلال 24 ساعة
+## Patterns of reaching +20% within 24 hours
 
-خط الأساس: train {_pct(baselines['train']['up20_rate'])}، val
-{_pct(baselines['val']['up20_rate'])}، test {_pct(test_base['up20_rate'])}.
-عمود `صفوف/عملات` للاختبار. فاصل الثقة هو فرق النسبة عن بقية الاختبار، مع bootstrap
-على مستوى العملة لا الصف.
+Baseline: train {_pct(baselines['train']['up20_rate'])}, val
+{_pct(baselines['val']['up20_rate'])}, test {_pct(test_base['up20_rate'])}.
+The `rows/coins` column is for the test split. The confidence interval is the rate
+difference from the rest of the test split, bootstrapped at the coin level, not the
+row level.
 
-| النمط | القاعدة المثبتة من train | train | val | test | صفوف/عملات | ثبات الأيام | 95% CI للاختلاف |
+| Pattern | Rule fitted from train | train | val | test | rows/coins | day stability | 95% CI of the difference |
 |---|---|---:|---:|---:|---:|---:|---:|
 {chr(10).join(pattern_lines)}
 
-التفسير العملي:
+Practical reading:
 
-- الزخم المرتفع مع تذبذب حقيقي هو **مرشح اندفاعة قصيرة**.
-- العمر فوق عتبة التدريب، أو ضعف دوران الحجم/السيولة، أو ضعف التذبذب، أو قلة
-  المعاملات هي **مرشحات ضوضاء منخفضة الصعود**. ليست بالضرورة انهيارات؛ كثير منها
-  يتحرك قرب الصفر، أي أن الإشارة لا تضيف حركة تستحق المخاطرة.
+- High momentum with real volatility is a **short-burst filter**.
+- Age above the train threshold, weak volume/liquidity turnover, weak volatility, or
+  few transactions are **low-upside noise filters**. Not necessarily collapses; many of
+  them move near zero — meaning the signal adds no movement worth the risk.
 
-## محاكاة مسار السعر للنمط الأقوى
+## Price-path simulation for the strongest pattern
 
-المحاكاة تمشي على الشموع بترتيبها. إذا لمس السعر الهدف والوقف في الشمعة نفسها
-تفترض الوقف أولاً. التكلفة المفترضة 2% للدورة، ولا يوجد نموذج مستقل لرفض التنفيذ.
+The simulation walks the bars in order. If the price touches both the target and the
+stop within the same bar, the stop is assumed first. The assumed cost is 2% per round
+trip, and there is no separate model for execution rejection.
 
-| الجزء | كل الإشارات | متوسطها الصافي | نمط الزخم صفوف/عملات | هدف | وقف | متوسط النمط | وسيط النمط |
+| Split | all signals | their net mean | momentum pattern rows/coins | target | stop | pattern mean | pattern median |
 |---|---:|---:|---:|---:|---:|---:|---:|
 {chr(10).join(exit_lines)}
 
-في اختبار العملات غير المرئية كان فاصل الثقة لتفوق متوسط النمط الصافي على بقية
-الاختبار [{_pct(exit_result['test_mean_net_uplift_ci']['low'], signed=True)},
-{_pct(exit_result['test_mean_net_uplift_ci']['high'], signed=True)}]. أقصى تكلفة دورة
-يبقى عندها **متوسط الاختبار** غير سالب هي تقريباً
-{_pct(test_exit['breakeven_round_trip_cost'])}، لكنها غير مستقرة: في التدريب كانت
-{_pct(exit_result['train']['momentum']['breakeven_round_trip_cost'])} فقط.
+On unseen coins in the test split, the confidence interval for the pattern's net mean
+beating the rest of the test split was
+[{_pct(exit_result['test_mean_net_uplift_ci']['low'], signed=True)},
+{_pct(exit_result['test_mean_net_uplift_ci']['high'], signed=True)}]. The highest
+round-trip cost at which the **test mean** stays non-negative is roughly
+{_pct(test_exit['breakeven_round_trip_cost'])}, but it is unstable: on train it was
+{_pct(exit_result['train']['momentum']['breakeven_round_trip_cost'])} only.
 
-## ما لا يصلح كدليل
+## What does not work as evidence
 
-نوع الحدث وحده لا يميز الصعود في الاختبار:
+Event type alone does not separate the risers in the test split:
 
-| النوع | صفوف | عملات | بلغ +20% |
+| Type | rows | coins | reached +20% |
 |---|---:|---:|---:|
 {chr(10).join(type_rows)}
 
-كذلك لم يظهر تطابق متداول متصدر أو كون الصفقة أول شراء كأثر ثابت أقوى من السوق.
-والحقول التالية فارغة 100% في العينة، لذلك مُنعت من أي استنتاج:
+Likewise, top-trader overlap or the trade being a first buy did not show up as an
+effect more stable than the market. And the following fields are 100% empty in the
+sample, so they are barred from any conclusion:
 `{', '.join(missing)}`.
 
-## حدود الاستنتاج والخطوة التالية
+## Limits of the conclusion and the next step
 
-- الفترة قصيرة ({frame['day'].nunique()} أيام) وسوق meme يغير نظامه بسرعة.
-- الضابطة الحية المؤهلة صغيرة وغير متوازنة شبكياً؛ لذلك لا يوجد حكم سببي أن الإشارة
-  نفسها تخلق أفضلية على اختيار عملة عشوائية مماثلة.
-- استُخدمت `val` لاختيار الصياغة، ثم فُحص `test` في هذا التقرير؛ **مجموعة test الحالية
-  أصبحت مستهلكة** ولا يجوز تعديل القواعد وإعادة تسميتها اختباراً مستقلاً.
-- جمّد القواعد أعلاه الآن، واجمع 7–14 يوماً جديدة، ثم اختبرها زمنياً بلا تغيير.
-  معيار قبول مقترح لنمط الزخم: ≥100 إشارة و≥30 عملة جديدة، بقاء معدل الهدف فوق
-  خط الأساس، وفاصل ثقة مجمّع بالعملة فوق الصفر، ومتوسط صافٍ موجب عند تكلفة 2–5%.
+- The period is short ({frame['day'].nunique()} days) and the meme market changes its
+  regime quickly.
+- The eligible live control arm is small and unbalanced across networks; so there is no
+  causal verdict that the signal itself creates an edge over picking a similar random
+  coin.
+- `val` was used to choose the wording, then `test` was examined in this report; **the
+  current test set is now consumed** and the rules must not be modified and renamed an
+  independent test.
+- Freeze the rules above now, collect 7–14 new days, then test them temporally with no
+  changes. A proposed acceptance criterion for the momentum pattern: ≥100 signals and
+  ≥30 new coins, the target rate staying above baseline, a coin-clustered confidence
+  interval above zero, and a positive net mean at a 2–5% cost.
 
-هذا تحليل احتمالي تاريخي، لا ضمان سعر ولا توصية استثمارية.
+This is a historical probabilistic analysis, not a price guarantee and not investment
+advice.
 """
 
 

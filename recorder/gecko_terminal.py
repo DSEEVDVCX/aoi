@@ -1,29 +1,35 @@
-"""عميل GeckoTerminal العام — fallback عمر العملات عبر pool_created_at.
+"""Generic GeckoTerminal client — token-age fallback via pool_created_at.
 
-لماذا هذه الطبقة: بوابة العمر تقفل على «مجهول» fail-closed حين لا يجد
-`filterTokens` العملة (عملات غير رائجة تحديدًا — مقيس: فئة المجهول ليست فئة
-الحديثة). مقيس 2026-08-27 على عيّنة من مجهولي fomo: **17 من 18** أرجعها
-GeckoTerminal بعمر حقيقي عبر أقدم pool. عميل HTTP العادي يُحجب (403 على
-أي UA غير متصفح) لذا نستخدم curl_cffi ببصمة كروم، كخط fomo نفسه.
+Why this layer exists: the age gate fails closed on "unknown" when
+`filterTokens` cannot find the token (non-trending tokens in particular —
+measured: the unknown class is not the young class). Measured 2026-08-27 on a
+sample of fomo unknowns: **17 of 18** came back from GeckoTerminal with a real
+age via the oldest pool. A plain HTTP client is blocked (403 on any
+non-browser UA), so we use curl_cffi with a Chrome fingerprint, same as the
+fomo client itself.
 
-القيود المقيسة التي يبنى عليها التصميم:
-- الحد العام ~30 نداء/دقيقة بلا مفتاح → نداء واحد لكل عملة، والدورة تجرّ
-  المرشّحين الجدد فقط (وسيط 1.11/دورة)، والنتيجة تُخزَّن فلا يُسأل ثانيةً.
-- القائمة تُرتَّب بالحجم لا بالزمن → نأخذ **أقدم** `pool_created_at` من
-  أوّل صفحة (العملة قد تفتح pools جديدة متأخرة؛ القديم هو الميلاد).
-- 429 يعني «لاحقًا» لا «فشل»: يعيد None فيكمل fomo مساره الطبيعي، والإعادة
-  تُدار من `AGE_MISSING_RETRY_SECONDS` في `token_age_lookup_state`.
+Design constraints, all measured:
+- The anonymous limit is ~30 calls/min with no key → one call per token, the
+  cycle carries only new candidates (median 1.11/cycle), and the result is
+  stored so it is never asked again.
+- The list is sorted by size, not time → take the **oldest** `pool_created_at`
+  from the first page (a token may open newer pools later; the old one is the
+  birth).
+- 429 means "later", not "failed": it returns None and fomo continues its
+  normal path; the retry is governed by `AGE_MISSING_RETRY_SECONDS` in
+  `token_age_lookup_state`.
 
-الأمان: `pool_created_at` يمثّل ميلاد أول pool سيول — وهو ما تقيسه البوابة
-(«عمر قابل للتداول»)؛ ومقارنة حيّة على عملة مشتركة أظهرت فرق 88 ثانية عن
-`createdAt` لدى fomo، أي تطابق ضمن دقيقة على مدى بوابة يومين.
+Safety: `pool_created_at` is the birth of the first pool ever — which is what
+the gate measures ("tradable age"); a live comparison on a shared token showed
+an 88-second difference from fomo's `createdAt`, i.e. agreement within a minute
+over a two-day gate range.
 """
 from __future__ import annotations
 
 import asyncio
 from typing import Any
 
-# خريطة معرّفات شبكاتنا إلى معرّفات GeckoTerminal (ميدان مقيس 2026-08-27).
+# Map of our network ids to GeckoTerminal network ids (measured in the field 2026-08-27).
 NETWORK_MAP = {
     "1399811149": "solana",
     "4663": "eth",
@@ -37,7 +43,7 @@ _TIMEOUT = 15
 
 
 class GeckoTerminalClient:
-    """زبون قراءة فقط لـpool_created_at. يُنشأ مرة ويُعاد استخدامه."""
+    """Read-only client for pool_created_at. Created once and reused."""
 
     def __init__(self, session: Any = None) -> None:
         self._session = session
@@ -54,10 +60,11 @@ class GeckoTerminalClient:
         return await self._session.get(url)
 
     async def pool_created_at(self, address: str, network_id: str) -> str | None:
-        """أقدم pool_created_at للعملة، أو None إن لم توجد/انتهى الحد.
+        """The oldest pool_created_at for the token, or None if absent/rate-limited.
 
-        لا يرفع أبدًا: فشل الشبكة والحد والغياب كلها None — الطبقة العليا
-        تفرّق بينها عبر الحالة المخزّنة، وهذا النداء مجرّد fallback.
+        Never raises: network failure, rate limit and absence are all None —
+        the layer above tells them apart via the stored lookup state, and this
+        call is just a fallback.
         """
         gecko_net = NETWORK_MAP.get(str(network_id))
         if not gecko_net:
@@ -65,13 +72,13 @@ class GeckoTerminalClient:
         url = f"{_BASE}/{gecko_net}/tokens/{address}/pools"
         try:
             resp = await self._get(url)
-        except Exception:  # noqa: BLE001 — fallback لا يُسقط الدورة أبدًا
+        except Exception:  # noqa: BLE001 — a fallback must never kill the cycle
             return None
         if getattr(resp, "status_code", None) != 200:
-            return None            # 404 غير موجود، 429 حد المعدل — لاحقًا
+            return None            # 404 not found, 429 rate limit — later
         try:
             data = resp.json()
-        except Exception:  # noqa: BLE001 — إجابة غير متوقعة
+        except Exception:  # noqa: BLE001 — unexpected response
             return None
         created: list[str] = [
             pool["attributes"]["pool_created_at"]
@@ -88,7 +95,7 @@ class GeckoTerminalClient:
             if close is not None:
                 try:
                     await close()
-                except Exception:  # noqa: BLE001 — إغلاق لا يهم فشله
+                except Exception:  # noqa: BLE001 — a close whose failure does not matter
                     pass
             self._session = None
 
@@ -98,7 +105,7 @@ _shared_lock = asyncio.Lock()
 
 
 async def shared_gecko_client() -> GeckoTerminalClient:
-    """زبون واحد على مستوى العملية — الجلسة تُعاد استخدامها بلا إنشاء متكرر."""
+    """One process-wide client — the session is reused, not recreated."""
     global _shared
     if _shared is None:
         async with _shared_lock:

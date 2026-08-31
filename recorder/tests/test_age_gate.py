@@ -1,11 +1,12 @@
-"""بوّابة العمر عند الإشارة — لا نراقب عملةً أصغر من يومين لحظة الإشارة.
+"""The age gate at signal time — we never watch a coin younger than two days at the moment of its signal.
 
-الغرضُ صريح: لا يُبنى بوتٌ على عملةٍ عمرُها أقلّ من يومين. ومقيس على الإشارات
-المستقلّة أنّ ما دون اليومين ترتفع فيه نسبة الانهيار 29 ضعفاً ووسيطُ المردود
-−46.2% مقابل −5.1%، وثمنُ إقصائه 4% من صفوف التدريب.
+The purpose is explicit: no bot is built on a coin younger than two days. Measured
+on independent signals, below two days the rug rate is 29x higher and the median
+return is −46.2% vs −5.1%, and excluding them costs 4% of training rows.
 
-والرفضُ **ليس حظراً**: العملة المرفوضة لا تدخل القائمة فحسب، فإن جاءتها إشارةٌ
-أخرى وهي حينها أكبر من يومين دخلت كأيّ عملة. هذه هي الحالة التي تُختبر أوّلاً.
+Rejection is **not a ban**: a rejected coin merely does not enter the watchlist;
+if another signal arrives once it is older than two days, it enters like any
+other coin. That is the case tested first.
 """
 import os
 
@@ -21,7 +22,7 @@ SCHEMA = os.path.join(
 )
 NOW = "2026-08-20T12:00:00+00:00"
 DAY = 86400
-NOW_TS = 1787227200          # == NOW بالثواني
+NOW_TS = 1787227200          # == NOW in seconds
 
 
 @pytest.fixture()
@@ -66,7 +67,7 @@ async def _feed_cycle(db, policy, stats, raw, client=None, now=NOW):
 
 
 class _AgeClient:
-    """يجيب filterTokens بتاريخ إنشاء معطى. يعدّ نداءاته ليُقاس ثمنُ البوّابة."""
+    """Answers filterTokens with a given creation date. Counts its calls so the gate's cost can be measured."""
 
     def __init__(self, created=None, *, fail=False):
         self.calls = []
@@ -88,14 +89,14 @@ class _AgeClient:
 
 
 # ---------------------------------------------------------------------------
-# الحكم المجرّد على تاريخ واحد
+# The abstract verdict on a single date
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     ("days_old", "expected"),
     [
         (0.0, recorder.AGE_TOO_YOUNG),
         (1.99, recorder.AGE_TOO_YOUNG),
-        (2.0, recorder.AGE_OK),          # الحدّ نفسه مقبول
+        (2.0, recorder.AGE_OK),          # the boundary itself is accepted
         (30.0, recorder.AGE_OK),
     ],
 )
@@ -106,12 +107,12 @@ def test_age_verdict_at_the_boundary(days_old, expected):
 
 @pytest.mark.parametrize("created", [None, "", "abc", "0", "-5"])
 def test_unreadable_creation_date_is_unknown_not_old(created):
-    """الفراغُ والنصُّ غيرُ الرقميّ لا يصيران عمراً هائلاً بالغلط."""
+    """Empty and non-numeric text must not accidentally become a huge age."""
     assert recorder.age_verdict(created, NOW) == recorder.AGE_UNKNOWN
 
 
 def test_future_creation_date_is_unknown_not_old():
-    """عمرٌ سالب (انحرافُ ساعةٍ أو خطأُ منبع) ليس عمراً — ولا يفتح البوّابة."""
+    """A negative age (clock skew or an upstream error) is not an age — and must not open the gate."""
     created = str(NOW_TS + 3 * DAY)
     assert recorder.age_verdict(created, NOW) == recorder.AGE_UNKNOWN
 
@@ -123,8 +124,8 @@ def test_gate_disabled_by_zero(monkeypatch):
 
 
 def test_epoch_seconds_are_read_as_text():
-    """`token_created_at` **ثوانٍ مخزَّنةٌ نصّاً**، و`julianday()` عليها يعيد
-    NULL بصمت — فالحساب في بايثون لا في SQL."""
+    """`token_created_at` is **epoch seconds stored as text**, and `julianday()`
+    on it returns NULL silently — so the arithmetic lives in Python, not SQL."""
     assert recorder.token_age_days("1787054400", NOW) == pytest.approx(2.0)
     assert recorder.token_age_days(1787054400, NOW) == pytest.approx(2.0)
 
@@ -141,7 +142,7 @@ def test_creation_date_accepts_iso_and_millisecond_timestamps(created):
 
 
 def test_admission_and_labeler_agree_on_edge_timestamp_formats():
-    """صيغةٌ يقبلها القبول يجب أن يفهمها الموسِّم — لا «مقبول ثم مجهول»."""
+    """A format the admission path accepts, the labeler must understand too — never "admitted then unknown"."""
     for created in ("1.787e9", "0", "-5", str(NOW_TS * 1000 - 2 * DAY * 1000)):
         admission = recorder.age_verdict(created, NOW)
         labeler_age = labeler.token_age_days(
@@ -169,7 +170,7 @@ def test_solana_address_case_stays_exact_but_evm_is_case_insensitive(db, policy)
 
 
 # ---------------------------------------------------------------------------
-# البوّابة داخل مسار القبول
+# The gate inside the admission path
 # ---------------------------------------------------------------------------
 async def test_young_coin_is_rejected(db, policy):
     _age(db, "tok", 1399811149, days_old=0.5)
@@ -177,8 +178,8 @@ async def test_young_coin_is_rejected(db, policy):
 
     await _feed_cycle(db, policy, stats, _feed())
 
-    assert stats["signals"] == 1              # الإشارة محفوظة
-    assert stats["watch_added"] == 0           # والمراقبة مرفوضة
+    assert stats["signals"] == 1              # the signal is kept
+    assert stats["watch_added"] == 0           # and the watch is rejected
     assert stats["age_rejected"] == 1
     assert db._conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
 
@@ -197,14 +198,14 @@ async def test_old_coin_is_admitted(db, policy):
 
 
 async def test_rejection_is_not_a_ban_a_later_signal_admits(db, policy):
-    """جوهرُ الطلب: المرفوضةُ لا تُحظر. نفس العملة، إشارةٌ بعد ثلاثة أيّام."""
+    """The heart of the request: rejection is not a ban. Same coin, a signal three days later."""
     _age(db, "tok", 1399811149, days_old=0.5)
     first = _stats()
     await _feed_cycle(db, policy, first, _feed(event_id="e1"))
     assert first["age_rejected"] == 1
     assert db._conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
 
-    later = "2026-08-23T12:00:00+00:00"        # +3 أيّام ⇒ صارت 3.5 يوماً
+    later = "2026-08-23T12:00:00+00:00"        # +3 days ⇒ it is now 3.5 days old
     second = _stats()
     await _feed_cycle(db, policy, second, _feed(event_id="e2"), now=later)
 
@@ -216,9 +217,10 @@ async def test_rejection_is_not_a_ban_a_later_signal_admits(db, policy):
 
 
 async def test_unknown_age_is_rejected(db, policy):
-    """مجهولُ العمر يُرفض: الجهلُ لا يحمل خبراً (39.8% منها كانت < يومين مقابل
-    42.4% لمعروفاتها)، فقبولُه يقبل الصغيرَ بمعدّل السكّان."""
-    client = _AgeClient(created=None)          # المنبع يجيب بلا تاريخ
+    """Unknown age is rejected: ignorance carries no information (39.8% of them
+    were < two days old vs 42.4% of the known ones), so accepting them admits
+    the young at the population rate."""
+    client = _AgeClient(created=None)          # upstream answers without a date
     stats = _stats()
 
     await _feed_cycle(db, policy, stats, _feed(), client=client)
@@ -229,10 +231,11 @@ async def test_unknown_age_is_rejected(db, policy):
 
 
 async def test_active_watch_is_not_re_gated(db, policy):
-    """نافذةٌ تجري لا تُحكَم ثانيةً — البوّابةُ تحكم فتحَ النوافذ لا استمرارَها.
+    """A running window is never judged twice — the gate rules on opening
+    windows, not on keeping them open.
 
-    عملةٌ دخلت وهي قديمة ثمّ جاءتها إشارةٌ ثانية: لا يجوز أن يُسقطها غيابُ
-    تاريخٍ أو تبدُّلُه في المنبع.
+    A coin admitted while old, then given a second signal: a missing or changed
+    date upstream must not drop it.
     """
     db.upsert_watch("tok", "1399811149", "large_buy", "s0", 48, NOW)
     stats = _stats()
@@ -246,8 +249,8 @@ async def test_active_watch_is_not_re_gated(db, policy):
 
 
 async def test_reactivation_of_an_expired_row_is_gated(db, policy):
-    """`upsert_watch` يُحيي صفّاً منتهياً بنافذةٍ جديدة — فلو حُصِرت البوّابة في
-    الصفّ الجديد لدخلت الصغيرةُ من باب الإحياء."""
+    """`upsert_watch` revives an expired row with a new window — so were the
+    gate limited to new rows, young coins would slip in through reactivation."""
     db.upsert_watch("tok", "1399811149", "large_buy", "s0", 48, NOW)
     db._conn.execute("UPDATE watchlist SET active=0 WHERE token_address='tok'")
     db._conn.commit()
@@ -263,7 +266,7 @@ async def test_reactivation_of_an_expired_row_is_gated(db, policy):
 
 
 async def test_non_trigger_signal_is_never_gated(db, policy):
-    """البوّابةُ على المُشغّلات وحدها (multi_user_buy / large_buy)."""
+    """The gate applies to triggers only (multi_user_buy / large_buy)."""
     raw = {"responseObject": {"data": [{
         "id": "e1", "tokenAddress": "tok", "networkId": 1399811149,
         "type": "comment", "createdAt": NOW, "body": {"ticker": "ABC"},
@@ -277,11 +280,12 @@ async def test_non_trigger_signal_is_never_gated(db, policy):
 
 
 # ---------------------------------------------------------------------------
-# مصدر العمر: نداءٌ واحد، ويُخزَّن فلا يُعاد
+# Age source: one call, then stored and never repeated
 # ---------------------------------------------------------------------------
 async def test_age_is_fetched_once_then_served_from_storage(db, policy):
-    """الإشارةُ لا تحمل عمرَ العملة (حدثُ الـfeed فيه العنوانُ والشبكةُ وتاريخُ
-    المنشور وحده)، فأوّلُ لقاءٍ ينادي المنبع — والثاني لا ينادي."""
+    """The signal carries no coin age (the feed event holds only the address,
+    the network, and the post date), so the first encounter calls upstream —
+    the second does not."""
     client = _AgeClient(created=int(NOW_TS - 9 * DAY))
     stats = _stats()
 
@@ -295,7 +299,7 @@ async def test_age_is_fetched_once_then_served_from_storage(db, policy):
     ).fetchone()[0]
     assert stored == str(int(NOW_TS - 9 * DAY))
 
-    # إشارةٌ ثانية على العملة نفسها بعد انتهاء نافذتها: لا نداءَ ثانياً.
+    # A second signal on the same coin after its window ends: no second call.
     db._conn.execute("UPDATE watchlist SET active=0 WHERE token_address='tok'")
     db._conn.commit()
     await _feed_cycle(db, policy, _stats(), _feed(event_id="e2"), client=client)
@@ -313,8 +317,9 @@ async def test_known_age_costs_no_call(db, policy):
 
 
 async def test_one_call_covers_every_candidate_in_the_cycle(db, policy):
-    """المرشّحون الجدد 1.11 في الدورة (أقصى ما رُصد 4) والدفعة تحمل 150 —
-    فنداءٌ واحدٌ يكفي، مقابل تسعة نداءات شموع في الدورة نفسها."""
+    """New candidates average 1.11 per cycle (4 at the most observed) and the
+    batch carries 150 — one call suffices, against nine bars calls in the same
+    cycle."""
     raw = {"responseObject": {"data": [
         {"id": f"e{i}", "tokenAddress": f"tok{i}", "networkId": 1399811149,
          "type": "large_buy", "createdAt": NOW, "body": {"ticker": "ABC"}}
@@ -329,15 +334,16 @@ async def test_one_call_covers_every_candidate_in_the_cycle(db, policy):
 
 
 async def test_lookup_failure_rejects_but_stays_audible(db, policy):
-    """502 من المنبع يجعل كلّ مرشّحٍ «مجهولاً» فتتوقّف المراقبة كلّها — انقطاعٌ
-    يجب أن يُسمع لا أن يُقرأ ترشيحاً عادياً: ختمُ خطأٍ وسلسلةٌ في `meta`."""
+    """A 502 from upstream makes every candidate "unknown" so all watching
+    stops — an outage that must be heard, not read as ordinary candidates: an
+    error stamp and a streak in `meta`."""
     client = _AgeClient(fail=True)
     stats = _stats()
 
     await _feed_cycle(db, policy, stats, _feed(), client=client)
 
     assert stats["age_lookup_failed"] == 1
-    assert stats["age_rejected"] == 1                    # البوّابة لا تُسرّب
+    assert stats["age_rejected"] == 1                    # the gate does not leak
     assert db.get_meta("age_lookup_failed_streak") == "1"
     assert "upstream boom" in (db.get_meta("last_error_age_lookup") or "")
     assert db._conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
@@ -359,8 +365,8 @@ async def test_successful_lookup_clears_the_failure_streak(db, policy):
 
 
 async def test_dead_address_dropped_by_provider_stays_unknown(db, policy):
-    """المنبعُ يحذف العنوانَ الميّت بصمت — فيبقى مجهولاً ويُرفض، ولا يُخترع له
-    عمرٌ من عنصرٍ آخر في الدفعة."""
+    """Upstream silently drops dead addresses — it stays unknown and is
+    rejected, and no age is invented for it from another item in the batch."""
     class _Empty(_AgeClient):
         async def _post(self, path, body):
             self.calls.append(body)
@@ -482,7 +488,7 @@ async def test_cycle_runs_age_cleanup_before_evm_admission(db, monkeypatch):
 
 
 async def test_same_address_on_two_networks_keeps_age_isolated(db, policy):
-    """العنوان المتكرر عبر الشبكات لا يرث عمر الشبكة الأخرى."""
+    """An address repeated across networks does not inherit the other network's age."""
     _age(db, "same", 56, days_old=9.0)
     client = _AgeClient(created=int(NOW_TS - 0.5 * DAY))
     raw = {"responseObject": {"data": [

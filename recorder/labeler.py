@@ -1,20 +1,25 @@
-"""الموسِّم (labeler): يحسب النتائج (labels) من الشموع بعد اكتمال النافذة.
+"""The labeler: computes outcomes (labels) from candles once the window completes.
 
-الفصل عن المسجّل مبدئيّ لا تنظيميّ: المسجّل يسجّل خاماً بختم زمنيّ فقط، وأي
-حساب لقيمة مشتقّة من المستقبل وقت التسجيل تسرّبٌ. الموسِّم يعمل في عملية
-منفصلة (FomoLabeler) ولا يلمس إشارة إلّا بعد `entry + 48h + هامش` — عندها
-"المستقبل" صار ماضياً مؤرشفاً.
+The separation from the recorder is principled, not organizational: the
+recorder records raw data with a timestamp only, and computing any value
+derived from the future at recording time is leakage. The labeler runs in a
+separate process (FomoLabeler) and never touches a signal until after
+`entry + 48h + margin` — by then the "future" has become archived past.
 
-ضمانات عدم التسرّب في الحساب نفسه:
-- سعر الدخول = إغلاق **أوّل شمعة عند أو بعد** لحظة الإشارة (لا قبلها — وإلّا
-  تسرّبٌ معكوس)، وبتأخّر أقصاه 30 دقيقة وإلّا `status=no_entry`.
-- القمم والقيعان من الشموع **التالية بعد شمعة الدخول حصراً**: قمّة شمعة الدخول
-  نفسها قد تكون حدثت قبل تنفيذنا الافتراضيّ فلا تُحسب مكسباً.
-- `bars_truncated` يعلّم السلسلة التي انتهت مبكراً بدل إسقاطها: العملة الميّتة
-  **إشارة لا نقص** — استبعادها يُدخل انحياز البقاء (متوثّق في fomo-getbars).
+No-leakage guarantees inside the computation itself:
+- Entry price = the close of the **first candle at or after** the signal
+  moment (never before it — that would be reverse leakage), and with a lag
+  of at most 30 minutes, otherwise `status=no_entry`.
+- Peaks and troughs come from candles **strictly after the entry candle**:
+  the entry candle's own peak may have occurred before our notional
+  execution, so it is not counted as a gain.
+- `bars_truncated` flags a series that ended early instead of dropping it:
+  a dead coin is **a signal, not missing data** — excluding it introduces
+  survivorship bias (documented in fomo-getbars).
 
-التقسيم (split) حتميّ بتجزئة عنوان العملة — كل إشارات العملة الواحدة في نفس
-القسم دائماً، وإلّا حفظ النموذجُ العملات (14.2 إشارة/عملة) وصار التحقّق وهماً.
+The split is deterministic via a hash of the token address — all signals for a
+single token always land in the same partition, otherwise the model would
+memorize tokens (14.2 signals/token) and validation would become an illusion.
 """
 from __future__ import annotations
 
@@ -28,18 +33,21 @@ import config
 from db import RecorderDB, utcnow_iso
 from features import epoch_of
 
-# نوافذ المكاسب الجزئية (بالساعات) — أعمدة max_gain_*
+# Partial-gain windows (in hours) — the max_gain_* columns
 _GAIN_WINDOWS = (1, 4, 24, 48)
 
 
 def assign_split(token_address: str) -> str:
-    """train/val/test حتمياً من تجزئة العنوان (70/10/20).
+    """Deterministic train/val/test from a hash of the address (70/10/20).
 
-    - **بالعملة لا بالصفّ**: كل إشارات العملة في قسم واحد — منع تسرّب الحفظ.
-    - **حتميّ بلا حالة**: نفس العنوان نفس القسم في أي تشغيل وعلى أي جهاز،
-      بلا جدول يُفقد أو يُعاد توليده.
-    - lower() لتوحيد عناوين EVM المتفاوتة الحالة؛ عناوين سولانا حسّاسة للحالة
-      لكنّ توحيدها هنا لا يضرّ (أسوأ حالة: عملتان مختلفتان في قسم واحد).
+- **Per token, not per row**: all of a token's signals go to one partition —
+  prevents memorization leakage.
+- **Deterministic and stateless**: the same address maps to the same
+  partition in any run and on any machine, with no table to lose or
+  regenerate.
+- lower() normalizes EVM addresses with mixed casing; Solana addresses are
+  case-sensitive, but normalizing them here is harmless (worst case: two
+  distinct tokens end up in one partition).
     """
     digest = hashlib.sha1(
         token_address.strip().lower().encode(), usedforsecurity=False
@@ -58,14 +66,14 @@ def compute_labels(
     window_h: int | None = None,
     admission_price_usd: float | None = None,
 ) -> dict[str, Any]:
-    """شموع (مرتّبة تصاعدياً) + لحظة دخول → قاموس النتائج.
+    """Candles (ascending) + an entry moment → an outcomes dict.
 
-    دالة خالصة: لا قاعدة ولا شبكة ولا ساعة نظام — قابلة للاختبار حتمياً.
-    تعيد دائماً قاموساً فيه `status`:
-      ok         — دخول وشموع بعده؛ كل الحقول المطلوبة محسوبة.
-      no_entry   — لا شمعة دخول خلال المهلة (فجوة سحب لحظة الإشارة).
-      no_bars    — شمعة دخول بلا أي شمعة بعدها (العملة ماتت فوراً).
-      incomplete — توجد شموع، لكن مقياس مطلوب لا يمكن اشتقاقه منها.
+A pure function: no database, no network, no system clock — deterministically
+testable. Always returns a dict containing `status`:
+  ok         — an entry exists with candles after it; all required fields computed.
+  no_entry   — no entry candle within the deadline (a listing gap at signal time).
+  no_bars    — an entry candle with no candle after it (the coin died instantly).
+  incomplete — candles exist, but a required metric cannot be derived from them.
     """
     window_h = window_h or config.LABEL_WINDOW_HOURS
     window_end = entry_ts + window_h * 3600
@@ -75,24 +83,28 @@ def compute_labels(
         "max_drawdown_48h": None, "final_return_48h": None,
         "time_to_peak_h": None, "candles_48h": 0, "suspect_bars": 0,
         "last_bar_lag_h": None, "bars_truncated": None, "is_rug": None,
-        # (fv15) ليبل الانفجار: قمة ≥2x **و** +50% منها متاحة خلال أول 24س —
-        # قياس 2026-08-28 على 2,378 انفجارًا: 82-96% من الانفجارات الحقيقية
-        # تبلغ نصف قمتها في يومها الأول (كلما ضخم الانفجار زادت النسبة)،
-        # والفائتة (345) وسيط ما كان متاحًا منها خلال 24س هو +26% فقط —
-        # صيد هامشي، فالليبل يفرّز «قابلًا للالتقاط» من «قمة متأخرة».
+        # (fv15) Explosive label: a peak ≥2x **and** +50% of it reachable within
+        # the first 24h — measurement on 2026-08-28 over 2,378 explosions: 82-96%
+        # of true explosions reach half their peak on their first day (the bigger
+        # the explosion, the higher the share), and the missed ones (345) had a
+        # median of only +26% available within 24h — marginal hunting, so the
+        # label separates "catchable" from "a late peak".
         "is_explosive": None,
-        # (fv15) سنارة إعلان القوة: دقائق حتى أول إغلاق ≥ +20% — **فلتر
-        # إسقاط مرشحين فقط، لا قاعدة دخول أبدًا** (قرار المالك 2026-08-28
-        # بعد قياس: كل الدخول بعد +20% خاسر صافيًا -1% إلى -11% لأنك تشتري
-        # بسعر أعلى فيبقى جزء صغير من الصعود وكامل الهبوط). الاستخدام
-        # الوحيد الصالح: عملة لم تبلغ +20% خلال ~4 ساعات ⇒ احتمال انفجارها
-        # ضعيف (وسيط المنفجرة 259د مقابل 816د لغيرها) — تُسقط من المراقبة.
+        # (fv15) Strength-announcement snare: minutes until the first close
+        # ≥ +20% — **a candidate-dropping filter only, never an entry rule**
+        # (owner decision 2026-08-28 after measuring: every entry after +20%
+        # is a net loss of -1% to -11% because you buy at a higher price and
+        # keep only a small part of the rise plus all of the fall). The only
+        # valid use: a coin that has not reached +20% within ~4 hours is
+        # unlikely to explode (median 259 min for exploders vs 816 min for the
+        # rest) — drop it from watch.
         "time_to_plus20_min": None,
     }
 
-    # شمعة الدخول: أولى الشموع عند/بعد اللحظة، ضمن مهلة قصوى.
-    # الإغلاق المشوّه لا يصلح سعر دخول (شوهد إغلاق 12,052.5 بين إغلاقين ~0.0004)
-    # فنتخطّاه إلى أوّل إغلاق سليم — ما زال ضمن نفس شرط المهلة.
+    # Entry candle: the first candle at/after the moment, within a maximum deadline.
+    # A corrupted close is not a valid entry price (a close of 12,052.5 was seen
+    # between two closes of ~0.0004), so we skip it to the first clean close —
+    # still within the same deadline condition.
     entry_bar = next(
         (b for b in bars if b["ts"] >= entry_ts and not b.get("c_suspect")), None
     )
@@ -105,13 +117,13 @@ def compute_labels(
         return out
     entry_px = float(admission_price_usd) if use_admission_price else float(entry_bar["c"])
     if not math.isfinite(entry_px) or entry_px <= 0:
-        # سعر صفري/غير محدود يجعل كل النسب لا-نهائية — لا نفبرك.
+        # A zero/non-finite price makes every ratio infinite — we fabricate nothing.
         out["status"] = "no_entry"
         return out
     out["entry_px"] = entry_px
     out["entry_lag_s"] = 0 if use_admission_price else int(entry_bar["ts"] - entry_ts)
 
-    # النافذة: بعد شمعة الدخول حصراً وحتى نهاية 48 ساعة.
+    # The window: strictly after the entry candle, up to the end of the 48 hours.
     entry_bar_ts = entry_ts if use_admission_price else entry_bar["ts"]
     window = [b for b in bars if entry_bar_ts < b["ts"] <= window_end]
     out["candles_48h"] = len(window)
@@ -119,9 +131,10 @@ def compute_labels(
         out["status"] = "no_bars"
         return out
 
-    # الذيول المستحيلة من المنبع تُستبعد من القمّة/القاع فقط — لا تُصلَح ولا
-    # تُحذف شمعتها (o/c سليمان ويُستعملان). بلا هذا الاستبعاد كان ذيل واحد
-    # (h = 119 مليون ضعف إغلاقه) يجعل max_gain مليارات النسب المئوية.
+    # Impossible wicks from upstream are excluded from peak/trough only — the
+    # candle is neither repaired nor deleted (its o/c are sound and used).
+    # Without this exclusion, a single wick (h = 119 million times its close)
+    # would push max_gain into billions of percent.
     hi_ok = [b for b in window if not b.get("h_suspect")]
     lo_ok = [b for b in window if not b.get("l_suspect")]
     close_ok = [b for b in window if not b.get("c_suspect")]
@@ -140,18 +153,20 @@ def compute_labels(
     if hi_ok:
         peak_bar = max(hi_ok, key=lambda b: float(b["h"]))
         out["time_to_peak_h"] = (peak_bar["ts"] - entry_ts) / 3600
-    # العائد النهائي من آخر إغلاق **سليم**؛ وطزاجة السلسلة من آخر شمعة مرصودة
-    # (وجود الشمعة دليل حياة حتى لو تشوّه إغلاقها).
+    # Final return from the last **clean** close; series freshness from the last
+    # observed candle (a candle's presence is proof of life even if its close
+    # is corrupted).
     last_bar = window[-1]
     if close_ok:
         out["final_return_48h"] = float(close_ok[-1]["c"]) / entry_px - 1
         out["is_rug"] = 1 if out["final_return_48h"] <= config.LABEL_RUG_THRESHOLD else 0
 
-    # (fv15) الليبلان الجديدان — من نفس الشموع المحسوبة أعلاه، بلا كلفة:
-    # الانفجار يستعمل الذرى السليمة (hi_ok) لا الإغلاقات، والسنارة عكسه.
-    # ⚠️ time_to_plus20_min ليس قاعدة دخول أبدًا (قياس المالك 2026-08-28):
-    # الدخول بعد +20% خاسر صافيًا في كل النوافذ — استخدامه الوحيد فلترُ
-    # إسقاط مرشحين (من لم تبلغ +20% خلال ~4س ⇒ انفجارها غير مرجّح).
+    # (fv15) The two new labels — from the same candles computed above, at no
+    # cost: explosive uses the clean highs (hi_ok) rather than closes, and the
+    # snare the opposite. ⚠️ time_to_plus20_min is never an entry rule (owner
+    # measurement 2026-08-28): entering after +20% is a net loss in every
+    # window — its only use is a candidate-dropping filter (a coin that has
+    # not reached +20% within ~4h is unlikely to explode).
     peak_48 = out["max_gain_48h"]
     if peak_48 is not None and out["max_gain_24h"] is not None:
         out["is_explosive"] = 1 if (
@@ -198,11 +213,13 @@ def token_age_days(
 def label_pending(
     db: RecorderDB, now_epoch: int, batch: int | None = None
 ) -> dict[str, int]:
-    """يوسم كل ما نضجت نافذته ولم يُوسَم — الإشارات ثمّ دخولات المراقبة ثمّ
-    أحداث النشاط الرجعية (المسدَّاة شموعها فقط — انظر activities_pending_label).
+    """Labels everything whose window has matured and is still unlabeled —
+    signals, then watch entries, then retroactive activity events (only those
+    with candles — see activities_pending_label).
 
-    تزايديّ و idempotent: كل صفّ يُوسَم مرّة واحدة إلى الأبد؛ إعادة التشغيل
-    تلتقط من حيث توقّفت. غير الناضج يُتخطّى بصمت ويُلتقط في دورة لاحقة.
+    Incremental and idempotent: every row is labeled exactly once, forever; a
+    restart picks up where it stopped. The immature are skipped silently and
+    picked up in a later cycle.
     """
     batch = batch or config.LABEL_BATCH
     mature_before = (
@@ -281,7 +298,7 @@ def label_pending(
             "token_address": w["token_address"],
             "network_id": str(w["network_id"] or ""),
             "signal_type": w["source"], "is_control": w["is_control"],
-            "is_independent": None,  # مفهوم الاستقلال يخصّ الإشارات المتتالية
+            "is_independent": None,  # the independence concept applies to consecutive signals
             "entry_ts": entry,
             "split": assign_split(w["token_address"]),
             "labeled_at": labeled_at, "design_version": w["design_version"],
@@ -302,9 +319,10 @@ def label_pending(
         stats["watches"] += 1
         stats[labels["status"]] += 1
 
-    # أحداث النشاط الرجعية (backfill_activity): نفس الحساب ونفس علم الاستقلال،
-    # لكن is_control=0 دائماً — لا ضابطة رجعية ممكنة (لا نعرف الكون غير المُشار
-    # إليه تاريخياً)، وهذا قيد موثّق على أي مقارنة ضابطة تشملها.
+    # Retroactive activity events (backfill_activity): same computation and same
+    # independence flag, but is_control=0 always — no retroactive control group
+    # is possible (we cannot know the historically unreferenced universe), and
+    # this is a documented constraint on any control comparison that includes them.
     for a in db.activities_pending_label(mature_before, batch):
         entry = a["entry_epoch"]
         bars = db.bars_for(

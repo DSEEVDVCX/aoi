@@ -1,7 +1,7 @@
 """Do BSC (56) and Robinhood (4663) contracts vary enough to be features?
 
 Read-only: eth_getCode plus the pure analyze_code(). Writes nothing.
-Answers the question schema.sql:1099 leaves open — "يُوسَّع إن تباينت شبكة أخرى".
+Answers the question schema.sql:1099 leaves open — "to be extended if another network varies".
 """
 from __future__ import annotations
 

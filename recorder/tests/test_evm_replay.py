@@ -1,12 +1,17 @@
-"""اختبارات الإعادة الرجعيّة: الوقت، الأرصدة التراكميّة، وحدّ التغطية الحيّة.
+"""Tests for historical replay: time, cumulative balances, and the live
+coverage boundary.
 
-لا نداء شبكة في أي اختبار. وما يُتحقَّق منه هنا هو ما لو انكسر بصمت لسمّم
-التدريب كلّه ولم يظهر في أي سجلّ:
+No network calls in any test. What is verified here is what, if it broke
+silently, would poison the whole training set and never show up in any log:
 
-  * **قانون النقطة الزمنيّة**: تحويلٌ وقع بعد لحظة اللقطة لا يدخلها بحال.
-  * **الهامش يُضاف لا يُطرح**: السجلّ الحدوديّ يُؤجَّل ولا يُستبق.
-  * **الرصيد السالب يُكشَف لا يُثبَّت**: عملة بدأت قراءتها متأخّرة لا تُكتب أصلاً.
-  * **الإعادة تتوقّف حيث تبدأ التغطية الحيّة**: لا تشابك سلسلتين بإيقاعين.
+  * **The point-in-time law**: a transfer that happened after the snapshot's
+    moment never enters it.
+  * **The margin is added, never subtracted**: a borderline log is delayed,
+    not anticipated.
+  * **A negative balance is exposed, not baked in**: a token whose reading
+    started late is not written at all.
+  * **Replay stops where live coverage begins**: no interleaving two chains
+    at two rhythms.
 """
 import os
 
@@ -28,17 +33,19 @@ A = "0x1111111111111111111111111111111111111111"
 B = "0x2222222222222222222222222222222222222222"
 ZERO = "0x0000000000000000000000000000000000000000"
 
-# خطّ زمنيّ للعقدة المزيّفة: 0.1ث للكتلة (إيقاع روبن‑هود المقيس)، والكتلة `HEAD`
-# وقتها `NOW` بالضبط. والسلسلة تمتدّ 2 مليون ثانية ≈ 23 يوماً — أوسع من نافذة
-# `EVM_REPLAY_LOOKBACK_SECONDS` (7 أيّام)، فبداية المدى تقع داخل السلسلة لا عند
-# الكتلة صفر: بدون ذلك لا يُختبَر فرع «وسّع المدى إلى أوّل السلسلة» أصلاً.
+# A timeline for the fake node: 0.1s per block (Robinhood's measured pace),
+# and block `HEAD`'s time is exactly `NOW`. The chain spans 2 million seconds
+# ≈ 23 days — wider than the `EVM_REPLAY_LOOKBACK_SECONDS` window (7 days), so
+# the start of the range falls inside the chain, not at block zero: without
+# that, the "widen the range to the start of the chain" branch is never
+# tested at all.
 T0 = evm_replay._epoch(NOW)
 HEAD = 20_000_000
 BASE = T0 - 2_000_000
 
 
 def _blk(seconds_ago):
-    """رقم الكتلة التي وقتها `T0 - seconds_ago`."""
+    """The block number whose time is `T0 - seconds_ago`."""
     return HEAD - 10 * int(seconds_ago)
 
 
@@ -54,7 +61,7 @@ def _topic(addr):
 
 
 def _log(frm, to, value, block, token=TOK, ts=None):
-    """سجلّ خام. `ts=None` يحاكي روبن‑هود: `blockTimestamp: '0x0'`."""
+    """A raw log. `ts=None` mimics Robinhood: `blockTimestamp: '0x0'`."""
     out = {
         "address": token,
         "topics": [evm_rpc.TRANSFER_TOPIC, _topic(frm), _topic(to)],
@@ -78,7 +85,8 @@ async def _noop(_seconds):
 
 
 class _FakeRPC:
-    """عقدة مزيّفة: سجلّات جاهزة، وطوابع كتل من خطّ زمنيّ معلوم."""
+    """A fake node: canned logs, and block timestamps from a known
+    timeline."""
 
     def __init__(self, logs=(), head=1000, rate=0.1, base_ts=1_000_000,
                  complete=True, resume=None, fail_ts=False, mint=None):
@@ -95,10 +103,13 @@ class _FakeRPC:
         self.mint_scans = []
 
     async def first_mint_block(self, _net, address, head):
-        """`None` افتراضاً = «لم أعرف» ⇒ مشيٌ من genesis كما تصفه بقيّة الاختبارات.
+        """`None` by default = "unknown" ⇒ a walk from genesis, as the rest
+        of the tests describe.
 
-        وهو ليس تبسيطاً بل حالةٌ يجب أن تبقى مغطّاة: العملة الصاخبة تقصّ ردّ
-        المسح فلا يُعتمَد أدناه. والمسح الناجح يُختبَر بتمرير `mint=` صريحاً.
+        And this is not a simplification but a case that must stay covered:
+        a noisy token truncates the scan's response, so its bottom is not
+        trusted. The successful scan is tested by passing an explicit
+        `mint=`.
         """
         self.mint_scans.append((address.lower(), int(head)))
         return self.mint
@@ -119,7 +130,8 @@ class _FakeRPC:
 
 
 class _GaggedRPC(_FakeRPC):
-    """عقدة تكتم أوّل `gags` نداءَ طابعٍ ثمّ تجيب — حصّة العقدة العامّة."""
+    """A node that gags its first `gags` timestamp calls, then answers —
+    the public node's lot."""
 
     def __init__(self, gags=1, **kw):
         super().__init__(**kw)
@@ -133,7 +145,7 @@ class _GaggedRPC(_FakeRPC):
 
 
 # ---------------------------------------------------------------------------
-# الشبكة الزمنيّة
+# The time grid
 # ---------------------------------------------------------------------------
 def test_grid_aligns_to_step_multiples_and_includes_end():
     pts = evm_replay.grid_points(1003, 1902, 300)
@@ -165,7 +177,7 @@ def test_reactivated_token_replays_each_window_without_filling_gap(db):
 
 
 def test_post_gate_young_window_is_not_sent_to_evm_workers(db, monkeypatch):
-    """العمر المرفوض لا يستهلك RPC حيّاً ولا إعادةً تاريخية."""
+    """A rejected age consumes no live RPC and no historical replay."""
     monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", "2026-08-22T00:00:00+00:00")
     entry = "2026-08-23T12:00:00+00:00"
     db.upsert_static({
@@ -225,18 +237,19 @@ def test_old_live_coverage_does_not_swallow_a_later_window(db):
 
 
 # ---------------------------------------------------------------------------
-# ساعة الكتل
+# The block clock
 # ---------------------------------------------------------------------------
 def test_clock_interpolates_between_anchors(db):
     clock = evm_replay.BlockClock(db, NET)
     clock.add(1000, 100_000, NOW)
-    clock.add(2000, 100_100, NOW)          # 0.1ث للكتلة
+    clock.add(2000, 100_100, NOW)          # 0.1s per block
     assert clock.time_at(1500) == 100_050
-    assert clock.time_at(1000) == 100_000  # مرساة مضبوطة لا استقراء
+    assert clock.time_at(1000) == 100_000  # an exact anchor, not extrapolation
 
 
 def test_clock_extends_slope_beyond_the_last_anchor(db):
-    """كل تحويلات العملة الجديدة فوق آخر مرساة — ورفضها يعني ألّا نقيس شيئاً."""
+    """Every transfer of a new token sits above the last anchor — refusing
+    them would mean measuring nothing."""
     clock = evm_replay.BlockClock(db, NET)
     clock.add(1000, 100_000, NOW)
     clock.add(2000, 100_100, NOW)
@@ -245,7 +258,8 @@ def test_clock_extends_slope_beyond_the_last_anchor(db):
 
 
 def test_clock_anchors_persist_and_reload(db):
-    """المرساة صفة كتلة لا صفة عملة ⇒ تُقرأ من القاعدة للعملة التالية."""
+    """An anchor is a property of a block, not of a token ⇒ it is read from
+    the database for the next token."""
     clock = evm_replay.BlockClock(db, NET)
     clock.add(1000, 100_000, NOW)
     again = evm_replay.BlockClock(db, NET)
@@ -262,18 +276,21 @@ async def test_clock_probe_does_not_recall_a_known_block(db):
 
 
 async def test_a_gagged_anchor_is_waited_out_not_raised(db):
-    """الكتم (429) في نداء المرساة ينتظر ويعيد — ولا يُسقط العملة.
+    """A gag (429) on an anchor call waits and retries — it does not drop
+    the token.
 
-    أوّل تشغيل حيّ مات هنا بالضبط: تسعة نداءات ثمّ 429 من روبن‑هود.
+    The first live run died right here: nine calls, then a 429 from
+    Robinhood.
     """
     rpc = _GaggedRPC(gags=2, head=1000)
     clock = evm_replay.BlockClock(db, NET)
     assert await clock.probe(rpc, 500, NOW, _noop) == 1_000_050
-    assert clock.calls == 3                 # محاولتان مكتومتان ثمّ جواب
+    assert clock.calls == 3                 # two gagged attempts, then an answer
 
 
 async def test_a_gag_that_never_lifts_is_raised_not_swallowed(db):
-    """ابتلاعه يكتب «لا وقت لهذه الكتلة» وهي معلومة كاذبة تُخزَّن كأنّها مقيسة."""
+    """Swallowing it would write "no time for this block" — false
+    information stored as if measured."""
     rpc = _GaggedRPC(gags=99, head=1000)
     clock = evm_replay.BlockClock(db, NET)
     with pytest.raises(evm_rpc.EVMRateLimit):
@@ -282,10 +299,11 @@ async def test_a_gag_that_never_lifts_is_raised_not_swallowed(db):
 
 
 async def test_block_at_time_answers_on_the_older_side(db):
-    """الخطأ مقصود في اتّجاه القِدَم: كتلة أحدث تُفقِد تحويلات ⇒ أرقاماً كاذبة."""
+    """The error is deliberate toward the past: a newer block loses
+    transfers ⇒ false numbers."""
     rpc = _FakeRPC(head=1_000_000)
     clock = evm_replay.BlockClock(db, NET)
-    target = 1_050_000                      # = الكتلة 500,000 بالضبط
+    target = 1_050_000                      # = exactly block 500,000
 
     block = await clock.block_at_time(
         rpc, target, 1_000_000, NOW, _noop, max_calls=20,
@@ -293,11 +311,12 @@ async def test_block_at_time_answers_on_the_older_side(db):
 
     assert block <= 500_000
     assert clock.time_at(block) <= target
-    assert clock.calls <= 8                 # استقراء لا تنصيف
+    assert clock.calls <= 8                 # extrapolation, not bisection
 
 
 async def test_block_at_time_falls_back_to_genesis(db):
-    """وقت أقدم من كل مرساة ⇒ الكتلة صفر: أوّل السلسلة هو الجواب الصحيح."""
+    """A time older than every anchor ⇒ block zero: the start of the chain
+    is the correct answer."""
     rpc = _FakeRPC(head=1000)
     clock = evm_replay.BlockClock(db, NET)
     got = await clock.block_at_time(rpc, 1, 1000, NOW, _noop, max_calls=20)
@@ -305,10 +324,11 @@ async def test_block_at_time_falls_back_to_genesis(db):
 
 
 # ---------------------------------------------------------------------------
-# وقت السجلّ: الحقيقة إن أُعطيت، والاستقراء زائد هامش إن غابت
+# Log time: the truth when given, extrapolation plus a margin when absent
 # ---------------------------------------------------------------------------
 def test_real_block_timestamp_is_used_without_margin(db):
-    """Base وBSC تعطيان الطابع ⇒ لا استقراء ولا هامش: هو الحقيقة."""
+    """Base and BSC give the timestamp ⇒ no extrapolation and no margin:
+    it is the truth."""
     clock = evm_replay.BlockClock(db, NET)
     clock.add(0, 0, NOW)
     clock.add(100, 100, NOW)
@@ -319,14 +339,15 @@ def test_real_block_timestamp_is_used_without_margin(db):
 
 
 def test_zero_timestamp_is_absence_not_epoch_1970(db):
-    """`'0x0'` لو قُرئ وقتاً لأدخل كل التحويلات في كل اللقطات — عكس المطلوب."""
+    """If `'0x0'` were read as a time, every transfer would enter every
+    snapshot — the opposite of what is wanted."""
     clock = evm_replay.BlockClock(db, NET)
     clock.add(0, 100_000, NOW)
     clock.add(1000, 100_100, NOW)
     times, unknown = evm_replay.resolve_log_times(
         [_log(A, B, 5, 500, ts=None)], clock, margin=5,
     )
-    assert times == {500: 100_055}          # 100_050 + هامش 5
+    assert times == {500: 100_055}          # 100_050 + margin 5
     assert unknown == 0
 
 
@@ -339,7 +360,7 @@ def test_block_without_any_anchor_is_unknown_not_guessed(db):
 
 
 # ---------------------------------------------------------------------------
-# قلب الصحّة: المرور على الشبكة
+# The heart of correctness: the grid pass
 # ---------------------------------------------------------------------------
 def test_balances_are_cumulative_across_grid_points():
     logs = [_log(ZERO, A, 1000, 10, ts=1000), _log(A, B, 200, 20, ts=2000)]
@@ -352,17 +373,18 @@ def test_balances_are_cumulative_across_grid_points():
     ]
     assert [r["holder_count"] for r in rows] == [1, 2]
     assert [r["top1_pct"] for r in rows] == [100.0, 80.0]
-    assert meta["empty"] == 1               # اللحظة 900 قبل أوّل تحويل
+    assert meta["empty"] == 1               # the moment 900 precedes the first transfer
 
 
 def test_a_transfer_after_the_point_never_enters_it():
-    """قانون النقطة الزمنيّة: ثانية واحدة بعد اللقطة تكفي لاستبعاده."""
+    """The point-in-time law: one second after the snapshot is enough to
+    exclude it."""
     logs = [_log(ZERO, A, 1000, 10, ts=1000), _log(A, B, 400, 20, ts=1501)]
     rows, _ = evm_replay.replay_rows(
         logs, {10: 1000, 20: 1501}, [1500], TOK, NET, _watch(),
     )
     assert len(rows) == 1
-    assert rows[0]["holder_count"] == 1     # B لم يوجد بعد
+    assert rows[0]["holder_count"] == 1     # B does not exist yet
     assert rows[0]["top1_pct"] == 100.0
 
 
@@ -375,21 +397,23 @@ def test_transfer_exactly_at_the_point_is_included():
 
 
 def test_margin_delays_a_borderline_log_never_advances_it(db):
-    """السجلّ على الحدّ يُخرَج باللقطة لا يُدخَل: تأخير قياس لا استباقه."""
+    """A log on the boundary is kept out of the snapshot, not let in:
+    delaying a measurement, not anticipating it."""
     clock = evm_replay.BlockClock(db, NET)
     clock.add(0, 0, NOW)
-    clock.add(100, 1000, NOW)               # 10ث للكتلة
+    clock.add(100, 1000, NOW)               # 10s per block
     logs = [_log(ZERO, A, 1000, 10, ts=None), _log(A, B, 400, 50, ts=None)]
     times, _ = evm_replay.resolve_log_times(logs, clock, margin=5)
 
-    assert times == {10: 105, 50: 505}      # الاستقراء 100 و500 زائد 5
+    assert times == {10: 105, 50: 505}      # extrapolation 100 and 500 plus 5
     rows, _ = evm_replay.replay_rows(logs, times, [500], TOK, NET, _watch())
-    assert rows[0]["holder_count"] == 1     # التحويل الثاني أُجِّل خارج اللقطة
+    assert rows[0]["holder_count"] == 1     # the second transfer was delayed out of the snapshot
 
 
 def test_negative_balance_writes_nothing_at_all():
-    """بدءٌ متأخّر ⇒ إرسال بلا استلام: الأرقام كاذبة لا ناقصة."""
-    logs = [_log(A, B, 200, 10, ts=1000)]   # لا سكّ سابق
+    """A late start ⇒ a send with no receive: the numbers are false, not
+    incomplete."""
+    logs = [_log(A, B, 200, 10, ts=1000)]   # no prior mint
     rows, meta = evm_replay.replay_rows(
         logs, {10: 1000}, [1500, 1800], TOK, NET, _watch(),
     )
@@ -398,17 +422,18 @@ def test_negative_balance_writes_nothing_at_all():
 
 
 def test_burn_address_may_go_negative_without_voiding_the_token():
-    """السكّ يخرج من عنوان الصفر فرصيده سالبٌ بالضرورة — وليس عطباً."""
+    """The mint leaves the zero address, so its balance is necessarily
+    negative — and that is not a defect."""
     logs = [_log(ZERO, A, 1000, 10, ts=1000)]
     rows, meta = evm_replay.replay_rows(
         logs, {10: 1000}, [1500], TOK, NET, _watch(),
     )
     assert meta["negatives"] == 0
-    assert rows[0]["holder_count"] == 1     # عنوان الصفر ليس حائزاً
+    assert rows[0]["holder_count"] == 1     # the zero address is not a holder
 
 
 # ---------------------------------------------------------------------------
-# الطبقة غير المتزامنة: عملة كاملة
+# The async layer: a whole token
 # ---------------------------------------------------------------------------
 def _rpc(logs=(), head=HEAD, **kw):
     return _FakeRPC(logs=list(logs), head=head, rate=0.1, base_ts=BASE, **kw)
@@ -423,7 +448,8 @@ def _iso_dt(ts):
 
 
 def _story(token=TOK):
-    """سكٌّ عند `T0-3000` ثمّ تحويل عند `T0-1500`، بلا طابع (روبن‑هود)."""
+    """A mint at `T0-3000`, then a transfer at `T0-1500`, with no timestamp
+    (Robinhood)."""
     return [
         _log(ZERO, A, 1000, _blk(3000), token=token),
         _log(A, B, 200, _blk(1500), token=token),
@@ -439,14 +465,15 @@ async def test_replay_token_writes_a_full_grid_marked_is_replay(db):
     )
 
     assert res["status"] == "done"
-    assert res["written"] == res["rows"] == 9      # T0-2700 … T0-300 خطوةَ 300
+    assert res["written"] == res["rows"] == 9      # T0-2700 … T0-300 in steps of 300
     rows = db._conn.execute(
         "SELECT recorded_at, holder_count, top1_pct, is_replay, raw_json"
         "  FROM chain_concentration ORDER BY recorded_at"
     ).fetchall()
     assert rows[0]["recorded_at"] == _iso_dt(T0 - 2700)
     assert rows[-1]["recorded_at"] == _iso_dt(T0 - 300)
-    # التحويل وقته T0-1495 (استقراء زائد هامش) ⇒ يدخل من اللقطة T0-1200.
+    # The transfer's time is T0-1495 (extrapolation plus margin) ⇒ it enters
+    # from the T0-1200 snapshot.
     assert [r["holder_count"] for r in rows] == [1] * 5 + [2] * 4
     assert rows[-1]["top1_pct"] == 80.0
     assert {r["is_replay"] for r in rows} == {1}
@@ -454,10 +481,12 @@ async def test_replay_token_writes_a_full_grid_marked_is_replay(db):
 
 
 async def test_replay_state_is_written_and_live_pacing_is_untouched(db):
-    """الحالة تُحفَظ في جدولها، و`chain_fetch_state` لا يُلمَس.
+    """State is saved in its own table, and `chain_fetch_state` is
+    untouched.
 
-    كتابة إيقاع الطبقة الحيّة من هنا تُخبرها أنّ العملة قيست الآن فتؤجّل لقطتها
-    الحقيقيّة — إعادةٌ رجعيّة تُفقِدنا قياساً حاضراً.
+    Writing the live layer's pacing from here would tell it the token was
+    just measured, delaying its real snapshot — a historical replay costing
+    us a present measurement.
     """
     rpc = _rpc(_story())
     clock = evm_replay.BlockClock(db, NET)
@@ -471,7 +500,7 @@ async def test_replay_state_is_written_and_live_pacing_is_untouched(db):
     assert state["to_block"] == HEAD - int(config.EVM_CONFIRMATIONS)
     assert state["from_block"] == 0
     assert db._conn.execute("SELECT COUNT(*) c FROM chain_fetch_state").fetchone()["c"] == 0
-    # والمراسي محفوظة للعملة التالية على نفس الشبكة.
+    # And the anchors are saved for the next token on the same network.
     assert len(evm_replay.BlockClock(db, NET)) > 0
 
 
@@ -506,7 +535,8 @@ async def test_replay_rows_roll_back_when_state_write_fails(db, monkeypatch):
 
 
 async def test_replay_stops_where_live_coverage_begins(db):
-    """أوّل صفّ حيّ يقصّ النافذة قبله بخطوة كاملة — لا تشابك سلسلتين."""
+    """The first live row trims the window before it by a full step — no
+    interleaving two chains."""
     seed, _ = evm_replay.replay_rows(
         [_log(ZERO, A, 1000, 10, ts=1000)], {10: 1000}, [1500], TOK, NET, _watch(),
     )
@@ -526,7 +556,7 @@ async def test_replay_stops_where_live_coverage_begins(db):
     last = db._conn.execute(
         "SELECT MAX(recorded_at) m FROM chain_concentration WHERE is_replay=1"
     ).fetchone()["m"]
-    assert last == _iso_dt(T0 - 2100)          # 1800 + خطوة 300
+    assert last == _iso_dt(T0 - 2100)          # 1800 + a 300 step
     assert db._conn.execute(
         "SELECT COUNT(*) c FROM chain_concentration WHERE is_replay=1 AND recorded_at>=?",
         (_iso_dt(T0 - 1800),),
@@ -553,7 +583,7 @@ async def test_replay_aborts_if_live_coverage_starts_during_fetch(db):
         logs=_story(), head=HEAD, rate=0.1, base_ts=BASE,
     )
     try:
-        with pytest.raises(StaleEVMState, match="التغطية الحيّة"):
+        with pytest.raises(StaleEVMState, match="live coverage"):
             await evm_replay.replay_token(
                 rpc, db, _live_watch(), evm_replay.BlockClock(db, NET), HEAD, NOW,
                 sleep=_noop,
@@ -586,7 +616,7 @@ async def test_replay_aborts_if_a_window_is_added_during_fetch(db):
         logs=_story(), head=HEAD, rate=0.1, base_ts=BASE,
     )
     try:
-        with pytest.raises(StaleEVMState, match="نوافذ replay"):
+        with pytest.raises(StaleEVMState, match="replay windows"):
             await evm_replay.replay_token(
                 rpc, db, watch, evm_replay.BlockClock(db, NET), HEAD, NOW,
                 sleep=_noop,
@@ -599,7 +629,8 @@ async def test_replay_aborts_if_a_window_is_added_during_fetch(db):
 
 
 async def test_a_window_swallowed_by_live_coverage_writes_nothing(db):
-    """تغطية حيّة أقدم من الدخول ⇒ لا شيء يُعاد، ولا خطأ."""
+    """Live coverage older than the entry ⇒ nothing is replayed, and no
+    error."""
     seed, _ = evm_replay.replay_rows(
         [_log(ZERO, A, 1000, 10, ts=1000)], {10: 1000}, [1500], TOK, NET, _watch(),
     )
@@ -640,7 +671,8 @@ async def test_redo_to_skip_removes_old_replay_rows_atomically(db):
 
 
 async def test_an_unknown_block_time_writes_no_row_at_all(db):
-    """المراسي ممنوعة ⇒ لا وقت للسجلّ ⇒ `no_time` بلا صفّ مخمَّن."""
+    """Anchors forbidden ⇒ no time for the log ⇒ `no_time` with no guessed
+    row."""
     rpc = _rpc(_story(), fail_ts=True)
     clock = evm_replay.BlockClock(db, NET)
     res = await evm_replay.replay_token(
@@ -662,7 +694,8 @@ async def test_a_token_with_no_transfer_is_empty_not_zero(db):
 
 
 async def test_negative_balance_retries_from_genesis_once(db):
-    """الإعادة تبدأ من genesis؛ سالب بعدها فساد حقيقي لا نافذة قصيرة."""
+    """Replay starts from genesis; a negative after that is real corruption,
+    not a short window."""
     rpc = _rpc([_log(A, B, 200, _blk(1500))])
     clock = evm_replay.BlockClock(db, NET)
 
@@ -678,7 +711,8 @@ async def test_negative_balance_retries_from_genesis_once(db):
 
 
 async def test_negative_prefix_stays_partial_until_the_range_is_complete(db):
-    """السالب في جزء أول لا يصبح حكماً نهائياً قبل قراءة بقية المدى."""
+    """A negative in an early part does not become a final verdict before
+    the rest of the range is read."""
     _seed_watch(db, TOK, 3600, 1)
     first_rpc = _rpc(
         [_log(A, B, 200, _blk(1500))], complete=False, resume=_blk(1800),
@@ -702,7 +736,7 @@ async def test_negative_prefix_stays_partial_until_the_range_is_complete(db):
 
 
 # ---------------------------------------------------------------------------
-# المهمّة كاملة
+# The whole job
 # ---------------------------------------------------------------------------
 def _seed_watch(db, token, first, hours):
     db.upsert_watch(
@@ -711,7 +745,8 @@ def _seed_watch(db, token, first, hours):
 
 
 async def test_run_replay_refuses_a_network_without_a_free_archive(db):
-    """BSC خارج `EVM_REPLAY_NETWORKS` بقياس: لا عقدة حرّة تخدم سجلّاً قديماً."""
+    """BSC is outside `EVM_REPLAY_NETWORKS` by measurement: no free node
+    serves an old log."""
     _seed_watch(db, TOK, 3600, 1)
     stats = await evm_replay.run_replay(
         _rpc(_story()), db, networks=["56"], sleep=_noop,
@@ -798,7 +833,8 @@ async def test_active_window_stays_partial_until_head_reaches_end(db):
 
 
 async def test_finished_window_caps_replay_at_window_end(db, monkeypatch):
-    """النافذة المنتهية لا تجلب كتل الشبكة التي جاءت بعدها."""
+    """A finished window does not fetch the network's blocks that came
+    after it."""
     watch = _watch(_iso_dt(T0 - 7200), _iso_dt(T0 - 3600))
     monkeypatch.setattr(config, "EVM_REPLAY_HEAD_GRACE_SECONDS", 0)
     rpc = _rpc([_log(ZERO, A, 1000, _blk(5000))])
@@ -813,7 +849,8 @@ async def test_finished_window_caps_replay_at_window_end(db, monkeypatch):
 
 
 async def test_partial_is_retried_because_a_gag_is_not_a_verdict(db):
-    """`partial` ليست نهائيّة: سقفُ نداءات نفد أو كتمٌ عابر — لا حكم على العملة."""
+    """`partial` is not final: the call cap ran out or a passing gag — no
+    verdict on the token."""
     _seed_watch(db, TOK, 3600, 1)
     db.set_evm_replay_state(TOK, NET, "partial", NOW)
     stats = await evm_replay.run_replay(
@@ -823,7 +860,8 @@ async def test_partial_is_retried_because_a_gag_is_not_a_verdict(db):
 
 
 async def test_partial_replay_resumes_from_saved_block(db):
-    """الحالة الجزئية تبدأ من resume المحفوظ لا من بداية النافذة كل مرة."""
+    """A partial state starts from the saved resume point, not from the
+    start of the window every time."""
     _seed_watch(db, TOK, 3600, 1)
 
     first_rpc = _rpc(_story(), complete=False, resume=_blk(1800))
@@ -846,11 +884,13 @@ async def test_partial_replay_resumes_from_saved_block(db):
 
 
 async def test_replay_starts_at_the_first_mint_where_there_is_no_archive(db):
-    """الإعادة أشدّ حاجةً للمسح من الطبقة الحيّة: تمشي كل عملة من نشأتها.
+    """Replay needs the mint scan more than the live layer does: it walks
+    every token from its genesis.
 
-    والمقيس على السلسلة الحيّة أنّ ثلاثاً من أربع عملات روبن‑هود سُكَّت فوق 67%
-    من طولها، فـ`from_block = 0` يقرأ 27–37 مليون كتلة لا تحمل تحويلاً واحداً —
-    وهي بالضبط النداءات التي كانت تنفد قبل أوّل لقطة.
+    And what was measured on the live chain is that three of four Robinhood
+    tokens were minted above 67% of the chain's length, so `from_block = 0`
+    reads 27–37 million blocks carrying not a single transfer — exactly the
+    calls that used to run out before the first snapshot.
     """
     _seed_watch(db, TOK, 3600, 1)
     mint = _blk(4000)
@@ -866,7 +906,8 @@ async def test_replay_starts_at_the_first_mint_where_there_is_no_archive(db):
 
 
 async def test_an_unknown_mint_block_replays_from_genesis_instead_of_guessing(db):
-    """`None` = «لم أعرف» ⇒ المشي الكامل. حدٌّ أدنى كاذب يُسقط العملة كلّها."""
+    """`None` = "unknown" ⇒ the full walk. A false lower bound drops the
+    whole token."""
     _seed_watch(db, TOK, 3600, 1)
     rpc = _rpc(_story(), mint=None)
 
@@ -876,12 +917,15 @@ async def test_an_unknown_mint_block_replays_from_genesis_instead_of_guessing(db
 
 
 async def test_a_window_staled_token_resumes_from_its_checkpoint_not_genesis(db):
-    """`window` حكمٌ أُبطل ومشيٌ قائم — فتُقرأ من نقطة الاستئناف لا من النشأة.
+    """`window` is an invalidated verdict with a walk still standing — so
+    it resumes from the checkpoint, not from genesis.
 
-    كانت النافذةُ الجديدة تحذف صفَّ الحالة كلَّه، فتُقرأ العملةُ «لم تُحاوَل قطّ»
-    وتُمشى من الكتلة صفر. صارت `db.stale_evm_replay_verdict` تُبقي المشي وتُبطل
-    الحكم وحدَه — ولا ينفع ذلك شيئاً إن لم تكن `window` في مجموعةِ استئناف
-    الـcheckpoint هنا: يُقرأ الصفُّ ثمّ يُهمَل مشيُه فيعود العطبُ كما كان.
+    A new window used to delete the whole state row, so the token read as
+    "never attempted" and was walked from block zero.
+    `db.stale_evm_replay_verdict` now keeps the walk and invalidates the
+    verdict alone — which is worth nothing unless `window` is in the
+    checkpoint-resume set here: the row is read but its walk ignored, and
+    the failure returns as it was.
     """
     _seed_watch(db, TOK, 3600, 1)
     next_grid = evm_replay.grid_points(T0 - 4200, T0 - 4200, 300)[0]
@@ -897,22 +941,26 @@ async def test_a_window_staled_token_resumes_from_its_checkpoint_not_genesis(db)
     rpc = _rpc([], complete=False, resume=200)
     await evm_replay.run_replay(rpc, db, networks=[NET], sleep=_noop)
 
-    assert rpc.ranges, "لم تُنتقَ العملة — `window` صارت نهائيّةً بالخطأ"
-    assert rpc.ranges[0][0] == 100, "مشيٌ من النشأة: الـcheckpoint أُهمل"
-    # والرصيدُ المستأنف حاضر: مجموعُ الاستئناف لا يُعاد بناؤه من لا شيء.
+    assert rpc.ranges, "the token was not picked — `window` became final by mistake"
+    assert rpc.ranges[0][0] == 100, "a walk from genesis: the checkpoint was ignored"
+    # And the resumed balance is present: the resume total is not rebuilt
+    # from nothing.
     state = db.evm_replay_state(TOK, NET)
     assert decode_raw(state["checkpoint_json"])["balances"] == {A: "1000"}
-    assert state["calls"] >= 40, "عدّادُ السقف تصفّر عند إبطال الحكم"
+    assert state["calls"] >= 40, "the cap counter resets when the verdict is invalidated"
 
 
 async def test_a_token_that_spends_its_call_cap_stops_final_with_a_checkpoint(
     db, monkeypatch,
 ):
-    """سقفٌ لكل عملة: `partial` أبديّة تأكل ميزانيّة العملات التي تُنجَز.
+    """A cap per token: an eternal `partial` eats the budget of tokens that
+    finish.
 
-    `EVM_REPLAY_MAX_CALLS` سقف **الدورة** لا العملة، فعملة تعود `partial` كل
-    دورة تستأنف إلى الأبد. مقيس على Base: عملتان أنفقتا 15,270 و11,665 نداءً
-    بصفر صفّ، مقابل ~4,960 نداءً لأثقل مشيٍ مشروع — فالتجاوز عطبٌ صامت لا بطء.
+    `EVM_REPLAY_MAX_CALLS` caps the **cycle**, not the token, so a token
+    that returns `partial` every cycle resumes forever. Measured on Base:
+    two tokens spent 15,270 and 11,665 calls for zero rows, versus ~4,960
+    calls for the heaviest legitimate walk — so an overrun is a silent
+    defect, not slowness.
     """
     monkeypatch.setattr(config, "EVM_REPLAY_TOKEN_CALL_CAP", 5)
     _seed_watch(db, TOK, 3600, 1)
@@ -930,13 +978,15 @@ async def test_a_token_that_spends_its_call_cap_stops_final_with_a_checkpoint(
     assert result["budget"] == 1
     state = db.evm_replay_state(TOK, NET)
     assert state["status"] == "budget"
-    # نقطة الاستئناف والـcheckpoint محفوظان: التوقّف ليس حرقاً للعمل المنجَز،
-    # فرفعُ السقف أو `--redo` يُكمل من هنا لا من الصفر.
+    # The resume point and the checkpoint are both saved: stopping is not
+    # burning finished work — raising the cap or `--redo` continues from
+    # here, not from zero.
     assert state["from_block"] == 200
     assert decode_raw(state["checkpoint_json"])["balances"] == {A: "1000"}
-    assert "سقف العملة" in (state["last_error"] or "")
+    assert "token call cap" in (state["last_error"] or "")
 
-    # ولا تُعاد: `budget` نهائيّة، وإلّا كان السقف عدّاداً بلا أثر.
+    # And it is not retried: `budget` is final, otherwise the cap would be a
+    # counter with no effect.
     again = await evm_replay.run_replay(
         _rpc([], complete=False, resume=200), db, networks=[NET], sleep=_noop,
     )
@@ -949,14 +999,18 @@ async def test_a_token_that_spends_its_call_cap_stops_final_with_a_checkpoint(
 
 
 async def test_the_call_cap_never_overrides_a_verdict_the_data_gives(db, monkeypatch):
-    """السقف يخصّ `partial` وحدها: رصيدٌ سالب حكمٌ على البيانات لا على الميزانيّة.
+    """The cap applies to `partial` alone: a negative balance is a verdict
+    on the data, not on the budget.
 
-    خلطُهما يخفي `negative` — أي رقماً كاذباً — خلف «نفد السقف»، فتبدو العملة
-    ناقصةَ عملٍ وهي مرفوضة أصلاً، ويُفتَح لها بابُ إعادةٍ لا تنتهي عند رفع السقف.
+    Mixing the two hides `negative` — that is, false numbers — behind "the
+    cap ran out", so the token looks like unfinished work when it is
+    rejected outright, and a door of endless replay opens for it whenever
+    the cap is raised.
     """
     monkeypatch.setattr(config, "EVM_REPLAY_TOKEN_CALL_CAP", 1)
     _seed_watch(db, TOK, 3600, 1)
-    # تحويلٌ من حائز لم يستلم قطّ ⇒ رصيد سالب بعد اكتمال المدى.
+    # A transfer from a holder that never received anything ⇒ a negative
+    # balance once the range completes.
     rpc = _rpc([_log(A, B, 500, _blk(3000), ts=T0 - 3000)])
 
     result = await evm_replay.run_replay(rpc, db, networks=[NET], sleep=_noop)
@@ -966,7 +1020,8 @@ async def test_the_call_cap_never_overrides_a_verdict_the_data_gives(db, monkeyp
 
 
 async def test_empty_partial_replay_jumps_to_contract_creation(db, monkeypatch):
-    """Checkpoint فارغ قد يتجاوز فقط الكتل التي سبقت وجود العقد."""
+    """An empty checkpoint may have skipped only the blocks that preceded
+    the contract's existence."""
     _seed_watch(db, TOK, 3600, 1)
     next_grid = evm_replay.grid_points(T0 - 4200, T0 - 4200, 300)[0]
     db.set_evm_replay_state(
@@ -975,8 +1030,9 @@ async def test_empty_partial_replay_jumps_to_contract_creation(db, monkeypatch):
         checkpoint={"balances": {}, "next_grid": next_grid},
     )
     monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (NET,))
-    # الشبكة في مجموعةٍ واحدة لا اثنتين: هنا نصفها بأنّها تحفظ أرشيفاً، فيكون
-    # `eth_getCode` هو الجواب. ومسح السكّ بديلٌ عنه حيث لا أرشيف لا زميلٌ له.
+    # The network is in one set, not both: here we declare that it keeps an
+    # archive, so `eth_getCode` is the answer. The mint scan is its
+    # substitute where there is no archive — it has no peer.
     monkeypatch.setattr(config, "EVM_MINT_SCAN_NETWORKS", ())
     rpc = _rpc([], complete=False, resume=800)
 
@@ -995,15 +1051,17 @@ async def test_empty_partial_replay_jumps_to_contract_creation(db, monkeypatch):
 
 
 async def test_redo_negative_replay_ignores_old_counters_for_creation_jump(db, monkeypatch):
-    """محاولة مرفوضة سابقة لا تُجبر إعادةً جديدة على المسح من genesis."""
+    """A previously rejected attempt must not force a fresh replay to scan
+    from genesis."""
     _seed_watch(db, TOK, 3600, 1)
     db.set_evm_replay_state(
         TOK, NET, "negative", NOW, from_block=700, to_block=900,
         transfers=123, snapshots=0, calls=45, balance_check="negative",
     )
     monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (NET,))
-    # الشبكة في مجموعةٍ واحدة لا اثنتين: هنا نصفها بأنّها تحفظ أرشيفاً، فيكون
-    # `eth_getCode` هو الجواب. ومسح السكّ بديلٌ عنه حيث لا أرشيف لا زميلٌ له.
+    # The network is in one set, not both: here we declare that it keeps an
+    # archive, so `eth_getCode` is the answer. The mint scan is its
+    # substitute where there is no archive — it has no peer.
     monkeypatch.setattr(config, "EVM_MINT_SCAN_NETWORKS", ())
     rpc = _rpc([], complete=False, resume=800)
 
@@ -1084,7 +1142,8 @@ async def test_partial_redo_resumes_its_replacement_checkpoint(db):
 
 
 async def test_incomplete_empty_prefix_stays_partial(db):
-    """مدى جزئي قبل أول تحويل ليس حكماً نهائياً بأن العملة فارغة."""
+    """A partial range before the first transfer is not a final verdict
+    that the token is empty."""
     _seed_watch(db, TOK, 3600, 1)
     rpc = _rpc([], complete=False, resume=_blk(1800))
 

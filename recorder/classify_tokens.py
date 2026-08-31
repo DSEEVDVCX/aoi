@@ -1,19 +1,21 @@
-"""تصنيف الأصول: عملة ميم أم أصل كبير أم مستقرّة أم سهم/سلعة مرمّزة (بلا شبكة).
+"""Asset classification: meme coin vs major asset vs stable vs tokenized stock/commodity (no network).
 
-fomo منصّة **متعدّدة الأصول** لا سوق ميمات — مقيس 2026-07-30 في أرشيفنا:
-BTC ($1.27T) · ETH · SOL (103 إشارة) · USDT · XRP · BNB · HYPE · ذهب PAXG ·
-أسهم مرمّزة: AAPL ($339) · SNDK ($1013) · MU ($958) · MSTR · HOOD · INTC ·
-META · DRAM · NET. خلط هذه بالميمات يفسد التدريب: سهم آبل لا يسلك سلوك عملة
-عمرها ساعتان، والقيمة السوقية **لا تكشفها** (AAPL بـ$1.36M فقط لأنّ المرمَّز
-جزء ضئيل من السهم) — السعر هو المميّز.
+fomo is a **multi-asset** platform, not a meme market — measured 2026-07-30 in
+our archive: BTC ($1.27T) · ETH · SOL (103 signals) · USDT · XRP · BNB · HYPE
+· PAXG gold · tokenized stocks: AAPL ($339) · SNDK ($1013) · MU ($958) · MSTR
+· HOOD · INTC · META · DRAM · NET. Mixing these with memes corrupts training:
+an Apple share does not behave like a two-hour-old coin, and market cap does
+**not** reveal it (AAPL is only $1.36M because the tokenized part is a tiny
+fraction of the share) — price is the discriminator.
 
-يجمع كل مشاهدات كل عملة من `signal_events` و`activity_events` و`market_ticks`
-ثمّ يحكم بـ`extract.classify_asset` ويكتب `token_class`. مشتقّ بالكامل ⇒ يُعاد
-بناؤه في أيّ وقت، ولا يمسّ صفّاً خامّاً.
+Gathers every observation of every token from `signal_events`,
+`activity_events` and `market_ticks`, then rules with `extract.classify_asset`
+and writes `token_class`. Fully derived ⇒ rebuildable at any time, and it
+never touches a raw row.
 
-الاستعمال:
-    py classify_tokens.py --dry-run     # التوزيع وأمثلة غير الميمات
-    py classify_tokens.py               # كتابة/تحديث token_class
+Usage:
+    py classify_tokens.py --dry-run     # distribution and non-meme examples
+    py classify_tokens.py               # write/update token_class
 """
 from __future__ import annotations
 
@@ -34,8 +36,8 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, OSError):  # pragma: no cover
         pass
 
-# مشاهدات السعر/القيمة/الاسم من كل المصادر. `symbol` من token_static أوّلاً
-# (الأدقّ) ثمّ ticker الأحداث.
+# Price/value/symbol observations from every source. `symbol` comes from
+# token_static first (most accurate), then the events' ticker.
 _OBS_SQL = """
 WITH obs AS (
     SELECT token_address a, network_id n, ticker sym, price_usd px, market_cap mc
@@ -86,9 +88,9 @@ def main() -> None:
         dist: dict[str, int] = {}
         for r in rows:
             dist[r["asset_class"]] = dist.get(r["asset_class"], 0) + 1
-        print(f"عملات مصنَّفة: {len(rows)}")
-        print("التوزيع:", dict(sorted(dist.items(), key=lambda kv: -kv[1])))
-        print("\nغير الميمية (كلّها):")
+        print(f"Classified tokens: {len(rows)}")
+        print("Distribution:", dict(sorted(dist.items(), key=lambda kv: -kv[1])))
+        print("\nNon-meme (all of them):")
         for r in sorted(
             (x for x in rows if x["asset_class"] != "meme"),
             key=lambda x: -(x["price_max"] or 0),
@@ -97,7 +99,7 @@ def main() -> None:
                   f"px_max={r['price_max']} mc_max={r['market_cap_max']} "
                   f"obs={r['observations']} — {r['reason']}")
         if dry:
-            print("\n(dry-run — بلا كتابة)")
+            print("\n(dry-run — no writes)")
             return
         cols = ("token_address", "network_id", "asset_class", "reason", "symbol",
                 "price_min", "price_max", "market_cap_max", "observations",
@@ -108,7 +110,7 @@ def main() -> None:
                 f"VALUES({', '.join('?' * len(cols))})",
                 [tuple(r[c] for c in cols) for r in rows],
             )
-        print(f"\nكُتبت {len(rows)} صفّاً في token_class.")
+        print(f"\nWrote {len(rows)} rows to token_class.")
     finally:
         db.close()
 
