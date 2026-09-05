@@ -107,6 +107,32 @@ class EVMAdmissionPolicy:
         return int.from_bytes(digest[:8], "big")
 
 
+def _hypersync_covered_networks(db: RecorderDB) -> frozenset[str]:
+    """Networks the EVM worker routed through HyperSync in a **fresh** cycle.
+
+    The stamp is written by `evm_layer.run_evm_cycle` every cycle (60s), so a
+    stamp older than `EVM_HYPERSYNC_STAMP_FRESH_SECONDS` means the worker is
+    dead or the key vanished — and the admission gate must then fall back to
+    the public-node math on its own, with no operator involved. The same guard
+    rejects a stamp from the future beyond the window: a clock skew backwards
+    must not make one stamp live forever.
+    """
+    raw = db.get_meta("evm_hypersync_covered")
+    if not raw:
+        return frozenset()
+    try:
+        decoded = json.loads(raw)
+        at = datetime.fromisoformat(str(decoded["at"]))
+        networks = {str(net) for net in decoded["networks"]}
+    except (KeyError, TypeError, ValueError):
+        return frozenset()
+    fresh = float(getattr(config, "EVM_HYPERSYNC_STAMP_FRESH_SECONDS", 900))
+    age = (datetime.fromisoformat(utcnow_iso()) - at).total_seconds()
+    if not -fresh <= age <= fresh:
+        return frozenset()
+    return frozenset(networks)
+
+
 def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
     """Build independent admission budgets from each network's RPC limits.
 
@@ -129,6 +155,7 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
             previous = {}
 
     states: dict[str, EVMNetworkAdmission] = {}
+    hypersync = _hypersync_covered_networks(db)
     for network in networks:
         rows = db._conn.execute(
             """SELECT b.status, b.from_block, b.to_block
@@ -150,9 +177,20 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
         if rpc_limit:
             batch_size = min(batch_size, rpc_limit)
         range_hint = int(config.EVM_LOG_RANGE_HINT.get(network, 0)) or 10_000
+        # The fast lane: a network the worker actually routed through HyperSync
+        # this cycle is not spending the public node's budget on backfill at
+        # all, so the public node's ration (pacing, call cap, 10K-block work
+        # units) is the wrong yardstick — under it every fresh Base token
+        # looked like ~3,400 units against a capacity of 72, and the network
+        # re-paused the moment it opened (10,948 coins deferred, 2026-09-04).
+        # The stamp decides, not the config: no key ⇒ no stamp ⇒ old math.
+        fast = network in hypersync
         pacing = (
-            config.EVM_BATCH_PACING_SECONDS
-            if batch_size > 1 else config.EVM_PACING_SECONDS
+            config.EVM_HYPERSYNC_PACING_SECONDS if fast
+            else (
+                config.EVM_BATCH_PACING_SECONDS
+                if batch_size > 1 else config.EVM_PACING_SECONDS
+            )
         )
         requests_by_time = max(
             1,
@@ -163,11 +201,21 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
             ),
         )
         request_capacity = min(
-            int(config.EVM_BACKFILL_MAX_CALLS), requests_by_time
+            int(
+                config.EVM_HYPERSYNC_MAX_CALLS if fast
+                else config.EVM_BACKFILL_MAX_CALLS
+            ),
+            requests_by_time,
         )
         capacity_units = max(
             1,
-            request_capacity * batch_size * max(1, int(config.EVM_BACKFILL_TOKENS_PER_CYCLE)),
+            request_capacity
+            # The public batch multiplier is the multi-address filter (10
+            # addresses per call on Base); the HyperSync query is one address
+            # per request, so the fast lane must not borrow it — an inflated
+            # capacity is an admission promise the lane cannot keep.
+            * (1 if fast else batch_size)
+            * max(1, int(config.EVM_BACKFILL_TOKENS_PER_CYCLE)),
         )
 
         pending_rows = [
@@ -182,7 +230,14 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
         # 2026-08-29: a full token with 79,894 transfers completed in 33 calls.
 
         blocks_per_call = max(
-            1, int(config.EVM_BACKFILL_BLOCKS_PER_CALL.get(network, range_hint))
+            1,
+            int(
+                # The fast lane's calibrated figure, not the range cap — see
+                # `EVM_HYPERSYNC_BLOCKS_PER_CALL` in config for why it is the
+                # deliberately pessimistic side of the measurement.
+                config.EVM_HYPERSYNC_BLOCKS_PER_CALL if fast
+                else config.EVM_BACKFILL_BLOCKS_PER_CALL.get(network, range_hint)
+            ),
         )
         work_units = 0
         head = int(cursor["last_block"]) if cursor and cursor["last_block"] else None

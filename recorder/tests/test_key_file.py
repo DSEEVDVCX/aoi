@@ -208,5 +208,10 @@ def test_every_provider_has_the_five_fields_the_dashboard_reads():
     for name, meta in key_file.PROVIDERS.items():
         assert set(meta) == {"plural", "singular", "env", "title", "probe"}, name
         assert meta["probe"]["method"] == "POST", name
-        assert "{key}" in meta["probe"]["url"], name
-        assert meta["probe"]["json"]["method"], name
+        # The key must be templated somewhere the dashboard's probe replaces —
+        # in the URL (JSON-RPC style) or in a header (HyperSync's Bearer auth).
+        # Either way a 200 from the probe proves the key, not just the endpoint.
+        url, headers = meta["probe"]["url"], meta["probe"].get("headers") or {}
+        assert "{key}" in url or any("{key}" in text for text in headers.values()), name
+        if "method" in meta["probe"]["json"]:
+            assert meta["probe"]["json"]["method"], name

@@ -30,6 +30,7 @@ Read-only (FR-012). No key anywhere in this layer ⇒ no secret to revoke.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 from typing import Any, Sequence
@@ -238,16 +239,39 @@ async def _apply_network(
         stats["evm_lagging"] += 1
 
 
+async def _first_mint_block(hyper: Any, net: str, token: str, head: int) -> int | None:
+    """HyperSync's mint scan, with unavailability falling back to `None` (unknown).
+
+    `None` is the honest "do not know": the caller keeps the from-zero walk,
+    which is always safe, never a guessed lower bound (a wrong bound shows a
+    pre-existing holder as a negative balance ⇒ the whole token is rejected).
+    Unavailability here must not kill the backfill — the history read that
+    follows falls back to the public node on its own.
+    """
+    try:
+        return await hyper.first_mint_block(net, token, head)
+    except Exception:  # noqa: BLE001 — a broken probe must not stop the backfill
+        return None
+
+
 async def _backfill_token(
     rpc: Any, db: RecorderDB, watch: dict[str, Any], recorded_at: str,
     stats: dict[str, int], sleep, deadline: float | None = None,
-    max_calls: int | None = None,
+    max_calls: int | None = None, hyper: Any | None = None,
 ) -> None:
     """Step 2 for one token: its entire history up to the current cursor.
 
     The upper bound is the network cursor **at the moment the backfill starts**,
     and that is what prevents double-applying: every block above it will come
     from step 1, and every block below it comes from here.
+
+    `hyper` is the Envio HyperSync adapter (`envio_hypersync.EnvioHyperSync`).
+    When it covers this network, the **history** read goes through it — the
+    public node's 10K range cap is the whole reason the Base queue exists —
+    while the head anchor and the live apply stay on the public node. One
+    contract, two transports, and the resume-point semantics are identical
+    (both return "the first unread block"), so nothing else in this function
+    knows which one answered.
     """
     generation = db.evm_ledger_generation()
     net = str(watch["network_id"])
@@ -260,19 +284,37 @@ async def _backfill_token(
     expected_from = watch.get("from_block")
     expected_to = watch.get("to_block")
     from_block = config.EVM_BACKFILL_FROM_BLOCK
-    if state in ("partial", "retry") and watch.get("from_block") is not None:
+    # A resume point promises "everything below me is applied to the ledger".
+    # An empty ledger cannot back that promise: the point outlives a ledger
+    # rebuild that wiped `evm_balances` (measured live 2026-09-04 on 4663,
+    # tokens 0xa5be0eeb… and 0xb0fea401…: `retry` rows frozen at from_block
+    # 47.4M/47.26M over zero ledger rows — the walk started after holders were
+    # credited, so every attempt died on `negative EVM balance`). Discard the
+    # point and re-derive the anchor below; the worst case is re-reading
+    # blocks nothing was applied from.
+    frontier = db.evm_ledger_frontier(net, token)
+    if (
+        state in ("partial", "retry")
+        and frontier is not None
+        and watch.get("from_block") is not None
+    ):
         # `retry` is treated like `partial` **by necessity**, not as a nicety:
         # the resume point stays saved on transient failure (`COALESCE` in
         # `set_evm_backfill_state`), and starting from zero while it remains
         # means re-applying an already-applied range ⇒ **doubling every balance
         # in it**. And the point is written only after a successful call, so it
-        # is always an honest bound.
+        # is always an honest bound — the `frontier` guard above is what keeps
+        # that sentence true after a ledger rebuild.
         from_block = int(watch["from_block"])  # resume from where the cap stopped
         # A partial token is excluded from live apply, so it must read up to the
         # cursor at the start of this cycle, not up to a stale target that the
         # head outgrows at the same pace, keeping it `partial` forever.
         to_block = max(to_block, int(watch.get("to_block") or to_block))
-    creation_due = state is None or watch.get("from_block") is None
+    creation_due = (
+        state is None
+        or watch.get("from_block") is None
+        or (state in ("partial", "retry") and frontier is None)
+    )
     # "When was this token born?" has two routes depending on what the node
     # keeps, and a network is on one of them, not both: an archive allows a
     # binary search on `eth_getCode`, and where there is no archive (Robinhood
@@ -287,7 +329,15 @@ async def _backfill_token(
     ):
         ledger = db.evm_ledger_stats(net, token, exclude=evm_rpc.BURN_ADDRESSES)
         creation_due = int(ledger.get("holder_count") or 0) == 0
-    if creation_due and net in config.EVM_MINT_SCAN_NETWORKS:
+    use_hyper = hyper is not None and getattr(hyper, "covers", lambda _n: False)(net)
+    if creation_due and use_hyper:
+        # HyperSync answers "first mint" in one query; on Base the alternatives
+        # are a ~20-call `eth_getCode` binary search (public) or nothing.
+        # `None` keeps the from-zero walk, the same honest-unknown rule as below.
+        minted = await _first_mint_block(hyper, net, token, to_block)
+        if minted is not None:
+            from_block = max(from_block, minted)
+    elif creation_due and net in config.EVM_MINT_SCAN_NETWORKS:
         # Measured: three of four Robinhood tokens were minted above 67% of the
         # chain, i.e. 27–37 **million** empty blocks were walked before the
         # first transfer. `None` means "unknown", so we stay on
@@ -301,10 +351,28 @@ async def _backfill_token(
         creation = await rpc.contract_creation_block(net, token, to_block)
         if creation is not None:
             from_block = max(from_block, creation)
+    # A saved resume point can also sit *ahead* of the ledger — the opposite
+    # healing direction, measured live 2026-09-04 on 4663: a retry row stuck at
+    # from_block 53,705,748 while live apply had kept the ledger current
+    # through 54,473,722 — the re-walk spent balances that were already spent,
+    # and the token has sat in `negative EVM balance` retry ever since (the
+    # Aug-28 wall of 4663 retries is this exact shape; one such chronic retry
+    # holds the whole network's admission gate in `active_retry`). The ledger's
+    # own frontier is the honest floor: nothing at or below it may be applied
+    # again, and everything above it is the true unread.
+    if frontier is not None and from_block <= frontier:
+        from_block = frontier + 1
+    source = hyper if use_hyper else rpc
+    # The fast lane's own call cap: 24 is a public-node ration, and on HyperSync
+    # the coin's real limit is the shared time budget below, not a request quota.
+    default_cap = (
+        config.EVM_HYPERSYNC_MAX_CALLS if use_hyper
+        else config.EVM_BACKFILL_MAX_CALLS
+    )
     try:
-        logs, calls, complete, resume = await rpc.get_logs_paged(
+        logs, calls, complete, resume = await source.get_logs_paged(
             net, [token], from_block, to_block,
-            max_calls=(config.EVM_BACKFILL_MAX_CALLS if max_calls is None else max_calls),
+            max_calls=(default_cap if max_calls is None else max_calls),
             sleep=sleep, deadline=deadline,
         )
     except EVMLogLimit as exc:
@@ -403,6 +471,7 @@ def _snapshot_token(
 
 async def run_evm_cycle(
     rpc: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep,
+    hyper: Any | None = None,
 ) -> dict[str, int]:
     """A full cycle: apply, then backfill, then snapshot, for each enabled network.
 
@@ -411,6 +480,9 @@ async def run_evm_cycle(
     written to both `evm_block_cursor.last_error` and `meta.last_error_evm`:
     the former for per-network diagnosis, the latter because the dashboard
     reads `meta` alone.
+
+    `hyper` (Envio HyperSync) routes the **backfill history reads** of the
+    networks it covers; live apply stays on the public node whatever it is.
     """
     stats = {
         "evm_networks": 0, "evm_calls": 0, "evm_logs": 0, "evm_cursor_init": 0,
@@ -429,6 +501,23 @@ async def run_evm_cycle(
     networks = [str(n) for n in config.EVM_NETWORKS]
     if not networks:
         return stats
+
+    # Which networks the HyperSync route actually covers **this cycle** —
+    # routing is a fact about the key pool right now, not a config hope. The
+    # admission gate in the recorder process reads this stamp to apply the fast
+    # lane's numbers, and its freshness window (`EVM_HYPERSYNC_STAMP_FRESH_SECONDS`)
+    # is what turns a dead worker or a removed key back into the public-node
+    # math without anyone touching anything. `note_error`, not `set_meta`: this
+    # is bookkeeping that must survive a locked database.
+    covered = [
+        net for net in networks
+        if hyper is not None and getattr(hyper, "covers", lambda _n: False)(net)
+    ]
+    if hyper is not None:
+        db.note_error(
+            "evm_hypersync_covered",
+            json.dumps({"at": recorded_at, "networks": covered}, sort_keys=True),
+        )
 
     # 1) Periodic apply — one call per address batch, per network.
     for net in networks:
@@ -460,8 +549,18 @@ async def run_evm_cycle(
     ]
     # Last tried is last to be tried again: ordering by attempt time puts the
     # transient fault back at the tail of the queue, with no "how many times"
-    # column and no timer.
-    pending.sort(key=lambda w: (w.get("backfill_last_try_at") or "",))
+    # column and no timer — with one exception: a network on the fast lane
+    # goes first. Measured live 2026-09-04: a fast-lane token finishes in one
+    # or two cycles, while a public-path token can eat a whole cycle's budget
+    # by itself (a 30k-transfer Robinhood walk), so "oldest first" left three
+    # Base partials starving behind a three-week-old wall of them for hours —
+    # and the admission gate stays shut the whole time. Clearing the cheap
+    # queue first costs the wall nothing: those tokens exit instead of
+    # competing.
+    pending.sort(key=lambda w: (
+        0 if str(w["network_id"]) in covered else 1,
+        w.get("backfill_last_try_at") or "",
+    ))
     stats["evm_backfill_due"] = len(pending)
     # A time budget for the whole step: backfill is the only one that may be cut
     # off (it resumes from its point with no lost logs), while everything after
@@ -478,7 +577,7 @@ async def run_evm_cycle(
             continue
         generation = db.evm_ledger_generation()
         try:
-            await _backfill_token(rpc, db, w, recorded_at, stats, sleep, deadline)
+            await _backfill_token(rpc, db, w, recorded_at, stats, sleep, deadline, hyper=hyper)
         except StaleEVMState:
             # Another worker or a reset beat us to it. Its state is the truth; we do not write retry over it.
             continue
@@ -546,13 +645,16 @@ async def run_evm_cycle(
 
 async def run_evm_backfill_assist(
     rpc: Any, db: RecorderDB, networks: Sequence[str], recorded_at: str | None = None,
-    sleep=asyncio.sleep,
+    sleep=asyncio.sleep, hyper: Any | None = None,
 ) -> dict[str, int]:
     """Backfills the live ledgers only, to run as a priority ahead of the historical replay.
 
     It applies no periodic logs and writes no snapshots; `FomoChain` remains
     the owner of those two steps. This worker speeds new tokens up without
     creating a second path for applying the same range.
+
+    `hyper` routes covered networks' history reads through HyperSync, the same
+    as in `run_evm_cycle`.
     """
     now = recorded_at or utcnow_iso()
     stats = {
@@ -576,7 +678,7 @@ async def run_evm_backfill_assist(
         try:
             await _backfill_token(
                 rpc, db, watch, now, stats, sleep, deadline,
-                max_calls=config.EVM_REPLAY_MAX_CALLS,
+                max_calls=config.EVM_REPLAY_MAX_CALLS, hyper=hyper,
             )
         except StaleEVMState:
             continue

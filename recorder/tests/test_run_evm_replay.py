@@ -35,7 +35,7 @@ class _LockedDB(_DB):
 def _patch_live_evm(monkeypatch, calls=None):
     calls = calls if calls is not None else []
 
-    async def fake_live(_rpc, _db, _recorded_at):
+    async def fake_live(_rpc, _db, _recorded_at, hyper=None):  # noqa: ARG001 — contract parity with run_evm_cycle
         calls.append("live")
         return {"evm_errors": 0}
 

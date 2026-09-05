@@ -1083,6 +1083,16 @@ async def test_zero_net_ledger_with_applied_transfers_keeps_saved_resume(db, mon
         net, TOK, "partial", NOW, from_block=500, to_block=988,
         transfers=2, calls=24,
     )
+    # Applied transfers leave rows even at balance zero (`evm_apply_transfers`
+    # pins, never deletes): the ledger's frontier — not the balance — is what
+    # proves the saved range was consumed. The zero-net row is that proof.
+    db._conn.execute(
+        "INSERT INTO evm_balances (network_id, token_address, holder_address,"
+        " balance_hex, first_seen_block, updated_block, updated_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (net, TOK, B, "0" * 64, 480, 499, NOW),
+    )
+    db._conn.commit()
     monkeypatch.setattr(config, "EVM_NETWORKS", (net,))
     monkeypatch.setattr(config, "EVM_CREATION_BLOCK_NETWORKS", (net,))
 
@@ -1565,3 +1575,114 @@ async def test_backfill_stops_starting_tokens_when_the_budget_is_spent(db, monke
     assert db._conn.execute(
         "SELECT COUNT(*) FROM evm_backfill_state"
     ).fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# The stale resume point: the ledger frontier is the honest floor
+# ---------------------------------------------------------------------------
+def test_ledger_frontier_reads_the_applied_high_water(db):
+    """`None` for a token with no rows; the highest applied block otherwise."""
+    assert db.evm_ledger_frontier(NET, TOK) is None
+    for holder, block in ((B, 350), (C, 120)):
+        db._conn.execute(
+            "INSERT INTO evm_balances (network_id, token_address, holder_address,"
+            " balance_hex, first_seen_block, updated_block, updated_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (NET, TOK, holder, f"{10:x}".rjust(64, "0"), block, block, NOW),
+        )
+    db._conn.commit()
+    assert db.evm_ledger_frontier(NET, TOK) == 350
+
+
+async def test_a_stale_resume_point_is_clamped_to_the_ledger_frontier(db, monkeypatch):
+    """Measured live 2026-09-04 on 4663: a retry row saved at from_block
+    53,705,748 while the ledger had already been applied through 54,473,722 —
+    the re-walk spent balances that were already spent (`negative EVM
+    balance`), and the chronic retry held the network's admission gate in
+    `active_retry` for a week (the Aug-28 wall of 4663 retries is this exact
+    shape). The walk must start at the frontier, not at the stale save."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db)
+    db.set_evm_cursor(NET, 400, NOW, "ok")
+    # The ledger is applied through block 350 (live apply kept it current)…
+    db._conn.execute(
+        "INSERT INTO evm_balances (network_id, token_address, holder_address,"
+        " balance_hex, first_seen_block, updated_block, updated_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (NET, TOK, B, f"{10:x}".rjust(64, "0"), 100, 350, NOW),
+    )
+    db._conn.commit()
+    # …but the backfill row still says "resume at 300" — the stale save.
+    db.set_evm_backfill_state(NET, TOK, "partial", NOW, from_block=300, to_block=310)
+
+    asked = []
+
+    class _Hyper:
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, *_a):
+            return None
+
+        async def get_logs_paged(self, network_id, addresses, from_block,
+                                 to_block, topics=None, max_calls=None,
+                                 sleep=None, deadline=None):
+            asked.append(int(from_block))
+            return ([], 1, True, int(to_block))
+
+    stats = await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[]), db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    # The walk began at the ledger's frontier — never at the stale save —
+    # and the empty remaining range completed the token instead of retrying.
+    assert asked == [351]
+    assert stats["evm_backfilled"] == 1
+    assert db.evm_backfill_state(NET, TOK)["status"] == "done"
+
+
+async def test_an_empty_ledger_discards_the_resume_point_and_rewalks_from_the_mint(
+    db, monkeypatch,
+):
+    """Measured live 2026-09-04 on 4663 (tokens 0xa5be0eeb…, 0xb0fea401…): a
+    retry row over an **empty** ledger — the resume point outlived a ledger
+    rebuild that wiped `evm_balances` — started the walk after holders were
+    credited, and every attempt died on `negative EVM balance`. A saved point
+    with nothing applied behind it is not a resume: the anchor is re-derived
+    and the walk restarts at the mint."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db)
+    db.set_evm_cursor(NET, 400, NOW, "ok")
+    # No `evm_balances` rows at all, and the retry row still points at block
+    # 300 — past the true mint at 250, the shape the old walk froze at.
+    db.set_evm_backfill_state(NET, TOK, "retry", NOW, from_block=300, to_block=310)
+
+    asked = []
+    mint_queries = []
+
+    class _Hyper:
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, network_id, address, head):
+            mint_queries.append((str(network_id), int(head)))
+            return 250
+
+        async def get_logs_paged(self, network_id, addresses, from_block,
+                                 to_block, topics=None, max_calls=None,
+                                 sleep=None, deadline=None):
+            asked.append(int(from_block))
+            return ([], 1, True, int(to_block))
+
+    stats = await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[]), db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    # The anchor was re-derived, the walk restarted at the mint — never at
+    # the stale save — and the empty range completed the token. (The mint
+    # query's head is the cursor the apply step settled on, finality-lagged
+    # below the RPC head — its exact value is not this test's subject.)
+    assert [net for net, _head in mint_queries] == [NET]
+    assert asked == [250]
+    assert stats["evm_backfilled"] == 1
+    assert db.evm_backfill_state(NET, TOK)["status"] == "done"

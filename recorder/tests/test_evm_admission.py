@@ -1,9 +1,10 @@
 import json
 import os
+from datetime import datetime, timedelta
 
 import config
 import pytest
-from db import RecorderDB
+from db import RecorderDB, utcnow_iso
 
 import recorder
 
@@ -277,3 +278,119 @@ def test_control_sample_throttles_only_evm(db):
     assert db._conn.execute(
         "SELECT network_id FROM watchlist WHERE is_control=1"
     ).fetchone()[0] == "1399811149"
+
+
+# ---------------------------------------------------------------------------
+# The HyperSync fast lane: the stamp is what the gate believes, nothing else
+# ---------------------------------------------------------------------------
+def _live_base_backlog(db):
+    """The live 2026-09-04 shape: three partial Base tokens with ~34M blocks
+    each remaining — the backlog that kept the network paused and deferred
+    10,948 coins under the public 10K-blocks-per-call math."""
+    db.set_evm_cursor("8453", 50_181_203, NOW, "ok")
+    for index in range(3):
+        token = f"0x{index + 10:040x}"
+        db.upsert_watch(token, "8453", "large_buy", f"s-{index}", 48, NOW)
+        db.set_evm_backfill_state(
+            "8453", token, "partial", NOW,
+            from_block=16_000_000, to_block=50_181_203,
+        )
+
+
+def _stamp(db, networks, at):
+    db.set_meta(
+        "evm_hypersync_covered",
+        json.dumps({"at": at, "networks": networks}),
+    )
+
+
+def test_without_a_stamp_the_live_base_backlog_pauses_admission(db, monkeypatch):
+    """The state that produced the 10,948 deferrals, reproduced exactly."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _live_base_backlog(db)
+
+    state = recorder.evm_admission_policy(db).network("8453")
+
+    assert state.paused is True
+    assert state.reason == "rpc_work_budget_exhausted"
+
+
+def test_a_fresh_stamp_opens_the_gate_on_the_same_backlog(db, monkeypatch):
+    """Same coins, same blocks — HyperSync pages them, so the gate admits."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _live_base_backlog(db)
+    _stamp(db, ["8453"], utcnow_iso())
+
+    state = recorder.evm_admission_policy(db).network("8453")
+
+    assert state.paused is False
+    # ~684 fast pages against a 300-page capacity: reduced, not paused —
+    # the gate still throttles a burst, it just stops shutting the door.
+    assert state.percent == 50
+    assert state.reason == "rpc_work_budget_reduced"
+
+
+def test_a_stale_stamp_is_the_public_math_again(db, monkeypatch):
+    """A dead worker or a removed key must return the network to the old caps
+    on its own — that is the whole point of the freshness window."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _live_base_backlog(db)
+    two_hours_ago = (
+        datetime.fromisoformat(utcnow_iso()) - timedelta(hours=2)
+    ).isoformat()
+    _stamp(db, ["8453"], two_hours_ago)
+
+    state = recorder.evm_admission_policy(db).network("8453")
+
+    assert state.paused is True
+
+
+def test_a_stamp_from_the_far_future_is_rejected_too(db, monkeypatch):
+    """A clock that jumped backwards must not make one stamp live forever."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _live_base_backlog(db)
+    two_hours_ahead = (
+        datetime.fromisoformat(utcnow_iso()) + timedelta(hours=2)
+    ).isoformat()
+    _stamp(db, ["8453"], two_hours_ahead)
+
+    assert recorder.evm_admission_policy(db).network("8453").paused is True
+
+
+def test_a_keyless_stamp_covers_nothing(db, monkeypatch):
+    """The worker stamps an empty list when the key is gone — same fallback."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _live_base_backlog(db)
+    _stamp(db, [], utcnow_iso())
+
+    assert recorder.evm_admission_policy(db).network("8453").paused is True
+
+
+def test_a_malformed_stamp_is_ignored_not_trusted(db, monkeypatch):
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _live_base_backlog(db)
+    db.set_meta("evm_hypersync_covered", "{not json")
+
+    assert recorder.evm_admission_policy(db).network("8453").paused is True
+
+
+def test_the_stamp_does_not_leak_between_networks(db, monkeypatch):
+    """A Base stamp must not loosen Robinhood's public-node math."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "4663"))
+    _live_base_backlog(db)
+    db.set_evm_cursor("4663", 50_181_203, NOW, "ok")
+    db.upsert_watch("0x" + "e" * 40, "4663", "large_buy", "r-1", 48, NOW)
+    db.set_evm_backfill_state(
+        "4663", "0x" + "e" * 40, "partial", NOW,
+        from_block=16_000_000, to_block=50_181_203,
+    )
+    _stamp(db, ["8453"], utcnow_iso())
+
+    policy = recorder.evm_admission_policy(db)
+
+    assert policy.network("8453").paused is False
+    # The same remaining blocks on the public node are still an enormous
+    # work estimate (4663 has no range cap but 500K blocks/call — measured).
+    assert policy.network("4663").capacity_units < policy.network(
+        "8453"
+    ).capacity_units

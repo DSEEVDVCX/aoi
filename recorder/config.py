@@ -809,6 +809,54 @@ EVM_BACKFILL_ASSIST_NETWORKS = ("8453",)
 # (Robinhood 133 coins and 92,677 snapshots with 5,309 calls) vs 41,386 calls on
 # Base with zero snapshots. So whoever wants a keyed provider here should read
 # the trap first: the paginator is asked "is there a next page?" before its response is read.
+#
+# **Envio HyperSync is the one exception, added 2026-09-04** — after a
+# measurement that answered the trap's question first: the paginated walk of a
+# queue token returned 239 pages and 31,215 logs in 185s (the whole history,
+# where the public-RPC ledger had recorded transfers=0 for weeks). The adapter
+# (`envio_hypersync.py`) reads `next_block` on **every** page and exits
+# incomplete without it — the GoldRush failure mode cannot occur by
+# construction. It serves the backfill history reads of Base alone; live apply
+# stays keyless on the public node (FR-012 holds everywhere except this one
+# measured route), and a missing/rejected key falls back to the public node,
+# never to an error. Alchemy and dRPC were measured on the same day and were
+# **not** routed: both are range-capped at or below the public node's own cap
+# (see `probe_evm_providers.py` — a route is earned by a measurement).
+#
+# --- The HyperSync fast lane (2026-09-04) ---
+# The three caps below exist because the public node is a shared, rate-limited
+# resource; the yearly HyperSync contract is not. They apply **only** to
+# networks the EVM worker has stamped as covered this cycle (meta
+# `evm_hypersync_covered`, written by `evm_layer.run_evm_cycle`), so a missing
+# or rejected key silently returns the network to the public-node caps above —
+# the stamp is the fact, not the config.
+# No inter-page wait: `EVM_PACING_SECONDS` exists because a public node 429'd
+# (measured 2026-08-17); HyperSync on the paid plan has no rate limit, and the
+# page latency itself (~0.4s measured) is the real pace. A small courtesy gap
+# remains rather than a true 0 — a burst of queries costs the service nothing
+# but costs us nothing either to spread slightly.
+EVM_HYPERSYNC_PACING_SECONDS = 0.05
+# 24 calls per coin per cycle is a public-node ration; on the fast lane the
+# coin's real limit is the shared cycle budget (`EVM_BACKFILL_BUDGET_SECONDS`,
+# which still applies — it protects the snapshot/contract/replay steps that
+# share the 60-second cycle, not the RPC). 100 pages ≈ the measured heavy
+# token (239 pages) completes in 2-3 cycles instead of 10.
+EVM_HYPERSYNC_MAX_CALLS = 100
+# The admission gate's work unit for a covered network. The public value for
+# Base (10,000 blocks/call — the range cap) made every fresh Base token look
+# like ~3,400 work units against a capacity of 72, so the network re-paused the
+# moment it opened: 10,948 coins deferred at admission (2026-09-04). HyperSync
+# pages by log count, not blocks, so any blocks→pages figure is a calibration,
+# not a law: the measured full-history token was 50M blocks in 239 pages ≈
+# 210K blocks/page. 150K is the deliberately pessimistic side — it over-counts
+# the work of a dense token (more pages than blocks suggest), which can only
+# make the gate pause sooner, never admit beyond its means.
+EVM_HYPERSYNC_BLOCKS_PER_CALL = 150_000
+# How fresh the coverage stamp must be for the fast lane to apply. The EVM
+# worker cycles every 60s and stamps every cycle, so 15 minutes is ~14 missed
+# cycles — well past "the worker is dead", which is exactly when the gate must
+# fall back to the public-node math.
+EVM_HYPERSYNC_STAMP_FRESH_SECONDS = 900
 
 # --- Live BSC measurement via NodeReal ---
 # `nr_getTokenHolders` returns the top balances sorted, and

@@ -13,6 +13,7 @@ import sys
 import time
 
 import bsc_layer
+import envio_hypersync
 import evm_contract
 import evm_replay
 import evm_layer
@@ -83,7 +84,7 @@ def _worked(stats: dict) -> bool:
     return False
 
 
-async def run_cycle(rpc, db, nodereal=None) -> dict:
+async def run_cycle(rpc, db, nodereal=None, hyper=None) -> dict:
     import config
 
     from db import utcnow_iso
@@ -91,7 +92,11 @@ async def run_cycle(rpc, db, nodereal=None) -> dict:
     # This is the sole EVM writer. Keeping live application, backfill,
     # snapshots, contract checks, and historical replay in one connection
     # prevents concurrent SQLite writers from holding incompatible batches.
-    live = await evm_layer.run_evm_cycle(rpc, db, utcnow_iso())
+    # `hyper` (Envio HyperSync) accelerates the backfill history reads of the
+    # networks it covers — Base, where the public 10K range cap is the whole
+    # queue. `None` is the normal no-key state: the backfill then runs on the
+    # public node exactly as before.
+    live = await evm_layer.run_evm_cycle(rpc, db, utcnow_iso(), hyper=hyper)
     if nodereal is not None:
         live.update(await bsc_layer.run_bsc_cycle(nodereal, db, utcnow_iso()))
     live.update(await evm_contract.run_evm_contract_cycle(rpc, db, utcnow_iso()))
@@ -181,6 +186,11 @@ async def _main(cycles: int | None = None) -> None:
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     rpc = evm_rpc.EVMRPC()
     nodereal = NodeRealRPC()
+    # HyperSync for the Base backfill — constructed once, key refreshed from
+    # disk per call inside it. A missing key makes every `covers()` check
+    # return False and the cycle runs keyless, so construction can never fail
+    # the worker.
+    hyper = envio_hypersync.EnvioHyperSync()
     count = 0
     # `None`, not `monotonic()`: the first cycle always logs no matter how
     # idle it is, because the startup line is the only proof that the worker
@@ -190,7 +200,7 @@ async def _main(cycles: int | None = None) -> None:
         while cycles is None or count < cycles:
             started = time.monotonic()
             try:
-                stats = await run_cycle(rpc, db, nodereal)
+                stats = await run_cycle(rpc, db, nodereal, hyper=hyper)
                 if _worked(stats):
                     _log(f"cycle: {stats}")
                     last_logged = started
@@ -242,6 +252,7 @@ async def _main(cycles: int | None = None) -> None:
                 await asyncio.sleep(remaining)
     finally:
         await rpc.aclose()
+        await hyper.aclose()
         await nodereal.aclose()
         db.close()
 

@@ -89,6 +89,22 @@ PROVIDERS: dict[str, dict[str, Any]] = {
             "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
         },
     },
+    # Envio HyperSync: an indexed historical-data service, not JSON-RPC — the
+    # probe is a one-block query on the Base HyperSync endpoint with the key in
+    # the `Authorization: Bearer` header, so a 200 means the key is accepted
+    # there, and a 401 means the key, not the endpoint.
+    "envio": {
+        "plural": "envio_api_keys",
+        "singular": "envio_api_key",
+        "env": "ENVIO_API_KEY",
+        "title": "Envio · HyperSync Base",
+        "probe": {
+            "method": "POST",
+            "url": "https://base.hypersync.xyz/query",
+            "headers": {"Authorization": "Bearer {key}"},
+            "json": {"from_block": 0, "to_block": 1, "logs": []},
+        },
+    },
 }
 
 # The shortest key whose tail may be shown. For a short key (≤11) the four-character

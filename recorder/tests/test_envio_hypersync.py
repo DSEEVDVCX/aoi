@@ -1,0 +1,644 @@
+"""Tests for the Envio HyperSync adapter: pagination, redaction, fallback.
+
+No network call in any test: responses are handmade HyperSync pages, and the
+key pool is a fixed list. What is verified is what silence corrupts — the
+GoldRush trap (#29): a dropped page is a false balance ledger that looks
+sound. So `next_block` must be honored on every page, and the "no more pages"
+answer must be told apart from "one page and done".
+"""
+import json
+import os
+
+import envio_hypersync
+import httpx
+import pytest
+from db import RecorderDB
+from tests.test_evm_layer import _CycleRPC, _log, _watch
+
+NOW = "2026-08-13T12:00:00+00:00"
+
+SCHEMA = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql"
+)
+
+KEY = "test-key-123456"
+BASE = "8453"
+TOKEN = "0xaaaa000000000000000000000000000000000001"
+A = "0x1111111111111111111111111111111111111111"
+B = "0x2222222222222222222222222222222222222222"
+
+
+@pytest.fixture()
+def db(tmp_path):
+    d = RecorderDB(str(tmp_path / "t.db"), SCHEMA)
+    yield d
+    d.close()
+
+
+def _page(logs, next_block=None):
+    """A HyperSync response page in the **measured live shape** (2026-09-04):
+    `data` is a list of block groups each carrying `logs`; an empty range
+    answers `data: []`. `next_block` absent ⇒ range complete."""
+    data = [{"logs": logs}] if logs else []
+    body = {"data": data}
+    if next_block is not None:
+        body["next_block"] = next_block
+    return httpx.Response(200, json=body)
+
+
+def _entry(frm, to, value, block):
+    """A HyperSync log row: decimal block numbers, unprefixed hex topics/data."""
+    return {
+        "block_number": block,
+        "log_index": 0,
+        "transaction_index": 0,
+        "address": TOKEN,
+        "topic0": envio_hypersync.TRANSFER_TOPIC,
+        "topic1": "0x" + "0" * 24 + frm[2:],
+        "topic2": "0x" + "0" * 24 + to[2:],
+        "data": hex(value),
+    }
+
+
+def _client(handler, keys=(KEY,)):
+    rpc = envio_hypersync.EnvioHyperSync(
+        urls={BASE: "https://base.test/query"}, keys=list(keys),
+    )
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return rpc
+
+
+async def _noop(_seconds):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Routing: availability is a fact about the config and the pool, not a hope
+# ---------------------------------------------------------------------------
+async def test_covers_requires_both_network_and_key():
+    rpc = envio_hypersync.EnvioHyperSync(urls={BASE: "u"}, keys=[KEY])
+    assert rpc.covers(BASE) is True
+    assert rpc.covers("143") is False            # no route for this network
+    keyless = envio_hypersync.EnvioHyperSync(urls={BASE: "u"}, keys=[])
+    assert keyless.covers(BASE) is False           # a route without a key is not a route
+
+
+async def test_the_default_map_covers_both_measured_networks():
+    """Base and Robinhood both earned a route by a same-day measurement
+    (2026-09-04); a network neither probed nor routed must stay out."""
+    rpc = envio_hypersync.EnvioHyperSync(keys=[KEY])
+    try:
+        assert rpc.covers("8453") is True
+        assert rpc.covers("4663") is True
+        assert rpc.covers("143") is False         # never probed, never routed
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The GoldRush trap: pagination must be honored page by page
+# ---------------------------------------------------------------------------
+async def test_the_measured_live_response_shape_parses():
+    """The exact body shape the service returned to a live query on
+    2026-09-04: `data` is a **list of block groups**, not a dict. The first
+    deployment read it as `data.logs` and every page failed with
+    "unrecognized response shape" — this test exists so that shape can never
+    silently drift again."""
+    first = httpx.Response(200, json={
+        "archive_height": 50_877_944,
+        "data": [{"logs": [_entry(A, B, 10, 5), _entry(A, B, 11, 7)]}],
+        "next_block": 100,
+        "rollback_guard": None,
+        "total_execution_time": 12,
+    })
+    second = _page([], next_block=None)
+
+    def handler(request):
+        return first if json.loads(request.content)["from_block"] == 0 else second
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, _resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 250, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+    assert (complete, requests, len(logs)) == (True, 2, 2)
+
+
+async def test_walk_follows_next_block_through_every_page():
+    pages = {
+        0: _page([_entry(A, B, 10, 5), _entry(A, B, 11, 7)], next_block=100),
+        100: _page([_entry(A, B, 12, 140)], next_block=200),
+        200: _page([], next_block=None),           # absent next_block ⇒ complete
+    }
+    asked = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        asked.append(body["from_block"])
+        return pages[body["from_block"]]
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 250, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert asked == [0, 100, 200]                  # every page was asked, in order
+    assert complete is True
+    assert resume == 250
+    assert requests == 3
+    assert len(logs) == 3
+    # And the translation to JSON-RPC shape happened: decode_transfer reads these.
+    import evm_rpc
+
+    assert evm_rpc.decode_transfer(logs[0]) == {
+        "token_address": TOKEN, "from": A, "to": B, "value": 10, "block": 5,
+    }
+
+
+async def test_max_calls_exits_short_with_the_honest_resume_point():
+    def handler(request):
+        body = json.loads(request.content)
+        return _page([_entry(A, B, 1, body["from_block"])], next_block=body["from_block"] + 100)
+
+    rpc = _client(handler)
+    try:
+        _logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 10_000, max_calls=2, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert complete is False
+    assert requests == 2
+    assert resume == 200                            # exactly where the third page would start
+
+
+# ---------------------------------------------------------------------------
+# The second key: a quota answer rides the other account, it does not wait
+# ---------------------------------------------------------------------------
+async def test_a_429_rides_the_second_key_and_succeeds():
+    """A 429 is a quota answer, not a broken service: with two keys on two
+    accounts (added 2026-09-05 for the Robinhood drain) the cooled key rotates
+    out and the same request is answered by the other account — the pool's
+    whole reason for existing. The walk must not even notice."""
+    second = "test-key-654321"
+    asked = []
+
+    def handler(request):
+        auth = request.headers["authorization"]
+        asked.append(auth)
+        if auth.endswith(KEY):
+            return httpx.Response(429, text="rate limit")
+        return _page([_entry(A, B, 10, 5)], next_block=None)
+
+    rpc = _client(handler, keys=(KEY, second))
+    try:
+        logs, requests, complete, _resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert [a.endswith(KEY) for a in asked] == [True, False]   # key 1, then key 2
+    assert (complete, requests, len(logs)) == (True, 1, 1)     # one logical page, retried
+    assert rpc.key_stats()["keys"] == 2
+
+
+async def test_a_429_on_every_key_raises_instead_of_rotating_forever():
+    """Each key is tried at most once per request: when both accounts have said
+    429, the raise is the honest answer and the caller's backoff does the
+    waiting — never an unbounded rotation over cooled keys."""
+    second = "test-key-654321"
+    asked = []
+
+    def handler(request):
+        asked.append(request.headers["authorization"])
+        return httpx.Response(429, text="rate limit")
+
+    rpc = _client(handler, keys=(KEY, second))
+    try:
+        with pytest.raises(Exception) as caught:
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+    assert type(caught.value).__name__ == "EVMRateLimit"
+    assert len(asked) == 2                                     # each key exactly once
+
+
+async def test_a_non_advancing_next_block_is_a_loud_error():
+    """The GoldRush failure mode is silence; spinning forever is its cousin — both are refused."""
+    def handler(_request):
+        return _page([_entry(A, B, 1, 1)], next_block=5)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 5, 100, max_calls=3, sleep=_noop,
+            )
+    finally:
+        await rpc.aclose()
+
+
+async def test_the_exhausted_tail_pins_next_block_at_from_block():
+    """Measured live 2026-09-04 (token 0xc52aedec…): the walk's last page lands
+    on the final single-block range and the service answers an empty page with
+    `next_block` pinned at `from_block` instead of omitting it. That is
+    "complete", not a spin — but only when the page is empty and the range is
+    exhausted; the row-bearing variant below stays a loud error."""
+    def handler(_request):
+        return _page([], next_block=5_018_120)
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 5_018_120, 5_018_120, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+    assert (complete, requests, resume, logs) == (True, 1, 5_018_120, [])
+
+    def handler_with_rows(_request):
+        return _page([_entry(A, B, 1, 5_018_120)], next_block=5_018_120)
+
+    rpc = _client(handler_with_rows)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 5_018_120, 5_018_120, sleep=_noop,
+            )
+    finally:
+        await rpc.aclose()
+
+
+async def test_single_address_is_enforced_not_assumed():
+    """The live apply's multi-address filter must never land on the HyperSync path."""
+    rpc = envio_hypersync.EnvioHyperSync(urls={BASE: "u"}, keys=[KEY])
+    try:
+        with pytest.raises(envio_hypersync.EnvioUnavailable):
+            await rpc.get_logs_paged(BASE, [TOKEN, B], 0, 10, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Key handling: rejected key ⇒ unavailable (fallback), never a leaked value
+# ---------------------------------------------------------------------------
+async def test_rejected_single_key_is_unavailability_not_error():
+    rpc = _client(lambda _r: httpx.Response(401, json={"error": "unauthorized"}))
+    try:
+        with pytest.raises(envio_hypersync.EnvioUnavailable):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_rejected_key_rotates_to_the_second_key():
+    calls = []
+
+    def handler(request):
+        calls.append(request.headers.get("authorization"))
+        if len(calls) == 1:
+            return httpx.Response(401, json={"error": "unauthorized"})
+        return _page([], next_block=None)
+
+    rpc = _client(handler, keys=("first-key-123456", "second-key-123456"))
+    try:
+        _logs, requests, complete, _resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 10, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert complete is True
+    assert requests == 1                           # the successful page counts; 401 rotated without counting
+    assert calls[0].endswith("first-key-123456")
+    assert calls[1].endswith("second-key-123456")
+
+
+async def test_error_messages_never_contain_the_key():
+    def handler(_request):
+        return httpx.Response(400, text=f"bad request from {KEY} account")
+
+    rpc = _client(handler)
+    try:
+        with pytest.raises(Exception) as excinfo:
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
+    finally:
+        await rpc.aclose()
+    assert KEY not in str(excinfo.value)
+
+
+async def test_rate_limit_shape_is_raised_for_the_callers_backoff():
+    def handler(_request):
+        return httpx.Response(429, text="slow down")
+
+    rpc = _client(handler)
+    try:
+        with pytest.raises(Exception) as excinfo:
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
+    finally:
+        await rpc.aclose()
+    import evm_rpc
+
+    assert isinstance(excinfo.value, evm_rpc.EVMRateLimit)
+
+
+# ---------------------------------------------------------------------------
+# The mint scan
+# ---------------------------------------------------------------------------
+async def test_first_mint_block_is_the_lowest_mint_page_block():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["logs"][0]["topics"] == [
+            [envio_hypersync.TRANSFER_TOPIC], ["0x" + "0" * 64],
+        ]
+        return _page([{"block_number": 5_006_972}], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 10_000_000) == 5_006_972
+    finally:
+        await rpc.aclose()
+
+
+async def test_first_mint_block_none_when_no_rows():
+    rpc = _client(lambda _r: _page([], next_block=None))
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 10_000_000) is None
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The deadline: a time cap is a short exit, not a failure
+# ---------------------------------------------------------------------------
+async def test_deadline_exits_short_after_the_first_page():
+    def handler(request):
+        body = json.loads(request.content)
+        return _page([], next_block=body["from_block"] + 100)
+
+    rpc = _client(handler)
+    try:
+        _logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 10_000,
+            sleep=_noop, deadline=time_deadline_in_the_past(),
+        )
+    finally:
+        await rpc.aclose()
+    assert requests == 1                           # one request is always allowed
+    assert complete is False
+    assert resume == 100
+
+
+def time_deadline_in_the_past():
+    import time
+
+    return time.monotonic() - 1
+
+
+# ---------------------------------------------------------------------------
+# The cycle-level routing: the backfill goes to HyperSync, the head does not
+# ---------------------------------------------------------------------------
+async def test_backfill_uses_hypersync_when_covered(db, monkeypatch):
+    """The whole point: a covered network's history read leaves the public node."""
+    import config
+    import evm_layer
+
+    NET = "8453"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    ZERO = "0x" + "0" * 40
+
+    rpc = _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)])
+
+    class _Hyper:
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, network_id, address, head):
+            return 100
+
+        async def get_logs_paged(self, network_id, addresses, from_block,
+                                 to_block, topics=None, max_calls=None,
+                                 sleep=None, deadline=None):
+            # ZERO→B: a mint, so the balance ledger stays non-negative.
+            return ([_log(ZERO, B, 500, 150)], 1, True, int(to_block))
+
+    async def _noop_sleep(_s):
+        pass
+
+    stats = await evm_layer.run_evm_cycle(
+        rpc, db, NOW, sleep=_noop_sleep, hyper=_Hyper(),
+    )
+
+    assert stats["evm_backfilled"] == 1
+    assert db.evm_top_balances(NET, TOKEN, 10) == [(B, 500)]
+    # The head anchor stayed on the public RPC, not HyperSync:
+    assert rpc.heads == [NET]
+
+
+async def test_backfill_falls_back_to_public_rpc_when_not_covered(db, monkeypatch):
+    """An uncovered network (or a missing key) must behave exactly as before."""
+    import config
+    import evm_layer
+
+    NET = "4663"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    rpc = _CycleRPC(head=400, mint=100, logs=[_log("0x" + "0" * 40, B, 500, 150)])
+
+    class _Hyper:
+        def covers(self, network_id):
+            return False                           # no key / no route
+
+        async def first_mint_block(self, *_a):
+            raise AssertionError("an uncovered network must not reach HyperSync")
+
+    async def _noop_sleep(_s):
+        pass
+
+    stats = await evm_layer.run_evm_cycle(
+        rpc, db, NOW, sleep=_noop_sleep, hyper=_Hyper(),
+    )
+
+    assert stats["evm_backfilled"] == 1
+    assert db.evm_top_balances(NET, TOKEN, 10) == [(B, 500)]
+    assert rpc.mint_scans == [(NET, TOKEN, 388)]   # the public node's mint scan ran
+
+
+# ---------------------------------------------------------------------------
+# The fast lane: the paid route gets the paid route's caps
+# ---------------------------------------------------------------------------
+async def test_the_fast_lane_call_cap_reaches_the_hypersync_path(db, monkeypatch):
+    """24 calls/coin is a public-node ration; the covered path gets its own."""
+    import config
+    import evm_layer
+
+    NET = "8453"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    ZERO = "0x" + "0" * 40
+    seen = {}
+
+    class _Hyper:
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, *_a):
+            return 100
+
+        async def get_logs_paged(self, network_id, addresses, from_block,
+                                 to_block, topics=None, max_calls=None,
+                                 sleep=None, deadline=None):
+            seen["max_calls"] = max_calls
+            return ([_log(ZERO, B, 500, 150)], 1, True, int(to_block))
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)]),
+        db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+    assert seen["max_calls"] == config.EVM_HYPERSYNC_MAX_CALLS
+
+
+async def test_pages_wait_the_fast_lane_pacing_not_the_public_one(monkeypatch):
+    """The 0.4s public-node courtesy (a measured 429) must not tax the paid route."""
+    import config
+
+    monkeypatch.setattr(config, "EVM_HYPERSYNC_PACING_SECONDS", 0.123)
+    waited = []
+
+    async def _recording_sleep(seconds):
+        waited.append(seconds)
+
+    pages = {
+        0: _page([], next_block=100),
+        100: _page([], next_block=200),
+        200: _page([], next_block=None),
+    }
+
+    def handler(request):
+        return pages[json.loads(request.content)["from_block"]]
+
+    rpc = _client(handler)
+    try:
+        await rpc.get_logs_paged(BASE, [TOKEN], 0, 250, sleep=_recording_sleep)
+    finally:
+        await rpc.aclose()
+    assert waited == [0.123, 0.123]          # between pages only, never before the first
+
+
+# ---------------------------------------------------------------------------
+# The coverage stamp: the admission gate's only truth about the fast lane
+# ---------------------------------------------------------------------------
+async def test_cycle_stamps_what_hypersync_actually_covers(db, monkeypatch):
+    import config
+    import evm_layer
+
+    NET = "8453"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    ZERO = "0x" + "0" * 40
+
+    class _Hyper:
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, *_a):
+            return 100
+
+        async def get_logs_paged(self, *_a, **_k):
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)]),
+        db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+    assert json.loads(db.get_meta("evm_hypersync_covered")) == {
+        "at": NOW, "networks": [NET],
+    }
+
+
+async def test_a_cycle_without_the_adapter_writes_no_stamp(db, monkeypatch):
+    """`hyper=None` is the keyless state: the stamp must not exist, so the
+    admission gate's freshness check keeps the public-node math."""
+    import config
+    import evm_layer
+
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453",))
+    _watch(db, token=TOKEN, network="8453")
+    db.set_evm_cursor("8453", 300, NOW, "ok")
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[]), db, NOW, sleep=_noop,
+    )
+    assert db.get_meta("evm_hypersync_covered") is None
+
+
+# ---------------------------------------------------------------------------
+# Queue priority: the cheap lane clears first, the wall waits
+# ---------------------------------------------------------------------------
+async def test_a_covered_partial_beats_an_older_public_one(db, monkeypatch):
+    """Measured live 2026-09-04: "oldest first" let three Base partials starve
+    for hours behind a wall of three-week-old public-path partials — each of
+    which eats a whole cycle's budget alone — while the admission gate stayed
+    shut. The fast lane sorts to the front because its tokens *leave* the
+    queue instead of competing in it."""
+    import config
+    import evm_layer
+
+    ZERO = "0x" + "0" * 40
+    SLOW = "0xbbbb000000000000000000000000000000000002"      # Robinhood
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "4663"))
+    monkeypatch.setattr(config, "EVM_BACKFILL_TOKENS_PER_CYCLE", 1)
+    for net, token, tried in (
+        ("4663", SLOW, "2026-08-14T17:40:13+00:00"),         # three weeks older
+        ("8453", TOKEN, "2026-09-04T16:44:28+00:00"),
+    ):
+        _watch(db, token=token, network=net)
+        db.set_evm_cursor(net, 300, NOW, "ok")
+        db.set_evm_backfill_state(
+            net, token, "partial", tried, from_block=100, to_block=300,
+        )
+
+    picked = []
+
+    class _Hyper:
+        def covers(self, network_id):
+            return str(network_id) == "8453"
+
+        async def first_mint_block(self, *_a):
+            return None
+
+        async def get_logs_paged(self, network_id, addresses, *_a, **_k):
+            picked.append((str(network_id), addresses[0]))
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    rpc = _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)])
+    stats = await evm_layer.run_evm_cycle(
+        rpc, db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    # The Base token took the cycle's only slot despite being the newer
+    # attempt, and finished; the older public-path token waits its turn.
+    assert picked == [("8453", TOKEN)]
+    assert stats["evm_backfilled"] == 1
+    assert db.evm_backfill_state("8453", TOKEN)["status"] == "done"

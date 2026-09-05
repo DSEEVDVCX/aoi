@@ -1395,6 +1395,24 @@ class RecorderDB:
             total += int(r["balance_hex"], 16)
         return {"holder_count": len(rows), "supply": total}
 
+    def evm_ledger_frontier(
+        self, network_id: str, token_address: str,
+    ) -> int | None:
+        """The highest block the ledger has applied for this token.
+
+        A backfill resume point older than this describes a range that was
+        already consumed — by live apply, after the row went stale — and
+        re-walking it would apply the same transfers twice. `None` for a
+        token with no ledger rows yet: a fresh walk is not clamped.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(updated_block) AS frontier FROM evm_balances"
+            " WHERE network_id=? AND token_address=?",
+            (str(network_id), token_address.lower()),
+        ).fetchone()
+        frontier = row["frontier"] if row else None
+        return int(frontier) if frontier is not None else None
+
     def evm_new_holders_since(
         self, network_id: str, token_address: str, since_block: int,
     ) -> int:
