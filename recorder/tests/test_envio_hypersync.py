@@ -83,14 +83,13 @@ async def test_covers_requires_successful_network_probe_and_key():
     assert keyless.covers(BASE) is False           # a route without a key is not a route
 
 
-async def test_the_default_map_covers_both_measured_networks():
-    """Base and Robinhood both earned a route by a same-day measurement
-    (2026-09-04); a network neither probed nor routed must stay out."""
+async def test_the_default_map_covers_all_measured_networks_after_probe():
+    """All configured networks start untrusted and become covered only after a query."""
     rpc = envio_hypersync.EnvioHyperSync(keys=[KEY])
     try:
-        assert rpc.covers("8453") is False
-        assert rpc.covers("4663") is False
-        assert rpc.covers("143") is False         # never probed, never routed
+        for network in ("143", "56", "8453", "4663"):
+            assert rpc.covers(network) is False
+        assert rpc.covers("999999") is False
     finally:
         await rpc.aclose()
 
@@ -228,7 +227,9 @@ async def test_failed_network_loses_only_its_coverage():
     try:
         await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
         assert rpc.covers(BASE) is True
-        with pytest.raises(Exception):
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRateLimit):
             await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
         assert rpc.covers(BASE) is False
         assert rpc.covers("4663") is False

@@ -1,4 +1,4 @@
-"""Envio HyperSync: the Base backfill's dedicated historical-log source.
+"""Envio HyperSync: the dedicated historical-log source for EVM backfill.
 
 **Why this module exists.** The Base queue exists because the public node caps
 `eth_getLogs` at a 10,000-block range, and a token's full history is millions of
@@ -49,15 +49,12 @@ from evm_rpc import TRANSFER_TOPIC
 from provider_keys import KeyPool, read_keys
 
 # HyperSync serves queries from `https://<network>.hypersync.xyz/query`. A
-# network joins this map after a probe, not before:
-# - 8453 (Base, 2026-09-04): the complete transfer history of a queue token
-#   (31,215 logs, 239 pages) in 185s where the public node had weeks of
-#   `transfers=0`.
-# - 4663 (Robinhood, 2026-09-04): `robinhood.hypersync.xyz` answered with the
-#   same shape and an archive ahead of our head (54,500,138 vs 54,498,936),
-#   and the queue's biggest token walked 64,090 rows in 60 pages — the same
-#   disease Base had, measured on the same day.
+# network joins this map after a probe, not before. All four EVM endpoints
+# answered the transport/query smoke test on 2026-09-05; live historical
+# capacity still falls back per network when a request fails.
 HYPERSYNC_URLS = {
+    "143": "https://monad.hypersync.xyz/query",
+    "56": "https://bsc.hypersync.xyz/query",
     "8453": "https://base.hypersync.xyz/query",
     "4663": "https://robinhood.hypersync.xyz/query",
 }
