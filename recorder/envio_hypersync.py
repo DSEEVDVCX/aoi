@@ -103,6 +103,10 @@ class EnvioHyperSync:
         # effect on the next query with no restart.
         self._fixed_keys = keys is not None
         self._keys = KeyPool(keys if keys is not None else _read_keys())
+        # Coverage is evidence of a successful request, not merely a configured
+        # key. The admission gate uses this set so a live Envio outage falls back
+        # to conservative public-RPC capacity on the next cycle.
+        self._successful_networks: set[str] = set()
         self._client = httpx.AsyncClient(
             timeout=self._timeout,
             headers={"content-type": "application/json"},
@@ -112,8 +116,21 @@ class EnvioHyperSync:
         await self._client.aclose()
 
     def covers(self, network_id: str) -> bool:
-        """True when this network is on HyperSync **and** a key exists — routing, not hope."""
-        return str(network_id) in self._urls and bool(self._keys.keys)
+        """True when this network is configured and currently usable.
+
+        A key in the pool proves only that the route can be attempted. Once a
+        request has failed with a transport, rate-limit, or server error, the
+        route is no longer trusted for admission until a later request succeeds.
+        """
+        net = str(network_id)
+        if not self._fixed_keys:
+            try:
+                self._keys.refresh(_read_keys())
+            except Exception:  # noqa: BLE001 — availability checks must fail closed
+                self._keys.refresh([])
+        return net in self._urls and bool(self._keys.keys) and (
+            net in self._successful_networks
+        )
 
     def key_stats(self) -> dict[str, Any]:
         """Pool snapshot for the meta report — counts only, no values (FR-013)."""
@@ -148,6 +165,7 @@ class EnvioHyperSync:
                 url, json=body, headers={"authorization": f"Bearer {key}"},
             )
         except httpx.TransportError as exc:
+            self._successful_networks.discard(str(network_id))
             # A wait, not a failure: raising rate-limit-shaped lets the caller's
             # existing backoff handle it (the `EVMRateLimit` remedy).
             from evm_rpc import EVMRateLimit  # local import keeps the module import-light
@@ -161,6 +179,7 @@ class EnvioHyperSync:
             if len(self._keys.keys) > 1:
                 self._keys.rotate(block_current=True)
                 return await self._query(network_id, body)
+            self._successful_networks.discard(str(network_id))
             raise EnvioUnavailable(f"hypersync [{network_id}] HTTP {resp.status_code}")
         if resp.status_code == 429:
             # A quota answer, not a broken service. The second key on a second
@@ -172,6 +191,7 @@ class EnvioHyperSync:
             if _retries < len(self._keys.keys) - 1:
                 self._keys.rotate(block_current=True)
                 return await self._query(network_id, body, _retries=_retries + 1)
+            self._successful_networks.discard(str(network_id))
             from evm_rpc import EVMRateLimit
 
             raise EVMRateLimit(
@@ -179,6 +199,7 @@ class EnvioHyperSync:
                 f"{self._hide(resp.text[:120])}",
             )
         if resp.status_code >= 500:
+            self._successful_networks.discard(str(network_id))
             from evm_rpc import EVMRateLimit
 
             raise EVMRateLimit(
@@ -186,6 +207,7 @@ class EnvioHyperSync:
                 f"{self._hide(resp.text[:120])}",
             )
         if resp.status_code >= 400:
+            self._successful_networks.discard(str(network_id))
             from evm_rpc import EVMRPCError
 
             raise EVMRPCError(
@@ -195,17 +217,20 @@ class EnvioHyperSync:
         try:
             parsed = resp.json()
         except ValueError:
+            self._successful_networks.discard(str(network_id))
             from evm_rpc import EVMRPCError
 
             raise EVMRPCError(
                 f"hypersync [{network_id}]: non-JSON response",
             ) from None
         if not isinstance(parsed, dict):
+            self._successful_networks.discard(str(network_id))
             from evm_rpc import EVMRPCError
 
             raise EVMRPCError(
                 f"hypersync [{network_id}]: unexpected response shape",
             )
+        self._successful_networks.add(str(network_id))
         return parsed
 
     @staticmethod

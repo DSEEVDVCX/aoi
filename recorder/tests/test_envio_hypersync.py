@@ -75,10 +75,10 @@ async def _noop(_seconds):
 # ---------------------------------------------------------------------------
 # Routing: availability is a fact about the config and the pool, not a hope
 # ---------------------------------------------------------------------------
-async def test_covers_requires_both_network_and_key():
+async def test_covers_requires_successful_network_probe_and_key():
     rpc = envio_hypersync.EnvioHyperSync(urls={BASE: "u"}, keys=[KEY])
-    assert rpc.covers(BASE) is True
-    assert rpc.covers("143") is False            # no route for this network
+    assert rpc.covers(BASE) is False               # config alone is not evidence
+    assert rpc.covers("143") is False             # no route for this network
     keyless = envio_hypersync.EnvioHyperSync(urls={BASE: "u"}, keys=[])
     assert keyless.covers(BASE) is False           # a route without a key is not a route
 
@@ -88,8 +88,8 @@ async def test_the_default_map_covers_both_measured_networks():
     (2026-09-04); a network neither probed nor routed must stay out."""
     rpc = envio_hypersync.EnvioHyperSync(keys=[KEY])
     try:
-        assert rpc.covers("8453") is True
-        assert rpc.covers("4663") is True
+        assert rpc.covers("8453") is False
+        assert rpc.covers("4663") is False
         assert rpc.covers("143") is False         # never probed, never routed
     finally:
         await rpc.aclose()
@@ -207,6 +207,33 @@ async def test_a_429_rides_the_second_key_and_succeeds():
     assert [a.endswith(KEY) for a in asked] == [True, False]   # key 1, then key 2
     assert (complete, requests, len(logs)) == (True, 1, 1)     # one logical page, retried
     assert rpc.key_stats()["keys"] == 2
+    assert rpc.covers(BASE) is True
+
+
+async def test_failed_network_loses_only_its_coverage():
+    second = "test-key-654321"
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content)["from_block"])
+        if len(calls) == 1:
+            return _page([], next_block=None)
+        return httpx.Response(503, text="temporarily unavailable")
+
+    rpc = envio_hypersync.EnvioHyperSync(
+        urls={BASE: "https://base.test/query", "4663": "https://rh.test/query"},
+        keys=[KEY, second],
+    )
+    rpc._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
+        assert rpc.covers(BASE) is True
+        with pytest.raises(Exception):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 10, sleep=_noop)
+        assert rpc.covers(BASE) is False
+        assert rpc.covers("4663") is False
+    finally:
+        await rpc.aclose()
 
 
 async def test_a_429_on_every_key_raises_instead_of_rotating_forever():
