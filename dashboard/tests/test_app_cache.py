@@ -57,6 +57,16 @@ class Spawner:
         return len(queued)
 
 
+def test_cache_evicts_old_cold_entries_when_bounded():
+    memo = cache.TTLMemo(max_entries=2)
+
+    memo.get("first", 60, lambda: "one")
+    memo.get("second", 60, lambda: "two")
+    memo.get("third", 60, lambda: "three")
+
+    assert list(memo._states) == ["second", "third"]
+
+
 @pytest.fixture()
 def spawner(monkeypatch):
     spawn = Spawner()
@@ -266,7 +276,7 @@ def test_a_failed_refresh_keeps_the_last_good_numbers(client, spawner, monkeypat
 
 # --- what the page itself does ---
 def test_the_page_asks_for_the_heavy_panels_less_often(client):
-    """The server caches 60–120 seconds, so asking it every ten brings the
+    """The server caches 60–600 seconds, so asking it every ten brings the
     same number six times over.
 
     And the last payload is reused in between — without that the dashboard
@@ -279,19 +289,61 @@ def test_the_page_asks_for_the_heavy_panels_less_often(client):
     # the second guard: a counter alone would have kept the dashboard empty
     # for a minute after a failed fetch.
     assert "heavy.counts === null" in page
-    assert 'wantHeavy ? getJSON("/api/counts") : heavy.counts' in page
+    assert 'getJSON("/api/counts")' in page
     # and the labeling panel too: its 5-minute lifetime is longer than the
     # networks cycle, but it rides the same rhythm — no new request except in
     # a "heavy" cycle.
     assert 'getOptionalJSON("/api/labeling", heavy.labeling' in page
-    assert "paint(\"labeling\", () => renderLabeling(labeling))" in page
+    assert 'paint("labeling", () => renderLabeling(heavy.labeling))' in page
+
+
+def test_the_heavy_panels_do_not_hold_the_light_ones(client):
+    """The load-time contract, measured 2026-09-02.
+
+    Cold — after a restart, or after the nightly backup has read all 26.6 GB
+    and evicted the OS page cache — `table_counts` and `network_summary` take
+    30 to 60 seconds, because they physically read millions of rows. While
+    they were inside the page's single `Promise.all`, the *whole* dashboard
+    waited on them: twelve panels had their data in under a second and still
+    showed skeletons for a minute, which is exactly what "the dashboard takes
+    a long time to load" meant.
+
+    So the heavy half is fetched on its own promise and deliberately not
+    awaited. This test pins the two halves apart; without it a later edit that
+    slips an `await` back in front of `tickHeavy()` restores the stall
+    silently, with every other test still green.
+    """
+    page = client.get("/", headers=HOST).text
+
+    # fired, never awaited — the comment is part of the contract for the reader
+    assert "if (wantHeavy) tickHeavy();" in page
+    assert "await tickHeavy()" not in page
+    # and the guard that stops slow cycles from stacking on a 60-second compute
+    assert "if (heavyInflight) return;" in page
+
+    # the light Promise.all must not carry a heavy path: those four are the
+    # ones that scan the archive. (Anchored on the light destructuring itself —
+    # `tickHeavy` has a Promise.all of its own, earlier in the file.)
+    light = page.split("controlProgress, keys, acct]")[1].split("]);")[0]
+    for heavy_path in ("/api/counts", "/api/networks", "/api/labeling", "/api/watchlist-market"):
+        assert heavy_path not in light, f"{heavy_path} is back inside the blocking fetch"
+
+
+def test_counts_ttl_is_longer_than_the_scan_it_pays_for(client):
+    """A TTL shorter than its own refresh makes the scan continuous.
+
+    At 60 s the refresh took about as long as the lifetime it was refreshing
+    for, so the dashboard process re-scanned the archive roughly half of every
+    minute, forever — competing with the recorder for the same disk.
+    """
+    assert config.TABLE_COUNTS_TTL_SECONDS >= 600
 
 
 def test_the_page_says_which_numbers_are_cached_and_which_are_live(client):
     """A number believed to be live when it isn't is worse than a number that states its age."""
     page = client.get("/", headers=HOST).text
 
-    assert "renderNetworks(networks.networks || [], networks.cache)" in page
+    assert "renderNetworks(heavy.networks?.networks || [], heavy.networks?.cache)" in page
     assert "Coverage counts computed" in page
     assert '"last market" is live on every refresh' in page
     assert "network-note" in page

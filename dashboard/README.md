@@ -116,6 +116,7 @@ The page refreshes itself every 10 seconds via fetch to the JSON endpoints.
 | Route | Description |
 |---|---|
 | `GET /` | The page |
+| `GET /api/health` | Single secret-free health summary for local services and recorder heartbeats |
 | `GET /api/status` | Recorder status (alive, cycle count, last cycle…) **and labeler status** — the top bar shows them separately because the labeler's death is silent (no errors, no cycle crashes) |
 | `GET /api/api-health` | Checks `http://127.0.0.1:8080/health` |
 | `GET /api/signals?limit=50` | Latest signals |

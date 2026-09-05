@@ -36,6 +36,7 @@ import config
 import dao
 import httpx
 import keystore
+import task_state
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -115,14 +116,31 @@ def _cached(key: str, ttl: float, fn) -> tuple[Any, dict[str, Any]]:
     )
 
 
-@app.get("/api/status")
-def api_status() -> dict[str, Any]:
+@app.get("/api/health")
+def api_health_summary() -> JSONResponse:
+    """Aggregate local service health without exposing credentials or payloads."""
+    body = _with_conn(lambda c: dao.system_health(c, config.SERVICE_HEALTH))
+    tasks = task_state.read_task_states()
+    if tasks:
+        body["scheduler"] = tasks
+    status = 503 if body["level"] == "bad" else 200
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/api/recorder-status")
+def recorder_status() -> dict[str, Any]:
     return _with_conn(
         lambda c: dao.recorder_status(
             c, config.RECORDER_ALIVE_WINDOW_SECONDS,
             labeler_window_seconds=config.LABELER_ALIVE_WINDOW_SECONDS,
         )
     )
+
+
+@app.get("/api/status")
+def status_alias() -> dict[str, Any]:
+    """Compatibility alias for the dashboard's established status endpoint."""
+    return recorder_status()
 
 
 @app.get("/api/api-health")

@@ -337,6 +337,7 @@ class RecorderDB:
             pass
         try:
             self._conn = sqlite3.connect(self._db_path, timeout=30)
+            self._conn.execute("PRAGMA journal_size_limit=268435456")
             self._conn.row_factory = sqlite3.Row
             self._batching = False
             steps.append("reconnected")

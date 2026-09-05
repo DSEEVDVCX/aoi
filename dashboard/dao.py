@@ -67,6 +67,44 @@ def all_meta(conn: sqlite3.Connection) -> dict[str, str]:
     return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
 
 
+def system_health(
+    conn: sqlite3.Connection,
+    services: tuple[dict[str, Any], ...],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return a single, secret-free health document for local operators."""
+    moment = now or datetime.now(UTC)
+    meta = all_meta(conn)
+    service_rows: list[dict[str, Any]] = []
+    for spec in services:
+        heartbeat = meta.get(spec["heartbeat"])
+        heartbeat_dt = _parse_iso(heartbeat)
+        age = (moment - heartbeat_dt).total_seconds() if heartbeat_dt else None
+        stale = age is None or age < 0 or age > spec["tolerance"]
+        ok = meta.get(spec["ok"])
+        ok_dt = _parse_iso(ok)
+        ok_age = (moment - ok_dt).total_seconds() if ok_dt else None
+        last_error = meta.get(f"last_error_{spec['name'].replace('-', '_')}")
+        level = "bad" if stale else ("degraded" if last_error and ok_age is None else "ok")
+        service_rows.append({
+            "name": spec["name"], "last_run_at": heartbeat,
+            "age_seconds": age, "ok_at": ok, "ok_age_seconds": ok_age,
+            "stale": stale, "last_error": last_error, "level": level,
+        })
+    discovered = sorted(
+        key.removeprefix("last_error_") for key in meta if key.startswith("last_error_")
+    )
+    bad = any(row["level"] == "bad" for row in service_rows)
+    degraded = any(row["level"] == "degraded" for row in service_rows)
+    return {
+        "level": "bad" if bad else ("degraded" if degraded else "ok"),
+        "checked_at": moment.isoformat(), "services": service_rows,
+        "error_sources": discovered,
+    }
+
+
+
+
 # --- counts ---
 _TABLES = ("signal_events", "market_ticks", "token_static", "watchlist", "snapshots",
            "outcomes", "token_bars", "activity_events")
@@ -259,11 +297,18 @@ def labeling_outcomes(
                 args,
             )
         ]
+        # `SUM(is_explosive)` is NULL when every row in the group has a NULL
+        # `is_explosive` — not only when the group is empty. So the count alone
+        # is not a safe guard for the ratio: with rows present but the column
+        # unlabelled, `row["explosive"]` is None and dividing it raised
+        # TypeError, turning /api/labeling into a 500. The normalised values are
+        # computed once here and the ratio is built from them.
+        count = int(row["n"] or 0)
+        explosive = int(row["explosive"] or 0)
         return {
-            "count": int(row["n"] or 0),
-            "explosive": int(row["explosive"] or 0),
-            "explosive_pct": round(row["explosive"] / row["n"] * 100, 1)
-            if row["n"] else None,
+            "count": count,
+            "explosive": explosive,
+            "explosive_pct": round(explosive / count * 100, 1) if count else None,
             "avg_return_pct": round(row["avg_ret"] * 100, 1)
             if row["avg_ret"] is not None else None,
             "avg_gain_pct": round(row["avg_gain"] * 100, 1)
@@ -1104,13 +1149,28 @@ def signal_timeline(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]
     if not _table_exists(conn, "signal_events"):
         return {"hours": [], "types": [], "series": {}}
     hours = max(1, min(hours, 168))
+    # The cut-off must be written in the *stored* format, and aligned to the
+    # same hour grid the buckets below are built on.
+    #
+    # `datetime('now', ?)` produced "2026-09-01 10:00:00" — a space where
+    # `recorded_at` (utcnow_iso) has a "T". SQLite compares these as plain
+    # text, and "T" (0x54) sorts after " " (0x20), so *every* row sharing the
+    # cut-off's date passed the filter whatever its hour: `?hours=1` at 10:30
+    # scanned and grouped ten hours of signals, not one. The surplus rows fell
+    # outside the bucket list and vanished from the series, but they still fed
+    # the `types` set — so a signal type last seen 30 hours ago earned a legend
+    # entry with a flat zero column behind it.
+    #
+    # Truncating to the hour (and stepping back hours-1) makes the filter and
+    # the bucket list cover exactly the same span, so no row is read that the
+    # chart cannot place.
     rows = conn.execute(
         """SELECT strftime('%Y-%m-%dT%H:00:00', recorded_at) AS hour,
                   signal_type, COUNT(*) AS n
              FROM signal_events
-            WHERE recorded_at >= datetime('now', ?)
+            WHERE recorded_at >= strftime('%Y-%m-%dT%H:00:00', 'now', ?)
             GROUP BY hour, signal_type""",
-        (f"-{hours} hours",),
+        (f"-{hours - 1} hours",),
     ).fetchall()
     if not rows:
         return {"hours": [], "types": [], "series": {}}

@@ -77,17 +77,24 @@ if ($LASTEXITCODE -ne 0) { $failed += "lint(recorder/dashboard)" }
 
 # The dashboard's JavaScript rendering is not covered by pytest: the tools
 # extract the functions from the page itself and run them on hostile payloads
-# and operating states. All are skipped when node is absent.
+# and operating states. Node is an explicit requirement so these checks cannot
+# silently disappear from a local or CI run.
 Write-Output "`n=== PAGE (node) ==="
-if (Get-Command node -ErrorAction SilentlyContinue) {
+$nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
+    Write-Output "FATAL: node is required for the dashboard render checks."
+    Write-Output "       CI installs the pinned version from .github/workflows/ci.yml."
+    $failed += "page(node missing)"
+} else {
+    & node --version
     & node "$root\dashboard\tools\check_key_render.mjs"
     if ($LASTEXITCODE -ne 0) { $failed += "page(check_key_render)" }
     & node "$root\dashboard\tools\check_tile_render.mjs"
     if ($LASTEXITCODE -ne 0) { $failed += "page(check_tile_render)" }
     & node "$root\dashboard\tools\check_watchlist_render.mjs"
     if ($LASTEXITCODE -ne 0) { $failed += "page(check_watchlist_render)" }
-} else {
-    Write-Output "node not found - skipping the render check"
+    & node "$root\dashboard\tools\check_loop_render.mjs"
+    if ($LASTEXITCODE -ne 0) { $failed += "page(check_loop_render)" }
 }
 
 Write-Output "`n=== TYPES ==="

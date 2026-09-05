@@ -56,11 +56,18 @@ async def _maybe_rotate_client(client, current_token: str):
 def _log(message: str) -> None:
     """Write a bounded diagnostic line without exposing credentials."""
     try:
-        with open(config.LOG_PATH, "a", encoding="utf-8") as handle:
+        with open(config.ACTIVITY_HEAD_LOG_PATH, "a", encoding="utf-8") as handle:
             handle.write(f"{utcnow_iso()} activity-head: {message}\n")
     except OSError:
         pass
 
+
+def _log_boot(message: str) -> None:
+    try:
+        with open(config.ACTIVITY_HEAD_BOOT_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(f"{utcnow_iso()} {message}\n")
+    except OSError:
+        pass
 
 async def main_loop(cycles: int | None = None) -> None:
     current_token = _load_access_token()
@@ -112,4 +119,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        _log_boot("boot starting")
+        main()
+        _log_boot("boot stopped cleanly")
+    except Exception:
+        import traceback
+
+        _log_boot("BOOT FAILURE:\n" + traceback.format_exc())
+        raise

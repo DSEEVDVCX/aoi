@@ -20,12 +20,17 @@ const render = script.slice(
   script.indexOf("function renderTiles"),
   script.indexOf("/* --- signal performance"),
 );
+// renderTiles maps network ids to names via NETWORK_META, which lives later in
+// the page — extracted separately so the tile slice can reference it.
+const metaStart = script.indexOf("const NETWORK_META");
+const metaEnd = script.indexOf("function coveragePct", metaStart);
+const meta = script.slice(metaStart, metaEnd);
 
 const HOST = { innerHTML: "" };
 const document = { getElementById: () => HOST };
 const { renderTiles } = new Function(
   "document",
-  `${utility}\n${ago}\n${render}\nreturn { renderTiles };`,
+  `${utility}\n${ago}\n${meta}\n${render}\nreturn { renderTiles };`,
 )(document);
 
 const attack = '<img src=x onerror="globalThis.pwned=1">';

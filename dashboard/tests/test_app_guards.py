@@ -56,7 +56,25 @@ def signed(monkeypatch):
     return client
 
 
-def test_host_guard_rejects_dns_rebinding_name():
+def test_health_endpoint_returns_secret_free_aggregate(tmp_path, monkeypatch):
+    path = tmp_path / "health.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(config, "DB_PATH", str(path))
+
+    response = TestClient(dashboard_app.app).get("/api/health", headers=HOST)
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["level"] == "bad"
+    assert "services" in body
+    assert "token" not in response.text.lower()
+    assert "authorization" not in response.text.lower()
+
+
+
     client = TestClient(dashboard_app.app)
     response = client.get("/api/counts", headers={"Host": "evil.example:8090"})
     assert response.status_code == 403

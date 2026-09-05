@@ -33,6 +33,8 @@ LOG_PATH = os.path.join(HERE, "recorder.log")
 # its own pagination, and it walks up to the first overlap with stored events without touching the history pointer.
 ACTIVITY_HEAD_INTERVAL_SECONDS = 300
 ACTIVITY_HEAD_MAX_PAGES = 3
+ACTIVITY_HEAD_LOG_PATH = os.path.join(HERE, "activity_head.log")
+ACTIVITY_HEAD_BOOT_LOG_PATH = os.path.join(HERE, "activity_head_boot.log")
 
 # Credential state file (session_token). The fomo_api default is relative
 # (.privy_state.json) and it lives inside api/, so resolve it against api/ unless already absolute.

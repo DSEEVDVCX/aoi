@@ -36,7 +36,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import config  # noqa: E402
-from db import RecorderDB  # noqa: E402
+from db import RecorderDB, utcnow_iso  # noqa: E402
 
 RES = "1"
 PAGE = 500                    # measured: the most the source returns at 1-minute resolution
@@ -69,6 +69,14 @@ def _targets(db: RecorderDB) -> list[dict]:
             ORDER BY entry_ts""",
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _stamp(db: RecorderDB, key: str, value: str) -> None:
+    """Record lifecycle metadata without turning bookkeeping into a new failure."""
+    try:
+        db.note_error(key, value)
+    except Exception:  # noqa: BLE001 — health bookkeeping must not hide archive work
+        pass
 
 
 def _state(db: RecorderDB, token: str, net: str) -> dict | None:
@@ -199,6 +207,8 @@ async def main() -> int:
     args = ap.parse_args()
 
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
+    started = utcnow_iso()
+    _stamp(db, "bars_1m_last_run_at", started)
     try:
         targets = _targets(db)
         if args.limit:
@@ -230,7 +240,12 @@ async def main() -> int:
                 pass
         print(f"round complete: done={stats['done']} · rows={stats['rows']:,} · "
               f"err={stats['errors']} · skip={stats['already_done']}")
+        _stamp(db, "bars_1m_last_ok_at", utcnow_iso())
+        _stamp(db, "bars_1m_last_stats", str(stats))
         return 0
+    except Exception as exc:
+        _stamp(db, "last_error_bars_1m", f"{utcnow_iso()}: {type(exc).__name__}: {exc}"[:400])
+        raise
     finally:
         db.close()
 

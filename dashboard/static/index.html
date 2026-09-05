@@ -1090,13 +1090,14 @@ function renderTiles(st, counts, bars, storage, api, labeling) {
     : storage.mb >= 1000 ? (storage.mb / 1000).toFixed(1) + " GB" : storage.mb + " MB";
   const admission = st.evm_admission_networks || {};
   const paused = st.evm_admission_paused_networks || [];
+  const netName = id => NETWORK_META[String(id)]?.name || `network ${id}`;
   const admissionText = Object.keys(admission).length
     ? Object.entries(admission).map(([network, state]) =>
-        `${network}: ${state.percent}%${state.paused ? " paused" : " available"}`
+        `${netName(network)}: ${state.percent}%${state.paused ? " paused" : " available"}`
       ).join(" · ")
     : "No per-network state yet";
   const admissionDetail = paused.length
-    ? `Paused: ${paused.join(", ")}`
+    ? `Paused: ${paused.map(netName).join(", ")}`
     : "Every network is measured with its own RPC budget";
   const items = [
     { l: "Watched coins", v: num(st.active_watch_count), d: "48-hour window" },
@@ -2415,76 +2416,127 @@ function paint(id, fn) {
   }
 }
 
+/* The four cached panels ride their own promise instead of the page's.
+   Measured 2026-09-02: `table_counts` and `network_summary` cost 30–60 seconds
+   whenever the OS page cache doesn't hold what they scan — the database is
+   26.6 GB, and every restart (and the nightly backup, which reads all of it)
+   leaves it cold. A single Promise.all over all sixteen requests made the
+   *whole* dashboard wait for that: twelve panels had their data in under a
+   second and still sat on their skeletons for a minute. Now the light half
+   paints on its own time and the heavy half fills in when it lands. */
+let heavyInflight = false;
+
+/** The last light payload — `hero` and `tiles` read from both halves, so the
+    heavy path needs the light one to repaint them. */
+const lastLight = { st: null, api: null, bars: null, storage: null, tl: null, wl: null };
+
+/** The two panels fed by both halves. They stay on their skeletons until both
+    have arrived rather than render a half-empty tile. */
+function paintCombined() {
+  const { st, api, bars, storage, tl } = lastLight;
+  if (!st || heavy.counts === null) return;
+  paint("hero",  () => renderHero(heavy.counts, tl));
+  paint("tiles", () => renderTiles(st, heavy.counts, bars, storage, api, heavy.labeling));
+}
+
+/** Paints everything that depends on the cached half. */
+function paintHeavy() {
+  paintCombined();
+  paint("network-summary",
+    () => renderNetworks(heavy.networks?.networks || [], heavy.networks?.cache));
+  paint("labeling", () => renderLabeling(heavy.labeling));
+  if (lastLight.wl) {
+    const market = heavy.watchMarket?.market || {};
+    paint("watchlist", () => renderWatchlist(lastLight.wl, market));
+    lastRows.wl = { rows: lastLight.wl, market };
+  }
+}
+
+/** Fetches the four cached panels without holding the light ones.
+    Never awaited by `tick` — the guard is what stops slow cycles from stacking. */
+async function tickHeavy() {
+  if (heavyInflight) return;
+  heavyInflight = true;
+  try {
+    const [cnt, networks, labeling, watchMarket] = await Promise.all([
+      getJSON("/api/counts"),
+      // optional: a page loaded before a server update doesn't lose the rest of
+      // its panels for the sake of this one.
+      getOptionalJSON("/api/networks", heavy.networks || { networks: [] }),
+      getOptionalJSON("/api/labeling", heavy.labeling || { live: false }),
+      // the market view is cached server-side for a minute, so it rides the
+      // heavy cycle — the 48h countdown itself stays live at 10s via /api/watchlist
+      getOptionalJSON("/api/watchlist-market", heavy.watchMarket || { market: {} }),
+    ]);
+    heavy.counts = cnt;
+    heavy.networks = networks;
+    heavy.labeling = labeling;
+    heavy.watchMarket = watchMarket;
+    paintHeavy();
+  } catch (e) {
+    // a failed heavy cycle leaves `heavy.counts` null, so the next tick retries
+    console.error("heavy panels", e);
+  } finally {
+    heavyInflight = false;
+  }
+}
+
 async function tick() {
   if (paused || inflight) return;
   inflight = true;
   const main = document.querySelector("main");
   const slow = setTimeout(() => main.classList.add("stale"), 400);   // no skeleton flash
   try {
-    // Heavy panels: requested the first time, then every HEAVY_EVERY, and
-    // restored from `heavy` in between. The condition is on the payload's
-    // existence too, not the counter alone — a failed request on the sixth
-    // cycle would have left the panel empty for a full minute before the
-    // second attempt.
+    // Heavy panels: requested the first time, then every HEAVY_EVERY, and kept
+    // in `heavy` in between. The condition is on the payload's existence too,
+    // not the counter alone — a failed request on the sixth cycle would have
+    // left the panel empty for a full minute before the second attempt.
     const wantHeavy = (heavyTick % HEAVY_EVERY === 0) || heavy.counts === null;
     heavyTick += 1;
-    const [st, api, sig, wl, cnt, errs, storage, bars, perf, tl, controlProgress, networks, keys,
-           acct, labeling, watchMarket] = await Promise.all([
+    if (wantHeavy) tickHeavy();   // deliberately not awaited: that is the whole fix
+
+    const [st, api, sig, wl, errs, storage, bars, perf, tl, controlProgress, keys, acct]
+      = await Promise.all([
       getJSON("/api/status"),
       getJSON("/api/api-health"),
       getJSON("/api/signals?limit=40"),
       getJSON("/api/watchlist"),
-      wantHeavy ? getJSON("/api/counts") : heavy.counts,
       getJSON("/api/errors"),
       getJSON("/api/storage"),
       getJSON("/api/bars"),
       getJSON(`/api/performance?limit=${perfLimit}&sort=${encodeURIComponent(perfSort.key)}&dir=${perfSort.dir}`),
       getJSON("/api/signal-timeline?hours=24"),
       getJSON("/api/control-progress"),
-      wantHeavy
-        ? getOptionalJSON("/api/networks", heavy.networks || { networks: [] })
-        : heavy.networks,
       // optional: a page loaded before a server update doesn't lose the rest of
       // its panels for the sake of this one.
       getOptionalJSON("/api/provider-keys", { pools: [], keys: [], providers: [] }),
       getOptionalJSON("/api/fomo-account", null),
-      wantHeavy
-        ? getOptionalJSON("/api/labeling", heavy.labeling || { live: false })
-        : heavy.labeling,
-      // the market view is cached server-side for a minute, so it rides the
-      // heavy cycle — the 48h countdown itself stays live at 10s via /api/watchlist
-      wantHeavy
-        ? getOptionalJSON("/api/watchlist-market", heavy.watchMarket || { market: {} })
-        : heavy.watchMarket,
     ]);
-    heavy.counts = cnt;
-    heavy.networks = networks;
-    heavy.labeling = labeling;
-    heavy.watchMarket = watchMarket;
     const rows = (perf.performance || []).map((r, i) => ({ ...r, _i: i }));
+    lastLight.st = st; lastLight.api = api; lastLight.bars = bars;
+    lastLight.storage = storage; lastLight.tl = tl; lastLight.wl = wl.watchlist || [];
 
     // every panel renders independently: a fault in one empties that one alone,
     // not the whole dashboard. (Without this isolation, one error in the column
     // chart emptied four panels at once.)
-    paint("hero",      () => renderHero(cnt, tl));
-    paint("tiles",     () => renderTiles(st, cnt, bars, storage, api, labeling));
     paint("perf",         () => renderPerf(rows));
     paint("perf-summary", () => renderPerfSummary(perf.summary));
     paint("comparison",   () => renderComparison(perf.comparison));
     paint("control-progress", () => renderControlProgress(controlProgress));
     paint("timeline",     () => renderTimeline(tl));
     paint("health",    () => renderHealth(bars, storage, st));
-    paint("watchlist", () => renderWatchlist(wl.watchlist || [], watchMarket?.market || {}));
+    // the prices come from the heavy half: before it lands the row renders with
+    // dashes, and `paintHeavy` repaints it — never a blank panel meanwhile.
+    paint("watchlist", () => renderWatchlist(lastLight.wl, heavy.watchMarket?.market || {}));
     paint("signals",   () => renderSignals(sig.signals || []));
     paint("errors",    () => renderErrors(errs.errors || []));
     paint("provider-keys", () => renderProviderKeys(keys));
     paint("fomo-account", () => renderFomoAccount(acct));
-    paint("network-summary", () => renderNetworks(networks.networks || [], networks.cache));
-    paint("labeling", () => renderLabeling(labeling));
     renderStatus(st);
     renderApi(api);
+    paintCombined();
     lastRows.perf = rows; lastRows.tl = tl;
-    lastRows.wl = { rows: wl.watchlist || [], market: watchMarket?.market || {} };
+    lastRows.wl = { rows: lastLight.wl, market: heavy.watchMarket?.market || {} };
 
     document.getElementById("alert").innerHTML = "";
     document.getElementById("updated").textContent =

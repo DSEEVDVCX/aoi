@@ -67,8 +67,8 @@ def main() -> None:
         while cycles is None or n < cycles:
             try:
                 stats = label_pending(db, now_epoch=int(time.time()))
-                db.set_meta("labeler_last_run_at", utcnow_iso())
-                db.set_meta("labeler_last_stats", str(stats))
+                db.note_error("labeler_last_run_at", utcnow_iso())
+                db.note_error("labeler_last_stats", str(stats))
                 # Log a line only when something happened — a line every 15
                 # minutes forever is noise.
                 if stats["signals"] or stats["watches"]:

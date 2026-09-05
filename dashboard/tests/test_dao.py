@@ -13,7 +13,20 @@ import pytest
 
 import dao
 
-# A miniature schema matching the columns dao reads.
+def test_system_health_marks_missing_heartbeats_bad(db_path):
+    """A scheduled task marked Running is not enough when its heartbeat is absent."""
+    conn = _conn(db_path)
+    out = dao.system_health(
+        conn,
+        ({"name": "recorder", "heartbeat": "last_cycle_at", "ok": "last_ok_cycle_at", "tolerance": 150},),
+        now=datetime(2026, 9, 3, tzinfo=UTC),
+    )
+    conn.close()
+    assert out["level"] == "bad"
+    assert out["services"][0]["stale"] is True
+    assert out["services"][0]["level"] == "bad"
+
+
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE signal_events (
@@ -1640,3 +1653,90 @@ def test_an_own_stamp_newer_than_the_error_still_heals_it(db_path):
     )
     assert row["stale"] is True
     conn.close()
+
+
+# --- the labelling ratio against an unlabelled column ---
+def test_labeling_explosive_ratio_survives_an_unlabelled_column(db_path):
+    """`SUM(is_explosive)` is NULL when every row's flag is NULL — rows present, sum absent.
+
+    The row count was used as the guard for the ratio, so with analysis-eligible
+    rows whose flag had not been written the division ran on None and raised
+    TypeError — a 500 on /api/labeling rather than a zero. The count is the
+    wrong guard for a sum that can be NULL on its own.
+    """
+    c = sqlite3.connect(db_path)
+    _outcomes_schema(c)
+    _seed_outcome(c, key="s1", is_control=0, is_explosive=None)
+    _seed_outcome(c, key="s2", is_control=0, is_explosive=None)
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.labeling_outcomes(conn, live_start_ts=0)
+    conn.close()
+
+    assert out["signal"]["count"] == 2
+    assert out["signal"]["explosive"] == 0
+    assert out["signal"]["explosive_pct"] == 0.0
+
+
+# --- signal timeline: the window is the window ---
+def test_signal_timeline_excludes_signals_older_than_the_window(db_path):
+    """The cut-off is compared as text, so it has to be written the way the rows are.
+
+    `datetime('now', ?)` yields "2026-09-01 10:00:00" while `recorded_at`
+    (utcnow_iso) yields "2026-09-01T10:00:00+00:00". SQLite compares them
+    character by character, and "T" sorts after " " — so every row sharing the
+    cut-off's *date* passed whatever its hour, and `?hours=1` answered with the
+    whole day behind it. Those extra rows fell outside the bucket list so they
+    never showed as columns, but they still populated the legend: a signal type
+    last seen many hours ago earned an entry with a flat zero series.
+
+    The stale row here is pinned to 00:05 on the date of the *old* cut-off, so
+    it shares that date in every timezone-free case — including just after
+    midnight, where the old cut-off falls on yesterday.
+    """
+    now = datetime.now(UTC)
+    stale_at = (now - timedelta(hours=1)).replace(
+        hour=0, minute=5, second=0, microsecond=0
+    )
+    c = sqlite3.connect(db_path)
+    c.execute(
+        "INSERT INTO signal_events(id, token_address, recorded_at, signal_type)"
+        " VALUES('old','tokA',?,'multi_user_sell')", (stale_at.isoformat(),),
+    )
+    c.execute(
+        "INSERT INTO signal_events(id, token_address, recorded_at, signal_type)"
+        " VALUES('new','tokB',?,'large_buy')", (now.isoformat(),),
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.signal_timeline(conn, hours=1)
+    conn.close()
+
+    assert out["types"] == ["large_buy"]          # no phantom legend entry
+    assert len(out["hours"]) == 1
+    assert sum(out["series"]["large_buy"]) == 1
+
+
+def test_signal_timeline_keeps_every_hour_including_empty_ones(db_path):
+    """A gap where the recorder was down must read as a gap, not as continuity."""
+    now = datetime.now(UTC)
+    c = sqlite3.connect(db_path)
+    c.execute(
+        "INSERT INTO signal_events(id, token_address, recorded_at, signal_type)"
+        " VALUES('a','tokA',?,'large_buy')", (now.isoformat(),),
+    )
+    c.commit()
+    c.close()
+
+    conn = _conn(db_path)
+    out = dao.signal_timeline(conn, hours=6)
+    conn.close()
+
+    assert len(out["hours"]) == 6
+    assert out["hours"] == sorted(out["hours"])          # oldest first
+    assert out["series"]["large_buy"][-1] == 1           # the newest bucket
+    assert sum(out["series"]["large_buy"]) == 1          # and only that one

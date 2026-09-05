@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -83,13 +84,15 @@ class TTLMemo:
         wall_clock: Callable[[], float] = time.time,
         spawn: Callable[[Callable[[], None]], None] = _spawn_thread,
         error_backoff: float = 15.0,
+        max_entries: int = 16,
     ) -> None:
         self._clock = clock
         self._wall = wall_clock
         self._spawn = spawn
         self._error_backoff = float(error_backoff)
+        self._max_entries = max(1, int(max_entries))
         self._lock = threading.Lock()
-        self._states: dict[str, _State] = {}
+        self._states: OrderedDict[str, _State] = OrderedDict()
 
     # --- Interface ---
     def get(
@@ -114,7 +117,13 @@ class TTLMemo:
             if state is None:
                 state = _State()
                 self._states[key] = state
+            self._states.move_to_end(key)
             entry = state.entry
+            if len(self._states) > self._max_entries:
+                for old_key, old_state in tuple(self._states.items()):
+                    if old_key != key and not old_state.refreshing:
+                        self._states.pop(old_key)
+                        break
             spawn_refresh = False
             meta: dict[str, Any] | None = None
             if entry is not None:

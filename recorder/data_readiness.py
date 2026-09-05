@@ -23,7 +23,7 @@ from typing import Any
 import config
 import features
 
-SCHEMA_VERSION = "data-readiness-v2"
+SCHEMA_VERSION = "data-readiness-v3"
 
 SOURCE_SPECS: dict[str, dict[str, Any]] = {
     "feed": {
@@ -258,20 +258,34 @@ def _load_model_rows(
         "kind", "key", "token_address", "network_id", "entry_ts", "asset_class",
         "status", "is_live", "is_independent", "feature_version",
     }
+    wanted = required | {
+        column for candidates in FEATURE_FAMILIES.values() for column in candidates
+    } | {"split", "final_return_48h", "max_gain_48h", "max_gain_24h", "is_rug"}
+
+    def select_projection(table: str) -> str:
+        available = _columns(connection, table)
+        # Avoid pulling raw payloads and unrelated feature columns into memory.
+        selected = [column for column in wanted if column in available]
+        return ", ".join(sorted(selected))
+
     if "training_rows" not in existing or not required.issubset(
         _columns(connection, "training_rows")
     ):
-        return (
-            connection.execute("SELECT * FROM model_training_rows").fetchall()
-            if "model_training_rows" in existing else []
-        )
+        if "model_training_rows" not in existing:
+            return []
+        projection = select_projection("model_training_rows")
+        return connection.execute(
+            f"SELECT {projection} FROM model_training_rows"
+        ).fetchall()
+
+    projection = select_projection("training_rows")
     rows = connection.execute(
-        """SELECT * FROM training_rows
+        f"""SELECT {projection} FROM training_rows
             WHERE kind='signal' AND is_live=1 AND asset_class='meme'
               AND status='ok' AND is_independent=1
               AND feature_version=?
-            ORDER BY key"""
-        , (features.FEATURE_VERSION,)
+            ORDER BY key""",
+        (features.FEATURE_VERSION,),
     ).fetchall()
     duplicate_event_ids: set[str] = set()
     if "signal_events" in existing:

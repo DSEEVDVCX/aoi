@@ -222,7 +222,7 @@ def test_build_report_measures_sources_features_and_integrity(tmp_path):
 
     report = data_readiness.build_report(path, now=NOW)
 
-    assert report["schema_version"] == "data-readiness-v2"
+    assert report["schema_version"] == "data-readiness-v3"
     assert report["database"]["mode"] == "ro"
     assert report["tables"]["snapshots"] == 2
     assert report["sources"]["feed"]["status"] == "ok"

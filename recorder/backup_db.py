@@ -173,6 +173,19 @@ def main() -> int:
         if args.check_config:
             print(destination)
             return 0
+        from db import RecorderDB, utcnow_iso
+
+        def stamp(key: str, value: str) -> None:
+            try:
+                health_db = RecorderDB(args.db, config.SCHEMA_PATH)
+                try:
+                    health_db.note_error(key, value)
+                finally:
+                    health_db.close()
+            except Exception:  # noqa: BLE001 — health bookkeeping must not hide backup results
+                _log(f"health stamp failed key={key}")
+
+        stamp("backup_last_run_at", utcnow_iso())
         backup, removed = backup_database(
             args.db,
             destination,
@@ -180,10 +193,26 @@ def main() -> int:
             verify=not args.skip_verify,
             log=_log,
         )
+        stamp("backup_last_ok_at", utcnow_iso())
+        _log(f"backup_last_run_at={datetime.now(UTC).isoformat()}")
+        _log(f"backup_last_ok_at={datetime.now(UTC).isoformat()}")
         _log(f"backup ok path={backup} bytes={backup.stat().st_size} pruned={len(removed)}")
         print(backup)
         return 0
     except Exception as exc:  # noqa: BLE001 — scheduled pythonw process needs a durable failure record
+        try:
+            from db import RecorderDB, utcnow_iso
+
+            health_db = RecorderDB(args.db, config.SCHEMA_PATH)
+            try:
+                health_db.note_error(
+                    "last_error_backup",
+                    f"{utcnow_iso()}: {type(exc).__name__}: {exc}"[:400],
+                )
+            finally:
+                health_db.close()
+        except Exception:  # noqa: BLE001 — failure bookkeeping must not mask the original error
+            pass
         _log(f"backup failed: {type(exc).__name__}: {exc}")
         print(f"backup failed: {exc}", file=sys.stderr)
         return 1

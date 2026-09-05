@@ -125,6 +125,20 @@ SOURCE_OK_STAMPS = {
 # independent stamp; a missing one means that source hasn't succeeded yet.
 RECORDER_OK_STAMPS = ("started_at", "last_ok_cycle_at")
 
+# Declarative service heartbeat contract used by the aggregate health endpoint.
+# A heartbeat proves the process ran; a separate success stamp is used where a
+# queue can fail independently inside that process. Task Scheduler state is
+# intentionally not included here: a task marked Running is not proof of life.
+SERVICE_HEALTH = (
+    {"name": "recorder", "heartbeat": "last_cycle_at", "ok": "last_ok_cycle_at", "interval": 60, "tolerance": 150},
+    {"name": "labeler", "heartbeat": "labeler_last_run_at", "ok": "labeler_last_run_at", "interval": 900, "tolerance": 2000},
+    {"name": "chain", "heartbeat": "chain_last_run_at", "ok": "chain_last_ok_at", "interval": 60, "tolerance": 150},
+    {"name": "evm-replay", "heartbeat": "evm_replay_last_run_at", "ok": "evm_replay_last_ok_at", "interval": 60, "tolerance": 180},
+    {"name": "activity-head", "heartbeat": "activity_head_last_run_at", "ok": "activity_head_last_run_at", "interval": 300, "tolerance": 750},
+    {"name": "build-rows", "heartbeat": "build_rows_last_run_at", "ok": "build_rows_last_run_at", "interval": 3600, "tolerance": 9000},
+    {"name": "backup", "heartbeat": "backup_last_run_at", "ok": "backup_last_ok_at", "interval": 86400, "tolerance": 129600},
+)
+
 # --- External provider keys ---
 # Pools live in each process's memory, and the dashboard is a different process
 # ⇒ each process stamps its `provider_keys_<owner>` row into meta: **counts and
@@ -183,9 +197,18 @@ ACCOUNT_PROBE_TIMEOUT = 12.0
 # it cuts the full archive sweep from 30 times/hour to just 6.
 NETWORK_SUMMARY_TTL_SECONDS = 600.0
 
-# Row counts per table: 400 ms, of which 357 in `market_ticks` alone. They're
-# displayed compressed on the cards, so a minute of lag is invisible anyway.
-TABLE_COUNTS_TTL_SECONDS = 60.0
+# Row counts per table: eight bare COUNT(*), and their cost is set by the disk,
+# not the query. Warm they total 760 ms; cold — after a restart, or after the
+# 03:15 backup has read all 26.6 GB and evicted the OS page cache — the same
+# eight take 30 to 60 seconds, because `market_ticks` (5.4M) and `token_bars`
+# (4.4M) have to be physically read.
+#
+# At 60 s that was pathological: the refresh took about as long as the lifetime
+# it was refreshing for, so the process spent roughly half of every minute
+# re-scanning the archive forever, competing with the recorder for the same
+# disk. Ten minutes matches the networks TTL and makes the sweep 6 times/hour.
+# The numbers are displayed compressed on the cards, so the lag is invisible.
+TABLE_COUNTS_TTL_SECONDS = 600.0
 
 # Ticks summary: 1520 ms, and the page doesn't call it today — but it's a
 # public path that costs a second and a half for whoever calls it, so it's

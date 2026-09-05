@@ -146,8 +146,8 @@ def main() -> None:
                 started = time.time()
                 stats = run_cycle(db)
                 stats["seconds"] = round(time.time() - started, 1)
-                db.set_meta("build_rows_last_run_at", utcnow_iso())
-                db.set_meta("build_rows_last_stats", str(stats))
+                db.note_error("build_rows_last_run_at", utcnow_iso())
+                db.note_error("build_rows_last_stats", str(stats))
                 # Log only when something was built — a line every hour
                 # forever is noise.
                 if stats["built"] or stats["skipped_no_event"]:
