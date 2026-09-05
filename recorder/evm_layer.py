@@ -329,7 +329,9 @@ async def _backfill_token(
     ):
         ledger = db.evm_ledger_stats(net, token, exclude=evm_rpc.BURN_ADDRESSES)
         creation_due = int(ledger.get("holder_count") or 0) == 0
-    use_hyper = hyper is not None and getattr(hyper, "covers", lambda _n: False)(net)
+    use_hyper = hyper is not None and getattr(
+        hyper, "can_attempt", getattr(hyper, "covers", lambda _n: False)
+    )(net)
     if creation_due and use_hyper:
         # HyperSync answers "first mint" in one query; on Base the alternatives
         # are a ~20-call `eth_getCode` binary search (public) or nothing.

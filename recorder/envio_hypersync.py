@@ -112,6 +112,16 @@ class EnvioHyperSync:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    def can_attempt(self, network_id: str) -> bool:
+        """True when a configured keyed route may be probed or used."""
+        net = str(network_id)
+        if not self._fixed_keys:
+            try:
+                self._keys.refresh(_read_keys())
+            except Exception:  # noqa: BLE001 — availability checks must fail closed
+                self._keys.refresh([])
+        return net in self._urls and bool(self._keys.keys)
+
     def covers(self, network_id: str) -> bool:
         """True when this network is configured and currently usable.
 
