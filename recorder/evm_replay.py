@@ -512,10 +512,33 @@ async def replay_token(
     rpc: Any, db: RecorderDB, watch: dict[str, Any], clock: BlockClock,
     head: int, now_iso: str, sleep=asyncio.sleep, write: bool = True,
     replace_existing: bool = False, deadline: float | None = None,
+    hyper: Any = None,
 ) -> dict[str, Any]:
-    """Replays one whole token: one range of logs, then one pass over the grid."""
+    """Replays one whole token: one range of logs, then one pass over the grid.
+
+    The history walk rides the paid HyperSync route when one is keyed for the
+    network, with the public node as the fallback on any refusal — the same
+    transport split as the backfill. Measured before routing it here
+    (`probe_hypersync_replay.py`, 2026-09-06): an exact log-for-log match
+    with the public node on three tokens / 16,222 logs at 2-3× the speed —
+    and one dense Base window where the public node spent 60 requests /
+    235 s and returned **zero** logs that HyperSync delivered complete in
+    36 requests, the failure shape behind replay's ~5-10 tokens/day.
+
+    One measured cost, accepted: HyperSync logs carry no `blockTimestamp`
+    (the field does not exist in its selection; block queries answer empty),
+    so a routed network joins Robinhood's interpolated-time regime — anchor
+    interpolation plus the always-added margin instead of the node's exact
+    time. The margin is the guard that was built for exactly this: a
+    boundary log lands after its snapshot, never before it. Timestamps and
+    anchors therefore stay on the public node, whose calls are single-block,
+    cached in `evm_block_time`, and shared across tokens.
+    """
     net = str(watch["network_id"])
     token = str(watch["token_address"]).lower()
+    use_hyper = hyper is not None and getattr(
+        hyper, "can_attempt", getattr(hyper, "covers", lambda _n: False)
+    )(net)
     generation = db.evm_ledger_generation()
     expected_status = watch.get("replay_status")
     expected_from = watch.get("replay_from_block")
@@ -527,7 +550,7 @@ async def replay_token(
         "token": token, "network": net, "status": "skip", "rows": 0,
         "written": 0, "calls": 0, "anchor_calls": 0, "events": 0,
         "negatives": 0, "unknown_time": 0, "from_block": None,
-        "to_block": None, "note": "",
+        "to_block": None, "note": "", "hyper_fallbacks": 0,
     }
     start_ts, end_ts, live_coverage = _window(db, watch, step)
     full_grid = watch_grid(watch, start_ts, end_ts, step, live_coverage)
@@ -607,7 +630,17 @@ async def replay_token(
         # layer: replay walks every token from its birth on every resume cycle.
         origin_calls = 1
         if net in config.EVM_MINT_SCAN_NETWORKS:
-            minted = await rpc.first_mint_block(net, token, to_block)
+            minted = None
+            hyper_mint = use_hyper
+            if hyper_mint:
+                # One query instead of a public mint filter; a refusal here is
+                # not a token failure — the public scan answers in its place.
+                try:
+                    minted = await hyper.first_mint_block(net, token, to_block)
+                except Exception:  # noqa: BLE001 — the public mint scan is the fallback
+                    hyper_mint = False
+            if not hyper_mint:
+                minted = await rpc.first_mint_block(net, token, to_block)
             if minted is not None:
                 from_block = max(from_block, minted)
         else:
@@ -634,10 +667,24 @@ async def replay_token(
     next_grid = int((checkpoint or {}).get("next_grid") or grid_points(start_ts, start_ts, step)[0])
     final_balances = dict(initial_balances)
     for _attempt in (0,):
-        logs, used, complete, resume = await rpc.get_logs_paged(
-            net, [token], attempt_from, to_block, max_calls=log_budget, sleep=sleep,
-            deadline=deadline,
-        )
+        try:
+            logs, used, complete, resume = await (
+                hyper if use_hyper else rpc
+            ).get_logs_paged(
+                net, [token], attempt_from, to_block, max_calls=log_budget,
+                sleep=sleep, deadline=deadline,
+            )
+        except Exception:  # the public node walks the same range instead
+            if not use_hyper:
+                raise
+            # The paid route refused (key, quota, transport) and nothing was
+            # applied yet: `get_logs_paged` returns its logs only on success,
+            # so the public retry reads the range exactly once, never twice.
+            out["hyper_fallbacks"] += 1
+            logs, used, complete, resume = await rpc.get_logs_paged(
+                net, [token], attempt_from, to_block, max_calls=log_budget,
+                sleep=sleep, deadline=deadline,
+            )
         calls_used += used
         covered_to = to_block if complete else int(resume) - 1
         blocks = [
@@ -790,7 +837,7 @@ async def run_replay(
     rpc: Any, db: RecorderDB, networks: Sequence[str] | None = None,
     limit: int | None = None, token: str | None = None,
     sleep=asyncio.sleep, write: bool = True, redo: bool = False,
-    log=None, budget_seconds: float | None = None,
+    log=None, budget_seconds: float | None = None, hyper: Any = None,
 ) -> dict[str, Any]:
     """The whole task: every due token on every allowed replay network.
 
@@ -806,7 +853,7 @@ async def run_replay(
         "networks": len(nets), "tokens": 0, "rows": 0, "written": 0,
         "calls": 0, "anchor_calls": 0, "done": 0, "partial": 0,
         "negative": 0, "empty": 0, "no_time": 0, "skip": 0, "budget": 0,
-        "errors": 0,
+        "errors": 0, "hyper_fallbacks": 0,
         "refused_networks": [n for n in asked if n not in allowed],
     }
     remaining = None if limit is None else int(limit)
@@ -845,7 +892,7 @@ async def run_replay(
             try:
                 res = await replay_token(
                     rpc, db, watch, clock, head, now_iso, sleep=sleep, write=write,
-                    replace_existing=redo, deadline=deadline,
+                    replace_existing=redo, deadline=deadline, hyper=hyper,
                 )
             except StaleEVMState:
                 # Another worker or a reset got there first; do not downgrade its successful state to error.
@@ -873,7 +920,7 @@ async def run_replay(
                 continue
             stats["tokens"] += 1
             stats[res["status"]] = stats.get(res["status"], 0) + 1
-            for key in ("rows", "written", "calls"):
+            for key in ("rows", "written", "calls", "hyper_fallbacks"):
                 stats[key] += res[key]
             if remaining is not None:
                 remaining -= 1

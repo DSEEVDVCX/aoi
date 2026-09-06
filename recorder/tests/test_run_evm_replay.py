@@ -88,6 +88,7 @@ async def test_cycle_rotates_replay_networks(monkeypatch):
     assert calls[3:] == [{
         "networks": ["8453"], "limit": 1, "log": run_evm_replay._log,
         "budget_seconds": config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE,
+        "hyper": None,        # no adapter wired in this test: keyless, all public
     }]
     assert db.get_meta("evm_replay_next_network") == "143"
     assert stats["tokens"] == 1

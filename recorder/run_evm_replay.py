@@ -92,9 +92,11 @@ async def run_cycle(rpc, db, nodereal=None, hyper=None) -> dict:
     # This is the sole EVM writer. Keeping live application, backfill,
     # snapshots, contract checks, and historical replay in one connection
     # prevents concurrent SQLite writers from holding incompatible batches.
-    # `hyper` (Envio HyperSync) accelerates the backfill history reads of the
-    # networks it covers — Base, where the public 10K range cap is the whole
-    # queue. `None` is the normal no-key state: the backfill then runs on the
+    # `hyper` (Envio HyperSync) accelerates the history reads of the networks
+    # it covers — the backfill walk and, since 2026-09-06, the replay walk
+    # (measured log-for-log equal to the public node in
+    # `probe_hypersync_replay.py`); both fall back to the public node on any
+    # refusal. `None` is the normal no-key state: everything then runs on the
     # public node exactly as before.
     live = await evm_layer.run_evm_cycle(rpc, db, utcnow_iso(), hyper=hyper)
     if nodereal is not None:
@@ -112,6 +114,7 @@ async def run_cycle(rpc, db, nodereal=None, hyper=None) -> dict:
         limit=max(1, int(config.EVM_REPLAY_TOKENS_PER_CYCLE)),
         log=_log,
         budget_seconds=config.EVM_REPLAY_BUDGET_SECONDS_PER_CYCLE,
+        hyper=hyper,
     )
     now = utcnow_iso()
     combined = {**live, **stats, "network": network}

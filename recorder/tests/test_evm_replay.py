@@ -1210,6 +1210,119 @@ async def test_check_reports_without_touching_the_network(db):
     assert evm_replay._check(db) == 0
 
 
+# ---------------------------------------------------------------------------
+# The transport split: the paid history route, the public node in reserve
+#
+# Measured 2026-09-06 (`probe_hypersync_replay.py`): the paid route returned
+# the identical log multiset on every probed token, 2–3× faster, and one
+# dense Base window cost the public node 60 requests / 235 s for **zero**
+# logs that the paid route returned complete. But it cannot return block
+# timestamps — so the routing law under test here is: the heavy walk and the
+# mint scan leave, the single-block anchors stay.
+# ---------------------------------------------------------------------------
+def _hs_log(frm, to, value, block, token=TOK):
+    """A log in the converted HyperSync shape: every field the ledger reads,
+    and no `blockTimestamp` key at all — the node's exact time is the one
+    thing the paid route does not carry."""
+    out = _log(frm, to, value, block, token=token)
+    del out["blockTimestamp"]
+    return out
 
 
+class _Hyper:
+    """The Envio adapter as replay sees it: routing intent (`can_attempt`),
+    a one-query mint scan, and pages in the converted shape."""
+
+    def __init__(self, logs=(), mint=None, fail_walk=False, fail_mint=False):
+        self.logs = list(logs)
+        self.mint = mint
+        self.fail_walk = fail_walk
+        self.fail_mint = fail_mint
+        self.ranges = []
+        self.mint_scans = []
+
+    def can_attempt(self, network_id):
+        return str(network_id) == NET
+
+    async def first_mint_block(self, _net, address, head):
+        self.mint_scans.append((address.lower(), int(head)))
+        if self.fail_mint:
+            raise RuntimeError("key pool empty")
+        return self.mint
+
+    async def get_logs_paged(self, _net, _addrs, lo, hi, **_kw):
+        self.ranges.append((lo, hi))
+        if self.fail_walk:
+            raise RuntimeError("429 across every key")
+        return list(self.logs), 1, True, int(hi)
+
+
+async def test_the_walk_and_mint_scan_leave_the_anchors_stay(db):
+    """`can_attempt` routes the two heavy reads to the paid route; the public
+    node keeps the anchor calls it is uniquely good at — cheap, cached in
+    `evm_block_time`, and the only source of exact block times."""
+    _seed_watch(db, TOK, 3600, 1)
+    mint = _blk(4000)
+    hyper = _Hyper(
+        logs=[
+            _hs_log(ZERO, A, 1000, _blk(3000)),
+            _hs_log(A, B, 200, _blk(1500)),
+        ],
+        mint=mint,
+    )
+    rpc = _rpc([])                  # nothing to answer: it must not be asked
+
+    stats = await evm_replay.run_replay(
+        rpc, db, networks=[NET], sleep=_noop, hyper=hyper,
+    )
+
+    assert stats["done"] == 1 and stats["hyper_fallbacks"] == 0
+    assert hyper.mint_scans and hyper.ranges[0][0] == mint
+    assert rpc.ranges == [] and rpc.mint_scans == []    # the public node walked nothing
+    assert rpc.blocks_asked                             # the anchors are still its job
+    state = db.evm_replay_state(TOK, NET)
+    assert state["status"] == "done" and state["snapshots"] > 0
+    # And the timestamp-less logs still produced rows: interpolation plus the
+    # margin covers for the field the paid route cannot return.
+    assert db._conn.execute(
+        "SELECT COUNT(*) c FROM chain_concentration WHERE is_replay=1"
+    ).fetchone()["c"] == state["snapshots"]
+
+
+async def test_a_walk_refusal_falls_back_to_the_public_node(db):
+    """A paid-route refusal is a transport event, not a token verdict: the
+    public node walks the identical range — exactly once, because
+    `get_logs_paged` returns its logs only on success."""
+    _seed_watch(db, TOK, 3600, 1)
+    hyper = _Hyper(fail_walk=True)
+    rpc = _rpc(_story())
+
+    stats = await evm_replay.run_replay(
+        rpc, db, networks=[NET], sleep=_noop, hyper=hyper,
+    )
+
+    assert stats["done"] == 1 and stats["hyper_fallbacks"] == 1
+    assert hyper.ranges and rpc.ranges == [hyper.ranges[0]]   # the same range, once
+    assert db.evm_replay_state(TOK, NET)["status"] == "done"
+
+
+async def test_a_mint_scan_refusal_uses_the_public_scan(db):
+    """The mint scan is replay's most valuable single call — a refusal sends
+    it to the public filter, not to a from-genesis walk."""
+    _seed_watch(db, TOK, 3600, 1)
+    mint = _blk(4000)
+    hyper = _Hyper(
+        logs=[_hs_log(ZERO, A, 1000, _blk(3000)), _hs_log(A, B, 200, _blk(1500))],
+        fail_mint=True,
+    )
+    rpc = _rpc(_story(), mint=mint)
+
+    stats = await evm_replay.run_replay(
+        rpc, db, networks=[NET], sleep=_noop, hyper=hyper,
+    )
+
+    assert stats["done"] == 1 and stats["hyper_fallbacks"] == 0   # the walk rode on
+    assert rpc.mint_scans                                      # the public scan answered
+    assert hyper.ranges[0][0] == mint                          # and the walk used its answer
+    assert db.evm_replay_state(TOK, NET)["status"] == "done"
 
