@@ -1,7 +1,8 @@
-"""اختبارات الموسِّم (بلا شبكة، بلا ساعة نظام).
+"""Labeler tests (no network, no system clock).
 
-تثبت خصائص عدم التسرّب قبل أي شيء: لا توسيم قبل نضج النافذة، سعر الدخول لا
-يسبق الإشارة، القمم من الشموع التالية حصراً، والتقسيم بالعملة لا بالصفّ.
+Leak-proofness properties come first: no labeling before the window matures,
+the entry price never precedes the signal, peaks come from the following bars
+only, and the split is by token, not by row.
 """
 import os
 from datetime import UTC
@@ -13,7 +14,7 @@ from db import RecorderDB
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 
-ENTRY = 1_785_000_000                      # لحظة الدخول (epoch)
+ENTRY = 1_785_000_000                      # the moment of entry (epoch)
 H = 3600
 
 
@@ -24,31 +25,31 @@ def db(tmp_path):
     d.close()
 
 
-def _bar(ts, o=1.0, h=1.0, low=1.0, c=1.0):
-    return {"ts": ts, "o": o, "h": h, "l": low, "c": c}
+def _bar(ts, o=1.0, h=1.0, low=1.0, c=1.0, **flags):
+    return {"ts": ts, "o": o, "h": h, "l": low, "c": c, **flags}
 
 
 def _series(*, entry_px=1.0):
-    """سلسلة معلومة النتائج: دخول 1.0، قمّة 3.0 في الساعة 2، قاع 0.5 في
-    الساعة 30، إغلاق نهائي 2.0."""
-    bars = [_bar(ENTRY, c=entry_px)]                       # شمعة الدخول
-    bars.append(_bar(ENTRY + 30 * 60, h=1.5, c=1.2))       # داخل أوّل ساعة
-    bars.append(_bar(ENTRY + 2 * H, h=3.0, c=2.5))         # القمّة (ساعة 2)
+    """A series with known outcomes: entry 1.0, peak 3.0 at hour 2, trough 0.5
+    at hour 30, final close 2.0."""
+    bars = [_bar(ENTRY, c=entry_px)]                       # the entry bar
+    bars.append(_bar(ENTRY + 30 * 60, h=1.5, c=1.2))       # inside the first hour
+    bars.append(_bar(ENTRY + 2 * H, h=3.0, c=2.5))         # the peak (hour 2)
     bars.append(_bar(ENTRY + 10 * H, h=2.0, c=1.8))
-    bars.append(_bar(ENTRY + 30 * H, h=1.0, low=0.5, c=0.6))  # القاع
-    bars.append(_bar(ENTRY + 48 * H, h=2.2, c=2.0))        # نهاية النافذة
+    bars.append(_bar(ENTRY + 30 * H, h=1.0, low=0.5, c=0.6))  # the trough
+    bars.append(_bar(ENTRY + 48 * H, h=2.2, c=2.0))        # end of the window
     return bars
 
 
-# ---------- compute_labels: دالة خالصة ----------
+# ---------- compute_labels: a pure function ----------
 
 def test_labels_from_a_known_series():
     out = labeler.compute_labels(_series(), ENTRY)
     assert out["status"] == "ok"
     assert out["entry_px"] == 1.0
     assert out["entry_lag_s"] == 0
-    assert out["max_gain_1h"] == pytest.approx(0.5)     # قمّة 1.5 خلال ساعة
-    assert out["max_gain_4h"] == pytest.approx(2.0)     # قمّة 3.0 في الساعة 2
+    assert out["max_gain_1h"] == pytest.approx(0.5)     # peak 1.5 within an hour
+    assert out["max_gain_4h"] == pytest.approx(2.0)     # peak 3.0 at hour 2
     assert out["max_gain_24h"] == pytest.approx(2.0)
     assert out["max_gain_48h"] == pytest.approx(2.0)
     assert out["max_drawdown_48h"] == pytest.approx(-0.5)
@@ -60,18 +61,20 @@ def test_labels_from_a_known_series():
 
 
 def test_entry_bar_never_precedes_the_signal():
-    """تسرّب معكوس: شمعة قبل الإشارة لا تصلح دخولاً ولا تُحسب قممها."""
+    """Reverse leak: a bar before the signal is not a valid entry, and its
+    peaks do not count."""
     bars = [_bar(ENTRY - 300, h=99.0, c=0.1), *_series()]
     out = labeler.compute_labels(bars, ENTRY)
-    assert out["entry_px"] == 1.0                        # لا 0.1 السابقة
-    assert out["max_gain_48h"] == pytest.approx(2.0)     # لا 99 السابقة
+    assert out["entry_px"] == 1.0                        # not the earlier 0.1
+    assert out["max_gain_48h"] == pytest.approx(2.0)     # not the earlier 99
 
 
 def test_entry_bars_own_high_is_not_counted_as_gain():
-    """قمّة شمعة الدخول نفسها قد تسبق تنفيذنا — لا تُحسب مكسباً."""
+    """The entry bar's own high may precede our execution — it does not count
+    as gain."""
     bars = [_bar(ENTRY, h=50.0, c=1.0), _bar(ENTRY + H, h=1.1, c=1.05)]
     out = labeler.compute_labels(bars, ENTRY)
-    assert out["max_gain_48h"] == pytest.approx(0.1)     # لا x50
+    assert out["max_gain_48h"] == pytest.approx(0.1)     # not x50
 
 
 def test_late_entry_bar_means_no_entry():
@@ -99,13 +102,28 @@ def test_admission_price_is_the_symmetric_watch_entry_price():
 
 
 def test_truncated_series_is_flagged_not_dropped():
-    """العملة الميّتة إشارة لا نقص — استبعادها يُدخل انحياز البقاء."""
+    """A dead coin is a signal, not a gap — excluding it introduces survivorship
+    bias."""
     bars = [_bar(ENTRY, c=1.0), _bar(ENTRY + 2 * H, h=1.2, low=0.05, c=0.08)]
     out = labeler.compute_labels(bars, ENTRY)
     assert out["status"] == "ok"
     assert out["bars_truncated"] == 1
     assert out["last_bar_lag_h"] == pytest.approx(46.0)
-    assert out["is_rug"] == 1                            # -92% ≤ عتبة -90%
+    assert out["is_rug"] == 1                            # -92% ≤ the -90% threshold
+
+
+def test_series_without_a_valid_peak_is_incomplete_not_ok():
+    bars = [
+        _bar(ENTRY, c=1.0),
+        _bar(ENTRY + H, h=1.1, c=1.0, h_suspect=1),
+    ]
+
+    out = labeler.compute_labels(bars, ENTRY)
+
+    assert out["status"] == "incomplete"
+    assert out["max_gain_24h"] is None
+    assert out["final_return_48h"] == pytest.approx(0.0)
+    assert out["is_rug"] == 0
 
 
 def test_zero_entry_price_is_rejected_not_divided_by():
@@ -120,17 +138,17 @@ def test_non_finite_admission_price_is_rejected(price):
     )["status"] == "no_entry"
 
 
-# ---------- التقسيم ----------
+# ---------- The split ----------
 
 def test_split_is_deterministic_and_by_token():
     a = labeler.assign_split("0xAbCd")
-    assert a == labeler.assign_split("0xabcd")           # حالة الأحرف لا تفرّق
+    assert a == labeler.assign_split("0xabcd")           # letter case does not matter
     assert all(labeler.assign_split("0xAbCd") == a for _ in range(50))
     splits = {labeler.assign_split(f"tok{i}") for i in range(300)}
-    assert splits == {"train", "val", "test"}            # الأقسام الثلاثة تظهر
+    assert splits == {"train", "val", "test"}            # all three splits appear
 
 
-# ---------- label_pending: تزايديّ وناضج فقط ----------
+# ---------- label_pending: incremental, mature only ----------
 
 def _seed_signal(db, sid, token, ts_iso):
     db.insert_signal({
@@ -178,7 +196,7 @@ def _iso(epoch):
 
 def test_only_mature_windows_are_labeled(db):
     _seed_signal(db, "old", "tokA", _iso(ENTRY))
-    _seed_signal(db, "fresh", "tokB", _iso(ENTRY + 40 * H))   # نافذتها لم تكتمل
+    _seed_signal(db, "fresh", "tokB", _iso(ENTRY + 40 * H))   # its window is not complete yet
     _seed_bars(db, "tokA", ENTRY)
 
     now = ENTRY + 48 * H + config.LABEL_MARGIN_SECONDS + 60
@@ -186,7 +204,7 @@ def test_only_mature_windows_are_labeled(db):
 
     assert stats["signals"] == 1
     keys = [r["key"] for r in db._conn.execute("SELECT key FROM outcomes WHERE kind='signal'")]
-    assert keys == ["old"]                               # الطازجة تُركت لدورة لاحقة
+    assert keys == ["old"]                               # the fresh one left for a later cycle
 
 
 def test_labeling_is_idempotent(db):
@@ -194,7 +212,7 @@ def test_labeling_is_idempotent(db):
     _seed_bars(db, "tokA", ENTRY)
     now = ENTRY + 49 * H
     assert labeler.label_pending(db, now_epoch=now)["signals"] == 1
-    assert labeler.label_pending(db, now_epoch=now)["signals"] == 0   # لا إعادة
+    assert labeler.label_pending(db, now_epoch=now)["signals"] == 0   # no re-labeling
 
 
 def test_signal_outcome_carries_labels_split_and_metadata(db):
@@ -213,10 +231,11 @@ def test_signal_outcome_carries_labels_split_and_metadata(db):
 
 
 def test_independence_flag_uses_the_gap_between_signals(db):
-    """69% من الإشارات متباعدة <5 دقائق — تكرار زائف يُعلَّم لا يُحذف."""
+    """69% of signals sit <5 minutes apart — a duplicate burst is labeled, not
+    deleted."""
     _seed_signal(db, "first", "tokA", _iso(ENTRY))
-    _seed_signal(db, "burst", "tokA", _iso(ENTRY + 600))       # بعد 10 دقائق
-    _seed_signal(db, "later", "tokA", _iso(ENTRY + 2 * H))     # بعد ساعتين
+    _seed_signal(db, "burst", "tokA", _iso(ENTRY + 600))       # 10 minutes later
+    _seed_signal(db, "later", "tokA", _iso(ENTRY + 2 * H))     # two hours later
     _seed_bars(db, "tokA", ENTRY)
     labeler.label_pending(db, now_epoch=ENTRY + 60 * H)
 
@@ -229,7 +248,7 @@ def test_watch_entries_including_control_get_labeled(db):
     db.upsert_watch("tokA", "56", "large_buy", "s1", 48, _iso(ENTRY))
     db.admit_control("tokC", "56", 48, _iso(ENTRY))
     _seed_bars(db, "tokA", ENTRY)
-    _seed_bars(db, "tokC", ENTRY, final=0.05)                  # الضابطة انهارت
+    _seed_bars(db, "tokC", ENTRY, final=0.05)                  # the control collapsed
     db.set_bars_state("tokA", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
     db.set_bars_state("tokC", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
 
@@ -241,10 +260,58 @@ def test_watch_entries_including_control_get_labeled(db):
     assert rows["tokA"]["is_control"] == 0
     assert rows["tokC"]["is_control"] == 1
     assert rows["tokC"]["is_rug"] == 1                         # -95%
-    assert rows["tokC"]["is_independent"] is None              # لا يخصّ المراقبة
+    assert rows["tokC"]["is_independent"] is None              # not for watch rows
     assert rows["tokC"]["design_version"] == 2
-    assert rows["tokC"]["analysis_eligible"] == 0
-    assert rows["tokC"]["exclusion_reason"] == "superseded_comparison_design"
+
+
+def test_window_labeled_when_bars_stopped_before_watch_end(db):
+    """A gappy series is labeled `ok` with the `bars_truncated` flag — not
+    parked forever.
+
+    Live measurement 2026-08-24: 1,900 mature windows unlabeled because the
+    last bars fetch preceded `watch_until` by hours, while the bars themselves
+    covered the window. The "last fetch" gate was blocking what it already
+    had the data for.
+    """
+    db.upsert_watch("tokT", "56", "large_buy", "s1", 48, _iso(ENTRY))
+    # A genuinely gappy series: the entry bar, then a void past the end.
+    db.insert_bars([
+        {"token_address": "tokT", "network_id": "56", "resolution": "5",
+         "ts": ENTRY, "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "fetched_at": "t"},
+        {"token_address": "tokT", "network_id": "56", "resolution": "5",
+         "ts": ENTRY + 3 * H, "o": 1.0, "h": 1.4, "l": 0.9, "c": 1.2,
+         "fetched_at": "t"},
+    ])
+    # The last fetch is 2h before the window's end — the old gate blocks this case.
+    db.set_bars_state("tokT", "56", "ok", 3, _iso(ENTRY + 46 * H))
+
+    stats = labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    assert stats["watches"] == 1
+    row = db._conn.execute(
+        "SELECT status, bars_truncated FROM outcomes WHERE kind='watch'"
+    ).fetchone()
+    assert row["status"] == "ok"
+    assert row["bars_truncated"] == 1
+
+
+def test_incomplete_watch_outcome_is_not_phase1_eligible(db):
+    db.admit_control("tokC", "56", 48, _iso(ENTRY), admission_price_usd=1.0)
+    db.insert_bars([
+        {"token_address": "tokC", "network_id": "56", "resolution": "5",
+         "ts": ENTRY + H, "o": 1.0, "h": 1.1, "l": 1.0, "c": 1.0,
+         "h_suspect": 1, "fetched_at": "t"},
+    ])
+    db.set_bars_state("tokC", "56", "ok", 1, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT status, analysis_eligible, exclusion_reason FROM outcomes"
+    ).fetchone()
+    assert row["status"] == "incomplete"
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "incomplete_metrics"
 
 
 def test_mature_watch_waits_until_bars_fetch_is_finalized(db):
@@ -278,6 +345,10 @@ def test_phase1_view_exposes_only_eligible_v2_watch_outcomes(db):
 
 
 def test_phase1_view_exposes_only_v3_outcomes(db):
+    db.upsert_static({
+        "token_address": "v3", "network_id": "56", "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY - 3 * 86400), "raw_json": "{}",
+    })
     db.admit_control(
         "v3", "56", 48, _iso(ENTRY), admission_price_usd=1.0,
         design_version=config.CONTROL_DESIGN_VERSION,
@@ -289,9 +360,154 @@ def test_phase1_view_exposes_only_v3_outcomes(db):
     assert [row["key"] for row in rows] == [f"v3:56:{_iso(ENTRY)}"]
 
 
+def test_young_v3_watch_is_quarantined_at_label_time(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "young", "network_id": "56", "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY - 3600), "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "young", "56", "large_buy", "s-young", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "young", ENTRY)
+    db.set_bars_state("young", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='young'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_gate_at_entry"
+
+
+def test_v3_watch_with_only_post_entry_age_is_unknown_at_entry(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "late-age", "network_id": "56",
+        "recorded_at": _iso(ENTRY + H),
+        "token_created_at": str(ENTRY - 3 * 86400), "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "late-age", "56", "large_buy", "s-late-age", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "late-age", ENTRY)
+    db.set_bars_state("late-age", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='late-age'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_v3_future_creation_timestamp_is_unknown_not_age_gate(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "future-age", "network_id": "56",
+        "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY + 86400), "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "future-age", "56", "large_buy", "s-future-age", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "future-age", ENTRY)
+    db.set_bars_state("future-age", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='future-age'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_age_filled_after_entry_is_not_treated_as_known_at_entry(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "filled-late", "network_id": "56",
+        "recorded_at": _iso(ENTRY), "token_created_at": None, "raw_json": "{}",
+    })
+    db.add_signal_comparison_window(
+        "filled-late", "56", "large_buy", "s-filled-late", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    db.set_static_created_at(
+        "filled-late", "56", str(ENTRY - 3 * 86400), _iso(ENTRY + H)
+    )
+    _seed_bars(db, "filled-late", ENTRY)
+    db.set_bars_state("filled-late", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='filled-late'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_unproven_age_is_unknown_at_entry(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY - H))
+    db.upsert_static({
+        "token_address": "unproven-age", "network_id": "56",
+        "recorded_at": _iso(ENTRY),
+        "token_created_at": str(ENTRY - 3 * 86400), "raw_json": "{}",
+    })
+    db._conn.execute(
+        "UPDATE token_static SET token_created_at_observed_at=NULL "
+        "WHERE token_address='unproven-age'"
+    )
+    db._conn.commit()
+    db.add_signal_comparison_window(
+        "unproven-age", "56", "large_buy", "s-unproven", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "unproven-age", ENTRY)
+    db.set_bars_state("unproven-age", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='unproven-age'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 0
+    assert row["exclusion_reason"] == "age_unknown_at_entry"
+
+
+def test_v3_window_before_gate_is_not_retroactively_age_filtered(db, monkeypatch):
+    monkeypatch.setattr(config, "AGE_GATE_ENABLED_AT", _iso(ENTRY + 10 * H))
+    db.add_signal_comparison_window(
+        "legacy-v3", "56", "large_buy", "s-legacy-v3", 48, _iso(ENTRY),
+        1.0, config.CONTROL_DESIGN_VERSION, "verified",
+    )
+    _seed_bars(db, "legacy-v3", ENTRY)
+    db.set_bars_state("legacy-v3", "56", "ok", 3, _iso(ENTRY + 48 * H + 60))
+
+    labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
+
+    row = db._conn.execute(
+        "SELECT analysis_eligible, exclusion_reason FROM outcomes "
+        "WHERE kind='watch' AND token_address='legacy-v3'"
+    ).fetchone()
+    assert row["analysis_eligible"] == 1
+    assert row["exclusion_reason"] is None
+
+
 def test_signal_without_bars_gets_an_auditable_status_row(db):
-    """بلا شموع لا نُسقط الصفّ بصمت — status=no_entry يبقى قابلاً للجرد
-    ولا يُعاد فحصه كل دورة إلى الأبد."""
+    """Without bars the row is not silently dropped — status=no_entry stays
+    auditable and is not re-examined every cycle forever."""
     _seed_signal(db, "s1", "ghost", _iso(ENTRY))
     stats = labeler.label_pending(db, now_epoch=ENTRY + 49 * H)
     assert stats["no_entry"] == 1
@@ -300,7 +516,7 @@ def test_signal_without_bars_gets_an_auditable_status_row(db):
     assert labeler.label_pending(db, now_epoch=ENTRY + 50 * H)["signals"] == 0
 
 
-# ---------- ترحيل outcomes القديم ----------
+# ---------- Migration of the old outcomes table ----------
 
 def test_old_empty_outcomes_table_is_replaced(tmp_path):
     import sqlite3
@@ -340,7 +556,7 @@ def test_old_outcomes_with_data_is_preserved_as_legacy(tmp_path):
     d = RecorderDB(p, SCHEMA)
     try:
         legacy = d._conn.execute("SELECT COUNT(*) FROM outcomes_legacy").fetchone()[0]
-        assert legacy == 1                                   # البيانات لم تُتلف
+        assert legacy == 1                                   # the data was not destroyed
         cols = {r["name"] for r in d._conn.execute("PRAGMA table_info(outcomes)")}
         assert "kind" in cols
     finally:

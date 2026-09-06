@@ -1,10 +1,12 @@
-"""اختبارات الطبقة البطيئة: صلاحيات المِنت وقابليّة التعديل وحيازة المطوّر.
+"""Tests for the slow layer: mint authorities, mutability, and developer holding.
 
-كل الأرقام في المُغلَّفات هنا مأخوذة من **ردود حيّة مقيسة** (2026-08-13) لا
-مُختلقة: عملات pump.fun على `spl-token-2022` تعيد `creators: []` و
-`updateAuthority: null` داخل امتداد `tokenMetadata`، وعملات `spl-token` القديمة
-تعيد سلطتها في `authorities[]` من DAS. الاختبارات تحرس هذا الفرق بالذات لأنّه
-موضع الخطأ الطبيعيّ: قراءة السلطة من مسار واحد تُصفّر نصف العملات.
+Every number in the envelopes here comes from **measured live replies**
+(2026-08-13), not invented ones: pump.fun tokens on `spl-token-2022` return
+`creators: []` and `updateAuthority: null` inside the `tokenMetadata`
+extension, while legacy `spl-token` tokens return their authority in
+`authorities[]` from DAS. The tests guard exactly this difference because it
+is where the natural mistake lives: reading the authority from one path
+zeroes out half the tokens.
 """
 import os
 
@@ -85,10 +87,10 @@ def _owner_accounts(*amounts, decimals=6):
 
 
 # ---------------------------------------------------------------------------
-# المستخرِج
+# The extractor
 # ---------------------------------------------------------------------------
 def test_extract_reads_revoked_authorities_as_null():
-    """الحالة الشائعة (45 من 48): السكّ والتجميد مشطوبان."""
+    """The common case (45 of 48): mint and freeze authorities revoked."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(), "asset": _asset_reply(mutable=True)},
         "tok", SOL, NOW, NOW, "sig-1",
@@ -103,7 +105,7 @@ def test_extract_reads_revoked_authorities_as_null():
 
 
 def test_extract_keeps_live_mint_authority():
-    """3 من 48: باب الطبع مفتوح — العنوان يُحفَظ لا مجرّد راية."""
+    """3 of 48: the mint door is open — the address itself is kept, not just a flag."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(mint_authority="DevWa11et", freeze_authority="FrzAuth"),
          "asset": _asset_reply(mutable=False)},
@@ -124,7 +126,7 @@ def test_extract_update_authority_from_token2022_extension():
 
 
 def test_extract_update_authority_from_das_for_legacy_token():
-    """21 من 48 على `spl-token` القديم: لا امتدادات، والسلطة من DAS وحده."""
+    """21 of 48 on legacy `spl-token`: no extensions, and the authority comes from DAS alone."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(program="spl-token", with_metadata_ext=False),
          "asset": _asset_reply(authorities=["MetaplexAuth"])},
@@ -135,20 +137,20 @@ def test_extract_update_authority_from_das_for_legacy_token():
 
 
 def test_extract_mutable_stays_null_when_das_failed():
-    """فشل DAS وحده: «لم نقس» ليست «غير قابلة للتعديل» (FR-007)."""
+    """DAS alone failing: "not measured" is not "immutable" (FR-007)."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(), "asset": None, "asset_error": "getAsset: JSON-RPC -32000"},
         "tok", SOL, NOW, NOW, None,
     )
     assert row is not None
     assert row["is_mutable"] is None
-    assert row["creator_count"] is None          # لا صفر: العدد غير معلوم
-    assert row["mint_authority"] is None         # وهذا مقيس فعلاً
+    assert row["creator_count"] is None          # not zero: the count is unknown
+    assert row["mint_authority"] is None         # this one IS measured
     assert row["supply"] == pytest.approx(999673699.453014)
 
 
 def test_extract_empty_creators_is_measured_zero():
-    """Token-2022 يعيد `creators: []` فعلاً ⇒ صفر **مقيس** حين ردّ DAS."""
+    """Token-2022 really returns `creators: []` ⇒ a **measured** zero when DAS replied."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(), "asset": _asset_reply(creators=())},
         "tok", SOL, NOW, NOW, None,
@@ -158,14 +160,15 @@ def test_extract_empty_creators_is_measured_zero():
 
 
 def test_extract_rejects_reply_without_mint_account():
-    """بلا حساب مِنت لا صفّ: صفٌّ كلّه NULL يُقرأ «بلا صلاحيات» وهي أخطر قراءة."""
+    """No mint account means no row: an all-NULL row would read as "no
+    authorities" — the most dangerous reading."""
     for env in (None, {}, {"mint": {"value": None}},
                 {"mint": {"value": {"data": {"program": "x"}}}}):
         assert extract.extract_chain_authority(env, "tok", SOL, NOW, NOW, None) is None
 
 
 def test_extract_dev_holding_percentage():
-    """حيازة المطوّر = مجموع حساباته ÷ المعروض، لا أكبر حساب."""
+    """Developer holding = the sum of their accounts ÷ supply, not the largest account."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(supply="1000000", decimals=6),
          "asset": _asset_reply(creators=["Dev1"]),
@@ -174,11 +177,12 @@ def test_extract_dev_holding_percentage():
         "tok", SOL, NOW, NOW, None,
     )
     assert row["dev_owner"] == "Dev1"
-    assert row["dev_holding_pct"] == pytest.approx(5.0)   # 50,000 من مليون
+    assert row["dev_holding_pct"] == pytest.approx(5.0)   # 50,000 of a million
 
 
 def test_extract_dev_holding_zero_when_owner_has_no_accounts():
-    """عنوان بلا حساب رمز = باع كلّ شيء ⇒ صفر **مقيس** لا NULL."""
+    """An address with no token account = sold everything ⇒ a **measured**
+    zero, not NULL."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(supply="1000000"), "asset": _asset_reply(creators=["Dev1"]),
          "dev_owner": "Dev1", "owner_accounts": _owner_accounts()},
@@ -193,12 +197,12 @@ def test_extract_dev_holding_null_when_second_call_failed():
          "dev_owner": "Dev1", "owner_accounts": None, "dev_error": "boom"},
         "tok", SOL, NOW, NOW, None,
     )
-    assert row["dev_owner"] == "Dev1"            # نعرف لِمن كنّا نقيس
+    assert row["dev_owner"] == "Dev1"            # we know whom we were measuring
     assert row["dev_holding_pct"] is None
 
 
 def test_extract_dev_holding_null_without_owner():
-    """لا عنوان ⇒ لم نسأل أصلاً ⇒ NULL لا صفر."""
+    """No address ⇒ never asked in the first place ⇒ NULL, not zero."""
     row = extract.extract_chain_authority(
         {"mint": _mint_reply(), "asset": _asset_reply()}, "tok", SOL, NOW, NOW, None,
     )
@@ -218,7 +222,7 @@ def test_extract_keeps_precision_on_large_supply():
 
 
 # ---------------------------------------------------------------------------
-# اختيار عنوان المطوّر
+# Picking the developer address
 # ---------------------------------------------------------------------------
 def test_pick_dev_owner_prefers_creator():
     owner = extract.pick_dev_owner({
@@ -240,16 +244,16 @@ def test_pick_dev_owner_falls_back_to_update_authority():
 
 
 def test_pick_dev_owner_none_when_nothing_known():
-    """الحالة الغالبة على pump.fun: لا منشئ ولا سلطة ⇒ لا نداء ثانٍ."""
+    """The dominant case on pump.fun: no creator and no authority ⇒ no second call."""
     assert extract.pick_dev_owner({"mint": _mint_reply(), "asset": _asset_reply()}) is None
     assert extract.pick_dev_owner(None) is None
 
 
 # ---------------------------------------------------------------------------
-# الدورة
+# The cycle
 # ---------------------------------------------------------------------------
 class _AuthRPC:
-    """عميل مزيّف للطبقة البطيئة. يعدّ النداءين ليُكشف نداءٌ لا لزوم له."""
+    """Fake client for the slow layer. Counts both calls so an unneeded one is exposed."""
 
     def __init__(self, replies=None, fail=None, dev_fail=(), key_missing=False,
                  balances=None):
@@ -264,7 +268,7 @@ class _AuthRPC:
     async def fetch_authority_raw(self, mint):
         self.calls.append(mint)
         if self._key_missing:
-            raise solana_rpc.ChainKeyMissing("ملف مفاتيح السلسلة غائب")
+            raise solana_rpc.ChainKeyMissing("the chain key file is missing")
         if mint in self._fail:
             raise solana_rpc.ChainRPCError("getAccountInfo: JSON-RPC -32603: boom")
         return self._replies.get(
@@ -308,7 +312,7 @@ async def test_auth_cycle_writes_row_and_state(db):
 
 
 async def test_auth_cycle_skips_second_call_without_owner(db):
-    """الحالة الغالبة: لا منشئ ولا سلطة ⇒ نداء واحد لا نداءان."""
+    """The dominant case: no creator and no authority ⇒ one call, not two."""
     _watch(db, "mint1")
     rpc = _AuthRPC()
 
@@ -339,7 +343,7 @@ async def test_auth_cycle_measures_dev_holding_when_creator_known(db):
 
 
 async def test_auth_cycle_survives_dev_call_failure(db):
-    """سقوط النداء الثاني يُسقط عموداً لا صفّاً."""
+    """The second call failing drops a column, not the row."""
     _watch(db, "mint1")
     rpc = _AuthRPC(
         replies={"mint1": {"mint": _mint_reply(), "asset": _asset_reply(creators=["Dev1"])}},
@@ -359,7 +363,7 @@ async def test_auth_cycle_survives_dev_call_failure(db):
     raw = decode_raw(
         db._conn.execute("SELECT raw_json FROM chain_authority").fetchone()["raw_json"]
     )
-    assert "dev_error" in raw                    # سبب الغياب مؤرشف لا مكتوم
+    assert "dev_error" in raw                    # the reason for the absence is archived, not suppressed
 
 
 async def test_auth_cycle_failure_marks_error_and_records_meta(db):
@@ -412,7 +416,7 @@ async def test_auth_missing_key_propagates_without_marking_tokens(db):
 
 
 async def test_auth_refresh_window_is_hourly_not_five_minutes(db):
-    """الفرق الجوهريّ عن الطبقة السريعة: لا سؤال ثانٍ بعد خمس دقائق."""
+    """The essential difference from the fast layer: no second ask after five minutes."""
     from datetime import datetime, timedelta
 
     _watch(db, "mint1")
@@ -422,7 +426,7 @@ async def test_auth_refresh_window_is_hourly_not_five_minutes(db):
 
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=600)).isoformat()
     await chain_layer.run_chain_auth_cycle(rpc, db, soon, sleep=_noop)
-    assert len(rpc.calls) == 1                   # عشر دقائق ليست نافذة تحديث
+    assert len(rpc.calls) == 1                   # ten minutes is not a refresh window
 
     later = (
         datetime.fromisoformat(NOW)
@@ -449,7 +453,7 @@ async def test_auth_error_retries_faster_than_refresh(db):
 
 
 async def test_auth_queue_is_independent_of_concentration_queue(db):
-    """طابوران منفصلان: تحديث السريعة لا يزعم أنّ البطيئة تحدّثت."""
+    """Two separate queues: updating the fast one does not claim the slow one was updated."""
     _watch(db, "mint1")
     rpc = _AuthRPC()
     await chain_layer.run_chain_auth_cycle(rpc, db, NOW, sleep=_noop)
@@ -467,6 +471,6 @@ async def test_auth_cycle_archives_raw_envelope(db):
     raw = decode_raw(
         db._conn.execute("SELECT raw_json FROM chain_authority").fetchone()["raw_json"]
     )
-    # ما أُسقط من الأعمدة لأنّه قِيس ثابتاً يبقى محفوظاً هنا.
+    # What was dropped from the columns because it measured constant stays preserved here.
     assert raw["asset"]["burnt"] is False
     assert raw["mint"]["value"]["data"]["program"] == "spl-token-2022"

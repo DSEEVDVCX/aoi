@@ -35,8 +35,8 @@ def _find_default_download() -> str | None:
 async def main() -> None:
     src = sys.argv[1] if len(sys.argv) > 1 else _find_default_download()
     if not src or not os.path.isfile(src):
-        print("الاستخدام: python import_privy_state.py <مسار privy_state.json>", flush=True)
-        print("(أو ضع الملف في مجلد api/ أو Downloads وشغّل بلا وسيطات)", flush=True)
+        print("Usage: python import_privy_state.py <path to privy_state.json>", flush=True)
+        print("(or put the file in the api/ folder or Downloads and run with no arguments)", flush=True)
         return
 
     from fomo_api.auth.credential_store import CredentialStore, StoredCredentials
@@ -57,12 +57,12 @@ async def main() -> None:
         ca_id=_c(raw.get("ca_id")),
     )
     if not creds.refresh_token:
-        print(">>> الملف لا يحتوي refresh_token — أعد الاستخراج بعد تسجيل الدخول.", flush=True)
+        print(">>> The file has no refresh_token — re-extract after signing in.", flush=True)
         return
 
     store = CredentialStore(settings.credential_state_file)
     store.save(creds)
-    print(f">>> حُفظت بيانات الاعتماد في {store.path} | قابلة للتجديد: {creds.is_refreshable()}", flush=True)
+    print(f">>> Credentials saved to {store.path} | refreshable: {creds.is_refreshable()}", flush=True)
 
     from fomo_api.auth.token_refresher import _call_privy_refresh
 
@@ -74,9 +74,9 @@ async def main() -> None:
         )
         store.save(StoredCredentials(access_token=r.get("access"), refresh_token=r.get("refresh"), pat=r.get("pat")))
         access = r.get("access")
-        print(">>> [OK] تجديد بلا متصفح نجح — النظام سيجدّد نفسه تلقائياً من الآن.", flush=True)
+        print(">>> [OK] Browserless refresh succeeded — the system renews itself automatically from now on.", flush=True)
     except Exception as exc:
-        print(f">>> تحذير: التجديد الفوري فشل ({exc})؛ سيُستخدم الرمز الملتقط.", flush=True)
+        print(f">>> Warning: the immediate refresh failed ({exc}); the captured token will be used.", flush=True)
         access = creds.access_token
 
     from fomo_api.clients.fomo_client import FomoClient
@@ -86,13 +86,13 @@ async def main() -> None:
         lb = await client.get_leaderboard(page=1, page_size=5, period="all")
         traders = lb["traders"] if isinstance(lb, dict) else lb.traders
         total = lb["total_items"] if isinstance(lb, dict) else lb.total_items
-        print(f">>> بيانات حيّة: {total} متداولاً في المتصدّرين", flush=True)
+        print(f">>> Live data: {total} traders on the leaderboard", flush=True)
         for t in (traders[:3] if isinstance(traders, list) else traders):
             print(f"      @{t['handle'] if isinstance(t, dict) else t.handle}", flush=True)
-        print(">>> اكتمل الإعداد. شغّل الخادم وسيعمل الاستخراج تلقائياً بلا تدخّل.", flush=True)
+        print(">>> Setup complete. Start the server and extraction runs automatically with no intervention.", flush=True)
     except Exception as exc:
-        print(f">>> فشل القراءة الحيّة ({type(exc).__name__}): الرمز غير صالح أو منتهٍ.", flush=True)
-        print(">>> أعد الاستخراج من Console بعد التأكّد من تسجيل الدخول في fomo.family.", flush=True)
+        print(f">>> Live read failed ({type(exc).__name__}): the token is invalid or expired.", flush=True)
+        print(">>> Re-extract from the Console after confirming you are signed in to fomo.family.", flush=True)
     finally:
         await client.aclose()
 

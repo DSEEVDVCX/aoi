@@ -1,19 +1,20 @@
-"""بناء جدول التدريب من النتائج الموسومة (المرحلة 2) — بلا شبكة.
+"""Build the training table from the labeled outcomes (stage 2) — no network.
 
-لكل صفّ في `outcomes` يبني `features.build_training_row` صفّاً كامل الميزات
-مقيَّداً بـ t=0، ويكتبه في `training_rows`. تزايديّ: الصفوف المبنية تُتخطّى إلّا
-مع `--rebuild`.
+For every row in `outcomes`, `features.build_training_row` builds a full-feature row
+pinned at t=0 and writes it to `training_rows`. Incremental: rows already built are
+skipped unless `--rebuild` is given.
 
-الفلترة تتبع PLAN §2.1: `asset_class='meme'` إلزاميّ للتدريب (الأرشيف يحوي BTC
-وأسهماً مرمّزة)، لكنّ السكربت يبني **كل** الأصناف ويكتب `asset_class` في الصفّ —
-الفصل عند الاستعلام لا عند الجمع، فلا نخسر إمكانية تحليل الأصناف الأخرى.
+Filtering follows PLAN §2.1: `asset_class='meme'` is mandatory for training (the
+archive holds BTC and tokenized stocks), but the script builds **all** classes and
+writes `asset_class` into the row — separation happens at query time, not at
+collection time, so we keep the ability to analyze the other classes.
 
-الاستعمال:
-    py build_training_rows.py --dry-run          # تقرير: كم صفّاً وأيّ ميزات فارغة
-    py build_training_rows.py                    # بناء تزايديّ
-    py build_training_rows.py --model-candidates-only  # الإشارات الحيّة المستقلّة فقط
-    py build_training_rows.py --rebuild          # إعادة بناء الكل
-    py build_training_rows.py --limit 200        # دفعة محدودة
+Usage:
+    py build_training_rows.py --dry-run          # report: how many rows, and which features are empty
+    py build_training_rows.py                    # incremental build
+    py build_training_rows.py --model-candidates-only  # only the independent live signals
+    py build_training_rows.py --rebuild          # rebuild everything
+    py build_training_rows.py --limit 200        # limited batch
 """
 from __future__ import annotations
 
@@ -123,17 +124,17 @@ def build(
 
 
 def coverage_report(rows: list[dict]) -> None:
-    """نسبة الحضور لكل ميزة — الفراغ الكامل يكشف عائلة معطوبة أو غير مغطّاة."""
+    """Presence ratio per feature — a completely empty one exposes a broken or uncovered family."""
     if not rows:
         return
     n = len(rows)
     filled = {
         c: sum(1 for r in rows if r.get(c) is not None) for c in features.FEATURE_COLUMNS
     }
-    print(f"\nتغطية الميزات على {n} صفّاً (المرتّبة تصاعدياً):")
+    print(f"\nFeature coverage over {n} rows (sorted ascending):")
     for c, k in sorted(filled.items(), key=lambda kv: kv[1]):
         pct = 100 * k / n
-        mark = "  ← فارغة تماماً" if k == 0 else ("  ← تغطية ضعيفة" if pct < 25 else "")
+        mark = "  ← completely empty" if k == 0 else ("  ← weak coverage" if pct < 25 else "")
         print(f"  {c:<28} {pct:5.1f}%{mark}")
 
 
@@ -174,19 +175,19 @@ def main() -> None:
                 if processed < take or processed == 0:
                     break
                 remaining -= processed
-        print(f"صفوف مبنيّة: {stats['built']} · بلا حدث مصدر: {stats['skipped_no_event']}")
+        print(f"rows built: {stats['built']} · no source event: {stats['skipped_no_event']}")
         if rows:
             classes: dict[str, int] = {}
             for r in rows:
                 cls = r.get("asset_class") or "unknown"
                 classes[cls] = classes.get(cls, 0) + 1
-            print("التوزيع بالصنف:", dict(sorted(classes.items(), key=lambda kv: -kv[1])))
+            print("Breakdown by class:", dict(sorted(classes.items(), key=lambda kv: -kv[1])))
             coverage_report(rows)
         if dry:
-            print("\n(dry-run — بلا كتابة)")
+            print("\n(dry-run — nothing written)")
         else:
             total = db._conn.execute("SELECT COUNT(*) FROM training_rows").fetchone()[0]
-            print(f"\nإجمالي training_rows: {total}")
+            print(f"\ntotal training_rows: {total}")
     finally:
         db.close()
 

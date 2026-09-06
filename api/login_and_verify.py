@@ -98,8 +98,8 @@ async def main() -> None:
         page = await context.new_page()
         await page.goto(APP, wait_until="domcontentloaded")
         print("=" * 70, flush=True)
-        print(">>> سجّل دخولك في نافذة المتصفح الآن. سيبدأ الاستخراج تلقائياً بعد الدخول.", flush=True)
-        print(f">>> (مهلة {LOGIN_TIMEOUT//60} دقائق)", flush=True)
+        print(">>> Sign in to fomo.family in the browser window now. Extraction starts automatically after sign-in.", flush=True)
+        print(f">>> (timeout {LOGIN_TIMEOUT//60} minutes)", flush=True)
         print("=" * 70, flush=True)
 
         token = await _harvest_token(page)
@@ -109,9 +109,9 @@ async def main() -> None:
             pass
 
     if not token:
-        print(">>> لم يُلتقط أي رمز دخول ضمن المهلة.", flush=True)
+        print(">>> No sign-in token captured within the timeout.", flush=True)
         return
-    print(">>> تم التقاط رمز دخول جديد. بدء الفحص الحيّ...", flush=True)
+    print(">>> New sign-in token captured. Starting the live checks...", flush=True)
     await _run_checks(token)
 
 

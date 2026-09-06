@@ -1,18 +1,21 @@
-"""إعادة حساب أعلام الذيول المستحيلة للشموع المخزّنة (بلا شبكة).
+"""Recompute impossible-wick flags for stored bars (no network).
 
-`h_suspect`/`l_suspect` تُحسب عند السحب منذ 2026-07-30، والشموع الأقدم أُدرجت
-بلا أعلام (كلّها 0 افتراضياً). هذا السكربت يعيد حسابها من `o/h/l/c` المخزّنة —
-الخام كافٍ، فلا نداء واحد على fomo.
+`h_suspect`/`l_suspect` have been computed at fetch time since 2026-07-30;
+older bars were inserted without flags (all defaulting to 0). This script
+recomputes them from the stored `o/h/l/c` — the raw data is enough, so not a
+single call goes to fomo.
 
-السبب: fomo تعيد أحياناً ذيلاً مستحيلاً (شوهد h = 2,626,092 لشمعة إغلاقها
-0.0219 = ×119 مليون، ومؤكَّد بإعادة سحب حيّة ⇒ تشوّه دائم في المنبع). أثره:
-`max_gain` وصل +3.78 مليار% في 4 صفوف، واللوحة عرضت +62,570,743,609%.
+Why: fomo sometimes returns an impossible wick (observed h = 2,626,092 on a
+bar whose close was 0.0219 = ×119 million, confirmed by a live re-fetch ⇒ a
+persistent distortion upstream). Its effect: `max_gain` reached +3.78 billion%
+in 4 rows, and the dashboard displayed +62,570,743,609%.
 
-القيم الخام **لا تُلمس**: نعلّم الذيل فقط ليُستبعد من حساب القمّة/القاع.
+The raw values are **never touched**: we only flag the wick so it is excluded
+from the high/low computation.
 
-الاستعمال:
-    py backfill_bar_flags.py --dry-run     # تقرير بلا كتابة
-    py backfill_bar_flags.py               # وسم الشموع المخالفة
+Usage:
+    py backfill_bar_flags.py --dry-run     # report without writing
+    py backfill_bar_flags.py               # flag the offending bars
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ if HERE not in sys.path:
 
 import config  # noqa: E402
 from db import RecorderDB  # noqa: E402
-from extract import bar_context_flags  # noqa: E402  (المرجع الوحيد لتعريف التشوّه)
+from extract import bar_context_flags  # noqa: E402  (the one reference defining distortion)
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -35,11 +38,11 @@ for _s in (sys.stdout, sys.stderr):
 
 
 def scan(db: RecorderDB) -> list[tuple[int, int, int, str, str, str, int]]:
-    """يعيد التغييرات المطلوبة: (h, l, c, token, network, resolution, ts).
+    """Returns the required changes: (h, l, c, token, network, resolution, ts).
 
-    الحكم بالسلسلة لا بالشمعة المعزولة (`bar_context_flags`) — نفس الدالة التي
-    يستعملها السحب الحيّ، فلا ينجرف تعريفان. نجمّع بالعملة/الشبكة/الدقّة لأنّ
-    الجار هو المرجع.
+    The verdict comes from the series, not the isolated bar (`bar_context_flags`)
+    — the same function live fetching uses, so the two definitions cannot drift.
+    We group by token/network/resolution because the neighbors are the reference.
     """
     series_keys = db._conn.execute(
         "SELECT DISTINCT token_address, network_id, resolution FROM token_bars"
@@ -72,13 +75,13 @@ def main() -> None:
         h_bad = sum(1 for c in changes if c[0])
         l_bad = sum(1 for c in changes if c[1])
         c_bad = sum(1 for c in changes if c[2])
-        print(f"شموع مفحوصة: {total}")
-        print(f"قمّة مستحيلة: {h_bad} · قاع مستحيل: {l_bad} · إغلاق مشوّه: {c_bad} "
-              f"· صفوف تحتاج تحديثاً: {len(changes)}")
+        print(f"bars scanned: {total}")
+        print(f"impossible high: {h_bad} · impossible low: {l_bad} · distorted close: {c_bad} "
+              f"· rows needing an update: {len(changes)}")
         if dry:
             for c in changes[:15]:
                 print(f"  {c[3][:14]}… ts={c[6]} h={c[0]} l={c[1]} c={c[2]}")
-            print("(dry-run — بلا كتابة)")
+            print("(dry-run — no writes)")
             return
         if changes:
             with db.batch():
@@ -87,9 +90,9 @@ def main() -> None:
                     "WHERE token_address=? AND network_id=? AND resolution=? AND ts=?",
                     changes,
                 )
-            print(f"وُسمت {len(changes)} شمعة. القيم الخام لم تُلمس.")
+            print(f"flagged {len(changes)} bars. Raw values untouched.")
         else:
-            print("لا تغيير.")
+            print("no changes.")
     finally:
         db.close()
 

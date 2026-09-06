@@ -1,8 +1,10 @@
-"""اختبارات الذاكرة المؤقّتة: بلا انتظارٍ حقيقيّ وبلا اعتمادٍ على جدولة الخيوط.
+"""Cache tests: no real waiting and no dependence on thread scheduling.
 
-الساعةُ والمُشعِلُ محقونان، فالبياتةُ تُصنع بتقديم عقربٍ لا بـ`sleep`، والتجديدُ
-الخلفيّ يُنفَّذ حين نقرّر نحن. اختبارٌ ينتظر ثانيتين هشّ، وآخرُ يعتمد على من يسبق
-من في الجدولة يفشل مرّةً من عشر — وكلاهما يجعل الفشلَ الحقيقيّ غيرَ مقروء.
+The clock and the spawner are injected, so expiry is produced by moving the
+hand rather than by `sleep`, and the background refresh runs when we decide. A
+test that waits two seconds is fragile, and one that depends on who the
+scheduler runs first fails one time in ten — and both make a real failure
+unreadable.
 """
 import threading
 
@@ -11,7 +13,7 @@ import pytest
 
 
 class Clock:
-    """عقربٌ يدويّ. `advance` هو الطريقةُ الوحيدة لمرور الزمن في هذه الاختبارات."""
+    """A manual clock. `advance` is the only way time passes in these tests."""
 
     def __init__(self, t: float = 1000.0) -> None:
         self.t = t
@@ -24,7 +26,7 @@ class Clock:
 
 
 class Spawner:
-    """يحتفظ بالتجديدات المؤجّلة ولا ينفّذها إلّا عند `run_all`."""
+    """Holds deferred refreshes and runs them only on `run_all`."""
 
     def __init__(self) -> None:
         self.pending: list = []
@@ -43,12 +45,12 @@ class Spawner:
 def memo():
     clock, spawn = Clock(), Spawner()
     memo = cache.TTLMemo(clock=clock, wall_clock=clock, spawn=spawn, error_backoff=15.0)
-    memo.clock, memo.spawn = clock, spawn      # للوصول من الاختبار
+    memo.clock, memo.spawn = clock, spawn      # for access from the test
     return memo
 
 
 def _counter():
-    """دالةُ حسابٍ تعدّ نداءاتها — بها نعرف «حُسب مرّةً» من «حُسب ثلاثةَ عشر»."""
+    """A compute function that counts its calls — how we tell "computed once" from "computed thirteen times"."""
     calls = []
 
     def compute():
@@ -58,7 +60,7 @@ def _counter():
     return compute, calls
 
 
-# --- الحساب البارد ---
+# --- cold computation ---
 def test_cold_call_computes_and_returns_fresh(memo):
     compute, calls = _counter()
     value, meta = memo.get("k", 60.0, compute)
@@ -81,27 +83,27 @@ def test_within_ttl_does_not_recompute(memo):
     assert memo.spawn.pending == []
 
 
-# --- البائتةُ تُقدَّم فوراً والتجديدُ في الخلف ---
+# --- the stale value is served immediately, the refresh happens in the back ---
 def test_stale_returns_old_value_without_waiting(memo):
-    """هذا هو جوهرُ التصميم: بعُمرٍ ساذجٍ كان الطلبُ الثاني عشر يدفع الثانيتين."""
+    """This is the heart of the design: with a naive lifetime, the twelfth request paid the two seconds."""
     compute, calls = _counter()
     memo.get("k", 60.0, compute)
     memo.clock.advance(61.0)
 
     value, meta = memo.get("k", 60.0, compute)
-    assert value == "v1"                     # القديمةُ رجعت فوراً
-    assert len(calls) == 1                   # ولم يُحسب شيءٌ في مسار الطلب
+    assert value == "v1"                     # the old one came back immediately
+    assert len(calls) == 1                   # and nothing was computed on the request path
     assert meta["stale"] is True
     assert meta["refreshing"] is True
 
-    assert memo.spawn.run_all() == 1          # التجديدُ كان مؤجّلاً فعلاً
+    assert memo.spawn.run_all() == 1          # the refresh really was deferred
     assert len(calls) == 2
     value, meta = memo.get("k", 60.0, compute)
     assert (value, meta["stale"], meta["refreshing"]) == ("v2", False, False)
 
 
 def test_only_one_refresh_in_flight(memo):
-    """طلباتُ الصفحة متوازية: بلا هذا الحرس تُشعل ثلاثةَ عشرَ مسحاً في آنٍ واحد."""
+    """A page's requests run in parallel: without this guard thirteen sweeps fire at once."""
     compute, calls = _counter()
     memo.get("k", 60.0, compute)
     memo.clock.advance(61.0)
@@ -115,7 +117,7 @@ def test_only_one_refresh_in_flight(memo):
 
 
 def test_concurrent_cold_callers_compute_once():
-    """حسابٌ واحد للبارد أيضاً — والخيوطُ هنا حقيقيّة لأنّ المُختبَر هو القفل."""
+    """One computation for the cold path too — and the threads here are real because what's under test is the lock."""
     started = threading.Event()
     release = threading.Event()
     calls: list[int] = []
@@ -143,9 +145,9 @@ def test_concurrent_cold_callers_compute_once():
     assert len(calls) == 1
 
 
-# --- الفشل ---
+# --- failure ---
 def test_failed_refresh_keeps_stale_value(memo):
-    """قاعدةٌ مشغولة تُسقط تجديداً؛ القيمةُ القديمة أفضلُ من لا شيء."""
+    """A busy database drops a refresh; the old value beats nothing."""
     calls: list[int] = []
 
     def compute():
@@ -167,7 +169,7 @@ def test_failed_refresh_keeps_stale_value(memo):
 
 
 def test_failure_respects_backoff_then_retries(memo):
-    """بلا تمهّلٍ يصير كلُّ طلبٍ محاولةً فاشلة جديدة — عشرُ محاولاتٍ في الدقيقة."""
+    """Without a backoff every request becomes a new failed attempt — ten tries a minute."""
     calls: list[int] = []
 
     def compute():
@@ -184,11 +186,11 @@ def test_failure_respects_backoff_then_retries(memo):
     memo.spawn.run_all()
     assert len(calls) == 2
 
-    memo.clock.advance(5.0)                   # داخل التمهّل ⇒ لا محاولة
+    memo.clock.advance(5.0)                   # inside the backoff ⇒ no attempt
     memo.get("k", 60.0, compute)
     assert memo.spawn.pending == []
 
-    memo.clock.advance(11.0)                  # انتهى التمهّل ⇒ محاولةٌ واحدة
+    memo.clock.advance(11.0)                  # backoff over ⇒ one attempt
     memo.get("k", 60.0, compute)
     assert memo.spawn.run_all() == 1
     assert memo.get("k", 60.0, compute)[0] == "recovered"
@@ -209,13 +211,13 @@ def test_error_backoff_argument_overrides_default(memo):
     memo.get("k", 60.0, compute, error_backoff=1.0)
     memo.spawn.run_all()
 
-    memo.clock.advance(2.0)                   # تمهّلٌ أقصر من الافتراضيّ (15ث)
+    memo.clock.advance(2.0)                   # a shorter backoff than the default (15s)
     memo.get("k", 60.0, compute, error_backoff=1.0)
     assert len(memo.spawn.pending) == 1
 
 
 def test_cold_failure_propagates(memo):
-    """لا قيمةَ تُقدَّم ⇒ الخطأ يخرج للمنادي: مسارُ FastAPI يعرضه، لا يكتمه."""
+    """No value to serve ⇒ the error goes out to the caller: FastAPI's path displays it, it doesn't swallow it."""
     def compute():
         raise sqlite_busy()
 
@@ -232,7 +234,7 @@ def test_warm_swallows_failure(memo):
     assert memo.get("j", 60.0, lambda: "other")[0] == "ok"
 
 
-# --- إدارة المفاتيح ---
+# --- key management ---
 def test_keys_are_independent(memo):
     memo.get("a", 60.0, lambda: "A")
     memo.get("b", 60.0, lambda: "B")
@@ -260,7 +262,7 @@ def test_zero_ttl_refreshes_every_call_but_never_blocks(memo):
     compute, calls = _counter()
     memo.get("k", 0.0, compute)
     value, meta = memo.get("k", 0.0, compute)
-    assert value == "v1"                      # ما زال بلا انتظار
+    assert value == "v1"                      # still without waiting
     assert meta["stale"] is True
     memo.spawn.run_all()
     assert len(calls) == 2

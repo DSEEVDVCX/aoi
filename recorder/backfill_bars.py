@@ -1,11 +1,12 @@
-"""استرجاع التاريخ السعري اليومي لكل العملات المجمّعة لحساب ATH موثوق.
+"""Backfill the daily price history of every collected token for a trustworthy ATH.
 
-واجهة ``getBarsNew`` تقصّ الاستجابة عند نحو 900 شمعة. لذلك نسحب بدقّة 1D
-ونتصفّح إلى الخلف باستعمال أقدم ختم عاد في الصفحة. الكتابة idempotent وحالة
-``historical_bars_state`` تجعل التشغيل قابلاً للاستئناف. لا تعتبر السلسلة صالحة
-للميزات إلا عندما تبلغ ``last_status='ok'``.
+The ``getBarsNew`` endpoint truncates the response at roughly 900 bars. So we
+fetch at 1D resolution and page backward using the oldest timestamp returned on
+each page. Writes are idempotent, and the ``historical_bars_state`` table makes
+runs resumable. The series only counts as valid for features once it reaches
+``last_status='ok'``.
 
-الاستخدام::
+Usage::
 
     py backfill_bars.py --dry-run
     py backfill_bars.py --max-calls 200
@@ -31,13 +32,13 @@ from features import epoch_of  # noqa: E402
 from recorder import _fetch_bars_raw  # noqa: E402
 
 RESOLUTION = "1D"
-EARLIEST_EPOCH = 1_420_070_400  # 2015-01-01؛ قبل تاريخ العملات التي نستهدفها
+EARLIEST_EPOCH = 1_420_070_400  # 2015-01-01; before any token date we target
 MAX_EMPTY_ATTEMPTS = 3
 PACING_SECONDS = 1.50
 
 
 def collected_tokens(db: RecorderDB) -> list[dict[str, Any]]:
-    """كل زوج عملة/شبكة ظهر في أي مصدر جمع، مع تاريخ الإنشاء إن توفر."""
+    """Every token/network pair seen in any collection source, with creation date when known."""
     rows = db._conn.execute(
         """WITH u AS (
                SELECT token_address, network_id FROM signal_events
@@ -188,14 +189,14 @@ async def run(
                     db.recompute_bar_flags(token, network, RESOLUTION)
                     stats["done"] += 1
                     break
-                if next_cursor >= cursor:  # حارس تقدّم ضد مغلّف منبع معطوب
+                if next_cursor >= cursor:  # progress guard against a broken upstream envelope
                     _save_state(db, token, network, cursor_to=cursor,
                                 oldest_ts=oldest, status="error", attempted=False)
                     stats["errors"] += 1
                     break
                 cursor = next_cursor
                 await sleep(PACING_SECONDS)
-            except Exception as exc:  # noqa: BLE001 — عملة واحدة لا توقف الكون كله
+            except Exception as exc:  # noqa: BLE001 — one token must not stop the whole run
                 consecutive_errors += 1
                 _save_state(db, token, network, cursor_to=cursor,
                             oldest_ts=None, status="error", added=0)
@@ -204,9 +205,10 @@ async def run(
                     f"{utcnow_iso()}: {token[:12]}…: {type(exc).__name__}: {exc}",
                 )
                 stats["errors"] += 1
-                # التوكن يتجدد على القرص، لكن العميل الحالي يحتفظ بالقديم.
-                # نخرج فوراً كي تعيد العملية التالية تحميل الاعتماد الطازج؛
-                # الاستمرار سيحوّل كل العملات الباقية إلى أخطاء وهمية.
+                # The token refreshes on disk, but the current client keeps the
+                # old one. Exit immediately so the next run reloads a fresh
+                # credential; continuing would turn every remaining token into
+                # spurious errors.
                 if type(exc).__name__ == "UnauthorizedError":
                     stats["stopped_reason"] = "session_expired"
                     return stats
@@ -230,7 +232,7 @@ def _load_client() -> Any:
 
     creds = CredentialStore(config.credential_state_path()).load()
     if creds is None or not creds.access_token:
-        raise RuntimeError("لا يوجد اعتماد fomo صالح في ملف الحالة.")
+        raise RuntimeError("No valid fomo credential in the state file.")
     return FomoClient(session_token=creds.access_token)
 
 
@@ -241,7 +243,7 @@ async def main() -> None:
         try:
             max_calls = max(0, int(sys.argv[sys.argv.index("--max-calls") + 1]))
         except (IndexError, ValueError):
-            raise SystemExit("--max-calls يحتاج عدداً صحيحاً") from None
+            raise SystemExit("--max-calls needs an integer") from None
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     client = None if dry_run else _load_client()
     try:

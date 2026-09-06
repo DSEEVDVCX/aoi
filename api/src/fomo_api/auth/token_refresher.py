@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -12,6 +15,40 @@ logger = logging.getLogger(__name__)
 _PRIVY_TOKEN_URL = "https://auth.privy.io/api/v1/sessions"
 _REFRESH_BEFORE_EXPIRY = 300  # renew 5 min before expiry
 _POLL_INTERVAL = 60
+
+
+def _expiry_of(token: str | None) -> float | None:
+    """The `exp` claim inside a JWT, or None when unreadable.
+
+    Same no-verification rule as `_did_of`: this is our own bookkeeping about a
+    token we already hold, never an authorization decision.
+    """
+    if not token:
+        return None
+    try:
+        body = token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(body)).get("exp")
+    except Exception:  # a token we cannot parse has no usable expiry
+        return None
+    return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def _did_of(token: str | None) -> str | None:
+    """The Privy DID (`sub`) inside a JWT, or None when unreadable.
+
+    Signature is NOT verified and must not be: this is used only to notice that
+    the identity on disk differs from the one in Redis, never to authorize.
+    """
+    if not token:
+        return None
+    try:
+        body = token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        sub = json.loads(base64.urlsafe_b64decode(body)).get("sub")
+    except Exception:  # a token we cannot parse simply has no comparable identity
+        return None
+    return str(sub) if sub else None
 
 
 class TokenRefresher:
@@ -25,6 +62,8 @@ class TokenRefresher:
         # restarts and the extractor keeps running with zero manual logins.
         self._cred_store = cred_store
         self._task: asyncio.Task[None] | None = None
+        # DID this loop is currently renewing; see _adopt_disk_identity.
+        self._identity: str | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._loop(), name="token-refresher")
@@ -43,10 +82,74 @@ class TokenRefresher:
                 logger.warning("Token refresh error: %s", exc)
             await asyncio.sleep(_POLL_INTERVAL)
 
+    async def _adopt_disk_identity(
+        self, creds: dict[str, str | None]
+    ) -> dict[str, str | None]:
+        """Adopt the credential file when it holds a DIFFERENT Privy identity.
+
+        Redis is seeded from disk at boot and then kept in step by every
+        renewal, so normally the two agree and this is a no-op. But an account
+        can be switched out of band — the dashboard writes the credential file
+        directly — and this loop would otherwise keep renewing the OLD identity
+        and mirror it straight back over the new one, silently undoing the
+        switch within a poll interval.
+
+        The comparison is by DID, not by refresh_token, on purpose. Privy
+        rotates the refresh_token on every renewal, so "disk differs" is the
+        normal state for a moment after each write and, if a disk write ever
+        failed, disk would hold a spent token — adopting that would break
+        renewal outright. A different DID cannot happen by rotation; it only
+        happens when a human changed the account.
+
+        The identity we compare against is the one THIS loop last renewed, kept
+        in memory. Redis holds no single "current access token" to read back —
+        `update_access_tokens` fans a new token out across every active session
+        — so the refresher's own record is the only honest reference point. On
+        the first pass it is simply seeded from disk, which is also where
+        bootstrap seeded Redis from, so nothing is adopted spuriously at boot.
+        """
+        if self._cred_store is None:
+            return creds
+        try:
+            stored = self._cred_store.load()
+        except Exception as exc:  # an unreadable file must not stop renewal
+            logger.warning("Could not read credential file: %s", exc)
+            return creds
+        if stored is None or not stored.refresh_token:
+            return creds
+        disk_did = _did_of(stored.access_token)
+        if not disk_did:
+            return creds
+        if self._identity is None:
+            self._identity = disk_did
+            return creds
+        if disk_did == self._identity:
+            return creds
+        logger.info(
+            "Credential file holds a different Privy identity (%s -> %s); "
+            "adopting it for renewal",
+            self._identity,
+            disk_did,
+        )
+        self._identity = disk_did
+        await self._store.update_access_tokens(
+            stored.access_token, stored.refresh_token, stored.pat
+        )
+        adopted = dict(creds)
+        adopted.update(
+            refresh_token=stored.refresh_token,
+            pat=stored.pat or creds.get("pat"),
+            app_id=stored.app_id or creds.get("app_id"),
+            client_id=stored.client_id or creds.get("client_id"),
+            ca_id=stored.ca_id or creds.get("ca_id"),
+        )
+        return adopted
+
     async def _maybe_refresh(self) -> None:
         creds = await self._store.get_full_refresh_creds()
         if not creds:
             return
+        creds = await self._adopt_disk_identity(creds)
         app_id = creds.get("app_id")
         pat = creds.get("pat")
         if not app_id:
@@ -62,8 +165,12 @@ class TokenRefresher:
             stored = self._cred_store.load()
             if stored:
                 current_access = stored.access_token
+        refresh_token = creds.get("refresh_token")
+        if not refresh_token:
+            logger.warning("No Privy refresh token stored; cannot refresh token")
+            return
         result = await _call_privy_refresh(
-            refresh_token=creds["refresh_token"],
+            refresh_token=refresh_token,
             app_id=app_id,
             pat=pat,
             client_id=creds.get("client_id"),
@@ -163,6 +270,24 @@ async def _call_privy_refresh(
             "Privy refresh returned no app token and no current access token was "
             f"provided (session_update_action={data.get('session_update_action')!r})"
         )
+    # The comment above says `token: null` means "yours is still valid". That is
+    # Privy's intent but NOT a guarantee, and trusting it cost an hour of silent
+    # collection loss on 2026-08-20: Privy answered 200 + `ignore` every 60s while
+    # the retained token sat expired, and this function returned it, and the loop
+    # logged "refreshed successfully" — so nothing anywhere said the word wrong
+    # while the recorder took 401 on all 38 calls a cycle. A renewal that hands
+    # back an EXPIRED token has failed no matter what the envelope says, and it
+    # must say so: raising here leaves the spent token unpersisted, lets `_loop`
+    # log it, and retries on the next poll.
+    if data.get("token") is None:
+        exp = _expiry_of(access)
+        if exp is not None and exp <= time.time():
+            raise RuntimeError(
+                "Privy declined to mint a token "
+                f"(session_update_action={data.get('session_update_action')!r}) and "
+                f"the retained one expired {int(time.time() - exp)}s ago — this "
+                "session can no longer renew; a fresh login is required"
+            )
     return {
         "access": access,
         "refresh": data.get("refresh_token"),

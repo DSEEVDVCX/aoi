@@ -3,7 +3,8 @@
 SQLite ``VACUUM INTO`` reads a fixed snapshot even while WAL writes continue.
 Backups go outside the repository (AOI_BACKUP_DIR, or OneDrive/aoi-backups), are
 published atomically after verification, and old snapshots are pruned only from
-that dedicated directory.
+that dedicated directory. Staging directories left behind by interrupted runs
+are swept by the next backup before it checks free space.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
@@ -22,7 +24,15 @@ import config
 
 BACKUP_PREFIX = "recorder-"
 BACKUP_SUFFIX = ".db"
-DEFAULT_KEEP = 3
+STAGING_PREFIX = "aoi-backup-"
+# A real backup rewrites its staging continuously, so its mtime stays fresh;
+# the daily task interval is 24 h and the longest measured run ~1 h, so six
+# hours separates "abandoned" from "in flight" with room on both sides.
+STALE_STAGING_SECONDS = 6 * 3600
+# Two verified copies, not three: each is a full ~27 GB database, and at three
+# the OneDrive folder alone was 86 GB of the C: drive that ran out of space
+# (measured 2026-09-06). One previous copy still survives a corrupt newest.
+DEFAULT_KEEP = 2
 MIN_FREE_MULTIPLIER = 1.10
 
 
@@ -30,7 +40,7 @@ def default_backup_dir() -> Path:
     configured = os.environ.get("AOI_BACKUP_DIR")
     if configured:
         return Path(configured).expanduser()
-    onedrive = os.environ.get("OneDrive")  # noqa: SIM112 — اسمُه في ويندوز بهذا الرسم لا بالكبير
+    onedrive = os.environ.get("OneDrive")  # noqa: SIM112 — this is its exact casing on Windows
     if onedrive:
         return Path(onedrive) / "aoi-backups"
     raise RuntimeError(
@@ -78,6 +88,39 @@ def _clean_partials(destination: Path) -> None:
                 path.unlink(missing_ok=True)
 
 
+def _purge_stale_staging(
+    base: Path, *, max_age_seconds: float = STALE_STAGING_SECONDS,
+    now: float | None = None, emit: Callable[[str], None] | None = None,
+) -> list[Path]:
+    """Remove staging directories abandoned by interrupted backups.
+
+    A backup killed mid-run — task stop, reboot, crash — never executes its
+    ``TemporaryDirectory`` cleanup. Measured 2026-09-06: two such leftovers,
+    23.4 GB and 12 GB, sat in Temp for up to a week while the C: drive filled,
+    and being on the same drive as the destination they could also fail the
+    next backup's own free-space check — the tool rotting its own runway.
+
+    Only directories older than ``max_age_seconds`` are touched, so a backup
+    running in parallel (its staging rewritten continuously) is never
+    disturbed. A removal failure is reported, not raised: cleanup must not
+    fail a backup that would otherwise succeed.
+    """
+    say = emit or (lambda _message: None)
+    moment = time.time() if now is None else float(now)
+    removed: list[Path] = []
+    for path in base.glob(f"{STAGING_PREFIX}*"):
+        if not path.is_dir():
+            continue
+        try:
+            if moment - path.stat().st_mtime <= max_age_seconds:
+                continue
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError as exc:
+            say(f"stale staging removal failed path={path} error={exc}")
+    return removed
+
+
 def backup_database(
     db_path: str | os.PathLike[str],
     destination: str | os.PathLike[str],
@@ -91,11 +134,20 @@ def backup_database(
         raise FileNotFoundError(source_path)
     if keep < 1:
         raise ValueError("keep must be at least 1")
+    emit = log or (lambda _message: None)
 
     destination_path = validate_destination(Path(destination))
     destination_path.mkdir(parents=True, exist_ok=True)
     source_bytes = source_path.stat().st_size
     staging_root = Path(tempfile.gettempdir()).resolve()
+    # Before any space math: an interrupted run's staging is itself disk use,
+    # and on the same drive it can be the very reason the check fails.
+    purged = _purge_stale_staging(staging_root, emit=emit)
+    if purged:
+        emit(
+            f"removed {len(purged)} stale staging dir(s) from interrupted"
+            f" backups: {', '.join(path.name for path in purged)}"
+        )
     same_drive = os.path.splitdrive(staging_root)[0].lower() == os.path.splitdrive(
         destination_path
     )[0].lower()
@@ -114,17 +166,23 @@ def backup_database(
 
     final_path = destination_path / _backup_name()
     temp_path = destination_path / f".{final_path.name}.tmp"
-    source_uri = source_path.as_uri().replace("file:///", "file:/") + "?mode=ro"
 
     try:
         # OneDrive/network destinations can be much slower than the live WAL
         # update cadence. Snapshot to a local unmanaged temp directory first so
         # source changes cannot repeatedly restart a multi-gigabyte cloud write.
-        with tempfile.TemporaryDirectory(prefix="aoi-backup-") as staging_dir:
+        with tempfile.TemporaryDirectory(prefix=STAGING_PREFIX) as staging_dir:
             staged_path = Path(staging_dir) / "recorder.db"
-            emit = log or (lambda _message: None)
             emit("creating consistent local snapshot with VACUUM INTO")
-            with closing(sqlite3.connect(source_uri, uri=True, timeout=60)) as source:
+            # Read-write on purpose, not `?mode=ro`: a read-only connection
+            # cannot rebuild the WAL shared-memory index, and minutes after a
+            # hard service restart that index is stale — measured 2026-09-06,
+            # the read-only VACUUM then sat at zero output bytes while every
+            # writer in the system was stuck on "database is locked" for 20
+            # minutes, until the backup process itself was killed. A
+            # read-write connection recovers the index on open, and VACUUM
+            # INTO still never writes a single row of the source.
+            with closing(sqlite3.connect(source_path, timeout=60)) as source:
                 source.execute("PRAGMA busy_timeout=60000")
                 source.execute("VACUUM INTO ?", (str(staged_path),))
             if verify:
@@ -173,6 +231,19 @@ def main() -> int:
         if args.check_config:
             print(destination)
             return 0
+        from db import RecorderDB, utcnow_iso
+
+        def stamp(key: str, value: str) -> None:
+            try:
+                health_db = RecorderDB(args.db, config.SCHEMA_PATH)
+                try:
+                    health_db.note_error(key, value)
+                finally:
+                    health_db.close()
+            except Exception:  # noqa: BLE001 — health bookkeeping must not hide backup results
+                _log(f"health stamp failed key={key}")
+
+        stamp("backup_last_run_at", utcnow_iso())
         backup, removed = backup_database(
             args.db,
             destination,
@@ -180,10 +251,26 @@ def main() -> int:
             verify=not args.skip_verify,
             log=_log,
         )
+        stamp("backup_last_ok_at", utcnow_iso())
+        _log(f"backup_last_run_at={datetime.now(UTC).isoformat()}")
+        _log(f"backup_last_ok_at={datetime.now(UTC).isoformat()}")
         _log(f"backup ok path={backup} bytes={backup.stat().st_size} pruned={len(removed)}")
         print(backup)
         return 0
     except Exception as exc:  # noqa: BLE001 — scheduled pythonw process needs a durable failure record
+        try:
+            from db import RecorderDB, utcnow_iso
+
+            health_db = RecorderDB(args.db, config.SCHEMA_PATH)
+            try:
+                health_db.note_error(
+                    "last_error_backup",
+                    f"{utcnow_iso()}: {type(exc).__name__}: {exc}"[:400],
+                )
+            finally:
+                health_db.close()
+        except Exception:  # noqa: BLE001 — failure bookkeeping must not mask the original error
+            pass
         _log(f"backup failed: {type(exc).__name__}: {exc}")
         print(f"backup failed: {exc}", file=sys.stderr)
         return 1

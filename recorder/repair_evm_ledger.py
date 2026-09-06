@@ -8,6 +8,7 @@ training rows so the normal builder recreates them from corrected snapshots.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -19,27 +20,30 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import config  # noqa: E402
-from db import RecorderDB, decode_raw  # noqa: E402
+import evm_replay  # noqa: E402 — the final-status list lives in one place, not a copy
+from db import RecorderDB, decode_raw, utcnow_iso  # noqa: E402
+
+COHORT_META_KEY = "evm_repair_cohort"
 
 
-def _allowed_networks() -> set[str]:
+def allowed_networks() -> set[str]:
     return {
         *(str(network) for network in config.EVM_NETWORKS),
         *(str(network) for network in config.EVM_REPLAY_NETWORKS),
     }
 
 
-def _validated_networks(
+def validated_networks(
     networks: Sequence[str], *, require_all: bool = False,
 ) -> tuple[str, ...]:
     nets = tuple(dict.fromkeys(str(network) for network in networks))
-    allowed = _allowed_networks()
+    allowed = allowed_networks()
     refused = sorted(set(nets) - allowed)
     if refused:
-        raise ValueError(f"شبكات EVM غير مسموح بها: {', '.join(refused)}")
+        raise ValueError(f"disallowed EVM networks: {', '.join(refused)}")
     if require_all and set(nets) != allowed:
         raise ValueError(
-            "يجب إصلاح مجموعة شبكات EVM كاملة في عملية واحدة: "
+            "the full EVM network set must be repaired in one operation: "
             + ", ".join(sorted(allowed))
         )
     return nets
@@ -53,12 +57,85 @@ def _epoch(value: str) -> int:
     return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
 
 
-def _replay_pending(db: RecorderDB, networks: Sequence[str]) -> int:
+def _cohort(db: RecorderDB) -> dict | None:
+    raw = db.get_meta(COHORT_META_KEY)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def capture_cohort(db: RecorderDB, networks: Sequence[str]) -> dict:
+    existing = _cohort(db)
+    if existing is not None:
+        return existing
+    nets = validated_networks(networks, require_all=True)
+    live = {str(network) for network in config.EVM_NETWORKS}
+    replay = {str(network) for network in config.EVM_REPLAY_NETWORKS}
+    active_networks = tuple(sorted(live & set(nets)))
+    active_backfills = [
+        {"network_id": str(row["network_id"]),
+         "token_address": str(row["token_address"]).lower()}
+        for row in db._conn.execute(
+            f"""SELECT network_id, token_address FROM watchlist
+                WHERE active=1 AND network_id IN ({_marks(active_networks)})
+                ORDER BY network_id, token_address""", active_networks,
+        ).fetchall()
+    ] if active_networks else []
+    replay_windows = []
+    for target in db.evm_replay_targets(tuple(sorted(replay & set(nets)))):
+        for window in target.get("replay_windows", []):
+            replay_windows.append({
+                "network_id": str(target["network_id"]),
+                "token_address": str(target["token_address"]).lower(),
+                "first_seen_at": str(window["first_seen_at"]),
+                "watch_until": str(window["watch_until"]),
+            })
+    cohort = {
+        "version": 1,
+        "captured_at": utcnow_iso(),
+        "networks": sorted(nets),
+        "active_backfills": active_backfills,
+        "replay_windows": sorted(
+            replay_windows,
+            key=lambda row: (row["network_id"], row["token_address"], row["first_seen_at"]),
+        ),
+    }
+    db.set_meta(COHORT_META_KEY, json.dumps(cohort, sort_keys=True))
+    return cohort
+
+
+def _replay_pending(
+    db: RecorderDB, networks: Sequence[str],
+    cohort_windows: Sequence[dict] | None = None,
+) -> int:
     now = int(datetime.now(UTC).timestamp())
     step = max(1, int(config.EVM_REPLAY_STEP_SECONDS))
-    final = {"done", "negative", "empty", "no_time", "skip"}
+    final = set(evm_replay.FINAL_STATUSES)
     pending = 0
-    for target in db.evm_replay_targets(networks):
+    targets = db.evm_replay_targets(networks)
+    if cohort_windows is not None:
+        wanted: dict[tuple[str, str], list[dict]] = {}
+        for window in cohort_windows:
+            key = (str(window["network_id"]), str(window["token_address"]).lower())
+            wanted.setdefault(key, []).append(window)
+        by_key = {
+            (str(target["network_id"]), str(target["token_address"]).lower()): target
+            for target in targets
+        }
+        targets = []
+        for key, windows in wanted.items():
+            target = dict(by_key.get(key) or {
+                "network_id": key[0], "token_address": key[1],
+                "replay_windows": windows, "replay_status": None,
+                "replay_checkpoint_json": None,
+            })
+            target["replay_windows"] = windows
+            targets.append(target)
+    for target in targets:
         mature = [
             window for window in target.get("replay_windows", [])
             if _epoch(window["watch_until"]) <= now
@@ -82,7 +159,7 @@ def _replay_pending(db: RecorderDB, networks: Sequence[str]) -> int:
 
 
 def inspect(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
-    nets = _validated_networks(networks)
+    nets = validated_networks(networks)
     if not nets:
         return {"balances": 0, "live_snapshots": 0, "replay_snapshots": 0,
                 "backfills": 0, "cursors": 0, "training_rows": 0,
@@ -111,36 +188,56 @@ def inspect(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
         name: int(db._conn.execute(sql, nets).fetchone()[0])
         for name, sql in queries.items()
     }
+    cohort = _cohort(db)
     if live_nets:
         live_marks = _marks(live_nets)
-        result["active_pending"] = int(db._conn.execute(
-            "SELECT COUNT(*) FROM watchlist w LEFT JOIN evm_backfill_state b "
-            "ON b.network_id=w.network_id AND b.token_address=w.token_address "
-            f"WHERE w.active=1 AND w.network_id IN ({live_marks}) "
-            "AND COALESCE(b.status, '') <> 'done'",
-            live_nets,
-        ).fetchone()[0])
+        if cohort:
+            result["active_pending"] = sum(
+                1 for item in cohort.get("active_backfills", [])
+                if str(item.get("network_id")) in live_nets
+                and (db.evm_backfill_state(
+                    item["network_id"], item["token_address"]
+                ) or {}).get("status") != "done"
+            )
+        else:
+            result["active_pending"] = int(db._conn.execute(
+                "SELECT COUNT(*) FROM watchlist w LEFT JOIN evm_backfill_state b "
+                "ON b.network_id=w.network_id AND b.token_address=w.token_address "
+                f"WHERE w.active=1 AND w.network_id IN ({live_marks}) "
+                "AND COALESCE(b.status, '') <> 'done'",
+                live_nets,
+            ).fetchone()[0])
     else:
         result["active_pending"] = 0
     if replay_nets:
-        result["replay_pending"] = _replay_pending(db, replay_nets)
+        result["replay_pending"] = _replay_pending(
+            db, replay_nets,
+            cohort.get("replay_windows") if cohort else None,
+        )
     else:
         result["replay_pending"] = 0
+    training_params: tuple = (*nets, __import__("features").FEATURE_VERSION)
+    training_cutoff = _epoch(cohort["captured_at"]) if cohort else None
+    training_filter = ""
+    if training_cutoff is not None:
+        training_filter = " AND o.entry_ts <= ?"
+        training_params = (*nets, training_cutoff, __import__("features").FEATURE_VERSION)
     result["training_missing"] = int(db._conn.execute(
         f"""SELECT COUNT(*) FROM outcomes o
              WHERE o.network_id IN ({marks}) AND o.status IN ('ok','no_bars')
+               {training_filter}
                AND NOT EXISTS (
                    SELECT 1 FROM training_rows r
                     WHERE r.kind=o.kind AND r.key=o.key
                       AND r.feature_version=?
                )""",
-        (*nets, __import__("features").FEATURE_VERSION),
+         training_params,
     ).fetchone()[0])
     return result
 
 
 def reset(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
-    nets = _validated_networks(networks, require_all=True)
+    nets = validated_networks(networks, require_all=True)
     if not nets:
         return inspect(db, nets)
     marks = _marks(nets)
@@ -183,26 +280,35 @@ def reset(db: RecorderDB, networks: Sequence[str]) -> dict[str, int]:
 
 
 def finalize_training(db: RecorderDB, networks: Sequence[str]) -> int:
-    nets = _validated_networks(networks, require_all=True)
+    nets = validated_networks(networks, require_all=True)
     generation = db.evm_ledger_generation()
     state = inspect(db, nets)
     if state["active_pending"]:
         raise RuntimeError(
-            f"لا يمكن إنهاء الإصلاح: {state['active_pending']} دفتر EVM نشط غير مكتمل"
+            f"cannot finalize the repair: {state['active_pending']} "
+            f"incomplete active EVM ledgers"
         )
     if state["replay_pending"]:
         raise RuntimeError(
-            f"لا يمكن إنهاء الإصلاح: {state['replay_pending']} إعادة EVM غير مكتملة"
+            f"cannot finalize the repair: {state['replay_pending']} "
+            f"incomplete EVM replays"
         )
     if not nets:
         return 0
     marks = _marks(nets)
+    cohort = _cohort(db)
+    training_filter = ""
+    training_params: tuple = nets
+    if cohort:
+        training_filter = " AND entry_ts <= ?"
+        training_params = (*nets, _epoch(cohort["captured_at"]))
     started = db.get_meta("evm_training_rebuild_started") == "1"
     if not started:
         with db.batch():
             db.assert_evm_ledger_generation(generation)
             cur = db._conn.execute(
-                f"DELETE FROM training_rows WHERE network_id IN ({marks})", nets,
+                f"DELETE FROM training_rows WHERE network_id IN ({marks}){training_filter}",
+                training_params,
             )
             db.set_meta("evm_training_rebuild_started", "1")
         return int(cur.rowcount)
@@ -214,18 +320,23 @@ def finalize_training(db: RecorderDB, networks: Sequence[str]) -> int:
                 return 0
             db.set_meta("evm_training_rebuild_started", "0")
             db.set_meta("evm_ledger_rebuild_required", "0")
+            db._conn.execute("DELETE FROM meta WHERE key=?", (COHORT_META_KEY,))
     return 0
 
 
 def wait_and_finalize(
     db: RecorderDB, networks: Sequence[str], interval_seconds: int,
 ) -> None:
-    """انتظر اكتمال السلسلة، ثم دع البنّاء المجدول يعيد التدريب تدريجياً."""
+    """Wait for the chain to finish, then let the scheduled builder rebuild
+    training incrementally."""
     while True:
         state = inspect(db, networks)
         print(f"waiting: {state}", flush=True)
         if state["active_pending"] == 0 and state["replay_pending"] == 0:
             finalize_training(db, networks)
+            if db.get_meta("evm_ledger_rebuild_required") == "0":
+                print("EVM training rebuild complete", flush=True)
+                return
             state = inspect(db, networks)
             if state["training_missing"] == 0 and db.get_meta(
                 "evm_ledger_rebuild_required"
@@ -240,6 +351,7 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--finalize-training", action="store_true")
     parser.add_argument("--wait-finalize", action="store_true")
+    parser.add_argument("--capture-cohort", action="store_true")
     parser.add_argument("--interval", type=int, default=60)
     default_networks = sorted({
         *(str(network) for network in config.EVM_NETWORKS),
@@ -251,7 +363,9 @@ def main() -> int:
     try:
         before = inspect(db, args.networks)
         print(f"before: {before}")
-        if args.wait_finalize:
+        if args.capture_cohort:
+            print(json.dumps(capture_cohort(db, args.networks), sort_keys=True))
+        elif args.wait_finalize:
             wait_and_finalize(db, args.networks, args.interval)
         elif args.finalize_training:
             removed = finalize_training(db, args.networks)

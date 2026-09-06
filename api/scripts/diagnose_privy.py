@@ -40,7 +40,7 @@ async def main() -> None:
 
         page.on("request", on_request)
         await page.goto(URL, wait_until="domcontentloaded")
-        print(">>> افتح النافذة وسجّل دخولك الآن. بانتظار اكتشاف جلسة مصادَق عليها (حتى 5 دقائق)...", flush=True)
+        print(">>> Open the window and sign in now. Waiting to detect an authenticated session (up to 5 minutes)...", flush=True)
 
         _LS_SCRIPT = (
             "() => { const o={}; for(let i=0;i<localStorage.length;i++)"
@@ -82,7 +82,7 @@ async def main() -> None:
         with open(OUT, "w", encoding="utf-8") as f:
             json.dump({"summary": summary, "_full_localStorage": ls, "_cookies": cookies}, f, indent=2, default=str)
 
-        print(">>> تم الحفظ في", OUT, flush=True)
+        print(">>> Saved to", OUT, flush=True)
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
         await browser.close()
 

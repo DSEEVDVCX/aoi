@@ -1,8 +1,9 @@
-"""اختبارات حلقة سحب الشموع (بلا شبكة).
+"""Tests for the bar fetch loop (no network).
 
-تثبت السلوك الذي يحمي جمع البيانات: الجدولة الدوّارة تأخذ شريحة صغيرة، النافذة
-المطلوبة تشمل سياقاً قبل الإشارة، فشل عملة واحدة لا يُسقط الشريحة، والعملة بلا
-سلسلة سعرية تُوسَم no_data لتُستبعد لاحقاً.
+Locks in the behavior that protects data collection: the rotating schedule
+takes a small slice, the requested window includes context before the signal,
+one token's failure does not sink the slice, and a token with no price series
+is marked no_data to be excluded later.
 """
 import os
 from datetime import datetime, timedelta
@@ -25,7 +26,7 @@ def db(tmp_path):
 
 
 class _BarsClient:
-    """عميل وهمي يسجّل أجسام الطلبات ويعيد مغلّفات مُعدّة سلفاً."""
+    """Fake client recording request bodies and returning prepared envelopes."""
 
     def __init__(self, replies=None, fail_on=None):
         self.bodies = []
@@ -50,7 +51,7 @@ def _ok_envelope(n=3, base=1000):
 
 
 async def _noop(_seconds):
-    """يستبدل asyncio.sleep حتى لا تنتظر الاختبارات فواصل اللُّطف."""
+    """Stands in for asyncio.sleep so tests never wait out pacing gaps."""
 
 
 def _watch(db, token, first_seen=NOW):
@@ -72,8 +73,8 @@ async def test_bars_cycle_writes_candles_and_marks_state(db):
 
 
 async def test_bars_request_uses_pair_symbol_and_required_window(db):
-    """symbol="address:networkId" و from/to إلزاميان — العنوان المجرّد يرمي 502
-    وغيابهما يرمي 400 (كلاهما مؤكَّد حيّاً)."""
+    """symbol="address:networkId" and from/to are both required — a bare
+    address gets a 502 and missing ones get a 400 (both confirmed live)."""
     _watch(db, "tokA")
     client = _BarsClient()
 
@@ -83,14 +84,14 @@ async def test_bars_request_uses_pair_symbol_and_required_window(db):
     assert body["symbol"] == "tokA:56"
     assert body["resolution"] == config.BARS_RESOLUTION
     assert body["from"] < body["to"]
-    # النافذة تبدأ قبل الإشارة بساعات السياق المضبوطة
+    # the window starts hours of configured context before the signal
     expected_from = datetime.fromisoformat(NOW) - timedelta(hours=config.BARS_PRE_SIGNAL_HOURS)
     assert body["from"] == int(expected_from.timestamp())
     assert body["to"] == int(datetime.fromisoformat(NOW).timestamp())
 
 
 async def test_bars_window_is_capped_for_old_watches(db):
-    """مراقبة قديمة جداً لا تطلب مدى أوسع ممّا يعيده fomo أصلاً."""
+    """A very old watch must not request a wider range than fomo returns anyway."""
     old = (datetime.fromisoformat(NOW) - timedelta(days=30)).isoformat()
     _watch(db, "tokA", first_seen=old)
     client = _BarsClient()
@@ -119,7 +120,7 @@ async def test_one_failing_token_does_not_stop_the_slice(db):
     stats = await recorder.run_bars_cycle(client, db, NOW, sleep=_noop)
 
     assert stats["bars_errors"] == 1
-    assert stats["bars_tokens"] == 1              # tokB نجحت رغم فشل tokA
+    assert stats["bars_tokens"] == 1              # tokB succeeded despite tokA failing
     assert db.bars_count("tokB", "56") == 3
     rows = {r["token_address"]: r["last_status"]
             for r in db._conn.execute("SELECT * FROM bars_fetch_state")}
@@ -146,16 +147,16 @@ async def test_freshly_fetched_token_is_not_refetched_next_cycle(db):
     await recorder.run_bars_cycle(client, db, NOW, sleep=_noop)
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     await recorder.run_bars_cycle(client, db, soon, sleep=_noop)
-    assert len(client.bodies) == 1                # ما زالت طازجة
+    assert len(client.bodies) == 1                # still fresh
 
     later = (datetime.fromisoformat(NOW)
              + timedelta(seconds=config.BARS_REFRESH_SECONDS + 60)).isoformat()
     await recorder.run_bars_cycle(client, db, later, sleep=_noop)
-    assert len(client.bodies) == 2                # حان وقت التحديث
+    assert len(client.bodies) == 2                # refresh time arrived
 
 
 async def test_refetch_revises_in_progress_candle_without_duplicating(db):
-    """السحب المتكرّر يُراجع الشمعة الأخيرة ولا يُكرّر الصفوف."""
+    """A repeated fetch revises the last bar and does not duplicate rows."""
     _watch(db, "tokA")
     client = _BarsClient()
     await recorder.run_bars_cycle(client, db, NOW, sleep=_noop)
@@ -168,14 +169,14 @@ async def test_refetch_revises_in_progress_candle_without_duplicating(db):
              + timedelta(seconds=config.BARS_REFRESH_SECONDS + 60)).isoformat()
     await recorder.run_bars_cycle(client, db, later, sleep=_noop)
 
-    assert db.bars_count("tokA", "56") == 3       # لا تكرار
+    assert db.bars_count("tokA", "56") == 3       # no duplicates
     row = db._conn.execute("SELECT c FROM token_bars WHERE ts=1600").fetchone()
-    assert row["c"] == 9.9                        # القيمة المُراجَعة
+    assert row["c"] == 9.9                        # the revised value
 
 
-# --- شموع السوق الكلّي (macro) ---
+# --- macro (whole-market) bars ---
 async def test_macro_cycle_fetches_all_assets_hourly_resolution(db):
-    """كل أصول config.MACRO_BARS تُسحب بالدقّة الساعية وتُخزَّن في token_bars."""
+    """Every config.MACRO_BARS asset is fetched at hourly resolution and stored in token_bars."""
     client = _BarsClient()
 
     stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
@@ -188,7 +189,7 @@ async def test_macro_cycle_fetches_all_assets_hourly_resolution(db):
         assert ":" in body["symbol"]
     for _label, addr, net in config.MACRO_BARS:
         assert db.bars_count(addr, net) == 3
-        # الدقّة الساعية لا تتصادم مع شموع المراقبة (5 دقائق)
+        # hourly resolution does not collide with watch bars (5 minutes)
         row = db._conn.execute(
             "SELECT DISTINCT resolution FROM token_bars WHERE token_address=?", (addr,)
         ).fetchone()
@@ -196,13 +197,14 @@ async def test_macro_cycle_fetches_all_assets_hourly_resolution(db):
 
 
 async def test_macro_cycle_paces_itself_via_meta(db):
-    """دورة ضمن الساعة تخرج بلا نداء شبكة؛ بعد انتهاء الفاصل تسحب مجدّداً."""
+    """A cycle within the hour exits with no network call; once the interval
+    ends it fetches again."""
     client = _BarsClient()
     await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
 
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     stats = await recorder.run_macro_bars_cycle(client, db, soon, sleep=_noop)
-    assert len(client.bodies) == len(config.MACRO_BARS)   # لا سحب جديد
+    assert len(client.bodies) == len(config.MACRO_BARS)   # no new fetch
     assert stats["macro_rows"] == 0
 
     later = (datetime.fromisoformat(NOW)
@@ -225,25 +227,27 @@ async def test_macro_one_failing_asset_does_not_stop_others(db):
 
 
 async def test_macro_total_failure_retries_next_cycle_not_next_hour(db):
-    """انقطاع كامل لا يختم last_macro_bars_at — وإلّا أُرجئت الاستعادة ساعة
-    كاملة بسبب عابر (حدث فعلاً عند أول نشر)."""
+    """A total outage must not stamp last_macro_bars_at — otherwise recovery
+    would be deferred a full hour over something transient (which actually
+    happened at first rollout)."""
     all_addrs = {addr for _l, addr, _n in config.MACRO_BARS}
     client = _BarsClient(fail_on=all_addrs)
 
     stats = await recorder.run_macro_bars_cycle(client, db, NOW, sleep=_noop)
 
     assert stats["macro_errors"] == len(config.MACRO_BARS)
-    assert db.get_meta("last_macro_bars_at") is None      # لا ختم بلا نجاح
+    assert db.get_meta("last_macro_bars_at") is None      # no stamp without success
 
-    client._fail_on = set()                                # fomo تعافى
+    client._fail_on = set()                                # fomo recovered
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     stats = await recorder.run_macro_bars_cycle(client, db, soon, sleep=_noop)
-    assert stats["macro_rows"] == 3 * len(config.MACRO_BARS)  # استعادة فورية
+    assert stats["macro_rows"] == 3 * len(config.MACRO_BARS)  # immediate recovery
 
 
 async def test_macro_all_empty_replies_are_not_stamped_as_success(db):
-    """ردود «ناجحة» بلا شموع: بلا استثناء لكنها فشل. الختم عليها كان سيحوّل
-    تهيئة خاطئة إلى فجوة صامتة أبدية بلا أي خطأ مسجَّل."""
+    """"Successful" replies with no bars: no exception, but a failure. Stamping
+    them would have turned a bad deployment into an eternal silent gap with
+    no logged error."""
     no_data = {addr: {"responseObject": {"s": "no_data", "t": []}}
                for _l, addr, _n in config.MACRO_BARS}
     client = _BarsClient(replies=no_data)
@@ -253,16 +257,17 @@ async def test_macro_all_empty_replies_are_not_stamped_as_success(db):
     assert stats["macro_rows"] == 0
     assert stats["macro_errors"] == 0
     assert stats["macro_no_data"] == len(config.MACRO_BARS)
-    assert db.get_meta("last_macro_bars_at") is None      # لا ختم على فراغ
+    assert db.get_meta("last_macro_bars_at") is None      # no stamp on emptiness
     assert "no data" in (db.get_meta("last_error_macro") or "")
 
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     stats = await recorder.run_macro_bars_cycle(client, db, soon, sleep=_noop)
-    assert len(client.bodies) == 2 * len(config.MACRO_BARS)   # يعيد لا ينتظر ساعة
+    assert len(client.bodies) == 2 * len(config.MACRO_BARS)   # retries, does not wait an hour
 
 
 async def test_macro_partial_success_still_stamps(db):
-    """أصل نجح وأصلان فارغان: الختم يُكتب (إعادة ساعية للفارغين) ولا خطأ كليّ."""
+    """One asset succeeded, two empty: the stamp is written (hourly retry for
+    the empty ones) with no overall error."""
     no_data = {config.MACRO_BARS[0][1]: {"responseObject": {"s": "no_data", "t": []}}}
     client = _BarsClient(replies=no_data)
 

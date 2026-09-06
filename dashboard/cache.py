@@ -1,32 +1,39 @@
-"""ذاكرةٌ مؤقّتة للاستعلامات الثقيلة — تُقدَّم البائتةُ فوراً وتُجدَّد في الخلف.
+"""A cache for heavy queries — stale values are served instantly and refreshed in the background.
 
-المشكلة المقيسة: `/api/networks` كان يستهلك 2.2 ثانية من أصل 2.2 ثانية لكلّ
-تحديثٍ للوحة، لأنّ عقدةً واحدة فيه تمسح 3,073,284 سطراً من `market_ticks` لتُخرج
-**خمسة أسطر**. والصفحة تسأل كلَّ عشر ثوانٍ، فذلك 22٪ من نواةٍ محجوزةً دائماً
-لرقمٍ مضغوطٍ لا يتغيّر معناه في دقيقتين.
+The measured problem: `/api/networks` used to eat 2.2 seconds out of the 2.2
+seconds of every dashboard refresh, because a single node in it scans
+3,073,284 rows of `market_ticks` to produce **five rows**. And the page asks
+every ten seconds, which is 22% of a core permanently reserved for a compressed
+number whose meaning doesn't change in two minutes.
 
-ولماذا «تُقدَّم البائتة» ولا يُكتفى بعُمرٍ محدّد؟ لأنّ ذاكرةً ساذجةً بعُمر 120
-ثانية تنقل العطب لا تُزيله: أحدَ عشر تحديثاً يُجاب من الذاكرة، والثاني عشر يدفع
-الثانيتين كاملةً وينتظر المتصفّح. أمّا هنا فالطلبُ لا ينتظر أبداً بعد أوّل حساب:
-يأخذ آخرَ قيمةٍ معروفة ويرجع، ويجري التجديدُ في خيطٍ خلفيّ. الثمنُ المقبول أنّ
-الرقم قد يتأخّر ثانيةً أو ثانيتين عن التجديد — وهو رقمٌ عمرُه دقيقتان أصلاً.
+And why "serve the stale value" instead of settling for a fixed TTL? Because a
+naive cache with a 120-second TTL moves the outage, it doesn't remove it:
+eleven refreshes get answered from cache, and the twelfth pays the full two
+seconds while the browser waits. Here instead, a request never waits after the
+first computation: it takes the last known value and returns, and the refresh
+runs in a background thread. The accepted cost is that the number may lag the
+refresh by a second or two — a number that is two minutes old to begin with.
 
-وثلاثة حدودٍ مقصودة:
+And three deliberate limits:
 
-- **حسابٌ واحد لا ثلاثة عشر.** الصفحة تُطلق طلباتها كلَّها متوازيةً، فبلا قفلٍ
-  لكلّ مفتاح كان أوّلُ تحديثٍ بعد الإقلاع يُشعل نفسَ المسح مرّاتٍ في آنٍ واحد.
-- **فشلُ التجديد لا يُفقد القيمة.** قاعدةٌ مشغولة تُسقط تجديداً، فنُبقي القديمةَ
-  ونسجّل الخطأ ونتمهّل قبل إعادة المحاولة — وإلّا صار كلُّ طلبٍ محاولةً فاشلة.
-- **لا كتابة.** هذه ذاكرةُ عمليّة اللوحة وحدها: لا جدولَ تخزينٍ مؤقّت، ولا ختمَ
-  في `meta`، ولا فهرسَ يُبنى. القاعدةُ تبقى `mode=ro` كما هي.
+- **One computation, not thirteen.** The page fires all its requests in
+  parallel, so without a per-key lock the first refresh after boot would start
+  the same scan several times at once.
+- **A failed refresh never loses the value.** A busy database drops a refresh,
+  so we keep the old value, log the error, and back off before retrying —
+  otherwise every request became a failed attempt.
+- **No writes.** This is the dashboard process's own memory: no staging table,
+  no stamp in `meta`, no index being built. The database stays `mode=ro` as it is.
 
-والمُدخَلة لا تُعدَّل بعد نشرها (`frozen`): الفشلُ يستبدلها بنسخةٍ لا يُغيّرها في
-مكانها، فقارئٌ يحمل مرجعاً إليها لا يرى نصفَ تحديث.
+And an entry is never mutated after publication (`frozen`): failure replaces it
+with a modified copy, it doesn't edit it in place, so a reader holding a
+reference to it never sees a half-applied update.
 """
 from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -35,11 +42,11 @@ from typing import Any
 
 @dataclass(frozen=True)
 class _Entry:
-    """قيمةٌ محسوبة وزمنُها. لا تُعدَّل بعد النشر — تُستبدل بنسخةٍ معدّلة."""
+    """A computed value and its time. Never mutated after publication — replaced with a modified copy."""
 
     value: Any
-    computed_at: float          # ساعةٌ رتيبة (monotonic) — للعمر
-    computed_wall: float        # ساعةُ الحائط — للعرض فقط
+    computed_at: float          # monotonic clock — for age
+    computed_wall: float        # wall clock — display only
     error: str | None = None
     failed_at: float | None = None
 
@@ -48,7 +55,7 @@ class _State:
     __slots__ = ("entry", "lock", "refreshing")
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()      # يُسلسل الحسابَ الباردَ وحدَه
+        self.lock = threading.Lock()      # serializes the cold computation only
         self.entry: _Entry | None = None
         self.refreshing = False
 
@@ -62,11 +69,12 @@ def _iso(wall: float) -> str:
 
 
 class TTLMemo:
-    """ذاكرةٌ بمفاتيح، لكلّ مفتاحٍ عمرُه ومنطقُ تجديدِه.
+    """A keyed cache; each key has its own TTL and refresh logic.
 
-    الساعاتُ والمُشعِلُ قابلةٌ للحقن كي تُختبر البياتةُ والتجديدُ بلا انتظارٍ
-    حقيقيّ ولا سباقِ خيوط: اختبارٌ ينتظر ثانيتين ليرى انتهاءَ العمر اختبارٌ
-    هشّ، وآخرُ يعتمد على جدولة الخيوط اختبارٌ يفشل مرّةً من عشر.
+    The clocks and the spawner are injectable so that expiry and refresh can be
+    tested without real waiting and without thread races: a test that waits two
+    seconds to watch the TTL expire is a brittle test, and one that depends on
+    thread scheduling fails once in ten.
     """
 
     def __init__(
@@ -76,15 +84,17 @@ class TTLMemo:
         wall_clock: Callable[[], float] = time.time,
         spawn: Callable[[Callable[[], None]], None] = _spawn_thread,
         error_backoff: float = 15.0,
+        max_entries: int = 16,
     ) -> None:
         self._clock = clock
         self._wall = wall_clock
         self._spawn = spawn
         self._error_backoff = float(error_backoff)
+        self._max_entries = max(1, int(max_entries))
         self._lock = threading.Lock()
-        self._states: dict[str, _State] = {}
+        self._states: OrderedDict[str, _State] = OrderedDict()
 
-    # --- الواجهة ---
+    # --- Interface ---
     def get(
         self,
         key: str,
@@ -93,11 +103,12 @@ class TTLMemo:
         *,
         error_backoff: float | None = None,
     ) -> tuple[Any, dict[str, Any]]:
-        """يعيد (القيمة، وصفَ طزاجتها). لا ينتظر إلّا إن لم يكن هناك قيمةٌ بعد.
+        """Returns (value, freshness description). Waits only if there is no value yet.
 
-        `compute` بلا مُعامِلات وتفتح اتصالَها بنفسها: التجديدُ يجري في خيطٍ
-        خلفيّ بعد أن يُغلق الطلبُ الذي أشعله اتصالَه، فتمريرُ اتصالِ الطلب كان
-        سيُستعمل بعد إغلاقه.
+        `compute` takes no arguments and opens its own connection: the refresh
+        runs in a background thread after the request that triggered it has
+        closed its connection, so passing the request's connection would have
+        been used after it was closed.
         """
         backoff = self._error_backoff if error_backoff is None else float(error_backoff)
         now = self._clock()
@@ -106,7 +117,13 @@ class TTLMemo:
             if state is None:
                 state = _State()
                 self._states[key] = state
+            self._states.move_to_end(key)
             entry = state.entry
+            if len(self._states) > self._max_entries:
+                for old_key, old_state in tuple(self._states.items()):
+                    if old_key != key and not old_state.refreshing:
+                        self._states.pop(old_key)
+                        break
             spawn_refresh = False
             meta: dict[str, Any] | None = None
             if entry is not None:
@@ -123,7 +140,7 @@ class TTLMemo:
                 self._start_refresh(key, compute)
             return entry.value, meta
 
-        # بارد: لا شيء يُقدَّم، فلا مفرّ من الانتظار — وواحدٌ فقط يحسب.
+        # Cold: nothing to serve yet, so waiting is unavoidable — and only one caller computes.
         with state.lock:
             with self._lock:
                 existing = state.entry
@@ -137,10 +154,10 @@ class TTLMemo:
         return fresh.value, self._describe(fresh, 0.0, ttl, refreshing=False)
 
     def warm(self, key: str, ttl: float, compute: Callable[[], Any]) -> bool:
-        """يُسخّن مفتاحاً بلا إسقاط منادٍ. للاستدعاء من خيطٍ خلفيّ عند الإقلاع."""
+        """Warms a key without dropping the caller. For calling from a background thread at boot."""
         try:
             self.get(key, ttl, compute)
-        except Exception:  # noqa: BLE001 — تسخينٌ فاشل ليس عطباً في اللوحة
+        except Exception:  # noqa: BLE001 — a failed warmup is not a dashboard outage
             return False
         return True
 
@@ -152,7 +169,7 @@ class TTLMemo:
         with self._lock:
             self._states.clear()
 
-    # --- الداخل ---
+    # --- Internals ---
     def _describe(
         self, entry: _Entry, age: float, ttl: float, *, refreshing: bool
     ) -> dict[str, Any]:
@@ -176,7 +193,7 @@ class TTLMemo:
         return entry
 
     def _note_failure(self, key: str, exc: BaseException) -> None:
-        """يُبقي القيمةَ القديمة ويختم الفشل — فلا تصير كلُّ طلبيّةٍ محاولةً فاشلة."""
+        """Keeps the old value and stamps the failure — so not every request becomes a failed attempt."""
         detail = f"{type(exc).__name__}: {exc}"[:200]
         with self._lock:
             state = self._states.get(key)
@@ -188,7 +205,7 @@ class TTLMemo:
         def run() -> None:
             try:
                 value = compute()
-            except Exception as exc:  # noqa: BLE001 — تجديدٌ فاشل يُسجَّل لا يُرفع
+            except Exception as exc:  # noqa: BLE001 — a failed refresh is logged, not raised
                 self._note_failure(key, exc)
             else:
                 self._store(key, value)
@@ -201,5 +218,5 @@ class TTLMemo:
         self._spawn(run)
 
 
-# ذاكرةُ عمليّة اللوحة. واحدةٌ لأنّ العمليّة واحدة، ومُصفّاةٌ في الاختبارات.
+# The dashboard process's cache. One instance because there is one process; cleared in tests.
 MEMO = TTLMemo()

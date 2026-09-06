@@ -1,4 +1,4 @@
-"""اختبارات دورة الحائزين ومستخرجيها (بلا شبكة)."""
+"""Tests of the holders cycle and its extractors (no network)."""
 import os
 
 import config
@@ -30,7 +30,7 @@ def _watch(db, token, *, control=False, network="56"):
 
 
 def _token_details_envelope(*, top10=None, holders=None):
-    """يحاكي POST /proxy/tokenDetails — responseObject مباشر بلا قائمة."""
+    """Simulates POST /proxy/tokenDetails — a direct responseObject, no list."""
     ro = {}
     if top10 is not None:
         ro["top10HoldersPercent"] = top10
@@ -40,7 +40,7 @@ def _token_details_envelope(*, top10=None, holders=None):
 
 
 def _hodlers_top_envelope(*, total=None, positions=None):
-    """يحاكي GET /hodlers/top — responseObject قائمة عناصر لكل عملة."""
+    """Simulates GET /hodlers/top — responseObject is a list, one entry per token."""
     if positions is None:
         positions = []
     entry = {"totalHolders": total, "topHolders": positions}
@@ -48,7 +48,7 @@ def _hodlers_top_envelope(*, total=None, positions=None):
 
 
 # ---------------------------------------------------------------------------
-# مستخرِج tokenDetails
+# tokenDetails extractor
 # ---------------------------------------------------------------------------
 def test_extract_token_details_preserves_both_metrics():
     row = extract.extract_token_details_holders(
@@ -73,7 +73,7 @@ def test_extract_token_details_rejects_empty_envelope():
 
 
 def test_extract_token_details_accepts_partial_data():
-    """واحد من الاثنين موجود → صفّ صالح (FR-007: الغائب يبقى NULL)."""
+    """One of the two present → a valid row (FR-007: the missing one stays NULL)."""
     row_top10_only = extract.extract_token_details_holders(
         _token_details_envelope(top10=21.9),
         "tok", "56", NOW, NOW, None,
@@ -92,7 +92,7 @@ def test_extract_token_details_accepts_partial_data():
 
 
 # ---------------------------------------------------------------------------
-# مستخرِج hodlers/top
+# hodlers/top extractor
 # ---------------------------------------------------------------------------
 def test_extract_platform_holders_computes_aggregates():
     positions = [
@@ -123,7 +123,7 @@ def test_extract_platform_holders_computes_aggregates():
 
 
 def test_extract_platform_holders_handles_missing_unrealized():
-    """الربح غير المحقّق غائب في بعض المراكز → التقييم على القائمة فقط."""
+    """Unrealized PnL missing in some positions → the verdict covers the listed ones only."""
     positions = [
         {"value": 50.0, "unrealizedPnl": -10.0},
         {"value": 60.0},
@@ -144,7 +144,7 @@ def test_extract_platform_holders_rejects_empty_list():
 
 
 def test_extract_platform_holders_accepts_total_only():
-    """حشد موجود بلا تفصيل → صفّ بعدد كلّي (FR-007)."""
+    """A crowd present with no detail → a row with the total count (FR-007)."""
     row = extract.extract_platform_holders(
         _hodlers_top_envelope(total=118),
         "tok", "56", NOW, NOW, None,
@@ -156,10 +156,11 @@ def test_extract_platform_holders_accepts_total_only():
 
 
 # ---------------------------------------------------------------------------
-# دورة run_holders_cycle
+# the run_holders_cycle cycle
 # ---------------------------------------------------------------------------
 class _HoldersClient:
-    """عميل مزيّف. الفشل **لكل مصدر** لأنّ عزل المصدرين هو ما نختبره."""
+    """A fake client. Failure is **per source** — isolating the two sources is
+    what we are testing."""
 
     def __init__(self, details_replies=None, top_replies=None,
                  fail_details=None, fail_top=None):
@@ -211,8 +212,9 @@ async def test_holders_cycle_writes_two_rows_per_token(db):
     assert stats == {
         "holders_tokens": 2, "holders_details": 2,
         "holders_top": 2, "holders_errors": 0,
-        # الردّ المزيّف هنا بلا مفاتيح تدفّق ⇒ لا صفّ تدفّق. غياب التدفّق لا
-        # يمنع صفّ الحيازة، وهذا هو المقصود: مستخرِجان مستقلّان على ردّ واحد.
+        # The fake reply here carries no flow keys ⇒ no flow row. The absence
+        # of flow does not block the holders row — that is the point: two
+        # independent extractors on one reply.
         "flow_rows": 0,
     }
     rows = db._conn.execute(
@@ -228,7 +230,8 @@ async def test_holders_cycle_writes_two_rows_per_token(db):
 
 
 async def test_details_failure_does_not_block_platform_source(db):
-    """سقوط مصدر لا يُسقط الثاني — التركّز يغيب والحشد يُسجّل."""
+    """One source falling does not fell the other — concentration is missing
+    but the crowd is recorded."""
     _watch(db, "partial")
     client = _HoldersClient(
         top_replies={"partial": _hodlers_top_envelope(total=61)},
@@ -263,7 +266,8 @@ async def test_both_sources_failing_marks_state_error(db):
 
 
 async def test_holders_cycle_archives_raw_envelopes(db):
-    """الخام مضغوط في العمود — الأرشيف يسمح بإعادة الاستخراج بلا شبكة."""
+    """The raw is compressed in the column — the archive allows re-extraction
+    without a network."""
     _watch(db, "tok")
     client = _HoldersClient(
         details_replies={"tok": _token_details_envelope(top10=24.29, holders=500)},
@@ -289,11 +293,11 @@ async def test_holders_refresh_and_error_retry_windows(db, monkeypatch):
     client = _HoldersClient()
     await recorder.run_holders_cycle(client, db, NOW, sleep=_noop)
     calls_after_first = len(client.calls)
-    assert calls_after_first == 2               # مصدران لكل عملة
+    assert calls_after_first == 2               # two sources per token
 
     soon = (datetime.fromisoformat(NOW) + timedelta(seconds=60)).isoformat()
     await recorder.run_holders_cycle(client, db, soon, sleep=_noop)
-    assert len(client.calls) == calls_after_first    # ما زال طازجاً
+    assert len(client.calls) == calls_after_first    # still fresh
 
     later = (
         datetime.fromisoformat(NOW)
@@ -315,7 +319,8 @@ async def test_signal_token_precedes_control_when_capped(db, monkeypatch):
 
 
 async def test_token_id_carries_network_suffix(db):
-    """`tokenId` بلا ":networkId" يجعل الخادم يرمي 502 مضلّلاً — نثبّت الشكل."""
+    """A `tokenId` without ":networkId" makes the server throw a misleading
+    502 — we pin the shape."""
     _watch(db, "tok", network="8453")
     client = _HoldersClient()
 

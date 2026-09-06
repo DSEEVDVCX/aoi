@@ -1,4 +1,4 @@
-# تشغيل Fomo Family API
+# Run the Fomo Family API
 # Run from the api/ directory
 
 Write-Host "=== Fomo Family API ===" -ForegroundColor Cyan

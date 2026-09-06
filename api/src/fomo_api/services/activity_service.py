@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fomo_api.api.errors import VALIDATION_ERROR, ApiError, NotFoundError
@@ -11,7 +11,10 @@ from fomo_api.models.activity import TraderActivity
 
 def _parse_ts(ts: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC)
     except (ValueError, AttributeError):
         return None
 
@@ -30,19 +33,24 @@ class ActivityService:
         chain: str | None = None,
         token_id: str | None = None,
     ) -> tuple[list[TraderActivity], datetime, int | None] | None:
-        if from_ts and to_ts:
-            from_dt = _parse_ts(from_ts)
-            to_dt = _parse_ts(to_ts)
-            if from_dt is None or to_dt is None:
-                raise ApiError(VALIDATION_ERROR, "Invalid timestamp format; use RFC 3339", {})
-            if to_dt < from_dt:
-                raise ApiError(
-                    VALIDATION_ERROR, "Invalid time range: 'to' must be >= 'from'", {"from": from_ts, "to": to_ts}
-                )
+        from_dt = _parse_ts(from_ts) if from_ts else None
+        to_dt = _parse_ts(to_ts) if to_ts else None
+        if (from_ts and from_dt is None) or (to_ts and to_dt is None):
+            raise ApiError(VALIDATION_ERROR, "Invalid timestamp format; use RFC 3339", {})
+        if from_dt is not None and to_dt is not None and to_dt < from_dt:
+            raise ApiError(
+                VALIDATION_ERROR, "Invalid time range: 'to' must be >= 'from'", {"from": from_ts, "to": to_ts}
+            )
         page = max(1, page)
         page_size = max(1, min(page_size, settings.max_page_size))
         data = await self._client.get_trader_activity(
-            trader_id, page, page_size, from_ts, to_ts, chain, token_id
+            trader_id,
+            page,
+            page_size,
+            from_dt.isoformat() if from_dt is not None else None,
+            to_dt.isoformat() if to_dt is not None else None,
+            chain,
+            token_id,
         )
         if data is None:
             return None

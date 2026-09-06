@@ -38,7 +38,19 @@ class Settings(BaseSettings):
             "30d": "/v2/leaderboard/30d",
         }
     )
-    upstream_trader_path: str = Field(default="/v2/users/{trader_id}")  # CONFIRMED
+    # DEAD upstream since ~2026-08-19T14:53Z: this path answers 404 "User not
+    # found" for EVERY well-formed uuid — including ids /v2/leaderboard itself
+    # had just returned, and ids that returned 26 fields the hour before. It is
+    # kept only so the shape stays documented; use the batch path below.
+    upstream_trader_path: str = Field(default="/v2/users/{trader_id}")  # DEAD 2026-08-19
+    # CONFIRMED 2026-08-20: GET /v2/users?userIds=<uuid>&userIds=<uuid> -> 200
+    # {"responseObject": {"users": [...]}} with the same user objects the dead
+    # path used to return. Repeated params only — a comma-joined list and a JSON
+    # array both 400. Upstream caps the array at 100 ("Array must contain at
+    # most 100 element(s)"). An unknown-but-well-formed id is silently omitted
+    # from `users`; a MALFORMED id 400s the whole batch, so callers must filter.
+    upstream_traders_batch_path: str = Field(default="/v2/users")  # CONFIRMED
+    upstream_traders_batch_max: int = Field(default=100)  # CONFIRMED (upstream says so)
     upstream_trader_by_handle_path: str = Field(
         default="/v2/users/userHandle/{handle}"
     )  # CONFIRMED

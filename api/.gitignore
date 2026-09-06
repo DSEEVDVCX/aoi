@@ -1,0 +1,4 @@
+
+# Block-experiment browser profile (local login session — never pushed)
+.chk_profile/
+.privy_state.json.bak-*

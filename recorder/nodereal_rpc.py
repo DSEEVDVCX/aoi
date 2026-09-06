@@ -1,8 +1,9 @@
-"""عميل قراءة NodeReal لقياسات حائزي BSC.
+"""Read-only NodeReal client for BSC holder metrics.
 
-NodeReal يعيد عدد الحائزين الدقيق وأعلى الأرصدة مرتبة، وهما ما لا يقدمه
-ERC-20 من خلال JSON-RPC القياسي. المفتاح يُقرأ من الملف المحلي كل دورة ولا
-يُطبع أو يُحفظ في الاستجابة.
+NodeReal returns the exact holder count and the top balances ranked — the two
+things ERC-20 does not provide through standard JSON-RPC. The key is read
+from the local file every cycle and is never printed or stored in the
+response.
 """
 from __future__ import annotations
 
@@ -15,11 +16,11 @@ from provider_keys import KeyPool, read_keys
 
 
 class NodeRealError(RuntimeError):
-    """فشل طلب NodeReal."""
+    """A NodeReal request failed."""
 
 
 class NodeRealRateLimit(NodeRealError):
-    """NodeReal رفض الطلب بسبب CUPS أو الحصة."""
+    """NodeReal rejected the request due to CUPS or quota."""
 
 
 def _hex_int(value: Any) -> int | None:
@@ -35,23 +36,24 @@ def _hex_int(value: Any) -> int | None:
 
 
 def _result_value(result: Any) -> Any:
-    """يفكّ الغلاف الإضافي الذي تعيده بعض واجهات NodeReal."""
+    """Unwraps the extra envelope some NodeReal endpoints return."""
     if isinstance(result, dict) and set(result) == {"result"}:
         return result["result"]
     return result
 
 
 def _read_keys() -> list[str]:
-    """كل مفاتيح NodeReal: البيئة، ثمّ الجمع، ثمّ المفرد القديم.
+    """All NodeReal keys in order: the environment, then the plural, then the old singular.
 
-    (حُذف `_read_key()` المفرد: طريقُ قراءةٍ ثانٍ ميّت يعني تدويراً يُفقد بالخطأ
-    بلا أثر ظاهر. مسار الملف انتقل إلى رسالة الغياب في `_call`.)
+    (The singular `_read_key()` was deleted: a dead second read path means a
+    rotation silently lost by mistake. The file path moved to the
+    missing-key message in `_call`.)
     """
     return read_keys("nodereal_api_keys", "nodereal_api_key", "NODEREAL_API_KEY")
 
 
 class NodeRealRPC:
-    """عميل HTTP غير متزامن لواجهة BSC Enhanced API."""
+    """Async HTTP client for the BSC Enhanced API."""
 
     def __init__(self, timeout: float = 60.0) -> None:
         self._timeout = timeout
@@ -65,17 +67,17 @@ class NodeRealRPC:
         await self._client.aclose()
 
     def key_stats(self) -> dict[str, Any]:
-        """صورةُ حوض المفاتيح للرصد — أعدادٌ فقط، بلا أي قيمة (FR-013)."""
+        """A snapshot of the key pool for monitoring — counts only, no values (FR-013)."""
         if not hasattr(self, "_keys"):
             self._keys = KeyPool(_read_keys())
         try:
             self._keys.refresh(_read_keys())
-        except Exception:  # noqa: BLE001 — قراءةُ قرصٍ فاشلة لا تُسقط تقريراً
+        except Exception:  # noqa: BLE001 — a failed disk read must not sink the report
             pass
         return self._keys.stats()
 
     async def _step_aside(self, *, rejected: bool) -> None:
-        """المفتاح المرفوض يُدوَّر، والخدمة المتعطّلة تُمهَل. راجع `solana_rpc`."""
+        """A rejected key gets rotated; a down service gets a backoff. See `solana_rpc`."""
         if rejected and len(self._keys.keys) > 1:
             self._keys.rotate(block_current=True)
             return
@@ -87,8 +89,8 @@ class NodeRealRPC:
             self._keys = KeyPool(_read_keys())
         self._keys.refresh(_read_keys())
         if not self._keys.keys:
-            raise NodeRealError(f"مفاتيح NodeReal غائبة: {config.chain_keys_path()}")
-        # المحاولات لا تُشتقّ من عدد المفاتيح وحده (راجع `CHAIN_TRANSIENT_RETRIES`).
+            raise NodeRealError(f"NodeReal keys missing: {config.chain_keys_path()}")
+        # Attempts are not derived from the key count alone (see `CHAIN_TRANSIENT_RETRIES`).
         attempts = max(
             int(config.CHAIN_TRANSIENT_RETRIES) + 1, len(self._keys.keys),
         )
@@ -102,7 +104,7 @@ class NodeRealRPC:
                         await self._step_aside(rejected=True)
                         continue
                 elif response.status_code >= 500 and attempt + 1 < attempts:
-                    await self._step_aside(rejected=False)   # عطل الخدمة لا المفتاح
+                    await self._step_aside(rejected=False)   # service fault, not the key
                     continue
                 if response.status_code == 429:
                     raise NodeRealRateLimit(f"{method}: HTTP 429")
@@ -119,7 +121,7 @@ class NodeRealRPC:
             except Exception as exc:  # noqa: BLE001
                 raise NodeRealError(f"{method}: {type(exc).__name__}") from None
             if not isinstance(body, dict):
-                raise NodeRealError(f"{method}: رد غير متوقع")
+                raise NodeRealError(f"{method}: unexpected response")
             error = body.get("error")
             if error is not None:
                 code = error.get("code") if isinstance(error, dict) else None
@@ -132,27 +134,27 @@ class NodeRealRPC:
                     raise NodeRealRateLimit(f"{method}: {message[:160]}")
                 raise NodeRealError(f"{method}: {message[:160]}")
             if "result" not in body:
-                raise NodeRealError(f"{method}: لا توجد نتيجة")
+                raise NodeRealError(f"{method}: no result")
             return _result_value(body["result"])
-        raise NodeRealRateLimit(f"{method}: كل مفاتيح NodeReal مرفوضة مؤقتاً")
+        raise NodeRealRateLimit(f"{method}: all NodeReal keys temporarily rejected")
 
     async def holder_count(self, token: str) -> int | None:
         raw = _result_value(await self._call("nr_getTokenHolderCount", [token.lower()]))
         if raw is None:
-            return None  # المصدر لا يعرف بعض العقود؛ غياب مقيس لا صفر.
+            return None  # the source does not know some contracts; a measured absence, not zero.
         value = _hex_int(raw)
         if value is None or value < 0:
-            raise NodeRealError("nr_getTokenHolderCount: عدد غير مفهوم")
+            raise NodeRealError("nr_getTokenHolderCount: unparseable count")
         return value
 
     async def top_holders(self, token: str, top_n: int = 20) -> list[tuple[str, int]]:
-        # pageSize=100, pageKey="", topN=20. هذا يطلب ترتيباً تنازلياً من المصدر.
+        # pageSize=100, pageKey="", topN=20. This asks the source for descending order.
         result = await self._call(
             "nr_getTokenHolders", [token.lower(), "0x64", "", hex(int(top_n))],
         )
         details = result.get("details") if isinstance(result, dict) else None
         if not isinstance(details, list):
-            raise NodeRealError("nr_getTokenHolders: تفاصيل غير موجودة")
+            raise NodeRealError("nr_getTokenHolders: details missing")
         out: list[tuple[str, int]] = []
         for item in details:
             if not isinstance(item, dict):
@@ -169,7 +171,7 @@ class NodeRealRPC:
         )
         value = _hex_int(result)
         if value is None or value < 0:
-            raise NodeRealError("eth_call: قيمة غير مفهومة")
+            raise NodeRealError("eth_call: unparseable value")
         return value
 
     async def total_supply(self, token: str) -> int:

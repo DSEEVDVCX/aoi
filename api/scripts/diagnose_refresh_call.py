@@ -51,7 +51,7 @@ async def main() -> None:
 
         page.on("response", lambda r: asyncio.create_task(on_response(r)))
         await page.goto(URL, wait_until="domcontentloaded")
-        print(">>> سجّل دخولك الآن. بانتظار جلسة مصادَق عليها (حتى 5 دقائق)...", flush=True)
+        print(">>> Sign in now. Waiting for an authenticated session (up to 5 minutes)...", flush=True)
 
         # wait for login (refresh token present)
         for _ in range(150):
@@ -63,7 +63,7 @@ async def main() -> None:
                 pass
             await asyncio.sleep(2)
 
-        print(">>> تم تسجيل الدخول. إعادة تحميل الصفحة لتحفيز تجديد التوكن...", flush=True)
+        print(">>> Signed in. Reloading the page to trigger the token refresh...", flush=True)
         for _ in range(3):
             await asyncio.sleep(2)
             try:
@@ -87,7 +87,7 @@ async def main() -> None:
                 "response_json_keys": c.get("response_json_keys"),
             }
             print(json.dumps(safe, indent=2, ensure_ascii=False), flush=True)
-        print(f">>> التفاصيل الكاملة في {OUT}", flush=True)
+        print(f">>> Full details in {OUT}", flush=True)
         await browser.close()
 
 

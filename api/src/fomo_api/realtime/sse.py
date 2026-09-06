@@ -20,6 +20,7 @@ class SSEManager:
     detects dead consumers (research.md Decision 3, contracts/alerts-sse.md)."""
 
     HEARTBEAT_INTERVAL = 15
+    RETRY_MILLISECONDS = 5000
 
     def __init__(self, pubsub: Any) -> None:
         self._pubsub = pubsub
@@ -28,7 +29,7 @@ class SSEManager:
         self,
         subscription_id: str,
         tracked_trader_ids: list[str],
-    ) -> AsyncIterator[dict[str, str]]:
+    ) -> AsyncIterator[dict[str, Any]]:
         tracked_set = set(tracked_trader_ids)
         seen_ids: deque[str] = deque(maxlen=_MAX_SEEN_IDS)
         seen_set: set[str] = set()
@@ -38,7 +39,11 @@ class SSEManager:
         # was not actually joined until the consumer asked for a second event —
         # anything published in that window was lost.
         pubsub_conn = await self._pubsub.subscribe()
-        yield {"event": "subscribed", "data": json.dumps({"trader_ids": tracked_trader_ids})}
+        yield {
+            "event": "subscribed",
+            "data": json.dumps({"trader_ids": tracked_trader_ids}),
+            "retry": self.RETRY_MILLISECONDS,
+        }
 
         try:
             while True:
@@ -66,7 +71,12 @@ class SSEManager:
                     evicted = seen_ids[0]
                     seen_ids.popleft()
                     seen_set.discard(evicted)
-                yield {"event": "alert", "data": json.dumps(alert)}
+                yield {
+                    "event": "alert",
+                    "id": aid,
+                    "data": json.dumps(alert),
+                    "retry": self.RETRY_MILLISECONDS,
+                }
         except asyncio.CancelledError:
             pass
         finally:

@@ -1,7 +1,8 @@
-"""يجعل حزمة recorder قابلة للاستيراد في الاختبارات دون تثبيت.
+"""Makes the recorder package importable in tests without installation.
 
-يضيف مجلّد recorder/ (الأب) إلى sys.path حتى تعمل `import extract` و`import db`
-كما يستوردها كود المسجّل نفسه (استيراد مسطّح، لا حزمة).
+Adds the recorder/ directory (the parent) to sys.path so that `import extract`
+and `import db` work the same way the recorder code itself imports them
+(flat imports, not a package).
 """
 import os
 import sys

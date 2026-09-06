@@ -1,22 +1,25 @@
-"""صيغةُ ملفّ مفاتيح المزوّدين على القرص — قراءةً وكتابةً — **بلا أيّ اعتمادٍ محلّيّ**.
+"""The on-disk format of the provider keys file — for both reading and writing — **with no local dependencies**.
 
-هذا الملف لا يستورد `config` ولا أيَّ وحدةٍ من المشروع، وذلك عن قصد: اللوحة
-مشروعٌ منفصل له `config.py` خاصٌّ به، فإضافةُ `recorder/` إلى `sys.path` كانت
-ستجعل `import config` داخل وحدةٍ مشتركة تُصيب أحدَ الملفّين بحسب الترتيب — عطبٌ
-يظهر متأخّراً وفي عمليّةٍ واحدةٍ فقط. ولأنّه بلا اعتمادات، تحمّله اللوحة بمسارٍ
-صريح (`importlib`) بلا لمس `sys.path` أصلاً، فتبقى صيغةُ الملفّ **معرّفةً في
-مكانٍ واحد** يقرأه المسجّل ويكتبه اللوحة، لا في مكانين يتباعدان بهدوء.
+This module imports neither `config` nor any other module of the project, and that is
+deliberate: the dashboard is a separate project with its own `config.py`, so adding
+`recorder/` to `sys.path` would make `import config` inside a shared module resolve to
+one file or the other depending on order — a breakage that appears late and in only
+one process. And because it has no dependencies, the dashboard loads it by explicit
+path (`importlib`) without ever touching `sys.path`, so the file format stays
+**defined in one place** that the recorder reads and the dashboard writes, not in two
+places that quietly drift apart.
 
-الصيغة تقبل ثلاثة أشكالٍ لكلّ مزوّد، لأنّ الملفّ الموجود كُتب بيدٍ قبل التعدّد:
+The format accepts three shapes per provider, because the existing file was written by hand before there were multiple keys:
 
-    {"helius_api_key": "..."}                        المفرد القديم
-    {"helius_api_keys": ["...", "..."]}              الجمع
-    {"helius_api_keys": [{"key": "...", "label": "حساب رئيسي", "enabled": true}]}
+    {"helius_api_key": "..."}                        the old singular form
+    {"helius_api_keys": ["...", "..."]}              plural
+    {"helius_api_keys": [{"key": "...", "label": "main account", "enabled": true}]}
 
-الشكل الثالث هو ما تكتبه اللوحة: `label` اسمُ الحساب الذي جُلب منه المفتاح —
-وهو المعرّف البشريّ الوحيد المسموح، إذ لا تُعرض القيمة نفسها (FR-013). و`enabled`
-إيقافٌ مؤقّت: المفتاح يبقى في الملفّ ولا يدخل الحوض، فيُوقف مفتاحٌ مشتبَهٌ به بلا
-فقدان قيمته.
+The third shape is what the dashboard writes: `label` is the name of the account the
+key was taken from — the only human identifier allowed, since the value itself is
+never shown (FR-013). And `enabled` is a temporary off switch: the key stays in the
+file but never enters the pool, so a suspect key can be switched off without losing
+its value.
 """
 from __future__ import annotations
 
@@ -25,21 +28,23 @@ import os
 import tempfile
 from typing import Any
 
-# المزوّدون الثلاثة الذين لهم مفاتيح على هذا الجهاز. `plural`/`singular` أسماءُ
-# الحقول في الملفّ (يجب أن تطابق نداءات `provider_keys.read_keys`)، و`env` متغيّرُ
-# البيئة الذي **يتقدّم على الملفّ** — فإن كان مضبوطاً فلا معنى لتحرير الملفّ من
-# اللوحة، ويجب أن تقول اللوحة ذلك صراحةً بدل أن تكتب في فراغ.
+# The three providers that have keys on this machine. `plural`/`singular` are the
+# field names in the file (they must match the `provider_keys.read_keys` calls), and
+# `env` is the environment variable that **takes precedence over the file** — when it
+# is set, editing the file from the dashboard is pointless, and the dashboard must say
+# so explicitly instead of writing into a void.
 #
-# `probe` نداءُ التحقّق الأرخص لكلّ مزوّد، وعنوانُه يطابق ما يستعمله العميل فعلاً
-# (`config.SOLANA_RPC_URL`, `nodereal_rpc._call`, `goldrush_rpc._chunk`) — فحصٌ
-# لعنوانٍ آخر كان سيقول «سليم» عن مفتاحٍ لا يعمل حيث يُستعمل. يحرسه
+# `probe` is the cheapest verification call per provider, and its URL matches what the
+# client actually uses (`config.SOLANA_RPC_URL`, `nodereal_rpc._call`) — probing some
+# other URL would report "healthy" for a key that fails where it is actually used.
+# Guarded by
 # `tests/test_key_file.py::test_probe_endpoints_match_the_clients`.
 PROVIDERS: dict[str, dict[str, Any]] = {
     "helius": {
         "plural": "helius_api_keys",
         "singular": "helius_api_key",
         "env": "HELIUS_API_KEY",
-        "title": "Helius · سولانا",
+        "title": "Helius · Solana",
         "probe": {
             "method": "POST",
             "url": "https://mainnet.helius-rpc.com/?api-key={key}",
@@ -57,34 +62,65 @@ PROVIDERS: dict[str, dict[str, Any]] = {
             "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
         },
     },
-    "goldrush": {
-        "plural": "goldrush_api_keys",
-        "singular": "goldrush_api_key",
-        "env": "GOLDRUSH_API_KEY",
-        "title": "GoldRush · إعادة EVM",
+    # The next two providers build no blocks: they audit the EVM ledger in archive
+    # mode (`audit_evm_ledger.py`) because our public endpoints have no archive — the
+    # Robinhood node is only ~128 blocks deep. The live layer stays keyless (FR-012).
+    "alchemy": {
+        "plural": "alchemy_api_keys",
+        "singular": "alchemy_api_key",
+        "env": "ALCHEMY_API_KEY",
+        "title": "Alchemy · EVM archive",
         "probe": {
-            "method": "GET",
-            "url": "https://api.covalenthq.com/v1/eth-mainnet/events/",
-            "headers": {"authorization": "Bearer {key}"},
-            # أضيقُ نافذةٍ ممكنة: التحقّق من المفتاح لا جلبُ بيانات. و402 هنا
-            # هي بذاتها الجواب المطلوب («المفتاح صحيح والرصيد نفد»).
-            "params": {"starting-block": 1, "ending-block": 2, "page-size": 1},
+            "method": "POST",
+            # The probe hits Base, not Robinhood: this key serves both, and Base is a
+            # stable public slice — so a failed probe means the key, not the network.
+            "url": "https://base-mainnet.g.alchemy.com/v2/{key}",
+            "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
+        },
+    },
+    "drpc": {
+        "plural": "drpc_api_keys",
+        "singular": "drpc_api_key",
+        "env": "DRPC_API_KEY",
+        "title": "dRPC · Base archive",
+        "probe": {
+            "method": "POST",
+            "url": "https://lb.drpc.org/ogrpc?network=base&dkey={key}",
+            "json": {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
+        },
+    },
+    # Envio HyperSync: an indexed historical-data service, not JSON-RPC — the
+    # probe is a one-block query on the Base HyperSync endpoint with the key in
+    # the `Authorization: Bearer` header, so a 200 means the key is accepted
+    # there, and a 401 means the key, not the endpoint.
+    "envio": {
+        "plural": "envio_api_keys",
+        "singular": "envio_api_key",
+        "env": "ENVIO_API_KEY",
+        "title": "Envio · HyperSync Base",
+        "probe": {
+            "method": "POST",
+            "url": "https://base.hypersync.xyz/query",
+            "headers": {"Authorization": "Bearer {key}"},
+            "json": {"from_block": 0, "to_block": 1, "logs": []},
         },
     },
 }
 
-# أقصرُ مفتاحٍ يجوز إظهارُ ذيله. مفتاحٌ قصير (≤11) ذيلُه الرباعيّ جزءٌ معتبَرٌ من
-# مادّته، فلا يُظهر شيءٌ منه أصلاً: التمييز يسقط، والسرّ يبقى.
+# The shortest key whose tail may be shown. For a short key (≤11) the four-character
+# tail is a meaningful part of its substance, so none of it is shown at all: the
+# distinguishability is dropped, and the secret stays.
 _MIN_LENGTH_FOR_TAIL = 12
 TAIL_LENGTH = 4
 
 
 def tail(key: str) -> str:
-    """آخرُ أربعة أحرف للتمييز البشريّ بين مفتاحين — لا أكثر، وليس بصمة.
+    """The last four characters, to tell two keys apart by eye — nothing more, and not a fingerprint.
 
-    عرضُ كسرٍ من السرّ خفضٌ مقصودٌ لِـ FR-013 طلبَه المستخدم للتمييز، ومحصورٌ
-    هنا في دالّةٍ واحدة: لا يُكتب هذا الذيل في سجلٍّ ولا في `meta` ولا في تقرير
-    الأحواض، بل يُحسب لحظةَ طلبِ اللوحة ويعيش في استجابةٍ واحدة.
+    Showing a fragment of the secret is a deliberate relaxation of FR-013 that the
+    user requested for distinguishability, and it is confined to this one function:
+    the tail is never written to a log, to `meta`, or to the pools report — it is
+    computed at the dashboard's request and lives inside a single response.
     """
     text = key.strip()
     if len(text) < _MIN_LENGTH_FOR_TAIL:
@@ -93,10 +129,11 @@ def tail(key: str) -> str:
 
 
 def load(path: str) -> dict[str, Any]:
-    """محتوى الملفّ كما هو. الغياب والعطب سواءٌ: قاموسٌ فارغ لا استثناء.
+    """The file's content as-is. Missing and broken are the same thing: an empty dict, not an exception.
 
-    الغيابُ حالةٌ عاديّة (جهازٌ بلا مفاتيح بعد)، والعطبُ لا يجوز أن يُسقط
-    اللوحةَ ولا المسجّل — من يكتب هو من يجب أن يتعثّر، لا من يقرأ.
+    Absence is a normal state (a machine with no keys yet), and breakage must not take
+    down the dashboard or the recorder — the writer is the one who should trip, not
+    the reader.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -107,13 +144,14 @@ def load(path: str) -> dict[str, Any]:
 
 
 def entries(data: dict[str, Any], plural: str, singular: str) -> list[dict[str, Any]]:
-    """أسطرُ مزوّدٍ واحد موحَّدةً: `{key, label, enabled}` — **بما فيها المعطّلة**.
+    """One provider's rows, normalized: `{key, label, enabled}` — **disabled ones included**.
 
-    الجمعُ يحجب المفردَ حتى لو كان فارغاً: قائمةٌ فارغة تعني «حُذف آخرُ مفتاح»
-    وليست «ارجع إلى القيمة القديمة»، وإلّا عاد المحذوفُ من قبره عند أوّل قراءة.
+    The plural shadows the singular even when it is empty: an empty list means "the
+    last key was deleted", not "fall back to the old value" — otherwise the deleted
+    key would rise from its grave on the very first read.
 
-    والمعطّلةُ مُدرَجةٌ هنا لأنّ اللوحة تحتاج أن تعرضها لتُعيد تشغيلها؛ ومَن
-    يبني الحوض (`provider_keys.read_keys`) هو مَن يُصفّيها.
+    The disabled ones are listed here because the dashboard needs to show them in order
+    to re-enable them; the pool builder (`provider_keys.read_keys`) filters them out.
     """
     raw = data.get(plural)
     candidates = raw if isinstance(raw, list) else [data.get(singular)]
@@ -125,7 +163,7 @@ def entries(data: dict[str, Any], plural: str, singular: str) -> list[dict[str, 
         elif isinstance(item, dict):
             key = str(item.get("key") or "").strip()
             label = str(item.get("label") or "").strip()
-            # الغيابُ تشغيلٌ: سطرٌ كتبه إنسانٌ بيده بلا `enabled` مفتاحٌ عامل.
+            # Absence means enabled: a row a human typed by hand without `enabled` is a working key.
             enabled = item.get("enabled", True) is not False
         else:
             continue
@@ -143,17 +181,18 @@ def load_entries(path: str, plural: str, singular: str) -> list[dict[str, Any]]:
 def save_entries(
     path: str, plural: str, singular: str, rows: list[dict[str, Any]],
 ) -> None:
-    """يكتب أسطرَ مزوّدٍ واحد ويُبقي كلَّ ما عداه في الملفّ كما هو.
+    """Writes one provider's rows and leaves everything else in the file untouched.
 
-    ثلاثةُ احتياطاتٍ لأنّ هذا الملفّ يقرأه المسجّل **عند كلّ نداء**:
+    Three precautions, because the recorder reads this file **on every call**:
 
-    1. `os.replace` على ملفٍّ مؤقّتٍ في نفس المجلّد — استبدالٌ ذرّيّ. الكتابةُ
-       فوق الأصل مباشرةً تعني نافذةً يرى فيها القارئُ ملفّاً نصفَ مكتوب فتختفي
-       كلُّ المفاتيح، أي عطلٌ كاملٌ في الجمع لأجل تعديلٍ في مفتاحٍ واحد.
-    2. تحقّقٌ قبل الاستبدال: نُعيد تحليل ما كتبناه ونطابق المفاتيح المفعّلة على
-       المقصود. تسلسلٌ ناقص يُكتشف قبل أن يصير هو الملفَّ.
-    3. المفردُ القديم يُحذف عند أوّل كتابة: بقاؤه بجانب الجمع يعني مصدرين
-       للحقيقة، والجمعُ يحجبه، فيُحرَّر أحدُهما ولا يتغيّر شيء.
+    1. `os.replace` on a temp file in the same folder — an atomic swap. Writing over
+       the original directly leaves a window where the reader sees a half-written file
+       and every key disappears: a total outage of collection over a one-key edit.
+    2. A check before the swap: re-parse what we wrote and match the enabled keys
+       against the intent. A truncated serialization is caught before it becomes the file.
+    3. The old singular is deleted on the first write: keeping it beside the plural
+       means two sources of truth, and since the plural shadows it, one of them could
+       be edited with nothing changing.
     """
     data = load(path)
     normalized = [
@@ -171,7 +210,7 @@ def save_entries(
     blob = json.dumps(data, ensure_ascii=False, indent=1)
     check = entries(json.loads(blob), plural, singular)
     if [row["key"] for row in check] != [row["key"] for row in normalized]:
-        raise ValueError("تحقّق الكتابة فشل: الملفّ المسلسل لا يعيد نفس المفاتيح")
+        raise ValueError("write verification failed: the serialized file does not yield the same keys")
 
     folder = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(folder, exist_ok=True)

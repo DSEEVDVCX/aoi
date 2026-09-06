@@ -1,19 +1,28 @@
-"""خادم اللوحة: قراءةٌ من قاعدة المسجّل، وكتابةٌ في ملفّ المفاتيح وحدَه.
+"""The dashboard server: reads from the recorder database, writes only to the key file.
 
-- **القاعدة للقراءة فقط**: `dao` يفتحها بـmode=ro ولا مسار كتابة إليها. هذا لا
-  يُساوَم عليه — كاتبٌ ثانٍ يزاحم المسجّل على قفلٍ رأينا موتَه ثلاثَ ساعاتٍ مرّة.
-- مسارُ الكتابة الوحيد `/api/provider-keys/{add,toggle,delete}` وهدفُه ملفُّ
-  `recorder/chain_keys.json` عبر `keystore`. وهذا هو أوّلُ مسارٍ يغيّر الحالة في
-  هذا الخادم — والحارس أدناه كان مكتوباً وجاهزاً قبله، فلم يُضَف على عجل.
-- الاستماع على 127.0.0.1 فقط (محلّي).
-- Host guard + CSRF: يمنعان DNS rebinding ويحرسان مسارات الكتابة تلك.
-- **والتخزينُ المؤقّت لا يخرق شيئاً من ذلك**: `cache.MEMO` ذاكرةُ هذه العمليّة
-  وحدها — لا جدولَ تخزينٍ في القاعدة ولا ختمَ في `meta` ولا فهرسَ يُبنى. ثلاثةُ
-  مساراتٍ تعدّ التاريخَ كلَّه (`networks`/`counts`/`ticks-summary`) تُحسب مرّةً
-  كلَّ مدّة بدل كلِّ عشر ثوانٍ؛ والسببُ والقياسُ في `cache.py`.
+- **The database is read-only**: `dao` opens it with mode=ro and there is no
+  write path to it. This is non-negotiable — a second writer would contend
+  with the recorder for a lock whose death we once watched for three hours.
+- The only write path `/api/provider-keys/{add,toggle,delete}` targets the
+  `recorder/chain_keys.json` file via `keystore`. And this is the first
+  state-changing route in this server — the guard below was written and ready
+  before it, not bolted on in a hurry.
+- And the second write path `/api/fomo-account/{switch,restore}` targets the
+  `api/.privy_state.json` file via `account`: switching the fomo account when
+  an identity gets blocked. It runs no shell command and stops no scheduled
+  task — a single file write, because the recorder reads that file every
+  cycle and picks up the switch on its own.
+- Listening on 127.0.0.1 only (localhost).
+- Host guard + CSRF: they block DNS rebinding and guard those write paths.
+- **And the cache breaks none of that**: `cache.MEMO` is this process's own
+  memory — no staging table in the database, no stamp in `meta`, no index
+  being built. Three paths that re-count the whole history
+  (`networks`/`counts`/`ticks-summary`) are computed once per period instead
+  of every ten seconds; the reason and the measurements are in `cache.py`.
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 import secrets
@@ -21,11 +30,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import account
 import cache
 import config
 import dao
 import httpx
 import keystore
+import task_state
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -39,32 +50,42 @@ def _allowed_origins() -> tuple[str, str]:
     return (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
 
 
+# The request body cap. The default is deliberately narrow — a provider key is
+# one line. But the account switch receives a pasted browser store containing
+# tokens hundreds of characters long plus other keys that aren't ours, easily
+# exceeding eight thousand — and it used to be rejected with "request too
+# large", a rejection the user couldn't understand the reason for.
+_BODY_LIMIT_DEFAULT = 8192
+_BODY_LIMITS = {"/api/fomo-account/switch": 262144}
+
+
 @app.middleware("http")
 async def local_security_guard(request: Request, call_next):
-    """يمنع DNS rebinding وCSRF قبل وصول أي طلب يغيّر مخزن الأسرار."""
+    """Blocks DNS rebinding and CSRF before any request that changes the secret store arrives."""
     allowed_origins = _allowed_origins()
     allowed_hosts = {origin.removeprefix("http://") for origin in allowed_origins}
     host = request.headers.get("host", "").lower()
     if host not in allowed_hosts:
         return JSONResponse(
-            {"error": "مرفوض: Host ليس عنوان اللوحة المحلي"}, status_code=403
+            {"error": "rejected: Host is not the local dashboard address"}, status_code=403
         )
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         length = request.headers.get("content-length")
-        if length and length.isdigit() and int(length) > 8192:
-            return JSONResponse({"error": "الطلب كبير جداً"}, status_code=413)
+        cap = _BODY_LIMITS.get(request.url.path, _BODY_LIMIT_DEFAULT)
+        if length and length.isdigit() and int(length) > cap:
+            return JSONResponse({"error": "request body too large"}, status_code=413)
         origin = request.headers.get("origin")
         referer = request.headers.get("referer")
         if origin and origin not in allowed_origins:
-            return JSONResponse({"error": "أصل الطلب غير مسموح"}, status_code=403)
+            return JSONResponse({"error": "request origin not allowed"}, status_code=403)
         if referer and not any(
             referer == allowed or referer.startswith(allowed + "/")
             for allowed in allowed_origins
         ):
-            return JSONResponse({"error": "مرجع الطلب غير مسموح"}, status_code=403)
+            return JSONResponse({"error": "request referer not allowed"}, status_code=403)
         sent = request.headers.get("x-dashboard-token", "")
         if not sent or not hmac.compare_digest(sent, _DASHBOARD_TOKEN):
-            return JSONResponse({"error": "رمز حماية اللوحة مفقود أو خاطئ"}, status_code=403)
+            return JSONResponse({"error": "dashboard token missing or invalid"}, status_code=403)
     response = await call_next(request)
     if request.url.path == "/":
         response.headers["Cache-Control"] = "no-store"
@@ -72,7 +93,7 @@ async def local_security_guard(request: Request, call_next):
 
 
 def _with_conn(fn):
-    """يفتح اتصال read-only، ينفّذ الدالة، يغلق دوماً."""
+    """Opens a read-only connection, runs the function, always closes."""
     conn = dao.connect_ro(config.DB_PATH)
     try:
         return fn(conn)
@@ -81,11 +102,13 @@ def _with_conn(fn):
 
 
 def _cached(key: str, ttl: float, fn) -> tuple[Any, dict[str, Any]]:
-    """قيمةٌ مخزَّنة مؤقّتاً لاستعلامٍ ثقيل، مع وصفِ طزاجتها للعرض.
+    """A cached value for a heavy query, with a freshness description for display.
 
-    الاتصالُ يُفتح **داخل** المُغلَّف لا خارجَه: التجديدُ يجري في خيطٍ خلفيّ بعد
-    أن يكون الطلبُ الذي أشعله قد أغلق اتصالَه، فتمريرُ اتصالٍ من هنا كان يعني
-    استعمالَه بعد الإغلاق. انظر `cache.py` لسبب «تُقدَّم البائتةُ فوراً».
+    The connection is opened **inside** the wrapper, not outside it: the
+    refresh runs in a background thread after the request that triggered it
+    has closed its connection, so passing a connection from here would have
+    meant using it after it was closed. See `cache.py` for why "the stale
+    value is served instantly".
     """
     return cache.MEMO.get(
         key, ttl, lambda: _with_conn(fn),
@@ -93,8 +116,19 @@ def _cached(key: str, ttl: float, fn) -> tuple[Any, dict[str, Any]]:
     )
 
 
-@app.get("/api/status")
-def api_status() -> dict[str, Any]:
+@app.get("/api/health")
+def api_health_summary() -> JSONResponse:
+    """Aggregate local service health without exposing credentials or payloads."""
+    body = _with_conn(lambda c: dao.system_health(c, config.SERVICE_HEALTH))
+    tasks = task_state.read_task_states()
+    if tasks:
+        body["scheduler"] = tasks
+    status = 503 if body["level"] == "bad" else 200
+    return JSONResponse(body, status_code=status)
+
+
+@app.get("/api/recorder-status")
+def recorder_status() -> dict[str, Any]:
     return _with_conn(
         lambda c: dao.recorder_status(
             c, config.RECORDER_ALIVE_WINDOW_SECONDS,
@@ -103,9 +137,15 @@ def api_status() -> dict[str, Any]:
     )
 
 
+@app.get("/api/status")
+def status_alias() -> dict[str, Any]:
+    """Compatibility alias for the dashboard's established status endpoint."""
+    return recorder_status()
+
+
 @app.get("/api/api-health")
 def api_health() -> dict[str, Any]:
-    """يفحص /health للـ API المحلّي. فشل/مهلة → connected=false مع سبب واضح."""
+    """Checks /health on the local API. Failure/timeout → connected=false with a clear reason."""
     import time
 
     t0 = time.perf_counter()
@@ -115,10 +155,10 @@ def api_health() -> dict[str, Any]:
         body: Any
         try:
             body = resp.json()
-        except Exception:  # noqa: BLE001 — جوابٌ ليس JSON يُعرض خاماً
+        except Exception:  # noqa: BLE001 — a non-JSON answer is shown raw
             body = {"raw": resp.text[:200]}
         status_str = body.get("status") if isinstance(body, dict) else None
-        # 200 + status=ok → متصل سليم. 503/degraded → متصل لكن معطوب.
+        # 200 + status=ok → connected and healthy. 503/degraded → connected but broken.
         connected = resp.status_code == 200
         return {
             "connected": connected,
@@ -131,17 +171,17 @@ def api_health() -> dict[str, Any]:
     except httpx.TimeoutException:
         return {
             "connected": False, "http_status": None, "status": None,
-            "degraded": True, "latency_ms": None, "detail": "مهلة انتهت (لا استجابة)",
+            "degraded": True, "latency_ms": None, "detail": "timed out (no response)",
         }
     except httpx.ConnectError:
         return {
             "connected": False, "http_status": None, "status": None,
-            "degraded": True, "latency_ms": None, "detail": "منقطع (الخادم لا يعمل؟)",
+            "degraded": True, "latency_ms": None, "detail": "disconnected (server not running?)",
         }
-    except Exception as e:  # noqa: BLE001 — نعرض السبب دون إسقاط اللوحة
+    except Exception as e:  # noqa: BLE001 — show the reason without dropping the dashboard
         return {
             "connected": False, "http_status": None, "status": None,
-            "degraded": True, "latency_ms": None, "detail": f"خطأ: {type(e).__name__}",
+            "degraded": True, "latency_ms": None, "detail": f"error: {type(e).__name__}",
         }
 
 
@@ -157,6 +197,23 @@ def api_watchlist() -> dict[str, Any]:
     return {"watchlist": rows}
 
 
+@app.get("/api/watchlist-market")
+def api_watchlist_market() -> dict[str, Any]:
+    """Price movement + sparkline per active watch — the heavy half of the watchlist page.
+
+    The 48-hour countdown must tick every 10 s, but recomputing entry/peak/
+    sparkline for ~150 coins on that cadence would hammer the bars table for
+    numbers that barely move. So the light `/api/watchlist` carries the window
+    and this cached route carries the market half; the page merges them by
+    `address|network`. Same split as `/api/networks`: cached heavy body, live
+    freshness layered on top.
+    """
+    rows, meta = _cached(
+        "watchlist_market", config.WATCHLIST_MARKET_TTL_SECONDS, dao.watchlist_market,
+    )
+    return {"market": rows, "cache": meta}
+
+
 @app.get("/api/ticks-summary")
 def api_ticks_summary() -> dict[str, Any]:
     summary, meta = _cached(
@@ -167,11 +224,12 @@ def api_ticks_summary() -> dict[str, Any]:
 
 @app.get("/api/networks")
 def api_networks() -> dict[str, Any]:
-    """تغطيةُ الشبكات: أعدادٌ مخزَّنة مؤقّتاً، وطزاجةٌ حيّةٌ فوقها.
+    """Network coverage: cached counts, with live freshness layered on top.
 
-    الأعدادُ تلزمها مسحةٌ كاملة (1724 مللي ثانية) فتُخزَّن؛ أمّا «آخرُ لقطة» فهو
-    الحقلُ الذي يُقرأ كنبضٍ ويُلاحظ تأخّرُه فوراً، وله طريقٌ يكلّف 0.4 مللي ثانية
-    ⇒ يُحسب حيّاً في كلّ طلبٍ ويُدمج فوق المخزَّن بلا أن يتراجع.
+    The counts need a full sweep (1724 ms) so they're cached; but the "latest
+    snapshot" is the field read as the pulse whose lag is noticed immediately,
+    and it has a route costing 0.4 ms ⇒ it's computed live on every request
+    and merged on top of the cached value without regressing it.
     """
     rows, meta = _cached(
         "network_summary", config.NETWORK_SUMMARY_TTL_SECONDS, dao.network_summary,
@@ -204,11 +262,12 @@ def api_control_progress() -> dict[str, Any]:
 def api_performance(
     limit: int = 12, sort: str = "peak_pct", dir: str = "desc"
 ) -> dict[str, Any]:
-    """أداء كل عملة مراقَبة منذ لحظة إشارتها + حصيلة الأرباح/الخسائر.
+    """Performance of every watched coin since its signal + the profit/loss tally.
 
-    الترتيب يجري على الخادم فوق المجموعة كاملة ثمّ يُقتطع — الترتيب في المتصفّح
-    بعد الاقتطاع كان سيعطي «أفضل N مقلوبة» لا الأسوأ فعلاً.
-    الحصيلة (`summary`) تُحسب على **كل** العملات لا على الشريحة المعروضة.
+    Sorting happens on the server over the full set and is then truncated —
+    sorting in the browser after truncation would have given "top N inverted"
+    rather than the actual worst.
+    The tally (`summary`) is computed over **all** coins, not the displayed slice.
     """
     def _load(conn) -> dict[str, Any]:
         rows = dao.watch_performance(
@@ -234,19 +293,50 @@ def api_performance(
 
 @app.get("/api/signal-timeline")
 def api_signal_timeline(hours: int = 24) -> dict[str, Any]:
-    """عدد الإشارات لكل ساعة حسب النوع — لعمود مكدّس."""
+    """Signal count per hour by type — for a stacked column."""
     return _with_conn(lambda c: dao.signal_timeline(c, hours=hours))
 
 
 @app.get("/api/bars")
 def api_bars() -> dict[str, Any]:
-    """تغطية الشموع — المقياس الحاسم لجاهزية البيانات للتوسيم."""
+    """Candle coverage — the decisive measure of data readiness for labeling."""
     return _with_conn(lambda c: dao.bars_coverage(c, config.LIVE_START_TS))
+
+
+@app.get("/api/labeling")
+def api_labeling() -> dict[str, Any]:
+    """Labeling and outcomes after 48 hours — the baseline's output, cached.
+
+    The heaviest query in the dashboard after the network summary (1.2 seconds
+    measured), and its numbers are final, changing only at the labeler's
+    cadence (every 15 minutes), so it's cached with a five-minute TTL. And the
+    last labeling activity is read live on top of it — without waiting for the
+    refresh — because it's the labeler's pulse from its output, and the
+    difference between "five minutes old" and "fresh" is visible.
+    """
+    summary, meta = _cached(
+        "labeling",
+        config.LABELING_TTL_SECONDS,
+        lambda c: dao.labeling_outcomes(
+            c,
+            config.LIVE_START_TS,
+            design_version=config.CONTROL_DESIGN_VERSION,
+            gate_targets=(
+                config.CONTROL_PRELIMINARY_TARGET,
+                config.CONTROL_DECISION_TARGET,
+            ),
+        ),
+    )
+    live_last = _with_conn(dao.last_labeled_at)
+    out = dict(summary)
+    out["last_labeled_at"] = live_last or out.get("last_labeled_at")
+    out["cache"] = meta
+    return out
 
 
 @app.get("/api/storage")
 def api_storage() -> dict[str, Any]:
-    """حجم القاعدة ومعدّل نموّها — رقابة على الانفجار الصامت للأرشيف."""
+    """Database size and growth rate — monitoring the archive's silent explosion."""
     return _with_conn(
         lambda c: dao.storage_stats(
             config.DB_PATH,
@@ -263,7 +353,8 @@ def api_errors() -> dict[str, Any]:
     rows = _with_conn(lambda c: dao.recorder_errors(
         c,
         config.RECORDER_SOURCES,
-        # لكل مصدرٍ ختمُ نجاحه من كاتبه؛ حدُّ المسجّل أساسٌ لمصادر دورته وحدها.
+        # Each source has its own success stamp from its own writer; the recorder's
+        # boundary is the basis only for the sources of its cycle.
         ok_stamps=config.SOURCE_OK_STAMPS,
         recorder_stamps=config.RECORDER_OK_STAMPS,
     ))
@@ -272,15 +363,18 @@ def api_errors() -> dict[str, Any]:
 
 @app.get("/api/provider-keys")
 def api_provider_keys() -> dict[str, Any]:
-    """أحواضُ المزوّدين وأسطرُ مفاتيحهم — حالةٌ وأسماءُ حسابات، **بلا قيمة**.
+    """Provider pools and their key rows — status and account names, **no values**.
 
-    مصدران لا مصدرٌ واحد، وهذا مقصود: `pools` أسطرُ `meta` التي كتبتها العمليّات
-    المالكة (أعدادٌ ومؤشّرات فقط، ولا تحمل مفتاحاً أصلاً)، و`keys` قراءةُ الملفّ
-    نفسه — منها اسمُ الحساب وآخرُ أربعة أحرف (`key_file.tail`، خفضٌ مقصودٌ
-    لِـ FR-013 طلبه المستخدم للتمييز). القيمةُ كاملةً لا تخرج من الخادم أبداً.
+    Two sources, not one, and that's deliberate: `pools` is the `meta` rows the
+    owning processes wrote (counts and gauges only, carrying no key at all),
+    and `keys` is a read of the file itself — from which come the account name
+    and the last four characters (`key_file.tail`, a deliberate relaxation of
+    FR-013 the user requested for telling keys apart). The full value never
+    leaves the server.
 
-    ودمجُهما هنا لا في المتصفّح: حالةُ المفتاح = ملفٌّ (مفعّل؟) + حوضٌ (مبرَّد؟)
-    + فحصٌ حيّ، وثلاثتُها لا تُقرأ من مكانٍ واحد.
+    And they're merged here, not in the browser: a key's status = file
+    (enabled?) + pool (thawed?) + live probe, and the three are not read from
+    one place.
     """
     pools = _with_conn(lambda c: dao.provider_keys(
         c,
@@ -292,13 +386,13 @@ def api_provider_keys() -> dict[str, Any]:
 
 
 async def _body(request: Request) -> dict[str, Any]:
-    """جسمُ الطلب كقاموس. **لا يُسجَّل ولا يُعاد في رسالة خطأ** — فيه المفتاح."""
+    """The request body as a dict. **Never logged and never echoed in an error message** — it contains the key."""
     try:
         data = await request.json()
-    except Exception:  # noqa: BLE001 — أيُّ عطبِ تحليلٍ جوابُه واحد
-        raise keystore.KeyStoreError("جسم الطلب ليس JSON صالحاً") from None
+    except Exception:  # noqa: BLE001 — any parse failure gets one answer
+        raise keystore.KeyStoreError("request body is not valid JSON") from None
     if not isinstance(data, dict):
-        raise keystore.KeyStoreError("جسم الطلب يجب أن يكون كائن JSON")
+        raise keystore.KeyStoreError("request body must be a JSON object")
     return data
 
 
@@ -306,7 +400,7 @@ def _slot(data: dict[str, Any]) -> int:
     try:
         return int(data.get("slot"))  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        raise keystore.KeyStoreError("موضع المفتاح مفقود أو غير صحيح") from None
+        raise keystore.KeyStoreError("key slot missing or invalid") from None
 
 
 def _fail(exc: keystore.KeyStoreError) -> JSONResponse:
@@ -315,11 +409,12 @@ def _fail(exc: keystore.KeyStoreError) -> JSONResponse:
 
 @app.post("/api/provider-keys/add")
 async def api_provider_keys_add(request: Request) -> Any:
-    """يضيف مفتاحاً إلى ملفّ المسجّل. لا إعادةَ تشغيلٍ لازمة.
+    """Adds a key to the recorder's file. No restart needed.
 
-    العملاء يقرأون الملفّ **عند كلّ نداء** (`solana_rpc._post`، `goldrush_rpc._key`،
-    `nodereal_rpc._call` تنادي `refresh(_read_keys())`)، فالمفتاح الجديد يدخل
-    الدورة التالية من نفسه — ولذلك لا تُوقف اللوحة مهمّةً ولا تلمس عمليّةً.
+    The clients read the file **on every call** (`solana_rpc._post` and
+    `nodereal_rpc._call` invoke `refresh(_read_keys())`), so the new key joins
+    the next cycle on its own — which is why the dashboard stops no task and
+    touches no process.
     """
     try:
         data = await _body(request)
@@ -334,7 +429,7 @@ async def api_provider_keys_add(request: Request) -> Any:
 
 @app.post("/api/provider-keys/toggle")
 async def api_provider_keys_toggle(request: Request) -> Any:
-    """يوقف مفتاحاً مؤقّتاً أو يعيده. القيمة تبقى في الملفّ، ويخرج من الحوض."""
+    """Suspends a key temporarily or restores it. The value stays in the file; it just leaves the pool."""
     try:
         data = await _body(request)
         return keystore.set_enabled(
@@ -350,7 +445,7 @@ async def api_provider_keys_toggle(request: Request) -> Any:
 
 @app.post("/api/provider-keys/delete")
 async def api_provider_keys_delete(request: Request) -> Any:
-    """يحذف مفتاحاً نهائيّاً — لا تراجع، فالقيمة لا تُحفظ في مكانٍ آخر."""
+    """Deletes a key permanently — no undo, since the value is stored nowhere else."""
     try:
         data = await _body(request)
         return keystore.remove(
@@ -365,15 +460,18 @@ async def api_provider_keys_delete(request: Request) -> Any:
 
 @app.post("/api/provider-keys/test")
 async def api_provider_keys_test(request: Request) -> Any:
-    """نداءٌ حقيقيّ واحد بهذا المفتاح: «مقبول» ليست «الخدمة تعمل».
+    """One real call with this key: "accepted" is not "the service works".
 
-    حالةُ العمّال وحدها لا تكفي: مفتاحٌ أُضيف قبل دقيقة لم يُنادَ به بعد، فيظهر
-    أخضرَ بلا دليل. والزرُّ هو الدليل. وهو POST لا GET رغم أنّه قراءة: يخرج
-    نداءً بمفتاحٍ سرّيّ إلى الخارج، فيمرّ بحارس الرمز مثل بقيّة ما يغيّر شيئاً.
+    The workers' state alone isn't enough: a key added a minute ago hasn't been
+    called yet, so it shows green with no evidence. The button is the evidence.
+    And it's a POST, not a GET, even though it's a read: it sends a call with a
+    secret key to the outside, so it passes the token guard like everything
+    else that changes something.
     """
     try:
         data = await _body(request)
-        return keystore.probe(
+        return await asyncio.to_thread(
+            keystore.probe,
             str(data.get("provider") or ""),
             _slot(data),
             str(data.get("tail") or ""),
@@ -383,13 +481,80 @@ async def api_provider_keys_test(request: Request) -> Any:
         return _fail(exc)
 
 
+def _fail_account(exc: account.AccountError) -> JSONResponse:
+    return JSONResponse({"error": str(exc)}, status_code=exc.status)
+
+
+async def _account_body(request: Request) -> dict[str, Any]:
+    """The account request body. **Never logged and never echoed in an error message** — it contains the token."""
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 — any parse failure gets one answer
+        raise account.AccountError("request body is not valid JSON") from None
+    if not isinstance(data, dict):
+        raise account.AccountError("request body must be a JSON object")
+    return data
+
+
+@app.get("/api/fomo-account")
+def api_fomo_account() -> dict[str, Any]:
+    """The current fomo account's status — identity fingerprint and expiry time, **no value**.
+
+    And no live probe here: this route is called with every dashboard refresh
+    every ten seconds, and its upstream call would have hit fomo six times a
+    minute with nobody asking for it — which is exactly the kind of load that
+    triggered the block. The check is an explicit button.
+    """
+    return account.status()
+
+
+@app.post("/api/fomo-account/probe")
+async def api_fomo_account_probe() -> Any:
+    """Probes the current account live: 200 works, 403 blocked, 401 expired token.
+
+    In a separate thread: `curl_cffi` is synchronous and three calls can hit
+    their timeout, which would freeze the event loop and stall the whole
+    dashboard for everyone during the probe.
+    """
+    try:
+        return await asyncio.to_thread(account.probe)
+    except account.AccountError as exc:
+        return _fail_account(exc)
+
+
+@app.post("/api/fomo-account/switch")
+async def api_fomo_account_switch(request: Request) -> Any:
+    """Switches the account from a pasted browser store, after an automatic backup.
+
+    And no restart is needed: the recorder reads the file every cycle
+    (`_reload_token`), and the api server adopts the new identity on its next
+    refresh because the file's fingerprint differs from the one it is
+    refreshing (`TokenRefresher._adopt_disk_identity`).
+    """
+    try:
+        return account.switch(await _account_body(request))
+    except account.AccountError as exc:
+        return _fail_account(exc)
+
+
+@app.post("/api/fomo-account/restore")
+async def api_fomo_account_restore(request: Request) -> Any:
+    """Reverts to a saved backup — the emergency exit from a bad paste."""
+    try:
+        data = await _account_body(request)
+        return account.restore(str(data.get("name") or ""))
+    except account.AccountError as exc:
+        return _fail_account(exc)
+
+
 @app.get("/")
 def index() -> HTMLResponse:
-    """صفحة اللوحة — **بلا تخزين مؤقّت**.
+    """The dashboard page — **not cached**.
 
-    اللوحة تُحدّث بياناتها كل 10 ثوانٍ، لكنّ هيكلها (HTML+JS) كان يُخدَّم من كاش
-    المتصفّح إلى أجل غير مسمّى: بعد أي تحديث للوحة يبقى المستخدم على النسخة
-    القديمة بلا أي إشارة — بما في ذلك بعد إصلاح عطب فيها.
+    The dashboard refreshes its data every 10 seconds, but its skeleton
+    (HTML+JS) used to be served from the browser cache indefinitely: after any
+    dashboard update the user stayed on the old version with no signal at all
+    — including after a bug in it was fixed.
     """
     html = Path(config.STATIC_DIR, "index.html").read_text(encoding="utf-8")
     html = html.replace("__DASHBOARD_TOKEN__", _DASHBOARD_TOKEN)
@@ -408,6 +573,6 @@ def index() -> HTMLResponse:
     )
 
 
-# ملفات ثابتة إضافية إن لزم (لا شيء الآن، لكن يبقى المسار متاحاً).
+# Extra static files if ever needed (nothing now, but the route stays available).
 if os.path.isdir(config.STATIC_DIR):
     app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")

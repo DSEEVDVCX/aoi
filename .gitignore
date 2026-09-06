@@ -20,12 +20,13 @@ privy_storage_dump.json
 privy_refresh_call.json
 captured_endpoints.json
 
-# مفاتيح مزوّدي البلوك تشين (Helius/NodeReal/GoldRush): نصٌّ صريح يُقرأ من القرص
-# كل نداء ولا يُطبع ولا يُسجَّل، ولا يُلتزَم إطلاقاً.
+# Blockchain provider keys (Helius/NodeReal/GoldRush): plaintext read from disk
+# on every call, never printed or logged, never committed.
 recorder/chain_keys.json
 chain_keys.json
-# واللوحة تكتبه باستبدالٍ ذرّيّ عبر ملفٍّ مؤقّت في نفس المجلّد (key_file.save_entries)؛
-# انقطاعٌ في أثناء الكتابة قد يُبقي واحداً منها وفيه المفاتيح كاملةً.
+# The dashboard writes it via atomic replacement through a temp file in the same
+# folder (key_file.save_entries); an interruption mid-write may leave one of
+# these behind holding the complete keys.
 .keys-*.tmp
 recorder/.keys-*.tmp
 
@@ -33,7 +34,7 @@ recorder/.keys-*.tmp
 evm_replay_run.err
 evm_replay_run.out
 *.log
-# سجلّات مُدوَّرة (server.log.1) — لا يطابقها *.log
+# Rotated logs (server.log.1) — not matched by *.log
 *.log.*
 *.db
 *.db-shm
@@ -52,3 +53,8 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 playwright/.cache/
+
+# Probe droppings: temp data files emptied out by probe_*.py during inspection
+recorder/probe_*.json
+recorder/probe_*.out
+recorder/probe_*.pkl

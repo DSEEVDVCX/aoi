@@ -1,10 +1,11 @@
-"""طبقة قراءة (read-only) لِـ recorder.db.
+"""A read-only data-access layer for recorder.db.
 
-يفتح القاعدة عبر URI بـ mode=ro فلا يمكنه الكتابة إطلاقاً — لا يعطّل كتابات
-المسجّل (WAL). كل استعلام دالة خالصة تأخذ اتصالاً، قابلة للاختبار على قاعدة مؤقّتة.
+It opens the database via a URI with mode=ro so it cannot write at all — it
+never blocks the recorder's writes (WAL). Every query is a pure function
+taking a connection, testable against a temporary database.
 
-ملاحظة: نفتح اتصالاً جديداً لكل طلب (رخيص لـ SQLite المحلّي) ونغلقه — أبسط من
-مشاركة اتصال عبر خيوط FastAPI.
+Note: we open a new connection per request (cheap for local SQLite) and close
+it — simpler than sharing a connection across FastAPI threads.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from typing import Any
 
 
 def connect_ro(db_path: str) -> sqlite3.Connection:
-    """اتصال للقراءة فقط. mode=ro يمنع أي كتابة على مستوى SQLite نفسه."""
+    """A read-only connection. mode=ro blocks any write at the SQLite level itself."""
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
@@ -44,8 +45,9 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
-    """اللوحة تقرأ قاعدة يكتبها المسجّل؛ قد تسبق نسخةُ اللوحة ترحيلَ المسجّل
-    (أو العكس). الفحص يجعل العمود الجديد اختيارياً بدل أن يُسقط اللوحة."""
+    """The dashboard reads a database the recorder writes; the dashboard's version may
+    run ahead of the recorder's migration (or behind). The check makes the new
+    column optional instead of crashing the dashboard."""
     if not _table_exists(conn, table):
         return False
     return any(r["name"] == column for r in conn.execute(f"PRAGMA table_info({table})"))
@@ -63,6 +65,44 @@ def all_meta(conn: sqlite3.Connection) -> dict[str, str]:
     if not _table_exists(conn, "meta"):
         return {}
     return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+
+
+def system_health(
+    conn: sqlite3.Connection,
+    services: tuple[dict[str, Any], ...],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return a single, secret-free health document for local operators."""
+    moment = now or datetime.now(UTC)
+    meta = all_meta(conn)
+    service_rows: list[dict[str, Any]] = []
+    for spec in services:
+        heartbeat = meta.get(spec["heartbeat"])
+        heartbeat_dt = _parse_iso(heartbeat)
+        age = (moment - heartbeat_dt).total_seconds() if heartbeat_dt else None
+        stale = age is None or age < 0 or age > spec["tolerance"]
+        ok = meta.get(spec["ok"])
+        ok_dt = _parse_iso(ok)
+        ok_age = (moment - ok_dt).total_seconds() if ok_dt else None
+        last_error = meta.get(f"last_error_{spec['name'].replace('-', '_')}")
+        level = "bad" if stale else ("degraded" if last_error and ok_age is None else "ok")
+        service_rows.append({
+            "name": spec["name"], "last_run_at": heartbeat,
+            "age_seconds": age, "ok_at": ok, "ok_age_seconds": ok_age,
+            "stale": stale, "last_error": last_error, "level": level,
+        })
+    discovered = sorted(
+        key.removeprefix("last_error_") for key in meta if key.startswith("last_error_")
+    )
+    bad = any(row["level"] == "bad" for row in service_rows)
+    degraded = any(row["level"] == "degraded" for row in service_rows)
+    return {
+        "level": "bad" if bad else ("degraded" if degraded else "ok"),
+        "checked_at": moment.isoformat(), "services": service_rows,
+        "error_sources": discovered,
+    }
+
+
 
 
 # --- counts ---
@@ -92,7 +132,7 @@ def control_maturity(
     decision_target: int,
     design_version: int = 3,
 ) -> dict[str, Any]:
-    """تقدّم الضابطة المؤهلة؛ `ok` فقط هو نافذة 48س مكتملة قابلة للمقارنة."""
+    """Qualified-control progress; `ok` alone is a complete, comparable 48h window."""
     row = None
     if _table_exists(conn, "outcomes"):
         required = ("design_version", "analysis_eligible", "is_control", "entry_ts")
@@ -124,6 +164,281 @@ def control_maturity(
     }
 
 
+# --- Labeling and outcomes (outcomes/training_rows) ---
+def _last_labeled(conn: sqlite3.Connection) -> str | None:
+    if not _table_exists(conn, "outcomes"):
+        return None
+    row = conn.execute("SELECT MAX(labeled_at) FROM outcomes").fetchone()
+    return row[0] if row else None
+
+
+def last_labeled_at(conn: sqlite3.Connection) -> str | None:
+    """The last labeling stamp — the labeler's pulse from its output, with no table scans.
+
+    A single-moment query, read live on every request on top of the cached
+    summary (see `/api/labeling` in app.py).
+    """
+    return _last_labeled(conn)
+
+
+def labeling_outcomes(
+    conn: sqlite3.Connection,
+    live_start_ts: int,
+    *,
+    design_version: int = 3,
+    gate_targets: tuple[int, int] = (100, 500),
+    eta_days: int = 14,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """A summary of what the pipeline produced once its windows closed — labeling and training rows.
+
+    This is the output the project was built for, and it was missing from the
+    whole dashboard: the "performance" display derives from the **running**
+    window (open positions not yet complete), while this is about **final**
+    outcomes after 48 hours — the ones `is_explosive` is labeled from and
+    training rows are built from.
+
+    - The tally is restricted to the live epoch (`live_start_ts`): what came
+      before it is retro collection without the live families, excluded from
+      training with its rows deleted, so mixing it with the live data corrupts
+      every ratio.
+    - The ratios (final_return_48h) are fractions, not percentages, and the
+      median is computed in Python — `median()` is not built into SQLite, so
+      it can't be relied on in SQL.
+    - `eta` for the gate is estimated from the average daily production, not
+      from a single last day: one zero day would have said "the gate is never
+      reached".
+    """
+    if not _table_exists(conn, "outcomes"):
+        return {"live": False, "has_outcomes_table": False}
+    # The dashboard may run ahead of the recorder's migration (a new column
+    # that hasn't arrived yet), so missing columns hide the dashboard rather
+    # than crash it — the same guard as `control_maturity` above.
+    required = (
+        "kind", "status", "entry_ts", "is_control", "is_explosive",
+        "final_return_48h", "max_gain_48h", "design_version",
+        "analysis_eligible", "labeled_at",
+    )
+    missing = [c for c in required if not _has_column(conn, "outcomes", c)]
+    if missing:
+        return {"live": False, "has_outcomes_table": True, "missing_columns": missing}
+
+    moment = now or datetime.now(UTC)
+
+    def _median_pct(values: list[float]) -> float | None:
+        """The median of a ratio from fractional values — in Python, not in SQL.
+
+        `median()` is not a built-in SQLite function (it's an extension loaded
+        conditionally), and a version check would have passed it confidently
+        and then blown up at runtime. The list here is small (tens of
+        thousands), so sorting it in memory is cheaper than a silent error.
+        """
+        if not values:
+            return None
+        ordered = sorted(values)
+        n = len(ordered)
+        mid = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) / 2
+        return round(mid * 100, 1)
+
+    # The labeling tally for the live epoch — per kind×status, and the gates
+    # (ok) break down their exclusions, tallying where the samples went and why.
+    status_rows = conn.execute(
+        "SELECT kind, status, COUNT(*) AS n FROM outcomes"
+        " WHERE entry_ts >= ? GROUP BY kind, status",
+        (live_start_ts,),
+    ).fetchall()
+    status_counts = [
+        {"kind": r["kind"], "status": r["status"], "count": int(r["n"])}
+        for r in status_rows
+    ]
+    exclusion_rows = conn.execute(
+        "SELECT status, exclusion_reason, COUNT(*) AS n FROM outcomes"
+        " WHERE entry_ts >= ? AND status != 'ok'"
+        " GROUP BY status, exclusion_reason ORDER BY n DESC",
+        (live_start_ts,),
+    ).fetchall()
+    exclusions = [
+        {
+            "status": r["status"],
+            "reason": r["exclusion_reason"] or "—",
+            "count": int(r["n"]),
+        }
+        for r in exclusion_rows
+    ]
+
+    # The analysis-eligible set: a labeled window, healthy, in the current design.
+    # (kind='watch' is the compared decision — signal and control together —
+    # while 'signal' is bookkeeping labeling of every event and never enters
+    # the comparison.)
+    # The live-epoch filter applies here too: the side tally used to include
+    # the retro data.
+    analysis_where = (
+        "kind='watch' AND status='ok' AND analysis_eligible=1 AND design_version>=?"
+        " AND entry_ts >= ?"
+    )
+    analysis_args = (design_version, live_start_ts)
+
+    def _group_stats(where_extra: str, args_extra: tuple = ()) -> dict[str, Any]:
+        where = analysis_where + where_extra
+        args = analysis_args + args_extra
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n, SUM(is_explosive) AS explosive,"
+            f"       AVG(final_return_48h) AS avg_ret,"
+            f"       AVG(max_gain_48h) AS avg_gain,"
+            f"       MAX(entry_ts) AS last_entry_ts"
+            f"  FROM outcomes WHERE {where}",
+            args,
+        ).fetchone()
+        # The median from the values themselves, in Python — see `_median_pct`.
+        median_values = [
+            float(r[0]) for r in conn.execute(
+                f"SELECT final_return_48h FROM outcomes WHERE {where}"
+                f" AND final_return_48h IS NOT NULL",
+                args,
+            )
+        ]
+        # `SUM(is_explosive)` is NULL when every row in the group has a NULL
+        # `is_explosive` — not only when the group is empty. So the count alone
+        # is not a safe guard for the ratio: with rows present but the column
+        # unlabelled, `row["explosive"]` is None and dividing it raised
+        # TypeError, turning /api/labeling into a 500. The normalised values are
+        # computed once here and the ratio is built from them.
+        count = int(row["n"] or 0)
+        explosive = int(row["explosive"] or 0)
+        return {
+            "count": count,
+            "explosive": explosive,
+            "explosive_pct": round(explosive / count * 100, 1) if count else None,
+            "avg_return_pct": round(row["avg_ret"] * 100, 1)
+            if row["avg_ret"] is not None else None,
+            "avg_gain_pct": round(row["avg_gain"] * 100, 1)
+            if row["avg_gain"] is not None else None,
+            "median_return_pct": _median_pct(median_values),
+            "last_entry_ts": row["last_entry_ts"],
+        }
+
+    signal_stats = _group_stats(" AND is_control=0")
+    control_stats = _group_stats(" AND is_control=1")
+
+    # The decision gate from the control group's actual production: the rate of
+    # mature days + extrapolating arrival at both targets. The window is 48h,
+    # so any day within the last two days may not have its windows complete
+    # yet (the labeler labels only what's available) — including it in the
+    # average would drag it down falsely, so we exclude it and state when the
+    # last day included in the computation was.
+    prelim_target, decision_target = gate_targets
+    now_ts = int(moment.timestamp())
+    per_day = conn.execute(
+        "SELECT CAST(entry_ts / 86400 AS INTEGER) AS day, COUNT(*) AS n"
+        "  FROM outcomes"
+        " WHERE kind='watch' AND is_control=1 AND status='ok'"
+        "   AND analysis_eligible=1 AND design_version>=?"
+        "   AND entry_ts >= ? AND entry_ts >= ?"
+        " GROUP BY day",
+        (design_version, live_start_ts, now_ts - eta_days * 86400),
+    ).fetchall()
+    today_day = now_ts // 86400
+    mature = [(int(r["day"]), int(r["n"])) for r in per_day if int(r["day"]) <= today_day - 2]
+    avg_per_day = (sum(n for _, n in mature) / len(mature)) if mature else None
+    remaining = max(0, decision_target - control_stats["count"])
+    eta = (
+        {"days": round(remaining / avg_per_day, 1)}
+        if avg_per_day and remaining else None
+    )
+
+    # Labeled daily production (all kinds) for the last eta_days — shows the pace of collection.
+    recent_days = conn.execute(
+        "SELECT CAST(entry_ts / 86400 AS INTEGER) AS day, COUNT(*) AS n"
+        "  FROM outcomes"
+        " WHERE entry_ts >= ?"
+        " GROUP BY day ORDER BY day DESC LIMIT ?",
+        (int(moment.timestamp()) - eta_days * 86400, eta_days),
+    ).fetchall()
+    labeled_per_day = [
+        {
+            "day": datetime.fromtimestamp(d * 86400, UTC).date().isoformat(),
+            "count": n,
+        }
+        for d, n in (
+            (int(r["day"]), int(r["n"])) for r in reversed(recent_days)
+        )
+    ]
+
+    # Training rows — modeling readiness without an approved training (the 500 gate is binding).
+    training: dict[str, Any] = {"available": False}
+    if _table_exists(conn, "training_rows"):
+        version_rows = conn.execute(
+            "SELECT feature_version, split, COUNT(*) AS n,"
+            "       SUM(is_explosive) AS explosive, MAX(built_at) AS last_built"
+            "  FROM training_rows GROUP BY feature_version, split"
+            " ORDER BY feature_version DESC, split",
+        ).fetchall()
+        versions: dict[int, dict[str, Any]] = {}
+        for r in version_rows:
+            v = versions.setdefault(int(r["feature_version"]), {
+                "feature_version": int(r["feature_version"]),
+                "splits": {},
+                "total": 0,
+                "explosive": 0,
+                "last_built_at": r["last_built"],
+            })
+            v["splits"][r["split"]] = {
+                "count": int(r["n"]),
+                "explosive": int(r["explosive"] or 0),
+            }
+            v["total"] += int(r["n"])
+            v["explosive"] += int(r["explosive"] or 0)
+        # "Current" = the highest feature version, the one that will be trained
+        # when the gate opens. The highest version may be **half-built** (fv16
+        # started 08-28 and isn't complete yet), so it gets classified as
+        # "building" without a misleading explosion rate.
+        current = None
+        if versions:
+            top = max(versions.values(), key=lambda v: v["feature_version"])
+            # Fully built = the last row's date is recent (within a day of now)
+            # — the builder runs hourly, so a version not built for more than a
+            # day is stopped, not running.
+            last_built = _parse_iso(top["last_built_at"]) if top["last_built_at"] else None
+            building = bool(
+                last_built and (moment - last_built).total_seconds() <= 86400
+            )
+            current = {**top, "building": building}
+        training = {
+            "available": True,
+            "versions": sorted(
+                versions.values(), key=lambda v: -v["feature_version"]
+            ),
+            "current": current,
+        }
+
+    # Last labeling activity — the labeler's pulse from its output, not from its cycle stamp.
+    last_labeled_at = _last_labeled(conn)
+
+    return {
+        "live": True,
+        "has_outcomes_table": True,
+        "live_start_ts": live_start_ts,
+        "design_version": design_version,
+        "status_counts": status_counts,
+        "exclusions": exclusions,
+        "signal": signal_stats,
+        "control": control_stats,
+        "gate": {
+            "completed": control_stats["count"],
+            "preliminary_target": prelim_target,
+            "decision_target": decision_target,
+            "preliminary_ready": control_stats["count"] >= prelim_target,
+            "decision_ready": control_stats["count"] >= decision_target,
+            "avg_per_day": round(avg_per_day, 1) if avg_per_day else None,
+            "remaining": remaining,
+            "eta": eta,
+        },
+        "labeled_per_day": labeled_per_day,
+        "training": training,
+        "last_labeled_at": last_labeled_at,
+    }
+
+
 # --- recorder status ---
 def recorder_status(
     conn: sqlite3.Connection,
@@ -131,10 +446,11 @@ def recorder_status(
     labeler_window_seconds: int,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """حالة المسجّل: حيّ؟ عدد الدورات، آخر دورة، إحصاؤها، الأخطاء.
+    """The recorder's status: alive? cycle count, last cycle, its stats, errors.
 
-    `labeler_window_seconds` إلزاميّ بلا افتراضي: القيمة تعيش في config وحده،
-    وافتراضيّ مكرّر هنا ينجرف عنها بصمت عند أي ضبط لاحق.
+    `labeler_window_seconds` is mandatory with no default: the value lives in
+    config alone, and a duplicate default here would silently drift from it on
+    any later adjustment.
     """
     now = now or datetime.now(UTC)
     meta = all_meta(conn)
@@ -149,24 +465,45 @@ def recorder_status(
     def _int(v: str | None) -> int:
         return int(v) if v and v.lstrip("-").isdigit() else 0
 
-    # طزاجة الـ feed المصدر — منفصلة تماماً عن حياة المسجّل: قد يعمل المسجّل
-    # بلا خطأ بينما feed فomo متجمّد ساعات، فيبدو الأرشيف "سوقاً هادئاً" وهو
-    # في الحقيقة انقطاع مصدر. شوهد متجمّداً 3 ساعات.
+    # Freshness of the source feed — fully separate from the recorder's
+    # aliveness: the recorder may run error-free while fomo's feed has been
+    # frozen for hours, making the archive look like a "quiet market" when
+    # it's really an upstream outage. Seen frozen for 3 hours.
     feed_dt = _parse_iso(meta.get("last_feed_event_at"))
     feed_age = (now - feed_dt).total_seconds() if feed_dt else None
 
-    # حياة الموسِّم (FomoLabeler): يكتب labeler_last_run_at كل دورة (15 دقيقة)
-    # حتى حين لا يوسم شيئاً. موته صامت تماماً — لا أخطاء ولا انهيار دورات —
-    # بينما تتوقّف النتائج عن التراكم، ولا ينكشف ذلك إلّا عند بوّابة النضج.
+    # Labeler (FomoLabeler) aliveness: it writes labeler_last_run_at every
+    # cycle (15 minutes) even when it labels nothing. Its death is completely
+    # silent — no errors, no cycle crashes — while the results stop
+    # accumulating, and that only surfaces at the maturity gate.
     labeler_dt = _parse_iso(meta.get("labeler_last_run_at"))
     labeler_age = (now - labeler_dt).total_seconds() if labeler_dt else None
+
+    admission_networks: dict[str, Any] = {}
+    raw_admission = meta.get("evm_admission_network_state")
+    if raw_admission:
+        try:
+            decoded = json.loads(raw_admission)
+            if isinstance(decoded, dict):
+                admission_networks = decoded
+        except (TypeError, ValueError):
+            admission_networks = {}
+    paused_networks: list[str] = []
+    raw_paused = meta.get("evm_admission_paused_networks")
+    if raw_paused:
+        try:
+            decoded = json.loads(raw_paused)
+            if isinstance(decoded, list):
+                paused_networks = [str(network) for network in decoded]
+        except (TypeError, ValueError):
+            paused_networks = []
 
     return {
         "alive": alive,
         "seconds_since_last_cycle": seconds_since,
         "last_feed_event_at": meta.get("last_feed_event_at"),
         "feed_age_seconds": feed_age,
-        # متجمّد = آخر حدث أقدم من ضعف نافذة الحياة بكثير (15 دقيقة)
+        # Stale = the last event much older than double the aliveness window (15 minutes)
         "feed_stale": bool(feed_age is not None and feed_age > 900),
         "last_cycle_at": last_cycle_at,
         "cycles_total": _int(meta.get("cycles_total")),
@@ -176,11 +513,13 @@ def recorder_status(
         "started_at": meta.get("started_at"),
         "schema_version": meta.get("schema_version"),
         "active_watch_count": active_watch_count(conn),
-        # الموسِّم: None = لم يعمل قطّ — يُعامَل كمتوقّف (stale) في العرض.
+        # Labeler: None = never ran — treated as stale in the display.
         "labeler_last_run_at": meta.get("labeler_last_run_at"),
         "labeler_age_seconds": labeler_age,
         "labeler_stale": bool(labeler_age is None or labeler_age > labeler_window_seconds),
         "labeler_last_stats": meta.get("labeler_last_stats"),
+        "evm_admission_networks": admission_networks,
+        "evm_admission_paused_networks": paused_networks,
     }
 
 
@@ -190,18 +529,25 @@ def recorder_errors(
     ok_stamps: dict[str, tuple[str, ...]] | None = None,
     recorder_stamps: tuple[str, ...] = ("started_at", "last_ok_cycle_at"),
 ) -> list[dict[str, Any]]:
-    """آخر خطأ لكل مصدر من meta (last_error_<src>). غياب = لا خطأ لذلك المصدر.
+    """The last error per source from meta (last_error_<src>). Absence = no error for that source.
 
-    ملاحظة: `last_error_<src>` قيمة meta ثابتة — تُكتب عند كل فشل ولا تُمسح عند
-    النجاح، فتبقى تعرض آخر خطأ حتى لو تعافى المصدر. لذلك نُعلّم الخطأ بأنّه
-    **قديم (stale)** إن سبق ختمَ نجاحٍ لاحقاً.
+    Note: `last_error_<src>` is a sticky meta value — written on every failure
+    and never cleared on success, so it keeps showing the last error even if
+    the source recovered. So we flag the error as **stale** when it predates a
+    later success stamp.
 
-    **والحدُّ لكل مصدر حدُّه.** كان حدّاً واحداً للجميع مبنيّاً على `started_at`
-    و`last_ok_cycle_at`، ولا يكتبهما إلّا `recorder.py`؛ فحين مات المسجّل ٣س١٤د
-    يوم 2026-08-17 تجمّد الحدُّ فبقيت شارات chain/chain_auth/evm حمراء وأخطاؤها
-    قد شُفيت — و`FomoChain` تُتمّ دوراتها النظيفة بلا أن يعنيَ ذلك شيئاً. فصار
-    لكلّ طابورٍ ختمُ نجاحٍ من كاتبه (`chain_last_ok_at`…)، ويُضاف إليه حدُّ
-    المسجّل كي لا يخسر خطأٌ قديمٌ سبيلَ الشفاء قبل أن يُكتب ختمُه أوّل مرّة.
+    **And each source has its own boundary.** It used to be one shared boundary
+    built from `started_at` and `last_ok_cycle_at`, which only `recorder.py`
+    writes; so when the recorder died for 3h14m on 2026-08-17 the boundary
+    froze and the chain/chain_auth/evm badges stayed red with errors that had
+    already healed — and `FomoChain` completing its clean cycles meant
+    nothing. So each queue got its own success stamp from its own writer
+    (`chain_last_ok_at`…). A source that is declared here has an independent
+    stamp and never falls back to the recorder's stamp in its absence: a
+    missing stamp means it hasn't proven success yet, and healing it with
+    another process's stamp would hide a first-run failure. The recorder's
+    boundary remains only for sources that declare no independent stamps in
+    `ok_stamps`.
     """
     meta = all_meta(conn)
     stamps = ok_stamps or {}
@@ -214,18 +560,23 @@ def recorder_errors(
     out = []
     for src in sources:
         val = meta.get(f"last_error_{src}")
-        # الختم في القيمة بصيغة "<iso>: <msg>" — نفصله على أول ": ".
+        # The stamp is inside the value as "<iso>: <msg>" — split on the first ": ".
         err_dt = _parse_iso(val.split(": ", 1)[0]) if val else None
-        own = _boundary(stamps.get(src, ()))
-        boundary = max(
-            (d for d in (own, recorder_boundary) if d is not None), default=None,
-        )
+        own_keys = stamps.get(src)
+        own = _boundary(own_keys or ())
+        # A source's presence in the map is an independent contract, even if
+        # its stamp hasn't been written yet. Falling back to the recorder's
+        # boundary is allowed only for a source that has no stamp contract at
+        # all; otherwise a first-run failure gets declared "recovered" after
+        # another process's healthy cycle.
+        boundary = own if own_keys is not None else recorder_boundary
         stale = bool(val) and boundary is not None and err_dt is not None and err_dt < boundary
         out.append({
             "source": src,
             "last_error": val,
             "stale": stale,
-            # مِن أين جاء الحدّ: تشخيصُ «لماذا ما زال أحمر؟» بلا قراءة meta يدوياً.
+            # Where the boundary came from: diagnosing "why is it still red?"
+            # without reading meta by hand.
             "ok_at": own.isoformat() if own else None,
         })
     return out
@@ -238,34 +589,41 @@ def provider_keys(
     stale_seconds: float = 2400.0,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """حالةُ أحواض مفاتيح المزوّدين كما ختمتها كل عمليّة في `meta`.
+    """The state of provider key pools as each process stamped it into `meta`.
 
-    **بلا أيّ قيمة مفتاح** (FR-013): الكاتب لا يكتب إلّا أعداداً ومؤشّرات، وهذه
-    الدالّة تقرأ ما كُتب — فلا سبيل لعرض مفتاح ولا كسرٍ منه أصلاً. (أسماءُ
-    الحسابات وآخرُ أربعة أحرف تأتي من طريقٍ آخر تماماً: `keystore` يقرأ الملفّ.
-    فلا يُخلط الطريقان — هذا الصفُّ يبقى صالحاً للسجلّ، وذاك لا.)
+    **With no key value at all** (FR-013): the writer writes only counts and
+    gauges, and this function reads what was written — so there is no way to
+    display a key or any fragment of one. (Account names and the last four
+    characters come from a completely different route: `keystore` reads the
+    file. The two routes must not be conflated — this row stays safe for
+    logs, and the other one doesn't.)
 
-    صفٌّ لكل (مالك، مزوّد) لا صفٌّ لكل مزوّد: حوض GoldRush يوجد في `FomoChain`
-    و`FomoEVMReplay` معاً بحالتين مستقلّتين (عمليّتان، ذاكرتان)، ودمجُهما كان
-    سيخفي نفادَ رصيدٍ في إحداهما تحت سلامة الأخرى.
+    One row per (owner, provider), not per provider: a single provider can
+    exist in both `FomoChain` and `FomoEVMReplay` with two independent states
+    (two processes, two memories), and merging them would hide one of them
+    running out of credits under the other's health. (The GoldRush pool was
+    exactly this case before the provider was deleted, and today's replay
+    route is keyless anyway.)
 
-    و`stale` هنا عن **التقرير** لا عن المفاتيح: تقريرٌ متجمّد يعني أنّ العمليّة
-    المالكة لم تُتمّ دورة، وأعدادُه أرقامٌ من الماضي لا وصفٌ للحاضر.
+    And `stale` here is about the **report**, not the keys: a frozen report
+    means the owning process didn't complete a cycle, and its counts are
+    numbers from the past, not a description of the present.
     """
     moment = now or datetime.now(UTC)
 
     def _count(value: object) -> int:
-        """عددٌ من JSON كتبته عمليّةٌ أخرى: نسخةٌ أقدم قد تُغفل مفتاحاً."""
+        """A count from JSON written by another process: an older version may omit a key."""
         try:
             return int(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return 0
 
     def _indices(value: object, limit: int) -> list[int]:
-        """مواضعُ صحيحة داخل المدى فقط.
+        """Only integer indices within range.
 
-        تقريرُ عمليّةٍ أخرى قد يكون من نسخةٍ أقدم أو أحدث؛ موضعٌ خارج المدى
-        كان سيُلوّن سطراً لا يقابله، أو يرفع في العرض. نُسقطه بصمت.
+        Another process's report may come from an older or newer version; an
+        out-of-range index would have colored a row with no counterpart, or
+        inflated the display. We drop it silently.
         """
         if not isinstance(value, list):
             return []
@@ -306,21 +664,25 @@ def provider_keys(
                 "blocked": blocked,
                 "available": available,
                 "index": _count(pool.get("index")),
-                # مواضعُ المبرَّدة لا عددُها: العددُ يقول «واحدٌ من ثلاثة مرفوض»
-                # ولا يقول أيُّها، فتُلوَّن الثلاثةُ حمراء ويُلام السليم. مؤشّرٌ
-                # في قائمة، لا قيمة ولا طولها (FR-013). نسخةٌ أقدم من الكاتب لا
-                # ترسله ⇒ قائمةٌ فارغة، فيبقى `blocked` هو المعنى المتاح.
+                # The cooled slots, not their count: the count says "one of
+                # three rejected" without saying which, so all three get
+                # colored red and the healthy one gets blamed. An index in a
+                # list, no value and no length (FR-013). An older version of
+                # the writer doesn't send it ⇒ an empty list, and `blocked`
+                # remains the available meaning.
                 "blocked_index": _indices(pool.get("blocked_index"), keys),
                 "rotations": _count(pool.get("rotations")),
                 "cooldown_seconds": pool.get("cooldown_seconds"),
-                # مزوّدٌ مُسكَت لبقيّة عمر العمليّة (نفاد رصيد GoldRush ⇒ 402):
-                # الأحواض تبدو سليمة والمزوّد معطَّل، فيُقال صراحةً.
+                # A provider silenced for the rest of the process's life
+                # (credits exhausted ⇒ 402, as happened to GoldRush): the
+                # pools look healthy while the provider is off, so it's said
+                # explicitly.
                 "disabled": bool(pool.get("disabled")),
                 "at": at,
                 "age_seconds": age,
                 "stale": stale,
-                # المستويات الثلاثة: معطَّل/بلا متاح ⇒ خطأ، مفتاحٌ واحد أو
-                # مبرَّدٌ الآن ⇒ تحذير، وإلّا سليم.
+                # Three levels: disabled/none available ⇒ bad, a single key or
+                # one cooling right now ⇒ warn, otherwise good.
                 "level": (
                     "bad" if (pool.get("disabled") or (keys and not available) or not keys)
                     else "warn" if (keys < min_keys or blocked)
@@ -353,11 +715,12 @@ def recent_signals(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, 
 def active_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     if not _table_exists(conn, "watchlist"):
         return []
-    # `watchlist.first_seen_at` اسمه يكذب: `upsert_watch` يكتب فوقه عند كل
-    # إعادة قبول بعد انتهاء النافذة (db.py:781)، فمعناه الحقيقي «بداية الدورة
-    # الحالية» لا «أوّل التقاط». عرضه وحده جعل عملة مُلتقطة منذ 7 أيام تبدو
-    # عمرها 22 ساعة. السجلّ غير القابل للكتابة فوقه هو `watch_windows`، فمنه
-    # نأخذ أوّل التقاط ونعرض الاثنين معاً: العمر الحقيقي وعمر الدورة.
+    # `watchlist.first_seen_at` is a lying name: `upsert_watch` overwrites it
+    # on every re-acceptance after the window ends (db.py:781), so its real
+    # meaning is "start of the current cycle", not "first capture". Displaying
+    # it alone made a token captured 7 days ago look 22 hours old. The
+    # write-once log is `watch_windows`, so we take the first capture from it
+    # and display both together: true age and cycle age.
     first_ever = (
         "(SELECT MIN(ww.first_seen_at) FROM watch_windows ww "
         "  WHERE ww.token_address = w.token_address"
@@ -365,9 +728,20 @@ def active_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         if _table_exists(conn, "watch_windows")
         else "w.first_seen_at AS first_ever_at"
     )
+    # The control pill on the watchlist page: control coins are watched and
+    # recorded exactly like signal coins (that is the point of the comparison),
+    # but the reader must be able to tell them apart at a glance.
+    control_sel = (
+        "w.is_control AS is_control,"
+        if _has_column(conn, "watchlist", "is_control")
+        else "0 AS is_control,"
+    )
     rows = conn.execute(
         f"""SELECT w.token_address, w.network_id, w.source, w.first_seen_at, w.watch_until,
                    {first_ever},
+                   {control_sel}
+                   (SELECT ts.symbol FROM token_static ts
+                      WHERE ts.token_address = w.token_address LIMIT 1) AS symbol,
                    (SELECT COUNT(*) FROM market_ticks m
                       WHERE m.token_address = w.token_address) AS tick_count
               FROM watchlist w
@@ -379,15 +753,18 @@ def active_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 # --- OHLCV bars ---
 def bars_coverage(conn: sqlite3.Connection, live_start_ts: int) -> dict[str, Any]:
-    """تقدّم التقاط الشموع: كم عملة مراقَبة لها سلسلة سعرية فعلاً.
+    """Progress of candle capture: how many watched coins actually have a price series.
 
-    هذا المقياس الحاسم للتوسيم: العملة بلا شموع لا يمكن حساب نتيجتها، فتُهدر
-    عيّنتها. قبل جدول token_bars كان ربع المراقَبات بلا أي سعر إطلاقاً.
+    This is the decisive measure for labeling: a coin without candles can't
+    have its outcome computed, so its sample is wasted. Before the token_bars
+    table, a quarter of watches had no price at all.
 
-    `live_start_ts` إلزاميّ بلا افتراضي: الحدّ يعيش في config وحده، وافتراضيّ
-    مكرّر هنا ينجرف عنه بصمت. عدّ الشموع يُقصر على الحِقبة الحيّة (`ts >= live`):
-    token_bars يحمل تاريخ سعر رجعيّاً سابقاً للإشارة (٤٦٦ ألف شمعة رجعيّة)، وهو
-    بيانات ليست من جمع البوت اللحظيّ فلا تُعرض كي لا تختلط ببيانات البوت.
+    `live_start_ts` is mandatory with no default: the boundary lives in config
+    alone, and a duplicate default here would silently drift from it. The
+    candle count is restricted to the live epoch (`ts >= live`): token_bars
+    carries retro price history predating the signal (466 thousand retro
+    candles), which is data the live bot didn't collect, so it isn't displayed
+    to keep it from mixing with bot data.
     """
     if not _table_exists(conn, "token_bars") or not _table_exists(conn, "watchlist"):
         return {"active": 0, "with_bars": 0, "pending": 0, "no_data": 0,
@@ -400,7 +777,7 @@ def bars_coverage(conn: sqlite3.Connection, live_start_ts: int) -> dict[str, Any
                           WHERE b.token_address = w.token_address
                             AND b.network_id = w.network_id)"""
     ).fetchone()["n"]
-    # الحِقبة الحيّة فقط — الشموع الرجعيّة (ts < live) تاريخ سعر لا جمعه البوت.
+    # The live epoch only — retro candles (ts < live) are price history the bot didn't collect.
     candles = conn.execute(
         "SELECT COUNT(*) AS n FROM token_bars WHERE ts >= ?", (live_start_ts,)
     ).fetchone()["n"]
@@ -417,7 +794,7 @@ def bars_coverage(conn: sqlite3.Connection, live_start_ts: int) -> dict[str, Any
     return {
         "active": active,
         "with_bars": with_bars,
-        # لم يصلها الدور بعد (المسح دوّار عبر عدّة دورات) — ليست فشلاً.
+        # The sweep hasn't reached it yet (the scan rotates over several cycles) — not a failure.
         "pending": max(0, active - with_bars - no_data),
         "no_data": no_data,
         "candles": candles,
@@ -425,16 +802,18 @@ def bars_coverage(conn: sqlite3.Connection, live_start_ts: int) -> dict[str, Any
     }
 
 
-# --- أداء الإشارات منذ الدخول ---
+# --- Signal performance since entry ---
 def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """لكل عملة مراقَبة: كيف تحرّك سعرها **منذ لحظة الإشارة**.
+    """For every watched coin: how its price moved **since the moment of the signal**.
 
-    هذا هو السؤال الذي بُني المشروع لأجله. سعر الدخول = إغلاق أوّل شمعة عند
-    `first_seen_at` أو بعدها (لا قبلها — وإلّا تسرّب المستقبل بالعكس). القمّة
-    والقاع من `h`/`l` داخل النافذة نفسها.
+    This is the question the project was built for. Entry price = the close of
+    the first candle at or after `first_seen_at` (not before it — otherwise
+    the future leaks in backwards). The peak and trough come from `h`/`l`
+    within the same window.
 
-    ملاحظة صدق: هذه **نافذة جارية لا نتيجة نهائية** — أغلب المراقَبات لم تُكمل
-    48 ساعة بعد، و`peak_pct` يرتفع أبداً ولا ينخفض بمرور الوقت. ليست labels.
+    An honesty note: this is a **running window, not a final outcome** — most
+    watches haven't completed 48 hours yet, and `peak_pct` only ever rises,
+    never falls, over time. These are not labels.
     """
     if not _table_exists(conn, "token_bars") or not _table_exists(conn, "watchlist"):
         return []
@@ -449,16 +828,18 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     design_sel = "COALESCE(ww.design_version, 1) AS design_version," if has_windows else (
         "1 AS design_version,"
     )
-    # الذيول المستحيلة من المنبع تُستبعد من القمّة/القاع: شوهد h = 2,626,092
-    # لشمعة إغلاقها 0.0219 فعرضت اللوحة +62,570,743,609%. العلم يُحسب عند السحب
-    # (h_suspect/l_suspect) وهنا نحترمه فقط؛ القيمة الخام تبقى في القاعدة.
+    # The impossible tails from upstream are excluded from the peak/trough: an
+    # h of 2,626,092 was seen for a candle closing at 0.0219, and the dashboard
+    # displayed +62,570,743,609%. The flag is computed at capture time
+    # (h_suspect/l_suspect); here we only respect it. The raw value stays in
+    # the database.
     has_flags = _has_column(conn, "token_bars", "h_suspect")
     peak_expr = ("MAX(CASE WHEN b.h_suspect = 1 THEN NULL ELSE b.h END)"
                  if has_flags else "MAX(b.h)")
     trough_expr = ("MIN(CASE WHEN b.l_suspect = 1 THEN NULL ELSE b.l END)"
                    if has_flags else "MIN(b.l)")
-    # سعر الدخول/الأخير من إغلاق **سليم**: الإغلاق نفسه يتشوّه أحياناً (12,052.5)
-    # فيصير مقام النسبة فاسداً.
+    # Entry/latest price from a **clean** close: the close itself is sometimes
+    # corrupted (12,052.5), which would make the ratio's denominator rotten.
     clean_c = "AND c_suspect = 0" if _has_column(conn, "token_bars", "c_suspect") else ""
     t_expr = ("MIN(CASE WHEN b.c_suspect = 1 THEN NULL ELSE b.ts END)"
               if has_flags else "MIN(b.ts)")
@@ -499,7 +880,7 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for r in rows:
         entry, last, peak = r["entry_px"], r["last_px"], r["peak"]
-        if not entry:  # صفر أو None → النِّسَب غير معرّفة، لا نفبركها
+        if not entry:  # zero or None → the ratios are undefined; we don't fake them
             continue
         out.append({
             "token_address": r["a"],
@@ -517,13 +898,13 @@ def _performance_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "trough_px": r["trough"],
             "change_pct": (last / entry - 1) * 100 if last else None,
             "peak_pct": (peak / entry - 1) * 100 if peak else None,
-            # كم انخفض عن قمّته الآن — مؤشّر "فاتك البيع"
+            # How far it has fallen from its peak now — a "you missed the sell" gauge
             "from_peak_pct": (last / peak - 1) * 100 if last and peak else None,
         })
     return out
 
 
-# مفاتيح الترتيب المسموحة — قائمة بيضاء تمنع أي تعبير عشوائي من الواجهة.
+# Allowed sort keys — a whitelist keeping any arbitrary expression out of the interface.
 _SORT_KEYS = (
     "peak_pct", "change_pct", "from_peak_pct",
     "first_seen_at", "candles", "entry_px", "last_px", "symbol",
@@ -536,13 +917,15 @@ def watch_performance(
     sort_key: str = "peak_pct",
     descending: bool = True,
 ) -> list[dict[str, Any]]:
-    """أفضل/أسوأ العملات حسب مفتاح مختار.
+    """The best/worst coins by the chosen key.
 
-    الترتيب يجري هنا على **المجموعة كاملة** قبل الاقتطاع. لو رُتِّبت في المتصفّح
-    بعد اقتطاع أوّل 12، لأعطى العكسُ «أفضل 12 مقلوبة» لا الأسوأ فعلاً — وهو خطأ
-    صامت يبدو صحيحاً.
+    Sorting happens here over the **full set** before truncation. If it were
+    sorted in the browser after truncating to the first 12, descending order
+    would have given "the top 12 inverted" instead of the actual worst — a
+    silent mistake that looks correct.
     """
-    # الجدول عنوانه «أداء الإشارات» — الضابطة مرجع للمقارنة لا صفوف فيه.
+    # The table is titled "signal performance" — the control group is a
+    # reference for comparison, not rows in it.
     rows = [r for r in _performance_rows(conn) if not r.get("is_control")]
     key = sort_key if sort_key in _SORT_KEYS else "peak_pct"
 
@@ -552,7 +935,8 @@ def watch_performance(
             return v.lower()
         return v
 
-    # الغائب يبقى في الذيل في الاتجاهين — لا يتصدّر الترتيب التصاعدي بلا معنى.
+    # The missing ones stay at the tail in both directions — they don't
+    # meaninglessly top an ascending sort.
     present = [r for r in rows if _sort_value(r) is not None]
     missing = [r for r in rows if _sort_value(r) is None]
     present.sort(key=_sort_value, reverse=descending)
@@ -560,15 +944,17 @@ def watch_performance(
 
 
 def group_comparison(conn: sqlite3.Connection) -> dict[str, Any]:
-    """يقارن عملات **الإشارة** بعملات **المجموعة الضابطة** على نفس المقاييس.
+    """Compares **signal** coins with **control-group** coins on the same measures.
 
-    هذا هو السؤال الذي لا يمكن لبقيّة اللوحة الإجابة عنه: ليس «أيّ عملة مُشار
-    إليها ترتفع أكثر» بل **«هل الإشارة تعني شيئاً أصلاً»**. بلا مجموعة ضابطة
-    قد تجد 41% من إشاراتك رابحة ثمّ يتّضح أنّ 41% من السوق رابح في تلك المدّة.
+    This is the question the rest of the dashboard cannot answer: not "which
+    signaled coin rises the most" but **"does the signal mean anything at
+    all"**. Without a control group you might find 41% of your signals are
+    winners and then discover 41% of the market was winning in that period.
 
-    `delta` = فرق الإشارة عن الضابطة. موجب = الإشارة تتفوّق.
-    `sufficient` = هل حجم العيّنتين يكفي لأخذ الفرق على محمل الجدّ (لا اختبار
-    إحصائيّ هنا؛ عتبة خام تمنع قراءة الضجيج كنتيجة).
+    `delta` = the signal's edge over the control. Positive = the signal wins.
+    `sufficient` = whether the two sample sizes are big enough to take the
+    difference seriously (no statistical test here; a raw threshold keeps
+    noise from being read as a result).
     """
     rows = [
         r for r in _performance_rows(conn)
@@ -598,22 +984,25 @@ def group_comparison(conn: sqlite3.Connection) -> dict[str, Any]:
         if sig.get(k) is not None and ctl.get(k) is not None else None
         for k in ("win_rate_pct", "avg_pct", "median_pct", "avg_peak_pct")
     }
-    # عتبة خام: أقل من 20 لكل جانب والفرق ضجيج على الأرجح.
+    # A raw threshold: below 20 per side the difference is most likely noise.
     return {"signal": sig, "control": ctl, "delta": delta,
             "sufficient": sig["count"] >= 20 and ctl["count"] >= 20}
 
 
 def performance_summary(conn: sqlite3.Connection) -> dict[str, Any]:
-    """حصيلة الأرباح والخسائر عبر **كل** العملات المراقَبة، لا الشريحة المعروضة.
+    """The profit-and-loss tally across **all** watched coins, not the displayed slice.
 
-    `change_pct` (السعر الآن مقابل الدخول) هو الأساس — لا `peak_pct`، لأنّ القمّة
-    لا تُحقَّق إلّا ببيع في لحظتها. المتوسّط يفترض وزناً متساوياً لكل إشارة.
+    `change_pct` (price now versus entry) is the basis — not `peak_pct`,
+    because a peak is only realized by selling at that exact moment. The
+    average assumes equal weight per signal.
 
-    تحذير صدق مقصود في `is_open`: هذه **مراكز مفتوحة في نافذة جارية**، لا نتائج
-    محقّقة — ولا إشارة أكملت 48 ساعة بعد. الوسيط معروض بجانب المتوسّط لأنّ
-    رابحاً واحداً بـ +789% يسحب المتوسّط وحده.
+    A deliberate honesty warning in `is_open`: these are **open positions in
+    a running window**, not realized outcomes — no signal has completed 48
+    hours yet. The median is shown next to the mean because a single +789%
+    winner drags the mean by itself.
     """
-    # الحصيلة تخصّ عملات **الإشارة**؛ الضابطة مرجع للمقارنة لا جزء من الأداء.
+    # The tally is about **signal** coins; the control group is a reference
+    # for comparison, not part of the performance.
     rows = [
         r for r in _performance_rows(conn)
         if r.get("change_pct") is not None and not r.get("is_control")
@@ -635,7 +1024,7 @@ def performance_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     worst = min(rows, key=lambda r: r["change_pct"])
 
     def _brief(r: dict[str, Any]) -> dict[str, Any]:
-        # network_id مُدرج ليتمكّن العميل من بناء رابط صفحة العملة على fomo
+        # network_id is included so the client can build the coin's page link on fomo
         return {
             "symbol": r.get("symbol"),
             "token_address": r["token_address"],
@@ -652,11 +1041,11 @@ def performance_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "avg_pct": sum(changes) / n,
         "median_pct": median,
         "gross_gain_pct": sum(gains),
-        "gross_loss_pct": sum(losses),        # سالب
+        "gross_loss_pct": sum(losses),        # negative
         "net_pct": sum(changes),
         "best": _brief(best),
         "worst": _brief(worst),
-        # نافذة جارية لا نتائج محقّقة — الواجهة تعرض هذا صراحةً
+        # A running window, not realized outcomes — the UI says this explicitly
         "is_open": True,
     }
 
@@ -665,7 +1054,7 @@ def token_series(
     conn: sqlite3.Connection, token_address: str, network_id: str,
     since_ts: int, points: int = 40,
 ) -> list[float]:
-    """سلسلة إغلاق مُخفَّضة العيّنات لرسم sparkline. أقل من نقطتين → []."""
+    """A downsampled close series for drawing a sparkline. Fewer than two points → []."""
     if not _table_exists(conn, "token_bars"):
         return []
     rows = conn.execute(
@@ -679,30 +1068,109 @@ def token_series(
         return []
     if len(closes) <= points:
         return closes
-    # تخفيض بخطوة ثابتة مع ضمان بقاء آخر نقطة (السعر الحالي).
+    # Downsample by a fixed step, guaranteeing the last point stays (the current price).
     step = len(closes) / points
     sampled = [closes[int(i * step)] for i in range(points)]
     sampled[-1] = closes[-1]
     return sampled
 
 
-# --- تدفّق الإشارات عبر الزمن ---
-def signal_timeline(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
-    """عدد الإشارات لكل ساعة مقسّمة حسب النوع — لعمود مكدّس.
+# Sparkline buckets per watch: 40 points over the 48-hour window — the same
+# resolution `token_series` gives the performance page, without its per-token
+# query.
+_SPARK_POINTS = 40
+_WINDOW_SECONDS = 48 * 3600
 
-    نُعيد كل الساعات في المدى حتى الفارغة، وإلّا بدا الرسم متّصلاً عبر فجوة
-    توقّف فيها المسجّل.
+
+def watchlist_market(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Market data for the active watches, keyed `"{address}|{network}"`.
+
+    One dict feeds the whole watchlist row: the movement numbers come from
+    `_performance_rows` (same math and same suspect-close guards as the
+    performance page — one definition of "since entry", not two), and the
+    sparkline comes from a **single** bucketed pass over the live bars.
+    Calling `token_series` per coin instead would mean one full candle scan
+    per coin per refresh; the GROUP BY walks the same rows once for all coins.
+
+    Coins without a clean entry price yet (the candle sweep hasn't reached
+    them) are absent from the map, exactly as they are absent from
+    /api/performance — the watchlist row still renders, with dashes.
+
+    Control coins are included: the watchlist page has always shown every
+    active watch, and the row carries the flag so the UI can badge it.
+    The caller caches this (60 s) — the entry/peak numbers are glance
+    material, and the 48-hour countdown itself stays live via /api/watchlist.
+    """
+    market: dict[str, dict[str, Any]] = {
+        f"{r['token_address']}|{r['network_id']}": r for r in _performance_rows(conn)
+    }
+
+    if not _table_exists(conn, "token_bars") or not _table_exists(conn, "watchlist"):
+        return {k: {**v, "spark": []} for k, v in market.items()}
+
+    # Same guard as `_performance_rows`: a suspect close must not bend the
+    # sparkline either. When the column is absent the CASE collapses to `b.c`.
+    clean_c = "CASE WHEN b.c_suspect = 1 THEN NULL ELSE b.c END" \
+        if _has_column(conn, "token_bars", "c_suspect") else "b.c"
+    rows = conn.execute(
+        f"""WITH w AS (
+               SELECT token_address, network_id,
+                      CAST(strftime('%s', first_seen_at) AS INTEGER) AS entry_ts
+                 FROM watchlist WHERE active = 1
+           )
+           SELECT w.token_address AS a, w.network_id AS n,
+                  MIN({_SPARK_POINTS - 1},
+                      (b.ts - w.entry_ts) * {_SPARK_POINTS} / {_WINDOW_SECONDS}) AS bucket,
+                  AVG({clean_c}) AS px
+             FROM w JOIN token_bars b
+               ON b.token_address = w.token_address AND b.network_id = w.network_id
+              AND b.ts >= w.entry_ts AND b.c IS NOT NULL
+            GROUP BY a, n, bucket
+            ORDER BY a, n, bucket"""
+    ).fetchall()
+
+    sparks: dict[str, list[float]] = {}
+    for r in rows:
+        if r["px"] is None:
+            continue
+        sparks.setdefault(f"{r['a']}|{r['n']}", []).append(float(r["px"]))
+    for key, row in market.items():
+        row["spark"] = sparks.get(key, [])
+    return market
+
+
+# --- Signal flow over time ---
+def signal_timeline(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
+    """The number of signals per hour split by type — for a stacked column.
+
+    We return every hour in the range including empty ones, otherwise the
+    chart would look continuous across a gap where the recorder was down.
     """
     if not _table_exists(conn, "signal_events"):
         return {"hours": [], "types": [], "series": {}}
     hours = max(1, min(hours, 168))
+    # The cut-off must be written in the *stored* format, and aligned to the
+    # same hour grid the buckets below are built on.
+    #
+    # `datetime('now', ?)` produced "2026-09-01 10:00:00" — a space where
+    # `recorded_at` (utcnow_iso) has a "T". SQLite compares these as plain
+    # text, and "T" (0x54) sorts after " " (0x20), so *every* row sharing the
+    # cut-off's date passed the filter whatever its hour: `?hours=1` at 10:30
+    # scanned and grouped ten hours of signals, not one. The surplus rows fell
+    # outside the bucket list and vanished from the series, but they still fed
+    # the `types` set — so a signal type last seen 30 hours ago earned a legend
+    # entry with a flat zero column behind it.
+    #
+    # Truncating to the hour (and stepping back hours-1) makes the filter and
+    # the bucket list cover exactly the same span, so no row is read that the
+    # chart cannot place.
     rows = conn.execute(
         """SELECT strftime('%Y-%m-%dT%H:00:00', recorded_at) AS hour,
                   signal_type, COUNT(*) AS n
              FROM signal_events
-            WHERE recorded_at >= datetime('now', ?)
+            WHERE recorded_at >= strftime('%Y-%m-%dT%H:00:00', 'now', ?)
             GROUP BY hour, signal_type""",
-        (f"-{hours} hours",),
+        (f"-{hours - 1} hours",),
     ).fetchall()
     if not rows:
         return {"hours": [], "types": [], "series": {}}
@@ -718,7 +1186,8 @@ def signal_timeline(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]
         (now - timedelta(hours=h)).strftime("%Y-%m-%dT%H:00:00")
         for h in range(hours - 1, -1, -1)
     ]
-    # ترتيب ثابت للأنواع: اللون يتبع النوع لا رتبته (وإلّا تبدّلت الألوان مع الفلترة)
+    # A fixed type order: the color follows the type, not its rank (otherwise
+    # the colors would shift with filtering)
     ordered = [t for t in _SIGNAL_TYPE_ORDER if t in types]
     ordered += sorted(t for t in types if t not in _SIGNAL_TYPE_ORDER)
     return {
@@ -728,7 +1197,7 @@ def signal_timeline(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]
     }
 
 
-# ترتيب ثابت يضمن أنّ كل نوع إشارة يحتفظ بلونه مهما تغيّرت البيانات.
+# A fixed order guaranteeing every signal type keeps its color no matter how the data changes.
 _SIGNAL_TYPE_ORDER = ("multi_user_buy", "large_buy", "multi_user_sell", "large_sell")
 
 
@@ -742,11 +1211,12 @@ def storage_stats(
     disk_free_warn_bytes: int = 25 * 1024**3,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """حجم القاعدة على القرص + معدّل النموّ اليوميّ المُقدَّر.
+    """The database's size on disk + the estimated daily growth rate.
 
-    أُضيف لأنّ النموّ غير المحدود بقي خفيّاً 20 ساعة حتى بلغت القاعدة 720 MB:
-    اللوحة كانت تعرض عدد الصفوف لا حجمها. المعدّل يُقدَّر من (الحجم / عمر
-    الأرشيف) لأنّ الصفوف كلّها بمعدّل ثابت (دورة/دقيقة).
+    Added because unlimited growth stayed hidden for 20 hours until the
+    database reached 720 MB: the dashboard used to show row counts, not
+    sizes. The rate is estimated from (size / archive age) because all rows
+    arrive at a fixed rate (one cycle per minute).
     """
     total_bytes = 0
     for suffix in ("", "-wal", "-shm"):
@@ -755,7 +1225,8 @@ def storage_stats(
         except OSError:
             pass
 
-    # عمر الأرشيف من أقدم لقطة — لا من started_at (الذي يُعاد ضبطه كل تشغيل).
+    # The archive's age from the oldest snapshot — not from started_at (which
+    # is reset on every run).
     span_days = None
     if _table_exists(conn, "snapshots"):
         row = conn.execute(
@@ -812,11 +1283,11 @@ def storage_stats(
 
 # --- market ticks summary ---
 def ticks_summary(conn: sqlite3.Connection) -> dict[str, Any]:
-    """العدد الكلّي + آخر لقطة سوق لكل عملة مراقَبة نشطة."""
+    """The total count + the latest market snapshot per active watched coin."""
     if not _table_exists(conn, "market_ticks"):
         return {"total": 0, "per_token": []}
     total = conn.execute("SELECT COUNT(*) AS n FROM market_ticks").fetchone()["n"]
-    # آخر tick لكل عملة نشطة (أحدث recorded_at).
+    # The last tick per active coin (newest recorded_at).
     rows = conn.execute(
         """SELECT m.token_address, m.recorded_at, m.price_usd, m.holders,
                   m.change_24h, m.volume_24h, m.buy_count_24h, m.sell_count_24h
@@ -834,18 +1305,21 @@ def ticks_summary(conn: sqlite3.Connection) -> dict[str, Any]:
 
 # --- network coverage ---
 def latest_tick_per_active_network(conn: sqlite3.Connection) -> dict[str, str]:
-    """آخرُ لقطةِ سوقٍ لكلّ شبكةٍ فيها مراقبةٌ نشطة — بقفزاتٍ لا بمسح.
+    """The latest market snapshot per network with an active watch — by seeks, not a scan.
 
-    `network_summary` يحسب هذا الختمَ ضمن تجميعٍ يمسح جدولَ اللقطات كلَّه (قياساً
-    1780 مللي ثانية على ثلاثة ملايين سطر) لأنّه يجمع بـ`network_id` ولا فهرسَ
-    يبدأ به. أمّا هنا فنعكس الاتّجاه: نمرّ على العملات النشطة (184) ونسأل عن آخر
-    ختمٍ لكلٍّ منها، فيُطابق `(token_address, network_id)` بدايةَ المفتاح الأساسيّ
-    ⇒ قفزةٌ واحدة إلى طرف مداها. القياس: **0.4 مللي ثانية**، بفهرسٍ موجودٍ أصلاً
-    ولا يُبنى شيءٌ جديد.
+    `network_summary` computes this stamp inside an aggregation that scans the
+    whole snapshots table (measured at 1780 ms over three million rows)
+    because it groups by `network_id` and no index starts with it. Here we
+    reverse the direction: we walk the active coins (184) and ask for the
+    latest stamp of each, so `(token_address, network_id)` matches the start
+    of the primary key ⇒ a single seek to the edge of its range. Measured:
+    **0.4 ms**, with an index that already exists and nothing new built.
 
-    والفرقُ الوحيد أنّه يعمى عن شبكةٍ بلا مراقبةٍ نشطة — ولذلك لا يُستعمل بديلاً
-    عن الملخّص بل طبقةً فوقه (`with_live_latest_tick`): المخزَّن يحمل كلَّ الشبكات
-    والحيُّ يُحدّث طزاجةَ العاملة منها.
+    And the only difference is that it's blind to a network with no active
+    watch — which is why it isn't used as a replacement for the summary but
+    as a layer on top of it (`with_live_latest_tick`): the cached value
+    carries all the networks and the live one refreshes the freshness of the
+    active ones.
     """
     if not (_table_exists(conn, "watchlist") and _table_exists(conn, "market_ticks")):
         return {}
@@ -870,15 +1344,18 @@ def latest_tick_per_active_network(conn: sqlite3.Connection) -> dict[str, str]:
 def with_live_latest_tick(
     rows: list[dict[str, Any]], live: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """ينسخ صفوفَ الملخّص ويرفع `latest_tick` إلى الأحدث بين المخزَّن والحيّ.
+    """Copies the summary rows and raises `latest_tick` to the newer of the cached and live values.
 
-    **ينسخ ولا يعدّل**: الصفوف الواردة قد تكون في ذاكرةٍ مؤقّتة يتشاركها طلباتٌ
-    متوازية، فتعديلها في مكانها كان سيُفسدها لمن يقرؤها في اللحظة نفسها.
+    **Copies, doesn't mutate**: the incoming rows may be in a cache shared by
+    concurrent requests, so editing them in place would corrupt them for
+    whoever reads them at the same moment.
 
-    و`max` لا استبدال: الحيُّ أعمى عن عملةٍ توقّفت مراقبتُها بعد آخر لقطةٍ لها،
-    فلو حملت هي أحدثَ ختمٍ في شبكتها لكان الاستبدالُ **تراجعاً** في الطزاجة —
-    ورقمٌ يتراجع في اللوحة يقرأ كأنّ البيانات تعود إلى الوراء. الأختامُ ISO بنفس
-    الإزاحة (‎+00:00) من كاتبٍ واحد، فترتيبُها المعجميّ هو ترتيبُها الزمنيّ.
+    And `max`, not replacement: the live view is blind to a coin whose watch
+    ended after its last snapshot, so if that coin held the newest stamp in
+    its network, replacing would be a **regression** in freshness — and a
+    number that goes backwards in the dashboard reads as the data moving back
+    in time. The stamps are ISO with the same offset (+00:00) from a single
+    writer, so their lexicographic order is their chronological order.
     """
     merged: list[dict[str, Any]] = []
     for row in rows:
@@ -892,16 +1369,19 @@ def with_live_latest_tick(
 
 
 def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """ملخّص تغطية كل شبكة من البيانات الحية والقياسات على السلسلة.
+    """A coverage summary per network for live data and on-chain measurements.
 
-    استعلامٌ ثقيل بحكم بنيته: عقدةُ `ticks` تجمع بـ`network_id` ولا فهرسَ يبدأ
-    به، فتمسح الجدولَ كلَّه (1724 من 1880 مللي ثانية مقيسة). ولا يُصلَح بلا فهرسٍ
-    جديد — وذلك مسٌّ للقاعدة — فيُخزَّن ناتجُه مؤقّتاً في `cache.MEMO` بعُمرٍ
-    محدّد، وتُرفع طزاجتُه فوقه من `latest_tick_per_active_network`.
+    A structurally heavy query: the `ticks` node groups by `network_id` and no
+    index starts with it, so it scans the whole table (1724 of 1880 measured
+    ms). It can't be fixed without a new index — which would mean touching
+    the database — so its output is cached in `cache.MEMO` with a fixed TTL,
+    and its freshness is lifted on top from `latest_tick_per_active_network`.
 
-    ولا تُستبدل عقدةُ `ticks` بالبديل الرخيص: هي أيضاً تُسهم في **قائمة الشبكات**
-    نفسها (`networks = active UNION ticks`)، فشبكةٌ لها لقطاتٌ بلا مراقبةٍ نشطة
-    تظهر بفضلها وحدها — واستبدالُها كان سيُخفيها من اللوحة بلا أن يقول أحدٌ شيئاً.
+    And the `ticks` node isn't replaced with the cheap alternative: it also
+    contributes to the **network list** itself
+    (`networks = active UNION ticks`), so a network with snapshots but no
+    active watch appears thanks to it alone — replacing it would have hidden
+    it from the dashboard without anyone saying a thing.
     """
     if not _table_exists(conn, "watchlist"):
         return []
@@ -975,12 +1455,19 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                  SELECT DISTINCT token_address, network_id
                    FROM watchlist
                   WHERE active=1 AND network_id IS NOT NULL AND network_id != ''
-             ), active AS (
-                 SELECT network_id, COUNT(*) AS active_watches
-                   FROM active_tokens GROUP BY network_id
-             ), latest_concentration AS (
-                 {concentration_cte}
-             ), conc AS (
+              ), active AS (
+                  SELECT network_id, COUNT(*) AS active_watches
+                    FROM active_tokens GROUP BY network_id
+              ), historical_tokens AS (
+                  SELECT DISTINCT token_address, network_id
+                    FROM watchlist
+                   WHERE active=0 AND network_id IS NOT NULL AND network_id != ''
+              ), historical AS (
+                  SELECT network_id, COUNT(*) AS historical_watches
+                    FROM historical_tokens GROUP BY network_id
+              ), latest_concentration AS (
+                  {concentration_cte}
+              ), conc AS (
                  SELECT a.network_id,
                         COUNT(lc.token_address) AS concentration_rows,
                         COUNT(lc.top1_pct) AS top1_rows,
@@ -993,8 +1480,20 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                    LEFT JOIN latest_concentration lc
                      ON lc.token_address = a.token_address
                     AND lc.network_id = a.network_id
-                  GROUP BY a.network_id
-             ), latest_details AS (
+                   GROUP BY a.network_id
+              ), historical_conc AS (
+                  SELECT h.network_id,
+                         COUNT(lc.token_address) AS historical_concentration_rows,
+                         COUNT(lc.top1_pct) AS historical_top1_rows,
+                         COUNT(lc.top5_pct) AS historical_top5_rows,
+                         COUNT(lc.top10_pct) AS historical_top10_rows,
+                         COUNT(lc.top20_pct) AS historical_top20_rows
+                    FROM historical_tokens h
+                    LEFT JOIN latest_concentration lc
+                      ON lc.token_address = h.token_address
+                     AND lc.network_id = h.network_id
+                   GROUP BY h.network_id
+              ), latest_details AS (
                  {details_cte}
              ), details AS (
                  SELECT a.network_id,
@@ -1008,17 +1507,25 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                   GROUP BY a.network_id
              ), ticks AS (
                  {ticks_cte}
-             ), networks AS (
-                 SELECT network_id FROM active
-                 UNION SELECT network_id FROM ticks
-             )
-             SELECT networks.network_id,
-                    COALESCE(active.active_watches, 0) AS active_watches,
-                    COALESCE(conc.concentration_rows, 0) AS concentration_rows,
+              ), networks AS (
+                  SELECT network_id FROM active
+                  UNION SELECT network_id FROM historical
+                  UNION SELECT network_id FROM ticks
+              )
+              SELECT networks.network_id,
+                     COALESCE(active.active_watches, 0) AS active_watches,
+                     COALESCE(historical.historical_watches, 0) AS historical_watches,
+                     COALESCE(conc.concentration_rows, 0) AS concentration_rows,
                     COALESCE(conc.top1_rows, 0) AS top1_rows,
                     COALESCE(conc.top5_rows, 0) AS top5_rows,
                     COALESCE(conc.top10_rows, 0) AS top10_rows,
-                    COALESCE(conc.top20_rows, 0) AS top20_rows,
+                     COALESCE(conc.top20_rows, 0) AS top20_rows,
+                     COALESCE(historical_conc.historical_concentration_rows, 0)
+                         AS historical_concentration_rows,
+                     COALESCE(historical_conc.historical_top1_rows, 0) AS historical_top1_rows,
+                     COALESCE(historical_conc.historical_top5_rows, 0) AS historical_top5_rows,
+                     COALESCE(historical_conc.historical_top10_rows, 0) AS historical_top10_rows,
+                     COALESCE(historical_conc.historical_top20_rows, 0) AS historical_top20_rows,
                     COALESCE(conc.holder_count_rows, 0) AS holder_count_rows,
                     COALESCE(details.details_holder_rows, 0) AS details_holder_rows,
                     COALESCE(details.details_top10_rows, 0) AS details_top10_rows,
@@ -1026,8 +1533,10 @@ def network_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                     conc.latest_concentration, details.latest_details,
                     ticks.latest_tick
                FROM networks
-               LEFT JOIN active ON active.network_id = networks.network_id
-               LEFT JOIN conc ON conc.network_id = networks.network_id
+                LEFT JOIN active ON active.network_id = networks.network_id
+                LEFT JOIN historical ON historical.network_id = networks.network_id
+                LEFT JOIN conc ON conc.network_id = networks.network_id
+                LEFT JOIN historical_conc ON historical_conc.network_id = networks.network_id
                LEFT JOIN details ON details.network_id = networks.network_id
                LEFT JOIN ticks ON ticks.network_id = networks.network_id
               ORDER BY active_watches DESC, networks.network_id"""

@@ -1,4 +1,4 @@
-"""اختبارات قياس BSC من NodeReal وإدراجه في جدول التركّز."""
+"""Tests for BSC measurement from NodeReal and its insertion into the concentration table."""
 from __future__ import annotations
 
 import os

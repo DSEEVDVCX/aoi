@@ -1,8 +1,9 @@
-"""ترقية صفوف التدريب القديمة إلى ميزة ATH اليومية من دون إعادة بناء كل الميزات.
+"""Upgrades old training rows to the daily ATH feature without rebuilding all features.
 
-الإصدار 3 غيّر عائلة ATH فقط. نستعمل ``dist_from_ath`` القديمة لاستعادة القمة
-المحلية من آخر إغلاق، ثم ندمجها مع القمة اليومية المكتملة. هذا يطابق منطق
-``features.price_history_features`` ويحفظ التقدم على دفعات.
+Version 3 changed only the ATH family. We use the old ``dist_from_ath`` to
+recover the local peak from the last close, then merge it with the completed
+daily peak. This matches the logic of ``features.price_history_features`` and
+saves progress in batches.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from db import RecorderDB  # noqa: E402
 
 
 def daily_prefixes(db: RecorderDB) -> dict[tuple[str, str], tuple[list[int], list[float | None]]]:
-    """أختمة إغلاق 1D وقمة تراكمية للشموع السليمة ذات التاريخ المكتمل."""
+    """1D close stamps and running peak for clean bars with a completed history."""
     grouped: dict[tuple[str, str], list[tuple[int, Any]]] = defaultdict(list)
     rows = db._conn.execute(
         """SELECT b.token_address,b.network_id,b.ts,b.h
@@ -54,7 +55,7 @@ def daily_prefixes(db: RecorderDB) -> dict[tuple[str, str], tuple[list[int], lis
 def intraday_prefixes(
     db: RecorderDB,
 ) -> dict[tuple[str, str], tuple[list[int], list[Any], list[float | None]]]:
-    """إغلاقات 5د السليمة وقمتها التراكمية؛ نفس مرشحات مستخرج الميزات تماماً."""
+    """Clean 5m closes and their running peak; exactly the same filters as the feature extractor."""
     rows = db._conn.execute(
         """SELECT token_address,network_id,ts,c,h,h_suspect
              FROM token_bars
@@ -158,7 +159,7 @@ def main() -> None:
         try:
             batch_size = max(1, int(sys.argv[sys.argv.index("--batch-size") + 1]))
         except (IndexError, ValueError):
-            raise SystemExit("--batch-size يحتاج عدداً صحيحاً") from None
+            raise SystemExit("--batch-size needs an integer") from None
     force = "--force" in sys.argv
     db = RecorderDB(config.DB_PATH, config.SCHEMA_PATH)
     try:

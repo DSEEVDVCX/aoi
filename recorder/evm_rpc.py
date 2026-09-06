@@ -1,23 +1,27 @@
-"""عميل قراءة لعقد EVM الرسميّة — بلا مفتاح، بلا مزوّد، بلا تسجيل.
+"""A read-only client for official EVM nodes — no key, no provider, no signup.
 
-**قراءة فقط** (FR-012): `eth_blockNumber`، `eth_getLogs`، `eth_call`،
-`eth_getCode` — ولا توقيع ولا إرسال معاملة.
+**Read-only** (FR-012): `eth_blockNumber`, `eth_getLogs`, `eth_call`,
+`eth_getCode` — no signing and no transaction sending.
 
-**لا مفتاح إطلاقاً**، وهذا نتيجة قياس لا تفضيل: Etherscan V2 يرفض بلا مفتاح
-(`Missing/Invalid API Key`)، وV1 القديم مُلغى، وSourcify يعرف 1 من 10 عملات،
-وBlockscout يكلّف 5.6 ثانية للعملة ويعطي أعلى 50 فقط. أمّا العقد الرسميّة فحرّة
-وأسرع بـ27 ضعفاً (0.21 ث/عملة على روبن‑هود). فلا شيء يُشطب هنا لأنّ لا سرّ في
-الرابط — بخلاف `solana_rpc.py` حيث المفتاح في الرابط نفسه.
+**No key at all**, and this is a measured outcome, not a preference: Etherscan
+V2 refuses without a key (`Missing/Invalid API Key`), the old V1 is retired,
+Sourcify knows 1 of 10 tokens, and Blockscout costs 5.6 seconds per token and
+gives only the top 50. The official nodes, by contrast, are free and 27 times
+faster (0.21s/token on Robinhood). So nothing here needs revoking, because
+there is no secret in the URL — unlike `solana_rpc.py`, where the key sits in
+the URL itself.
 
-**السقوف حدود المزوّد لا اختيارنا**، وكلّها مقيسة حيّاً 2026-08-13:
-- `publicnode` (BSC) يرفض بـ403 مصفوفةَ عناوين أكبر من 5 ⇒ `EVM_ADDRESS_BATCH`.
-- `bsc-dataseed1` يرفض المدى بـ`-32005 limit exceeded` عند كل عدد ⇒ مرفوض.
-- روبن‑هود وBase قبلا 57 و22 عنواناً في نداء واحد (0.5 و0.4 ثانية).
-- أي عقدة تقصّ عند 10,000 سجلّ ⇒ `_get_logs_paged` يقسم المدى نصفين ويعاود.
-- وروبن‑هود يردّ على تعبئة من الكتلة صفر بـ`-32000 log query timed out` (مقيس
-  على أوّل دورة حيّة) — وهي «المدى أوسع من طاقتي» بصياغة أخرى ⇒ تُقسَم مثله.
-- وهو يكتم بـ429 بعد استعلام ثقيل ⇒ انتظار ثمّ إعادة **نفس** المدى: تسليمُه
-  يعني ثغرة دائمة في الدفتر لا تأخيراً.
+**The caps are the provider's limits, not our choices**, all measured live on
+2026-08-13:
+- `publicnode` (BSC) rejects an address array larger than 5 with 403 ⇒ `EVM_ADDRESS_BATCH`.
+- `bsc-dataseed1` rejects the range with `-32005 limit exceeded` at every size ⇒ rejected.
+- Robinhood and Base accepted 57 and 22 addresses in a single call (0.5 and 0.4 seconds).
+- Any node truncates at 10,000 logs ⇒ `_get_logs_paged` splits the range in half and retries.
+- And Robinhood answers a backfill from block zero with `-32000 log query timed out`
+  (measured on the first live cycle) — which is "the range is wider than my
+  capacity" worded differently ⇒ it is split like the others.
+- And it rate-limits with 429 after a heavy query ⇒ wait, then reissue the **same**
+  range: surrendering it means a permanent hole in the ledger, not a delay.
 """
 from __future__ import annotations
 
@@ -30,12 +34,20 @@ from typing import Any
 import config
 import httpx
 
-# توقيع حدث `Transfer(address,address,uint256)` — keccak-256 لنصّ التوقيع.
-# هذا **الطريق الوحيد** إلى قائمة حائزين على EVM: معيار ERC-20 لا يخزّن القائمة
-# فلا نداء عقدة يعيدها، والرصيد لا يُعرف إلّا بإعادة تشغيل كل تحويل.
+# The signature of the `Transfer(address,address,uint256)` event — keccak-256 of
+# the signature text. This is **the only route** to a holder list on EVM: the
+# ERC-20 standard does not store the list, so no node call returns it, and a
+# balance can only be known by replaying every transfer.
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-# عناوين لا تُحسب حائزاً: الصفر (سكّ وحرق) والحرق الصريح.
+# A 32-byte-wide topic for the zero address. `topics=[Transfer, ZERO_TOPIC]`
+# means "transfers **from** the zero address", i.e. mints only — and the lowest
+# block in it is effectively the token's creation block: no balance exists
+# without a mint, and the ERC-20 standard emits `Transfer(0x0, …)` on every
+# `_mint`.
+ZERO_TOPIC = "0x" + "0" * 64
+
+# Addresses that do not count as holders: zero (mint and burn) and the explicit burn address.
 BURN_ADDRESSES = (
     "0x0000000000000000000000000000000000000000",
     "0x000000000000000000000000000000000000dead",
@@ -43,31 +55,51 @@ BURN_ADDRESSES = (
 
 
 class EVMRPCError(RuntimeError):
-    """فشل نداء عقدة EVM."""
+    """An EVM node call failed."""
 
 
 class EVMLogLimit(EVMRPCError):
-    """المدى أوسع ممّا تحمله العقدة ⇒ يجب أن يُقسَم لا أن يُقبَل أو يُهجَر.
+    """The range is wider than the node can carry ⇒ it must be split, not accepted or abandoned.
 
-    استثناء منفصل لا نصّ يُفحَص بـ`in` عند موضع الاستخدام: قبول ردٍّ مقصوص يعني
-    دفتر أرصدة ناقصاً بصمت، وهو أسوأ من لا دفتر — الأرقام تبدو سليمة وهي كاذبة.
+    A separate exception rather than text checked with `in` at the use site:
+    accepting a truncated response means a silently incomplete balance ledger,
+    which is worse than no ledger — the numbers look sound and are false.
 
-    ويشمل **مهلة الاستعلام** لا القصّ وحده: روبن‑هود ردّ على تعبئة من الكتلة صفر
-    بـ`-32000 log query timed out` (مقيس 2026-08-13) — وهي نفس المعلومة بصياغة
-    أخرى: «المدى أوسع من طاقتي». من دون ذلك تموت تعبئة العملة كلّها بدل أن تُقسَم.
+    And it covers the **query timeout**, not just truncation: Robinhood answered
+    a backfill from block zero with `-32000 log query timed out` (measured
+    2026-08-13) — the same information worded differently: "the range is wider
+    than my capacity". Without that, the token's entire backfill dies instead
+    of being split.
+    """
+
+
+class EVMBatchLimit(EVMRPCError):
+    """The combined response of a batch larger than the node can carry ⇒ the **count** of calls is reduced, not the range.
+
+    Separate from `EVMLogLimit` because the remedy differs: there the range is
+    wide; here the range is acceptable, but packing ten acceptable responses
+    into one response exceeds the size limit. Measured on Base 2026-08-19:
+    `-32020 backend response too large` drops the **entire batch atomically**,
+    and the largest acceptable batch is a property of the token, not of the
+    network — measured 10, 5, 3, 2 and 1 across five watched tokens. So
+    splitting the range here is a fix in the wrong place: it doubles the call
+    count to solve a size problem and wastes the available range cap.
+
+    And when the batch is already **one**, there is no count to reduce ⇒ it is treated as a truncation of the range.
     """
 
 
 class EVMRateLimit(EVMRPCError):
-    """العقدة العامّة كتمتنا (429) ⇒ تُنتظَر وتُعاد، ولا يُهجَر المدى.
+    """The public node rate-limited us (429) ⇒ it is waited out and retried; the range is not abandoned.
 
-    منفصل عن `EVMRPCError` لأنّ العلاج مختلف تماماً: القصّ يُقسَم، والكتم
-    يُنتظَر — وقسمة المدى عند 429 تضاعف عدد النداءات فتزيد الكتم.
+    Separate from `EVMRPCError` because the remedy is entirely different:
+    truncation is split, rate limiting is waited out — and splitting the range
+    on a 429 doubles the call count and makes the rate limiting worse.
     """
 
 
 def _num(value: Any) -> int | None:
-    """يحوّل عدداً ستّ‑عشريّاً (`0x…`) أو عشريّاً إلى int، أو None إن تعذّر."""
+    """Converts a hexadecimal (`0x…`) or decimal number to int, or None if that fails."""
     if value is None:
         return None
     if isinstance(value, int):
@@ -82,7 +114,7 @@ def _num(value: Any) -> int | None:
 
 
 def _topic_address(topic: Any) -> str | None:
-    """يستخرج عنواناً من موضوع بعرض 32 بايت (آخر 20 بايت)."""
+    """Extracts an address from a 32-byte-wide topic (the last 20 bytes)."""
     if (
         not isinstance(topic, str)
         or re.fullmatch(r"0x[0-9a-fA-F]{64}", topic) is None
@@ -104,11 +136,77 @@ def _uint256(value: Any) -> int | None:
     return int(value, 16)
 
 
-class EVMRPC:
-    """عميل غير متزامن لعقد EVM. عميل httpx واحد لكل الشبكات.
+def _classify(label: str, code: Any, message: str) -> EVMRPCError:
+    """Error code and message ⇒ the exception that carries the **remedy**, not the description.
 
-    الشبكة تُمرَّر في كل نداء لا تُثبَّت في الكائن: نداءٌ واحد يغطّي شبكة كاملة،
-    فالدورة تمرّ على ثلاث شبكات في ثوانٍ — وثلاثة كائنات لثلاث عقد تكلفة بلا مقابل.
+    Three remedies that must not be mixed up: rate limiting is waited out, a
+    wide range is split, a heavy batch has its count reduced. And the order is
+    deliberate: "too many requests" is rate limiting, not range capacity, even
+    though it shares one word with "too many logs".
+    """
+    low = message.lower()
+    if (
+        code in (429, -32011) or "too many requests" in low
+        or "rate limit" in low or "no backend" in low or "try again" in low
+    ):
+        return EVMRateLimit(f"{label}: {message[:150]}")
+    # A **response size** limit, not a range limit: Base answers `-32020 backend
+    # response too large` on a batch whose ranges are all acceptable (measured
+    # 2026-08-19) ⇒ the count is reduced. And when the count is already one,
+    # `get_logs_paged` escalates it to a split of the range.
+    if code == -32020 or "response too large" in low:
+        return EVMBatchLimit(f"{label}: {message[:150]}")
+    # Nodes word "the range is wider than my capacity" differently (`exceeds
+    # limit of 10000`, `query returned more than`, `limit exceeded`, `limited
+    # to a 10,000 range`, and **query timeout**) and all of them mean one
+    # thing: split the range.
+    if (
+        code == -32614
+        or "exceed" in low or "more than" in low or "too many" in low
+        or "timed out" in low or "timeout" in low or "limited to a" in low
+    ):
+        return EVMLogLimit(f"{label}: {message[:150]}")
+    return EVMRPCError(f"{label}: JSON-RPC {code}: {message[:150]}")
+
+
+def _split_range(lo: int, hi: int, hint: int) -> list[tuple[int, int]]:
+    """A rejected range ⇒ smaller ranges ordered **ascending**, with no gap and no overlap.
+
+    The hint is used **only if it actually shrinks the range**, and this is a
+    liveness condition, not an optimization: a range exactly 10,000 long on
+    Base makes `range(lo, hi+1, 10_000)` return a single range that is the same
+    one, which gets pushed back onto the stack to be rejected again — a loop
+    that eats the whole call cap with zero progress. Halving is the only exit
+    guaranteed to shrink.
+    """
+    if hint > 0 and (hi - lo + 1) > hint:
+        return [(start, min(hi, start + hint - 1)) for start in range(lo, hi + 1, hint)]
+    mid = lo + (hi - lo) // 2
+    return [(lo, mid), (mid + 1, hi)]
+
+
+def _in_block_order(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A strict chronological ordering for the returned logs.
+
+    A batch returns its ranges in one response, and one of them may come back
+    without its sibling, so the read order no longer matches the block order.
+    The consumers sort and aggregate on their own, but the contract here is
+    that what is returned is sorted: ordering once here is cheaper than lost
+    trust at every call site.
+    """
+    return sorted(logs, key=lambda log: (
+        _num(log.get("blockNumber")) or 0,
+        _num(log.get("transactionIndex")) or 0,
+        _num(log.get("logIndex")) or 0,
+    ))
+
+
+class EVMRPC:
+    """An async client for EVM nodes. One httpx client for all networks.
+
+    The network is passed on every call, not fixed on the object: one call
+    covers a whole network, so the cycle passes over three networks in seconds
+    — and three objects for three nodes are cost with no return.
     """
 
     def __init__(
@@ -118,8 +216,9 @@ class EVMRPC:
     ) -> None:
         self._urls = dict(urls or config.EVM_RPC_URLS)
         self._timeout = timeout if timeout is not None else config.EVM_TIMEOUT_SECONDS
-        # بعض العقد العامّة ترفض بـ403 طلباً بلا `user-agent` (مقيس على
-        # `bsc-rpc.publicnode.com`) — وترويسة واحدة أرخص من فقدان شبكة.
+        # Some public nodes reject a request without a `user-agent` header with
+        # 403 (measured on `bsc-rpc.publicnode.com`) — one header is cheaper
+        # than losing a network.
         self._client = httpx.AsyncClient(
             timeout=self._timeout,
             headers={"user-agent": "fomo-recorder/1.0", "content-type": "application/json"},
@@ -131,13 +230,13 @@ class EVMRPC:
     def url_for(self, network_id: str) -> str:
         url = self._urls.get(str(network_id))
         if not url:
-            raise EVMRPCError(f"لا عقدة معرّفة للشبكة {network_id}")
+            raise EVMRPCError(f"no node defined for network {network_id}")
         return url
 
     async def _call(
         self, network_id: str, method: str, params: Any, *, url: str | None = None,
     ) -> Any:
-        """نداء JSON-RPC واحد. يرفع `EVMLogLimit` عند القصّ و`EVMRPCError` سواه."""
+        """A single JSON-RPC call. Raises `EVMLogLimit` on truncation and `EVMRPCError` otherwise."""
         url = url or self.url_for(network_id)
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
@@ -146,11 +245,13 @@ class EVMRPC:
             if status == 429:
                 raise EVMRateLimit(f"{method} [{network_id}] HTTP 429")
             if status >= 400:
-                # الرمز وحده لا يكفي: Base تردّ على مدًى أوسع من 10,000 كتلة
-                # بـ**HTTP 413** وجسمٍ فيه `-32614 eth_getLogs is limited to a
-                # 10,000 range` (مقيس 2026-08-13)، فلو صار خطأً عامّاً لأُسقط
-                # النداء بدل أن يُقسَّم المدى. و5xx العابر («no backend is
-                # currently healthy») انتظارٌ لا عطب: نفس المدى يُعاد.
+                # The status code alone is not enough: Base answers a range
+                # wider than 10,000 blocks with **HTTP 413** and a body
+                # containing `-32614 eth_getLogs is limited to a 10,000 range`
+                # (measured 2026-08-13), so if it became a generic error the
+                # call would be dropped instead of the range being split. And a
+                # transient 5xx ("no backend is currently healthy") is a wait,
+                # not a failure: the same range is retried.
                 text = resp.text[:400]
                 low = text.lower()
                 if status == 413 or "-32614" in low or "limited to a" in low:
@@ -162,46 +263,33 @@ class EVMRPC:
         except EVMRPCError:
             raise
         except httpx.TransportError as exc:
-            # مهلة قراءة أو انقطاع اتّصال: انتظارٌ لا عطب — وهو ما كان يُسقط
-            # النداء نهائيّاً (شوهد `eth_blockNumber [4663] ReadTimeout` 2026-08-17)
-            # لأنّه يقع في `except Exception` العامّ. تصنيفه كتماً يُشغّل التمهّل
-            # الموجود في `get_logs_paged` بدل تسليم المدى — وتسليمه ثغرة دائمة.
+            # A read timeout or a dropped connection: a wait, not a failure —
+            # this is what used to kill the call for good (seen as
+            # `eth_blockNumber [4663] ReadTimeout` 2026-08-17) because it lands
+            # in the broad `except Exception`. Classifying it as rate limiting
+            # triggers the backoff already present in `get_logs_paged` instead
+            # of surrendering the range — and surrendering it is a permanent
+            # hole.
             raise EVMRateLimit(f"{method} [{network_id}] {type(exc).__name__}") from None
         except Exception as exc:  # noqa: BLE001
             raise EVMRPCError(f"{method} [{network_id}] {type(exc).__name__}: {exc}") from None
         if not isinstance(body, dict):
-            raise EVMRPCError(f"{method} [{network_id}]: ردّ غير متوقّع ({type(body).__name__})")
+            raise EVMRPCError(f"{method} [{network_id}]: unexpected response ({type(body).__name__})")
         err = body.get("error")
         if err is not None:
             code = err.get("code") if isinstance(err, dict) else None
             msg = str(err.get("message") if isinstance(err, dict) else err)
-            low = msg.lower()
-            if (
-                code in (429, -32011) or "too many requests" in low
-                or "rate limit" in low or "no backend" in low
-                or "try again" in low
-            ):
-                raise EVMRateLimit(f"{method} [{network_id}]: {msg[:150]}")
-            # العقد تصوغ «المدى أوسع من طاقتي» بعبارات مختلفة (`exceeds limit of
-            # 10000`، `query returned more than`، `limit exceeded`، `limited to a
-            # 10,000 range`، و**مهلة الاستعلام**) وكلّها تعني شيئاً واحداً:
-            # قسّم المدى.
-            if (
-                code == -32614
-                or "exceed" in low or "more than" in low or "too many" in low
-                or "timed out" in low or "timeout" in low or "limited to a" in low
-            ):
-                raise EVMLogLimit(f"{method} [{network_id}]: {msg[:150]}")
-            raise EVMRPCError(f"{method} [{network_id}]: JSON-RPC {code}: {msg[:150]}")
+            raise _classify(f"{method} [{network_id}]", code, msg)
         if "result" not in body:
-            raise EVMRPCError(f"{method} [{network_id}]: لا result ولا error")
+            raise EVMRPCError(f"{method} [{network_id}]: no result and no error")
         return body["result"]
 
     async def block_number(self, network_id: str) -> int:
-        """رأس السلسلة — **مرساة** الدورة، فيُعاد عند الكتم والعطل العابر.
+        """The chain head — the cycle's **anchor**, so it is retried on rate limiting and transient failure.
 
-        فشله لا يُسقط عملةً بل مسحَ الشبكة بأسره (`evm_layer._apply_live`)، ونداءٌ
-        واحد رخيص لا يستحقّ ذلك الثمن. راجع `EVM_HEAD_RETRIES`.
+        Its failure does not drop a token but the sweep of the entire network
+        (`evm_layer._apply_live`), and one cheap call is not worth that price.
+        See `EVM_HEAD_RETRIES`.
         """
         attempts = int(config.EVM_HEAD_RETRIES) + 1
         for attempt in range(attempts):
@@ -214,19 +302,21 @@ class EVMRPC:
                 continue
             block = _num(raw)
             if block is None:
-                raise EVMRPCError(f"eth_blockNumber [{network_id}]: رقم كتلة غير مفهوم")
+                raise EVMRPCError(f"eth_blockNumber [{network_id}]: unreadable block number")
             return block
-        raise EVMRateLimit(f"eth_blockNumber [{network_id}]: تعذّر بعد {attempts} محاولات")
+        raise EVMRateLimit(f"eth_blockNumber [{network_id}]: failed after {attempts} attempts")
 
     async def block_timestamp(self, network_id: str, block: int) -> int | None:
-        """طابع كتلة واحدة بالثواني. لازم للإعادة الرجعيّة وحدها.
+        """The timestamp of one block, in seconds. Needed by the historical replay alone.
 
-        الطبقة الحيّة لا تحتاجه (وقتها هو الآن)، أمّا الإعادة فتحوّل وقتاً إلى
-        رقم كتلة والعكس — وعقدة روبن‑هود تعيد `blockTimestamp: '0x0'` في سجلّات
-        `eth_getLogs` (مقيس 2026-08-13) فلا مصدر للوقت إلّا الكتلة نفسها.
+        The live layer does not need it (its time is now), while the replay
+        converts a time to a block number and back — and the Robinhood node
+        returns `blockTimestamp: '0x0'` in `eth_getLogs` records (measured
+        2026-08-13), so the block itself is the only source of time.
 
-        كتلة غير موجودة (أعلى من الرأس) تعيد `null` ⇒ `None` لا استثناء: السؤال
-        عن كتلة لم تُنتَج بعد جوابه «ليست بعد» لا عطب.
+        A nonexistent block (above the head) returns `null` ⇒ `None`, not an
+        exception: the answer to a question about a block not yet produced is
+        "not yet", not a failure.
         """
         blk = await self._call(network_id, "eth_getBlockByNumber", [hex(int(block)), False])
         if not isinstance(blk, dict):
@@ -234,12 +324,12 @@ class EVMRPC:
         return _num(blk.get("timestamp"))
 
     async def get_code(self, network_id: str, address: str) -> str:
-        """بايت‑كود العقد. `0x` = ليس عقداً (محفظة أو عنوان فارغ)."""
+        """The contract's bytecode. `0x` = not a contract (a wallet or an empty address)."""
         result = await self._call(network_id, "eth_getCode", [address, "latest"])
         return result if isinstance(result, str) else "0x"
 
     async def get_code_at(self, network_id: str, address: str, block: int) -> str:
-        """بايت‑كود عند كتلة محددة، مع خدمة الحالة التاريخية إن عُرّفت."""
+        """Bytecode at a specific block, using the historical-state service when one is defined."""
         net = str(network_id)
         historical = config.EVM_HISTORICAL_RPC_URLS.get(net)
         if not historical:
@@ -251,20 +341,20 @@ class EVMRPC:
         return result if isinstance(result, str) else "0x"
 
     async def historical_block_number(self, network_id: str) -> int:
-        """رأس خدمة الحالة التاريخية، أو رأس RPC الحي إن لم توجد خدمة خاصة."""
+        """The head of the historical-state service, or the live RPC head when no dedicated service exists."""
         net = str(network_id)
         historical = config.EVM_HISTORICAL_RPC_URLS.get(net)
         if not historical:
             return await self.block_number(net)
         block = _num(await self._call(net, "eth_blockNumber", [], url=historical))
         if block is None:
-            raise EVMRPCError(f"eth_blockNumber [{net}]: رقم كتلة غير مفهوم")
+            raise EVMRPCError(f"eth_blockNumber [{net}]: unreadable block number")
         return block
 
     async def contract_creation_block(
         self, network_id: str, address: str, head: int,
     ) -> int | None:
-        """أول كتلة كان فيها للعقد بايت‑كود، ببحث ثنائي مضبوط."""
+        """The first block in which the contract had bytecode, via an exact binary search."""
         historical_head = await self.historical_block_number(network_id)
         hi = min(max(0, int(head)), historical_head)
         if await self.get_code_at(network_id, address, hi) in ("0x", "0x0", ""):
@@ -282,13 +372,15 @@ class EVMRPC:
     async def eth_call(
         self, network_id: str, to: str, data: str, block: str = "latest",
     ) -> str | None:
-        """نداء دالّة قراءة. يعيد None عند الارتداد بدل أن يُسقط الدورة.
+        """A read-function call. Returns None on revert instead of dropping the cycle.
 
-        الارتداد **متوقّع** لا شاذّ: نسأل `owner()` عقداً قد لا يملكها، والدالّة
-        الغائبة ترتدّ. فالفشل هنا جوابٌ («لا هذه الدالّة») لا خطأ.
+        A revert is **expected**, not anomalous: we ask `owner()` of a contract
+        that may not have it, and a missing function reverts. So failure here
+        is an answer ("no such function"), not an error.
 
-        لكنّ الكتم (429) ليس جواباً: ابتلاعه يكتب «لا مالك لهذا العقد» وهي
-        معلومة كاذبة تُخزَّن كأنّها مقيسة ⇒ يُرفع ليصير الصفّ خطأً يُعاد.
+        But rate limiting (429) is not an answer: swallowing it writes "this
+        contract has no owner", which is false information stored as if
+        measured ⇒ it is raised, so the row becomes an error that gets retried.
         """
         try:
             result = await self._call(
@@ -308,7 +400,7 @@ class EVMRPC:
         to_block: int,
         topics: Sequence[Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """`eth_getLogs` نداءً واحداً. يرفع `EVMLogLimit` إن قصّت العقدة."""
+        """`eth_getLogs` in a single call. Raises `EVMLogLimit` if the node truncates."""
         params = [{
             "fromBlock": hex(int(from_block)),
             "toBlock": hex(int(to_block)),
@@ -317,14 +409,146 @@ class EVMRPC:
         }]
         result = await self._call(network_id, "eth_getLogs", params)
         if not isinstance(result, list):
-            raise EVMRPCError(f"eth_getLogs [{network_id}]: ردّ ليس قائمة")
-        # بعض العقد تعيد 200 بقائمة مقصوصة عند السقف بلا كتلة `error` ⇒ الوصول
-        # إلى العدد الحدّ بالضبط يُعامَل قصّاً. نصف مدى زائد أرخص من دفتر ناقص.
+            raise EVMRPCError(f"eth_getLogs [{network_id}]: response is not a list")
+        # Some nodes return 200 with a list truncated at the cap and no `error`
+        # block ⇒ reaching exactly the limit count is treated as truncation. An
+        # extra half-range call is cheaper than an incomplete ledger.
         if len(result) >= config.EVM_LOG_LIMIT:
             raise EVMLogLimit(
-                f"eth_getLogs [{network_id}]: {len(result)} سجلّاً ⇒ السقف بلغ"
+                f"eth_getLogs [{network_id}]: {len(result)} logs => limit reached"
             )
         return [r for r in result if isinstance(r, dict)]
+
+    async def get_logs_multi(
+        self,
+        network_id: str,
+        addresses: Sequence[str],
+        ranges: Sequence[tuple[int, int]],
+        topics: Sequence[Any] | None = None,
+    ) -> list[list[dict[str, Any]] | EVMRPCError]:
+        """Several `eth_getLogs` calls in **one HTTP request** (a JSON-RPC 2.0 batch).
+
+        This is the way out of the range caps without gaming them: the cap
+        limits the individual call, not the request, so packing ten acceptable
+        calls into one request is legitimate under the standard itself and
+        doubles the yield. Measured 2026-08-19: Base 5×10,000 blocks in 1.16s
+        (versus 0.88s for a single call), and Monad 100×100 blocks = 10,000
+        blocks in one request, while a single call there is capped at 100.
+
+        And it returns a list **aligned with `ranges`**: for each range, either
+        its logs or its exception. Raising at the first failed range throws
+        away nine successful results that were paid for — a batch mixes success
+        and failure in one response by its nature. But a failure of the
+        **request itself** (rate limit or size limit) is raised: there is no
+        result in it worth saving.
+        """
+        url = self.url_for(network_id)
+        label = f"eth_getLogs×{len(ranges)} [{network_id}]"
+        topic_filter = list(topics) if topics is not None else [TRANSFER_TOPIC]
+        addrs = [a.lower() for a in addresses]
+        payload = [
+            {
+                "jsonrpc": "2.0", "id": index, "method": "eth_getLogs",
+                "params": [{
+                    "fromBlock": hex(int(lo)), "toBlock": hex(int(hi)),
+                    "address": addrs, "topics": topic_filter,
+                }],
+            }
+            for index, (lo, hi) in enumerate(ranges)
+        ]
+        try:
+            resp = await self._client.post(url, json=payload)
+            status = resp.status_code
+            if status == 429:
+                raise EVMRateLimit(f"{label} HTTP 429")
+            if status >= 500:
+                raise EVMRateLimit(f"{label} HTTP {status}")
+            if status >= 400:
+                # 413 on a batch is ambiguous: a wide range or a heavy
+                # response? It is read as a **heavy batch**, because reducing
+                # the count is guaranteed progress in both cases, and at a
+                # count of one the caller escalates it to a range split. The
+                # converse is not true: splitting the range to solve a size
+                # problem wastes the whole available cap.
+                raise EVMBatchLimit(f"{label} HTTP {status}: {resp.text[:150]}")
+            body = resp.json()
+        except EVMRPCError:
+            raise
+        except httpx.TransportError as exc:
+            raise EVMRateLimit(f"{label} {type(exc).__name__}") from None
+        except Exception as exc:  # noqa: BLE001
+            raise EVMRPCError(f"{label} {type(exc).__name__}: {exc}") from None
+        if isinstance(body, dict):
+            # A single-object response to an array request: an error concerning the entire request, not one range in it.
+            err = body.get("error")
+            code = err.get("code") if isinstance(err, dict) else None
+            msg = str(err.get("message") if isinstance(err, dict) else err)
+            raise _classify(label, code, msg)
+        if not isinstance(body, list):
+            raise EVMRPCError(f"{label}: response is not an array ({type(body).__name__})")
+        by_id: dict[int, dict[str, Any]] = {}
+        for item in body:
+            if isinstance(item, dict) and isinstance(item.get("id"), int):
+                by_id[item["id"]] = item
+        out: list[list[dict[str, Any]] | EVMRPCError] = []
+        for index in range(len(ranges)):
+            item = by_id.get(index)
+            if item is None:
+                out.append(EVMRPCError(f"{label}: no response for call {index}"))
+                continue
+            err = item.get("error")
+            if err is not None:
+                code = err.get("code") if isinstance(err, dict) else None
+                msg = str(err.get("message") if isinstance(err, dict) else err)
+                out.append(_classify(label, code, msg))
+                continue
+            result = item.get("result")
+            if not isinstance(result, list):
+                out.append(EVMRPCError(f"{label}: call {index} has no result"))
+                continue
+            if len(result) >= config.EVM_LOG_LIMIT:
+                out.append(EVMLogLimit(f"{label}: {len(result)} logs => limit reached"))
+                continue
+            out.append([row for row in result if isinstance(row, dict)])
+        return out
+
+    async def first_mint_block(
+        self, network_id: str, address: str, head: int,
+    ) -> int | None:
+        """The first block in which this contract was minted — **one call** over the `0→head` range.
+
+        The replacement for `contract_creation_block` where there is no
+        archive: the Robinhood node keeps only ~128 blocks of state, so a
+        binary search on `eth_getCode` is impossible there, and the only
+        alternative was walking from block zero. The difference is measured
+        2026-08-19: four watched tokens were minted at 0.2%, 67.7%, 88.6% and
+        93.6% of the chain, i.e. 27–37 **million** empty blocks walked before
+        the first transfer — and the scan answers in 0.17 seconds.
+
+        The trick is that the two-topic filter trims the response down to
+        mints alone (a single mint across the four tokens), so it never
+        reaches the 10,000 cap even if the token is noisy.
+
+        It returns `None` when the answer is unknown, and then the caller
+        **must** start from zero rather than guess: a token that mints
+        continuously may truncate the response (`EVMLogLimit`), making the
+        lowest block we saw higher than the truth, and a wrong low means a
+        holder who received before it shows a negative balance — i.e. the
+        whole token gets rejected. And rate limiting is raised, not
+        swallowed: "I could not ask" is not "no mint before this block".
+        """
+        try:
+            logs = await self.get_logs(
+                network_id, [address], 0, int(head),
+                topics=[TRANSFER_TOPIC, ZERO_TOPIC],
+            )
+        except EVMLogLimit:
+            return None
+        blocks = [
+            block for block in (_num(log.get("blockNumber")) for log in logs)
+            if block is not None
+        ]
+        return min(blocks) if blocks else None
 
     async def get_logs_paged(
         self,
@@ -337,88 +561,161 @@ class EVMRPC:
         sleep=asyncio.sleep,
         deadline: float | None = None,
     ) -> tuple[list[dict[str, Any]], int, bool, int]:
-        """نفس النداء مع تقسيم المدى نصفين عند القصّ.
+        """The same call, with the range split on truncation and acceptable ranges packed into a batch.
 
-        يعيد (السجلّات، عدد النداءات، أُكمِل المدى كلّه؟، أوّل كتلة غير مقروءة).
-        الرابع هو نقطة الاستئناف: عند الإكمال يساوي `to_block`، وعند بلوغ سقف
-        النداءات يساوي أدنى كتلة بقيت في المكدّس — فيُستأنف من حيث توقّف بدل أن
-        يُعاد المدى كلّه أو يُعلَن مكتملاً كذباً.
+        Returns (the logs, the number of **requests**, whether the whole range
+        was completed, the first unread block). The fourth is the resume
+        point: on completion it equals `to_block`, and on hitting the cap it
+        equals the lowest block left on the stack — so work resumes where it
+        stopped, instead of the whole range being redone or falsely declared
+        complete. And the count is now the number of **HTTP requests**, not
+        calls: the quota measured on public nodes is a request quota (nine in
+        ~15s on Base), so a batch buys ten times the range for the same price.
 
-        القسمة تكيّفيّة لا خطوة ثابتة: العملة الهادئة مقيسة بنداء واحد لـ1.71
-        مليون كتلة، والصاخبة تقصّ عند 10,000 — وخطوة ثابتة تعني إمّا مئات
-        النداءات للهادئة أو قصّاً للصاخبة. والسقف `max_calls` يمنع عملةً واحدة
-        من أكل دقيقة الدورة كلّها.
+        And **the contract that is never broken**: every returned log's block
+        is below the resume point. Without it, a log gets applied and then
+        read again in the next cycle ⇒ a doubled balance, or the cursor
+        advances over an unread range ⇒ a permanent hole. And the batch
+        threatens it directly: of ten ranges in one request, the oldest may
+        fail while the newest succeeds, so the newest goes back on the stack
+        **and its logs are discarded** even though they were paid for — one
+        extra request is cheaper than a hole.
 
-        و`deadline` (لحظة `monotonic`) سقفٌ **بالزمن** لا بالعدد، وهو ما يلزم
-        فعلاً: نداء واحد يعلَق حتى `EVM_TIMEOUT_SECONDS` (25ث) فعشرون نداءً قد
-        تكون ثانيتين أو ثماني دقائق — والعدد لا يفرّق. مقيس على الدورة الحيّة
-        الثانية: 72 نداءً في 118 ثانية بينما الفترة 60. والتوقّف هنا **ليس
-        خسارة**: الخروج ناقصاً مع نقطة استئناف هو نفس مسار السقف، فتُكمِل الدورة
-        القادمة من حيث توقّفنا. ويُسمح دائماً بنداء واحد ولو انتهت الميزانية،
-        كي لا تدور العملة بلا تقدّم أبداً.
+        The split is adaptive, not a fixed step: the quiet token is measured
+        at one call for 1.71 million blocks, and the noisy one truncates at
+        10,000 — and a fixed step means either hundreds of calls for the quiet
+        one or truncation for the noisy one. And the `max_calls` cap stops a
+        single token from eating the cycle's whole minute.
+
+        And `deadline` (a `monotonic` instant) is a cap **in time**, not in
+        count, which is what is actually needed: a single call can hang for up
+        to `EVM_TIMEOUT_SECONDS` (25s), so twenty calls could be two seconds
+        or eight minutes — and a count cannot tell them apart. Measured on the
+        second live cycle: 72 calls in 118 seconds against a 60-second period.
+        And stopping here is **not a loss**: exiting short with a resume point
+        is the same path as the cap, so the next cycle continues from where we
+        stopped. And one request is always allowed even when the budget is
+        spent, so the token never spins with no progress at all.
         """
         cap = config.EVM_BACKFILL_MAX_CALLS if max_calls is None else max_calls
+        net = str(network_id)
+        hint = int(config.EVM_LOG_RANGE_HINT.get(net, 0))
+        # The batch size starts from the network's measured cap and then
+        # **only shrinks, never grows**: the largest acceptable batch is a
+        # property of the token, not of the network (measured 10, 5, 3, 2 and
+        # 1 across five Base tokens), so learning inside the call is truer
+        # than a constant in the file. And climbing back up would mean a fresh
+        # rejection every few requests, i.e. cost with no return.
+        batch = max(1, int(config.EVM_BATCH_SIZE.get(net, 1)))
         out: list[dict[str, Any]] = []
         calls = 0
-        # مكدّس مدى‑واحد بدل استدعاء ذاتيّ: العمق قد يبلغ 20 مستوًى على مدى
-        # مليون كتلة، والمكدّس يجعل احترام `cap` سطراً واحداً.
+        # A single-range stack instead of recursion: the depth can reach 20
+        # levels over a million-block range, and the stack makes respecting
+        # `cap` a one-liner. And its invariant is that reading it from top to
+        # bottom is **ascending**, which is what makes its top the resume
+        # point.
         pending: list[tuple[int, int]] = [(int(from_block), int(to_block))]
         while pending:
             spent = (
                 calls > 0 and deadline is not None and time.monotonic() >= deadline
             )
             if calls >= cap or spent:
-                # ما بقي في المكدّس غير مقروء ⇒ المدى غير مكتمل.
-                return out, calls, False, min(lo for lo, _ in pending)
-            lo, hi = pending.pop()
-            if lo > hi:
+                # What is left on the stack is unread ⇒ the range is incomplete.
+                return (
+                    _in_block_order(out), calls, False,
+                    min(lo for lo, _ in pending),
+                )
+            taken: list[tuple[int, int]] = []
+            while pending and len(taken) < batch:
+                lo, hi = pending.pop()
+                if lo <= hi:
+                    taken.append((lo, hi))
+            if not taken:
                 continue
             if calls:
-                await sleep(config.EVM_PACING_SECONDS)
+                await sleep(
+                    config.EVM_BATCH_PACING_SECONDS if len(taken) > 1
+                    else config.EVM_PACING_SECONDS
+                )
             calls += 1
-            try:
-                out.extend(await self.get_logs(network_id, addresses, lo, hi, topics))
-            except EVMRateLimit:
-                # الكتم يُنتظَر ولا يُقسَم: القسمة تضاعف النداءات فتزيد الكتم.
-                # والمدى يُعاد إلى المكدّس كما هو — تسليمُه هنا يعني ثغرةً في
-                # الدفتر لا تأخيراً. والسقف `cap` هو ما يمنع الحلقة من الدوران.
-                pending.append((lo, hi))
-                await sleep(config.EVM_RATE_LIMIT_BACKOFF_SECONDS)
-                continue
-            except EVMLogLimit:
-                if lo >= hi:
-                    # كتلة واحدة تفوق السقف — لا قسمة ممكنة. يُرفع الاستثناء بدل
-                    # أن تُعلَق الطبقة إلى الأبد على كتلة واحدة.
-                    raise
-                # بعض العقد تفرض سقف مدى ثابتاً (Base: 10,000 كتلة، Monad:
-                # 100 كتلة). التنصيف وحده يهدر 20+ نداءً قبل بلوغ السقف على
-                # مدى genesis؛ بعد أول رفض نتعلم السقف الأعلى المقبول لهذه
-                # الشبكة ونقسم مباشرةً إلى شرائح أقدم-أولاً.
-                hint = int(config.EVM_LOG_RANGE_HINT.get(str(network_id), 0))
-                if hint > 0:
-                    # بعد أول رفض لا نعيد تجربة بقايا المدى الكبير مراراً؛ نحوّله
-                    # دفعةً واحدة إلى شرائح معلومة القبول، مع دفع الأحدث أولاً
-                    # كي يسحب المكدّس الأقدم أولاً.
-                    chunks = [
-                        (start, min(hi, start + hint - 1))
-                        for start in range(lo, hi + 1, hint)
+            if len(taken) == 1:
+                lo, hi = taken[0]
+                try:
+                    results: list[Any] = [
+                        await self.get_logs(net, addresses, lo, hi, topics)
                     ]
-                    pending.extend(reversed(chunks))
+                except EVMRPCError as exc:
+                    results = [exc]
+            else:
+                try:
+                    results = list(
+                        await self.get_logs_multi(net, addresses, taken, topics)
+                    )
+                except EVMRPCError as exc:
+                    results = [exc] * len(taken)
+
+            fresh: list[tuple[int, int, list[dict[str, Any]]]] = []
+            requeue: list[tuple[int, int]] = []
+            waited = False
+            shrink = False
+            # `strict`: one response per range by construction, and a length
+            # mismatch means a response is being paired with a range that is
+            # not its own — a false ledger, not a loud exception.
+            for (lo, hi), result in zip(taken, results, strict=True):
+                if isinstance(result, list):
+                    fresh.append((lo, hi, result))
                     continue
-                mid = lo + (hi - lo) // 2
-                # الأقدم يُقرأ أوّلاً (آخر ما يُدفَع أوّل ما يُسحَب): الترتيب
-                # الزمنيّ شرط صحّة الرصيد حين يُثبَّت عند صفر.
-                pending.append((mid + 1, hi))
-                pending.append((lo, mid))
-        return out, calls, True, int(to_block)
+                if isinstance(result, EVMRateLimit):
+                    # Rate limiting is waited out, not split: splitting
+                    # doubles the calls and makes the rate limiting worse. And
+                    # the range goes back on the stack as is — surrendering it
+                    # here means a hole in the ledger, not a delay. And the
+                    # `cap` limit is what keeps the loop from spinning forever.
+                    requeue.append((lo, hi))
+                    waited = True
+                    continue
+                if isinstance(result, EVMBatchLimit) and len(taken) > 1:
+                    requeue.append((lo, hi))
+                    shrink = True
+                    continue
+                if isinstance(result, (EVMLogLimit, EVMBatchLimit)):
+                    if lo >= hi:
+                        # A single block exceeds the cap — no split is
+                        # possible. The exception is raised rather than
+                        # leaving the layer hung forever on one block.
+                        raise result
+                    requeue.extend(_split_range(lo, hi, hint))
+                    continue
+                raise result
+
+            floor = min((lo for lo, _ in requeue), default=None)
+            for lo, hi, logs in fresh:
+                if floor is not None and lo > floor:
+                    # This range succeeded, but an **older** range in the same
+                    # batch failed. Keeping its logs means either reading them
+                    # again later (a doubled balance) or advancing the resume
+                    # point past the failed range (a permanent hole). So they
+                    # are discarded and the range retried: one extra request
+                    # is cheaper than a false ledger.
+                    requeue.append((lo, hi))
+                else:
+                    out.extend(logs)
+            if shrink:
+                batch = max(1, batch // 2)
+            requeue.sort()
+            pending.extend(reversed(requeue))
+            if waited:
+                await sleep(config.EVM_RATE_LIMIT_BACKOFF_SECONDS)
+        return _in_block_order(out), calls, True, int(to_block)
 
 
 def decode_transfer(log: dict[str, Any]) -> dict[str, Any] | None:
-    """يفكّ سجلّ `Transfer` إلى (العملة، من، إلى، القيمة، الكتلة).
+    """Decodes a `Transfer` log into (token, from, to, value, block).
 
-    القيمة في `data` لا في المواضيع (غير مفهرسة في ERC-20 القياسيّ)، والعنوانان
-    في `topics[1]` و`topics[2]`. سجلّ بمواضيع أقلّ من ثلاثة ليس Transfer قياسيّاً
-    (بعض العقود تُطلق حدثاً بنفس التوقيع وحقول مختلفة) ⇒ يُهمَل ولا يُخمَّن.
+    The value is in `data`, not in the topics (not indexed in standard ERC-20),
+    and the two addresses are in `topics[1]` and `topics[2]`. A log with fewer
+    than three topics is not a standard Transfer (some contracts emit an event
+    with the same signature and different fields) ⇒ it is ignored, never guessed at.
     """
     topics = log.get("topics")
     if (

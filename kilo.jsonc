@@ -1,0 +1,42 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "project-files": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:/Users/rr/Desktop/aoi"
+      ],
+      "enabled": true,
+      "timeout": 10000
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "timeout": 15000
+    },
+    "chrome-devtools": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ],
+      "enabled": true,
+      "timeout": 15000
+    },
+    "sequential-thinking": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "enabled": true,
+      "timeout": 10000
+    }
+  }
+}

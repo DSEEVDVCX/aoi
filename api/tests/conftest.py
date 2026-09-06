@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,6 +12,49 @@ from httpx import Response
 
 from fomo_api.auth.session import SessionStore, _key
 from fomo_api.redis_state import FakeRedis, _state, get_redis
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SUITE_DIRS = {"api/tests", "recorder/tests", "dashboard/tests"}
+_DISPATCH_ENV = "AOI_ROOT_PYTEST_DISPATCHED"
+
+
+def _suite_name(argument: str) -> str:
+    normalized = argument.replace("\\", "/").rstrip("/")
+    try:
+        return Path(normalized).resolve().relative_to(_REPO_ROOT).as_posix()
+    except ValueError:
+        return normalized.removeprefix("./")
+
+
+def pytest_cmdline_main(config: pytest.Config) -> int | None:
+    """Run mixed flat-import suites in isolated Python processes.
+
+    ``recorder`` and ``dashboard`` both expose a top-level ``config`` module.
+    Pytest selects ``api/pyproject.toml`` as the root for a mixed invocation,
+    so this conftest is the common hook that is actually loaded. A single suite
+    keeps the normal in-process behavior used by the official test runner.
+    """
+    if os.environ.get(_DISPATCH_ENV) == "1":
+        return None
+    arguments = list(config.invocation_params.args)
+    suites = [_suite_name(arg) for arg in arguments if _suite_name(arg) in _SUITE_DIRS]
+    suites = list(dict.fromkeys(suites))
+    if len(suites) < 2:
+        return None
+
+    forwarded = [arg for arg in arguments if _suite_name(arg) not in _SUITE_DIRS]
+    failed = False
+    for suite in suites:
+        env = os.environ.copy()
+        env[_DISPATCH_ENV] = "1"
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", suite, *forwarded],
+            cwd=_REPO_ROOT,
+            env=env,
+            check=False,
+        )
+        failed = failed or result.returncode != 0
+    return 1 if failed else 0
 
 
 @pytest.fixture(autouse=True)

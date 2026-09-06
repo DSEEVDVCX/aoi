@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
@@ -41,43 +42,63 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self._store: dict[str, str] = {}
-        self._ttls: dict[str, float] = {}
+        self._expires_at: dict[str, float] = {}
         self._subscribers: list[_FakePubSub] = []
 
+    def _purge_if_expired(self, key: str) -> bool:
+        expires_at = self._expires_at.get(key)
+        if expires_at is None or expires_at > time.monotonic():
+            return False
+        self._store.pop(key, None)
+        self._expires_at.pop(key, None)
+        return True
+
     async def get(self, key: str) -> str | None:
+        self._purge_if_expired(key)
         return self._store.get(key)
 
     async def set(self, key: str, value: str) -> bool:
         self._store[key] = value
+        self._expires_at.pop(key, None)
         return True
 
     async def setex(self, key: str, ttl: int, value: str) -> None:
         self._store[key] = value
-        self._ttls[key] = float(ttl)
+        self._expires_at[key] = time.monotonic() + float(ttl)
 
     async def expire(self, key: str, ttl: int) -> None:
+        self._purge_if_expired(key)
         if key in self._store:
-            self._ttls[key] = float(ttl)
+            self._expires_at[key] = time.monotonic() + float(ttl)
 
     async def delete(self, *keys: str) -> int:
         removed = 0
         for k in keys:
             if k in self._store:
                 del self._store[k]
-                self._ttls.pop(k, None)
+                self._expires_at.pop(k, None)
                 removed += 1
         return removed
 
     async def exists(self, key: str) -> bool:
+        self._purge_if_expired(key)
         return key in self._store
 
     async def incr(self, key: str) -> int:
+        self._purge_if_expired(key)
         v = int(self._store.get(key, "0")) + 1
         self._store[key] = str(v)
         return v
 
     async def ttl(self, key: str) -> int:
-        return int(self._ttls.get(key, -1))
+        if self._purge_if_expired(key):
+            return -2
+        expires_at = self._expires_at.get(key)
+        if key not in self._store:
+            return -2
+        if expires_at is None:
+            return -1
+        return max(0, int(expires_at - time.monotonic()))
 
     async def publish(self, channel: str, message: str) -> int:
         """Fan the message out to every live subscriber of `channel`."""
@@ -101,6 +122,8 @@ class FakeRedis:
 
     async def keys(self, pattern: str = "*") -> list[str]:
         import fnmatch
+        for key in tuple(self._store):
+            self._purge_if_expired(key)
         return [k for k in self._store if fnmatch.fnmatch(k, pattern)]
 
     async def scan(

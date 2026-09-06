@@ -1,21 +1,22 @@
-"""باك تست كامل للاستراتيجية المستنتجة على كل الأرشيف (train + val + test).
+"""A full backtest of the derived strategy over the whole archive (train + val + test).
 
-الاستراتيجية (مشتقة من تحليل الأنماط، العتبات من train فقط):
-    1. دخول: إشارة مستقلة حيّة على عملة meme مع:
-         - زخم قوي:   ret_24h_before  >  العُشر الثمانيني (q80)
-         - تذبذب فعلي: vol_24h_before  >  العُشر الستّيني (q60)
-         - عملة شابة:  token_age_h     <  العُشر الربيعيّ (q25)
-    2. خروج: هدف +20% · وقف −30% · حدّ زمني 24 ساعة · تكلفة دورة 2%.
+The strategy (derived from pattern analysis, thresholds from train only):
+    1. Entry: a live independent signal on a meme coin with:
+         - strong momentum:   ret_24h_before  >  the 80th percentile (q80)
+         - real volatility:   vol_24h_before  >  the 60th percentile (q60)
+         - a young coin:      token_age_h     <  the 25th percentile (q25)
+    2. Exit: target +20% · stop −30% · time limit 24 hours · round-trip cost 2%.
 
-يقارن دائماً مع خطّ الأساس (كل الإشارات) ومع الوجه المضاد (إشارات لا يختارها
-النمط) حتى لا يُقرأ الانجراف السوقيّ كميزة استراتيجية. المحاكاة تمشي على
-الشموع بنفس قواعد `exit_sim` (الوقف قبل الهدف داخل الشمعة الواحدة).
+Always compared against the baseline (all signals) and against the opposite
+face (signals the pattern does not pick), so market drift is not read as a
+strategic edge. The simulation walks the bars with the same rules as
+`exit_sim` (the stop before the target within a single bar).
 
-    py backtest_strategy.py                     # كل الأرشيف
-    py backtest_strategy.py --cost 0.02         # تكلفة مخصّصة
-    py backtest_strategy.py --no-sim            # الأعمدة بدون محاكاة شموع
+    py backtest_strategy.py                     # the whole archive
+    py backtest_strategy.py --cost 0.02         # a custom cost
+    py backtest_strategy.py --no-sim            # the columns, without bar simulation
 
-قراءة فقط؛ آمن مع المسجّل والموسِّم العاملين.
+Read-only; safe alongside the running recorder and labeler.
 """
 from __future__ import annotations
 
@@ -159,40 +160,40 @@ def main() -> None:
     frame = load_frame(db_path)
     train = frame.loc[frame["split"] == "train"]
     sel = strategy_mask(frame, train)
-    print(f"أرشيف: {len(frame):,} إشارة مستقلة · {frame.groupby(['token_address', 'network_id']).ngroups} عملة")
-    print(f"استراتيجية تختار: {int(sel.sum()):,} إشارة ({sel.mean():.1%}) — العتبات من train فقط\n")
+    print(f"Archive: {len(frame):,} independent signals · {frame.groupby(['token_address', 'network_id']).ngroups} coins")
+    print(f"Strategy selects: {int(sel.sum()):,} signals ({sel.mean():.1%}) — thresholds from train only\n")
 
     if not do_sim:
         for split in ("train", "val", "test"):
             part = frame.loc[frame["split"] == split]
             selp = strategy_mask(part, train)
-            print(f"{split:<6} n={len(part):5d} مختارة={int(selp.sum()):4d} "
+            print(f"{split:<6} n={len(part):5d} selected={int(selp.sum()):4d} "
                   f"up20={part['max_gain_24h'].ge(0.20).mean():.1%}")
         return
 
     rule = ExitRule(take_profit=TP, stop_loss=SL, time_limit_h=TIME_LIMIT_H, cost=cost)
     rows = simulate_all_rows(db_path, frame, rule, sel)
-    print(f"محاكاة ناجحة: {len(rows):,} صفقة · قاعدة الخروج: {rule.label}\n")
+    print(f"Simulated successfully: {len(rows):,} trades · exit rule: {rule.label}\n")
 
     all_rows = rows
     strat = [r for r in rows if r["selected"]]
     anti = [r for r in rows if not r["selected"]]
 
-    print("=== جدول النتائج (كل أجزاء الداتا معاً) ===")
-    print(f"{'المجموعة':<28}{'n':>6}{'متوسط':>9}{'وسيط':>9}{'فوز':>8}{'أفضل':>9}{'أسوأ':>9}{'عامل ربح':>10}")
-    for name, s in (("كل الإشارات", all_rows), ("الاستراتيجية", strat), ("المضاد", anti)):
+    print("=== Results table (all data splits together) ===")
+    print(f"{'group':<28}{'n':>6}{'mean':>9}{'median':>9}{'win':>8}{'best':>9}{'worst':>9}{'profit factor':>10}")
+    for name, s in (("all signals", all_rows), ("strategy", strat), ("anti", anti)):
         r = summarize(s, name)
         if not r["n"]:
             continue
         print(f"{name:<28}{r['n']:>6}{fmt_pct(r['mean'], True):>9}{fmt_pct(r['median'], True):>9}"
               f"{r['win_rate'] * 100:>7.1f}%{fmt_pct(r['best'], True):>9}{fmt_pct(r['worst'], True):>9}"
               f"{r['profit_factor']:>10.2f}")
-    print("\n(كل الأجزاء معاً تعني: الأيام القديمة train + الأحدث val/test — الفرق بين الأجزاء أدناه أهم)")
+    print("\n(All splits together means: the older days are train + the newer val/test — the difference between the splits below matters more)")
 
-    print("\n=== بالجزء الزمني ===")
-    print(f"{'الجزء':<8}{'المجموعة':<14}{'n':>5}{'متوسط':>9}{'وسيط':>9}{'فوز':>8}{'هدف':>7}{'وقف':>7}{'عامل ربح':>10}")
+    print("\n=== By time split ===")
+    print(f"{'split':<8}{'group':<14}{'n':>5}{'mean':>9}{'median':>9}{'win':>8}{'target':>7}{'stop':>7}{'profit factor':>10}")
     for split in ("train", "val", "test"):
-        for label, src in (("الكل", all_rows), ("الاستراتيجية", strat), ("المضاد", anti)):
+        for label, src in (("all", all_rows), ("strategy", strat), ("anti", anti)):
             r = summarize([x for x in src if x["split"] == split], label)
             if not r["n"]:
                 continue
@@ -201,45 +202,46 @@ def main() -> None:
                   f"{r['win_rate'] * 100:>7.1f}%{reasons['target'] / r['n'] * 100:>6.1f}%"
                   f"{reasons['stop'] / r['n'] * 100:>6.1f}%{r['profit_factor']:>10.2f}")
 
-    print("\n=== محفظة $100 لكل صفقة (الاستراتيجية على كل الأرشيف) ===")
-    s = summarize(strat, "الاستراتيجية")
+    print("\n=== $100 per trade portfolio (strategy over the whole archive) ===")
+    s = summarize(strat, "strategy")
     per = 100.0
     pnl = s["total_net"] * per
     invested = s["n"] * per
-    print(f"صفقات: {s['n']} · عملات: {s['tokens']} · أيام: {s['days']} ({s['n'] / s['days']:.1f} صفقة/يوم)")
-    print(f"مُستثمر: ${invested:,.0f} (100$ لكل صفقة)")
-    print(f"صافي الربح الإجمالي: ${pnl:+,.0f} ({fmt_pct(s['total_net'])} على الرأس المال المستخدم)")
-    print(f"متوسط الصفقة: ${s['mean'] * per:+.2f} · وسيطها: ${s['median'] * per:+.2f}")
-    print(f"أسوأ سلسلة يومية (سحب المنحنى): {fmt_pct(s['max_dd'], True)}")
-    print(f"عامل الربح: {s['profit_factor']:.2f} (أكبر من 1 = الأرباح تغطي الخسائر)")
+    print(f"Trades: {s['n']} · coins: {s['tokens']} · days: {s['days']} ({s['n'] / s['days']:.1f} trades/day)")
+    print(f"Invested: ${invested:,.0f} ($100 per trade)")
+    print(f"Total net profit: ${pnl:+,.0f} ({fmt_pct(s['total_net'])} on the capital deployed)")
+    print(f"Mean per trade: ${s['mean'] * per:+.2f} · median: ${s['median'] * per:+.2f}")
+    print(f"Worst daily streak (equity drawdown): {fmt_pct(s['max_dd'], True)}")
+    print(f"Profit factor: {s['profit_factor']:.2f} (above 1 = gains cover losses)")
 
-    print("\n=== إعادة الاستثمار التسلسلي لنفس الـ$100 (بترتيب زمني) ===")
+    print("\n=== Serial reinvestment of the same $100 (in chronological order) ===")
     ordered = sorted(strat, key=lambda r: r["entry_ts"])
     equity = 100.0
     curve = [(ordered[0]["entry_ts"], 100.0)]
     for r in ordered:
         equity *= 1 + r["net_return"]
         curve.append((r["entry_ts"], equity))
-    print(f"الرصيد النهائي: ${equity:,.2f} (من $100 عبر {len(ordered)} صفقة متتالية)")
+    print(f"Final balance: ${equity:,.2f} (from $100 across {len(ordered)} consecutive trades)")
     eq = np.asarray([c[1] for c in curve])
     peak = np.maximum.accumulate(eq)
     dd = ((eq - peak) / peak).min()
-    print(f"أقصى سحب للمنحنى: {fmt_pct(dd, True)}")
+    print(f"Max equity drawdown: {fmt_pct(dd, True)}")
 
-    print("\n=== متانة التكلفة (أقصى تكلفة دورة قبل الخسارة) ===")
-    for label, src in (("كل الإشارات", all_rows), ("الاستراتيجية", strat), ("المضاد", anti)):
+    print("\n=== Cost robustness (the highest round-trip cost before losing) ===")
+    for label, src in (("all signals", all_rows), ("strategy", strat), ("anti", anti)):
         be = float(np.mean([r["gross_return"] for r in src]))
-        flag = "" if be > 0.03 else "  ← أضيق من انزلاق واقعي"
-        print(f"  {label:<24} تعادل ≈ {fmt_pct(be)}{flag}")
+        flag = "" if be > 0.03 else "  ← tighter than realistic slippage"
+        print(f"  {label:<24} breakeven ≈ {fmt_pct(be)}{flag}")
 
-    print("\n=== توزيع أسباب الخروج (الاستراتيجية) ===")
+    print("\n=== Exit reason distribution (strategy) ===")
     reasons = s["reasons"]
     total = sum(reasons.values())
     for k in ("target", "stop", "time", "window_end"):
         print(f"  {k:<12} {reasons[k]:>5} ({reasons[k] / total:.1%})")
 
-    print("\nهذا باك تست تاريخي على بيانات جمعناها؛ لا يعادل تنفيذاً حقيقياً "
-          "(انزلاق، رفض تنفيذ، تزامن الصفقات غير ممثَّلة).")
+    print("\nThis is a historical backtest on data we collected; it is not equivalent "
+          "to real execution (slippage, execution rejection, and trade concurrency "
+          "are not represented).")
 
 
 if __name__ == "__main__":

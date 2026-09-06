@@ -1,24 +1,29 @@
-"""تعبئة الأعمدة المستخرَجة حديثاً من الخام المحفوظ (بلا شبكة).
+"""Backfill newly extracted columns from stored raw data (no network).
 
-الحقول التالية كانت **موجودة في `raw_json` منذ اليوم الأول** ولم يكن المستخرج
-يقرأها، فضاعت من التحليل وحده لا من الأرشيف:
+The following fields were **present in `raw_json` from day one** but the
+extractor never read them, so they were lost to analysis only, not to the
+archive:
 
 - `signal_events`: likes · views · num_replies · pinned
-  (تغطية مقيسة: likes/views في 100% من الأحداث؛ numReplies نادر ⇒ يبقى NULL)
+  (measured coverage: likes/views in 100% of events; numReplies is rare ⇒
+  stays NULL)
 - `token_static`: exchanges_count/json · cmc_id · description(+len) ·
   has_banner · has_image
-- `token_social`: holder_authors — **تصحيح** لا إضافة: كان يقرأ `equity` وهو
-  صفر في 100% من الأطروحات، والمركز الحقيقي في `authorTrade`
+- `token_social`: holder_authors — a **fix**, not an addition: it used to read
+  `equity`, which is zero in 100% of theses; the real position is in
+  `authorTrade`
 
-لأن الخام محفوظ ومضغوط (zlib BLOB) نعيد الاشتقاق محلياً: **صفر نداء** على
-fomo، ولا خطر حدّ معدّل، والنتيجة مطابقة تماماً لما سيسجّله المسجّل الحيّ لأن
-السكربت يستدعي دوالّ `extract` نفسها — مرجع واحد فلا ينجرف تعريفان.
+Because the raw data is stored and compressed (zlib BLOB), we re-derive
+locally: **zero calls** to fomo, no rate-limit risk, and the result matches
+exactly what the live recorder will record, because the script calls the very
+same `extract` functions — one reference, so two definitions cannot drift.
 
-القيم الغائبة من المصدر تبقى NULL ولا تُفبرك صفراً (FR-007)، والخام لا يُلمس.
+Values absent from the source stay NULL and are never fabricated as zero
+(FR-007), and the raw data is never touched.
 
-الاستعمال:
-    py backfill_extracted_fields.py --dry-run    # تقرير بلا كتابة
-    py backfill_extracted_fields.py              # التعبئة
+Usage:
+    py backfill_extracted_fields.py --dry-run    # report without writing
+    py backfill_extracted_fields.py              # do the backfill
 """
 from __future__ import annotations
 
@@ -43,29 +48,33 @@ for _s in (sys.stdout, sys.stderr):
 
 BATCH = 5000
 
-# العمود → مفتاح المخرَج من `extract`. الاسمان متطابقان هنا، لكنّ الصراحة
-# تمنع تعبئة عمود بمفتاح مشابه الاسم مختلف المعنى عند أي إعادة تسمية لاحقة.
+# Column → output key from `extract`. The names happen to match here, but being
+# explicit prevents filling a column with a similarly named key of different
+# meaning after any future rename.
 SIGNAL_FIELDS = ("likes", "views", "num_replies", "pinned", "out_token_address")
 STATIC_FIELDS = (
     "exchanges_count", "exchanges_json", "cmc_id",
     "description", "description_len", "has_banner", "has_image",
-    # عمودان قديمان لا جديدان: كانا NULL في 100% من الصفوف لأن المحوِّل
-    # السابق توقّع قيمة منطقية والمصدر يعطي **عنوان** سلطة. الخام يحمل
-    # المفتاح في 40/40 لقطة، فالتصحيح رجعيّ بلا شبكة.
-    # ملاحظة تشغيلية: صفوف EVM تبقى NULL بحقّ (غير مقيسة — FR-007)، فتطابق
-    # شرط `IS NULL` في كل تشغيل لاحق. التكرار غير ضارّ (نفس الخام ⇒ نفس
-    # القيمة) لكنه يعني أن هذا السكربت لا يصل أبداً إلى "صفر صفّاً ناقصاً".
+    # Two old columns, not new ones: they were NULL in 100% of rows because the
+    # previous converter expected a boolean while the source gives an authority
+    # **address**. The raw data carries the key in 40/40 snapshots, so the fix
+    # is retroactive with no network.
+    # Operational note: EVM rows legitimately stay NULL (not measured — FR-007),
+    # so they match the `IS NULL` condition on every later run. Re-running is
+    # harmless (same raw ⇒ same value), but it means this script never reaches
+    # "zero missing rows".
     "mintable", "freezable",
 )
-# ليس حقلاً «جديداً» بل **مصحَّحاً**: كان مشتقّاً من `equity` وهو صفر في
-# 28,186/28,186 أطروحة مقيسة، فصار العمود ثابتاً على 0 في 46,040 صفّاً. المصدر
-# الصحيح `authorTrade.humanTokenAmount`، والخام يحمله في كل لقطة ⇒ تصحيح رجعيّ
-# بلا شبكة. لا نلمس بقيّة أعمدة اللقطة (المجاميع الأخرى صحيحة أصلاً).
+# Not a "new" field but a **corrected** one: it was derived from `equity`, zero
+# in 28,186/28,186 measured theses, so the column was pinned at 0 across 46,040
+# rows. The correct source is `authorTrade.humanTokenAmount`, which the raw data
+# carries in every snapshot ⇒ a retroactive fix with no network. We touch no
+# other snapshot columns (the other aggregates were already correct).
 SOCIAL_FIELDS = ("holder_authors",)
 
 
 def _same(a, b) -> bool:
-    """هل القيمة المشتقّة تطابق المخزَّنة؟ (يمنع كتابة لا تغيّر شيئاً)."""
+    """Does the derived value match the stored one? (blocks no-op writes)."""
     if a is None or b is None:
         return a is None and b is None
     if isinstance(a, float) or isinstance(b, float):
@@ -85,16 +94,17 @@ def _backfill(
     dry: bool,
     where_sql: str | None = None,
 ) -> tuple[int, int, int]:
-    """يعيد (مفحوص، محدَّث، متعذّر). يمرّ على الصفوف المرشَّحة فقط.
+    """Returns (scanned, updated, failed). Walks candidate rows only.
 
-    الشرط الافتراضي `أيّ عمود جديد IS NULL` يجعل السكربت قابلاً لإعادة التشغيل:
-    الصفوف المعبّأة تُتخطّى، والمقاطَعة في المنتصف لا تفسد شيئاً. و`where_sql`
-    يتجاوزه حين لا يكون الفراغ NULL — عمود ثابت على **صفر** خاطئ يبدو معبّأً
-    لكنّه ليس كذلك، فلا سبيل لالتقاطه بـ`IS NULL`.
+    The default condition `any new column IS NULL` makes the script re-runnable:
+    filled rows are skipped, and an interruption midway corrupts nothing.
+    `where_sql` overrides it when the gap is not NULL — a column pinned to a
+    wrong **zero** looks filled but is not, and `IS NULL` cannot catch it.
 
-    بعد الاشتقاق نقارن بالمخزَّن ونتخطّى المتطابق: الصفوف التي لا يملك المصدر
-    عنها شيئاً (EVM في mintable مثلاً) تطابق الشرط في كل تشغيل، فبلا المقارنة
-    يعيد السكربت كتابة عشرات الآلاف من الصفوف بنفس قيمها إلى الأبد.
+    After deriving we compare against the stored value and skip matches: rows
+    the source says nothing about (EVM in mintable, say) match the condition on
+    every run, so without the comparison the script would rewrite tens of
+    thousands of rows with their own values forever.
     """
     missing = where_sql or " OR ".join(f"{f} IS NULL" for f in fields)
     keys = ", ".join(key_cols)
@@ -102,10 +112,11 @@ def _backfill(
     total = db._conn.execute(
         f"SELECT COUNT(*) FROM {table} WHERE {missing}"
     ).fetchone()[0]
-    print(f"{table}: {total} صفّاً مرشَّحاً")
+    print(f"{table}: {total} candidate rows")
 
-    # القراءة تُستنفَد **قبل** أي كتابة: المسجّل الحيّ يكتب كل دقيقة، وترك
-    # مؤشّر قراءة مفتوحاً أثناء الكتابة يطيل نافذة القفل بلا داعٍ.
+    # The read is drained **before** any write: the live recorder writes every
+    # minute, and leaving a read cursor open during writes needlessly lengthens
+    # the lock window.
     scanned = failed = 0
     pending: list[tuple] = []
     cur = db._conn.execute(
@@ -122,16 +133,16 @@ def _backfill(
                 if row is None:
                     failed += 1
                     continue
-            except Exception as exc:  # noqa: BLE001 — صفّ تالف لا يوقف الباقي
+            except Exception as exc:  # noqa: BLE001 — one corrupt row must not stop the rest
                 failed += 1
                 if failed <= 3:
-                    print(f"  تعذّر: {type(exc).__name__}: {exc}")
+                    print(f"  failed: {type(exc).__name__}: {exc}")
                 continue
             vals = tuple(row.get(f) for f in fields)
             if all(v is None for v in vals):
-                continue  # المصدر صامت فعلاً — لا كتابة ولا فبركة
+                continue  # the source is genuinely silent — no write, no fabrication
             if all(_same(v, r[f]) for v, f in zip(vals, fields, strict=True)):
-                continue  # مطابق للمخزَّن — كتابة بلا أثر
+                continue  # matches stored — a write with no effect
             pending.append(vals + tuple(r[c] for c in key_cols))
 
     if dry or not pending:
@@ -146,11 +157,12 @@ def _backfill(
 
 
 def _write_with_retry(db: RecorderDB, sql: str, rows: list[tuple], tries: int = 6) -> None:
-    """كتابة دفعة مع انتظار متزايد عند القفل.
+    """Write a batch with increasing backoff on lock.
 
-    المسجّل والموسِّم يكتبان الآن؛ WAL يسلسل الكتابات لكنّ دفعة كبيرة قد تتجاوز
-    مهلة SQLite. الفشل هنا يعني ضياع الدفعة، والسكربت قابل لإعادة التشغيل، لكنّ
-    الانتظار أرخص من إعادة اشتقاق كل شيء.
+    The recorder and the labeler are writing right now; WAL serializes writes,
+    but a large batch can exceed SQLite's timeout. Failing here loses the
+    batch, and the script is re-runnable, but waiting is cheaper than
+    re-deriving everything.
     """
     for attempt in range(tries):
         try:
@@ -161,7 +173,7 @@ def _write_with_retry(db: RecorderDB, sql: str, rows: list[tuple], tries: int = 
             if "locked" not in str(exc).lower() or attempt == tries - 1:
                 raise
             wait = 2 ** attempt
-            print(f"  القاعدة مقفلة — إعادة المحاولة بعد {wait}ث")
+            print(f"  database locked — retrying after {wait}s")
             time.sleep(wait)
 
 
@@ -174,28 +186,29 @@ def main() -> None:
             lambda raw: extract.extract_signal_event(raw, "1970-01-01T00:00:00+00:00"),
             dry,
         )
-        print(f"  مفحوص {s1[0]} · محدَّث {s1[1]} · متعذّر {s1[2]}")
+        print(f"  scanned {s1[0]} · updated {s1[1]} · failed {s1[2]}")
 
         s2 = _backfill(
             db, "token_static", ("token_address", "network_id"), STATIC_FIELDS,
             lambda raw: extract.extract_token_static(raw, "1970-01-01T00:00:00+00:00"),
             dry,
         )
-        print(f"  مفحوص {s2[0]} · محدَّث {s2[1]} · متعذّر {s2[2]}")
+        print(f"  scanned {s2[0]} · updated {s2[1]} · failed {s2[2]}")
 
-        # `holder_authors` كان يقرأ `equity` وهو صفر في 100% من الأطروحات، فبقي
-        # العمود ثابتاً على 0 — فراغ **لا يظهر** لـ`IS NULL`، فنمرّ على الكلّ
-        # ونتّكل على مقارنة القيمة لتخطّي ما لا يتغيّر.
+        # `holder_authors` used to read `equity`, zero in 100% of theses, so
+        # the column stayed pinned at 0 — a gap `IS NULL` **cannot see**, so we
+        # walk everything and rely on the value comparison to skip what does
+        # not change.
         s3 = _backfill(
             db, "token_social", ("token_address", "network_id", "recorded_at"),
             SOCIAL_FIELDS,
             lambda raw: extract.extract_social(raw, "", "", ""),
             dry, where_sql="1",
         )
-        print(f"  مفحوص {s3[0]} · محدَّث {s3[1]} · متعذّر {s3[2]}")
+        print(f"  scanned {s3[0]} · updated {s3[1]} · failed {s3[2]}")
 
         if dry:
-            print("(dry-run — بلا كتابة)")
+            print("(dry-run — no writes)")
     finally:
         db.close()
 

@@ -1,7 +1,8 @@
-"""اختبارات دورة بناء صفوف التدريب المجدولة (بلا شبكة، بلا قاعدة حقيقيّة).
+"""Tests of the scheduled training-rows build cycle (no network, no real database).
 
-المُختبَر هو `run_cycle` لا `build`: منطق الدفعات والسقف هو ما أضافه المُشغّل،
-وهو ما قد ينحرف صامتاً. `build` نفسه مغطّى في test_features / test_flow_and_coverage.
+What is tested is `run_cycle`, not `build`: the batching and cap logic is what
+the launcher added, and it is what could drift silently. `build` itself is
+covered in test_features / test_flow_and_coverage.
 """
 import config
 import pytest
@@ -9,14 +10,15 @@ import run_build_rows
 
 
 class _FakeBuild:
-    """بديل `build` يُرجع أعداداً مُبرمَجة ويسجّل حدّ كل نداء."""
+    """A `build` stand-in returning programmed counts and recording the limit
+    of each call."""
 
     def __init__(self, per_call):
         self.per_call = list(per_call)
         self.takes = []
 
     def __call__(self, _db, rebuild, limit, dry, candidates_only):
-        assert rebuild is False, "المُشغّل يجب ألّا يمرّر rebuild أبداً"
+        assert rebuild is False, "the launcher must never pass rebuild"
         assert dry is False
         assert candidates_only is False
         self.takes.append(limit)
@@ -37,7 +39,8 @@ def patched(monkeypatch):
 
 
 def test_stops_when_pending_exhausted(patched):
-    """دفعة ناقصة تعني نفاد المعلّق — نتوقّف بلا نداء زائد."""
+    """A short batch means the pending is exhausted — we stop without an extra
+    call."""
     fake = patched([500, 120], batch=500, cap=4000)
     stats = run_build_rows.run_cycle(None)
     assert stats == {"built": 620, "skipped_no_event": 0, "batches": 2}
@@ -45,7 +48,8 @@ def test_stops_when_pending_exhausted(patched):
 
 
 def test_respects_per_cycle_cap(patched):
-    """السقف يقضم الرفع الكبير على دورات بدل قفل القاعدة دفعةً واحدة."""
+    """The cap chews a large backlog across cycles instead of locking the
+    database in one go."""
     fake = patched([500] * 10, batch=500, cap=1500)
     stats = run_build_rows.run_cycle(None)
     assert stats["built"] == 1500
@@ -54,14 +58,14 @@ def test_respects_per_cycle_cap(patched):
 
 
 def test_last_batch_is_clipped_to_cap(patched):
-    """الدفعة الأخيرة لا تتجاوز ما تبقّى من السقف."""
+    """The last batch does not exceed what remains of the cap."""
     fake = patched([500, 500], batch=500, cap=700)
     run_build_rows.run_cycle(None)
     assert fake.takes == [500, 200]
 
 
 def test_no_pending_is_a_single_cheap_call(patched):
-    """لا شيء معلّق ⇒ نداء واحد ثم خروج (الحالة الطبيعيّة كل ساعة)."""
+    """Nothing pending ⇒ one call then exit (the normal case every hour)."""
     fake = patched([0], batch=500, cap=4000)
     stats = run_build_rows.run_cycle(None)
     assert stats == {"built": 0, "skipped_no_event": 0, "batches": 1}
@@ -69,7 +73,8 @@ def test_no_pending_is_a_single_cheap_call(patched):
 
 
 def test_rows_are_not_accumulated(patched):
-    """الصفوف تُرمى بعد كل دفعة — العملية تعيش أياماً، والتكديس تسريب."""
+    """Rows are discarded after each batch — the process lives for days, and
+    stacking them is a leak."""
     patched([500, 10], batch=500, cap=4000)
     stats = run_build_rows.run_cycle(None)
     assert "rows" not in stats

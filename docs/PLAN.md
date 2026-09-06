@@ -1,58 +1,64 @@
-﻿# ماذا نفعل بعد جمع البيانات — الخطة التفصيلية
+﻿# What to Do After Data Collection — The Detailed Plan
 
-> هذه الوثيقة تفصّل كل خطوة بعد اكتمال الجمع، بترتيبها ومعاييرها ومصائدها.
-> المرجع العامّ: [`../README.md`](../README.md).
+> This document details every step after collection is complete, in order, with its criteria and traps.
+> General reference: [`../README.md`](../README.md).
 
-**الوضع الحالي** (محدَّث 2026-08-07): الجمع والتوسيم يعملان تلقائياً،
-**ومستخرج الميزات مبنيّ ومشغَّل** (§2.0 — `training_rows` جاهز). **قرار البيانات:
-التدريب على الحيّ فقط** — الصفوف الرجعية تفتقر بنيوياً إلى العائلات اللحظية
-(market_ticks، لقطات token_social، رتبة المتصدّر، الماكرو) فتخلق نمط غياب يطابق
-الحِقبة، يتعلّمه النموذج بدل الإشارة (تسريب حِقبة). الرجعيّ **حُذف من القاعدة
-الحيّة** (محفوظ في نسخة `.bak`) ويُستبعَد بـ`is_live=1`. **بوّابة النضج اكتملت
-(2026-08-02): كل الشروط مستوفاة، والضابطة 123/100.** المرحلة 1 شُغّلت في
-2026-08-02 و**لم تجتز البوابة**: على العينة الأساسية المنقّاة (ميم حيّ، ضابطة
-حيّة، عملة واحدة/مجموعة) كان وسيط عائد الإشارة −28.9% مقابل −2.2% للضابطة،
-ونسبة الفوز 19.9% مقابل 33.3%. وفوق ذلك، اختلاف الشبكات وارتفاع `no_entry` في
-الضابطة (30.8% مقابل 2.3%) يمنعان تفسير الفرق سببياً. **لا يبدأ تدريب نموذج
-دخول معتمد** قبل إصلاح تصميم الضابطة أو تثبيت فرضية فرعية جديدة؛ التدريب
-الاستكشافي المحدود عند بلوغ 100 ضابطة v3 موثق أدناه ولا يُعدّ اعتماداً. التقرير:
+**Current status** (updated 2026-08-29): collection, labeling, and row building run
+automatically. The current feature extractor is **fv16 = 171 features**. Control-group gate v3:
+**426/500** mature; the preliminary check is open, and the admission decision remains closed (74 remaining,
+rough ETA about 5 days at the current rate). These numbers change live; the binding reference
+for count and freshness is the "Labeling & Results" page and the `/api/labeling` route, and for source health
+it is the generated `recorder/data_readiness.py` report — not the historical numbers below.
+
+**Data decision:** train on live data only — retro rows are structurally missing the instantaneous families
+(market_ticks, token_social snapshots, leaderboard rank, macro), which creates an absence pattern tied to
+the era, and the model learns that instead of the signal (era leakage). The retro set **was deleted from the live
+database** (preserved in a `.bak` copy) and is excluded with `is_live=1`. **The historical maturity gate
+for the old control group completed (2026-08-02): all conditions were met at the time,
+and the old control group reached 123/100; its eligibility does not carry over to v3.** Phase 1 was run on
+2026-08-02 and **did not pass the gate**: on the cleaned core sample (live memes, live
+control group, one token per group) the median signal return was −28.9% versus −2.2% for the control,
+and the win rate was 19.9% versus 33.3%. On top of that, the network mismatch and the elevated `no_entry`
+in the control (30.8% versus 2.3%) prevent interpreting the difference causally. **No approved entry-model
+training begins** before the control-group design is fixed or a new sub-hypothesis is confirmed; the limited
+exploratory training at 100 mature v3 controls is documented below and does not count as approval. The report:
 [`phase1-2026-08-02.md`](phase1-2026-08-02.md).
 
 ---
 
-## المرحلة 0 — بوّابة النضج (أين نحن الآن)
+## Phase 0 — Maturity gate (where we are now)
 
-**لا تبدأ أي نمذجة قبل استيفاء هذه الشروط.** بناء نموذج على 50 عيّنة ليس
-تسريعاً بل تضييع وقت: النتيجة ضجيج لا يمكن تمييزه عن الصدفة.
+**Do not start any modeling before these conditions are met.** Building a model on 50 samples is not
+moving faster — it is wasting time: the result is noise indistinguishable from chance.
 
-| الشرط | العتبة | الحالة/القرار |
+| Condition | Threshold | Status/Decision |
 |---|---|---|
-| عيّنات موسومة مستقلّة (ميم حيّ) | ≥ 1000 | ✅ **1,925** (1447+133+345) |
-| منها في `test` | ≥ 200 | ✅ **345** |
-| ضابطة `v3` ناضجة للفحص الأولي | ≥ 100 | ⏳ **73/100** في 2026-08-07؛ ليست بوابة اعتماد |
-| ضابطة `v3` ناضجة للقرار الأساسي | **≥ 500** | ⏳ **73/500**؛ العتبة الملزمة قبل قبول/رفض الأطروحة |
-| نسبة `status='ok'` | ≥ 85% | ✅ ~99% |
-| أيام تقويمية حيّة | ≥ 5 | ✅ **7.7** (2026-07-25 – 08-02) |
-| **مستخرج الميزات** | مبنيّ ومختبَر | ✅ **§2.0** (104 ميزة · 34 اختبار حرس) |
+| Independent labeled samples (live memes) | ≥ 1000 | ✅ **1,925** (1447+133+345) |
+| Of which in `test` | ≥ 200 | ✅ **345** |
+| `v3` control group mature for the preliminary check | ≥ 100 | ✅ **426/100** as of 2026-08-29; preliminary check available, not an admission gate |
+| `v3` control group mature for the core decision | **≥ 500** | ⏳ **426/500**; the binding threshold before accepting/rejecting the thesis |
+| `status='ok'` ratio | ≥ 85% | ✅ ~99% |
+| Live calendar days | ≥ 5 | ✅ **7.7** (2026-07-25 – 08-02) |
+| **Feature extractor** | Built and tested | ✅ **fv16** (171 features · readiness report: model=ok) |
 
-⇒ **بوابة نضج بيانات الإشارات مفتوحة، لكن بوابة الضابطة v3 ما زالت مغلقة.**
-الضابطة القديمة حُذفت، ولا تُنقل أهليتها إلى التصميم الجديد. يلزم جمع v3 وفق
-العتبات المثبتة أدناه قبل إعادة القرار.
+⇒ **The signal data maturity gate is open, but the v3 control-group gate is still closed.**
+The old control group was deleted, and its eligibility does not carry over to the new design. v3 must be
+collected per the thresholds fixed below before the decision is revisited.
 
-**ملاحظة — البيانات الرجعية**: الجدول يقيس **الحيّ فقط** (`is_live=1`)، وهو
-ما يُدرَّب عليه النموذج. 1,144 صفّاً رجعياً إضافياً (multi_user_buy/sell من
-أكتوبر 2025) موسومون ومخزّنون لكنّهم **مستبعَدون من التدريب** بقرار المشروع —
-الفراغ البنيويّ في market_ticks والعائلات اللحظية يُنشئ تسريب حِقبة كامل.
-الرجعيّ يبقى للتحليل الاستكشافيّ فقط.
+**Note — retro data**: The table measures **live only** (`is_live=1`), which is what the
+model is trained on. An additional 1,144 retro rows (multi_user_buy/sell from
+October 2025) are labeled and stored but **excluded from training** by project decision —
+the structural gap in market_ticks and the instantaneous families creates full era leakage.
+The retro set remains for exploratory analysis only.
 
-> أول قراءة لها (فوز/وسيط/قمم/محاكي خروج): [README §8 «القراءة الرجعية
-> الأولى»](../README.md#8-ما-تقوله-البيانات-حتى-الآن) — ودور النموذج المحدَّث
-> على ضوئها في §3.1-5 أدناه.
+> First reading of it (win rate/median/peaks/exit simulator): [README §8 "First retro
+> reading"](../README.md#8-what-the-data-says-so-far) — and the updated role of the model
+> in light of it in §3.1-5 below.
 
-### استعلام البوّابة (شغّله قبل المرحلة 1)
+### Gate query (run it before Phase 1)
 
 ```sql
--- ملاحظة: القيد `asset_class='meme'` إلزاميّ (§2.1) — الأرشيف يحوي BTC وأسهماً مرمّزة.
+-- Note: the `asset_class='meme'` constraint is mandatory (§2.1) — the archive contains BTC and tokenized stocks.
 SELECT
   COUNT(*)                                                    AS labeled,
   SUM(o.status='ok')                                          AS ok,
@@ -67,117 +73,115 @@ LEFT JOIN token_class t
   ON t.token_address = o.token_address AND t.network_id = o.network_id;
 ```
 
-### أثناء الانتظار — لا تجلس مكتوف اليدين
+### While waiting — do not sit idle
 
-- راقب اللوحة يومياً: تغطية الشموع، تجمّد الـ feed، الأخطاء لكل مصدر.
-- إن هبطت `status='ok'` دون 85% ⇒ فتّش عن ثغرة جمع **الآن** لا لاحقاً.
-- إن بقي `multi_user_buy` نادراً في الجمع الأماميّ (~14/يوم) ⇒ لم يعد ذلك يعني
-  الانتظار: المسار الرجعيّ (`activity_events`، انظر التطوّر أعلاه) يغطّي هذا
-  الفرع حتى 2025-10-22 بعد توسيمه.
+- Check the dashboard daily: candle coverage, frozen feed, per-source errors.
+- If `status='ok'` drops below 85% ⇒ hunt for a collection gap **now**, not later.
+- If `multi_user_buy` stays rare in forward collection (~14/day) ⇒ that no longer means
+  waiting: the retro path (`activity_events`, see the evolution above) covers this branch
+  back to 2025-10-22 once labeled.
 
-### دورة النمذجة والتداول الورقي المرحلية (قرار ملزم 2026-08-02)
+### Staged modeling and paper-trading cycle (binding decision 2026-08-02)
 
-لا ننتظر 500 ضابطة بلا عمل، ولا نخلط نموذجاً مبكراً مع النموذج المعتمد. الدورة
-المثبتة هي:
+We do not sit idle waiting for 500 controls, and we do not mix an early model with the approved one. The fixed
+cycle is:
 
-#### عند 100 ضابطة v3 ناضجة
+#### At 100 mature v3 controls
 
-- شغّل فحص السلامة الأولي: التغطية، `no_entry`، توازن الشبكات والزمن، القيم
-  الشاذة، واستقرار الجمع.
-- نفّذ `classify_tokens.py` ثم `build_training_rows.py --rebuild`.
-- درّب نموذجاً استكشافياً مجمّداً باسم إصدار واضح، مثل
-  `model-v1-100-controls`، على الإشارات الصالحة وفق الفلاتر الموثقة.
-- أبقِ `test` مغلقاً؛ استعمل `train/val` لاختيار الميزات والمعاملات، ولا تعِد
-  تقسيم العملة أو تجرّب تقسيمات متعددة لاختيار الأفضل.
-- ابدأ تداولاً ورقياً استكشافياً منفصلاً باسم، مثل،
-  `paper-run-v1-model-100`. هذا الاختبار لا يثبت ربحية الأطروحة ولا يفتح تداولاً
-  حقيقياً؛ غايته اكتشاف أخطاء التنبؤ والتنفيذ والانزلاق والسيولة.
-- ثبّت النموذج وقواعد القرار أثناء التجربة. لا تغيّر العتبة يومياً كي تبدو
-  النتائج مربحة، ولا تختَر فترة ناجحة بعد رؤيتها.
+- Run the preliminary safety check: coverage, `no_entry`, network and time balance,
+  outliers, and collection stability.
+- Run `classify_tokens.py` then `build_training_rows.py --rebuild`.
+- Train a frozen exploratory model under a clear version name, e.g.
+  `model-v1-100-controls`, on the valid signals per the documented filters.
+- Keep `test` closed; use `train/val` for feature and parameter selection, and do not re-split
+  by token or try multiple splits to pick the best one.
+- Start a separate exploratory paper-trading run under a name like
+  `paper-run-v1-model-100`. This test does not prove the thesis is profitable and does not open real
+  trading; its purpose is to surface prediction, execution, slippage, and liquidity errors.
+- Freeze the model and decision rules during the run. Do not tweak the threshold daily to make
+  the results look profitable, and do not cherry-pick a winning window after seeing it.
 
-#### ما يسجله التداول الورقي v1
+#### What paper trading v1 logs
 
-- كل إشارة دخلت النموذج وكل إشارة رفضها، مع السبب والاحتمال والنسخة.
-- السعر المتوقع وسعر التنفيذ الافتراضي، التأخير، الرسوم، الانزلاق والسيولة.
-- الربح/الخسارة، التراجع، معدل `rug`، وعدد الصفقات غير القابلة للتنفيذ.
-- أساسيات ثابتة للمقارنة: لعب كل الإشارات، القيمة السوقية وحدها، الحجم وحده،
-  ونموذج بلا ميزات اجتماعية.
-- لا يُعلن «النموذج مربح» من v1؛ الوصف الصحيح: **تجربة ورقية استكشافية**.
+- Every signal the model entered and every signal it rejected, with reason, probability, and version.
+- Expected price and the default execution price, delay, fees, slippage, and liquidity.
+- Profit/loss, drawdown, `rug` rate, and the number of unexecutable trades.
+- Fixed baselines for comparison: playing every signal, market cap alone, volume alone,
+  and a model with no social features.
+- "The model is profitable" is not declared from v1; the correct description: **exploratory paper trial**.
 
-#### عند 500 ضابطة v3 ناضجة و14 يوماً
+#### At 500 mature v3 controls and 14 days
 
-- أعد المرحلة 1 رسمياً على `v3` فقط، وافتح `test` مرة واحدة للتقييم النهائي.
-- اشترط الوسيط ونسبة الفوز وحجم الأثر وفواصل الثقة والاستقرار عبر الأيام
-  والشبكات، وتحليل حساسية أكبر رابح وأعلى 1%.
-- نفّذ `classify_tokens.py` ثم `build_training_rows.py --rebuild` من جديد.
-- درّب نموذجاً جديداً مستقلاً باسم، مثل، `model-v2-500-controls`؛ لا تحدّث
-  ملفات v1 في مكانها ولا تخلط سجلات النموذجين.
-- أغلق `paper-run-v1` بتقرير مؤرخ، وأنشئ محفظة ورقية جديدة برصيد ابتدائي جديد
-  باسم `paper-run-v2-model-500`. **نُصفّر المحفظة الورقية فقط، ولا نحذف سجل v1**؛
-  المقارنة بين التجربتين جزء من التحقق.
+- Re-run Phase 1 formally on `v3` only, and open `test` a single time for the final evaluation.
+- Require median and win rate and effect size and confidence intervals and stability across days
+  and networks, plus sensitivity analysis of the biggest winner and the top 1%.
+- Run `classify_tokens.py` then `build_training_rows.py --rebuild` again.
+- Train a fresh independent model under a name like `model-v2-500-controls`; do not update
+  v1's files in place and do not mix the two models' logs.
+- Close `paper-run-v1` with a dated report, and create a new paper wallet with a fresh starting
+  balance named `paper-run-v2-model-500`. **We reset the paper wallet only; we do not delete v1's log**;
+  comparing the two trials is part of the validation.
 
-#### إذا بقي الحكم غير حاسم عند 500
+#### If the verdict is still inconclusive at 500
 
-- لا ننتقي نتيجة تعجبنا ولا نعتمد v2 قسراً؛ نستمر إلى 1,000 ضابطة أو حتى تضيق
-  الفواصل وتستقر النتيجة عبر الزمن.
-- يمكن استمرار التداول الورقي الاستكشافي، لكن يُوسم بوضوح بأنه غير معتمد.
+- We do not cherry-pick a result we like, nor force v2 through; we continue to 1,000 controls or until the
+  intervals narrow and the result stabilizes over time.
+- The exploratory paper trading can continue, but it must be clearly marked as not approved.
 
-الفصل الحاسم: **v1 عند 100 للتعلّم التشغيلي، v3 عند 500 و14 يوماً للاعتماد
-التحليلي والتجربة الورقية الجديدة**. لا يعني بلوغ 100 أن الأطروحة نجحت.
+The decisive split: **v1 at 100 for operational learning, v3 at 500 and 14 days for analytical
+admission and the new paper trial**. Reaching 100 does not mean the thesis succeeded.
 
 ---
 
-## المرحلة 1 — سؤال قبل النموذج: هل الإشارة تتفوّق على السوق؟
+## Phase 1 — a question before the model: does the signal beat the market?
 
-> **النتيجة (2026-08-02): غير مجتازة.** الإشارة أسوأ وصفياً في الوسيط ونسبة
-> الفوز، لكن الضابطة الحالية ليست مقابلاً سببياً نظيفاً بسبب اختلاف الكون
-> والشبكات وفقد الدخول الانتقائي. لا تدريب لنموذج الدخول العام قبل إصلاح ذلك.
-> التفاصيل القابلة للإعادة: [`phase1-2026-08-02.md`](phase1-2026-08-02.md)،
-> والأداة: `recorder/phase1_analysis.py`.
+> **Result (2026-08-02): not passed.** The signal is descriptively worse in median and
+> win rate, but the current control group is not a clean causal counterpart because of universe,
+> network, and missing-entry differences. No training of the general entry model before that is fixed.
+> Reproducible details: [`phase1-2026-08-02.md`](phase1-2026-08-02.md),
+> and the tool: `recorder/phase1_analysis.py`.
 
-### إصلاح تصميم الضابطة v3 (مطبّق 2026-08-03)
+### Control-group design fix v3 (applied 2026-08-03)
 
-أُغلقت العيوب البنيوية التي كشفها تدقيق المرحلة 1 وتدقيق التسريب للبيانات **الجديدة**:
+The structural flaws uncovered by the Phase 1 audit and the leakage audit are closed for **new** data:
 
-- `watch_windows` سجلّ immutable مستقلّ عن `watchlist` التشغيلية؛ ترقية ضابطة
-  إلى إشارة أو إعادة تنشيط العملة لا تمحو النافذة السابقة بعد الآن.
-- كل نافذة جديدة تحمل `design_version=3` وسعر القبول اللحظيّ الموثق من feed أو
-  trending/verified؛ السعر نفسه هو دخول المقارنة للطرفين، فلا يعتمد أحدهما على
-  وصول شمعة لاحقة أكثر من الآخر.
-- المرشح الضابط بلا سعر موجب محدود يُرفض، والاختيار يطابق تراكمياً نسب شبكات
-  الإشارات النشطة بدلاً من السحب من الشبكات المتاحة بلا ضبط.
-- النافذة لا تُعطّل ولا تُوسم قبل سحب شموع نهائيّ بعد `watch_until`؛ وبذلك لا
-  يكتب الموسّم `no_entry` دائماً بسبب سباق عابر مع المسجّل.
-- الترحيل محفوظ بقفل كتابة، وحالة سحب نافذة قديمة تُصفّر عند إعادة التنشيط.
-- حُذفت الضابطة القديمة نهائياً في 2026-08-02 بناءً على قرار المالك: النوافذ
-  والنتائج وحالات التشغيل الخاصة بها، وكذلك البيانات المشتقة حصراً من 194 عملة
-  ضابطة لم تظهر كإشارة، أزيلت من قاعدة التشغيل. لا توجد نسخة احتياطية محلية
-  لهذه الضابطة بعد الإجراء. الإشارات وبيانات العملات المشتركة لم تُحذف.
-- تبقى View باسم `phase1_watch_outcomes` كواجهة آمنة، وتعرض المؤهلة فقط؛ لا
-  تستعلم من `outcomes` الخام لإنتاج مقارنة.
-- لا تدخل نافذة الإشارة في المقارنة الجديدة إلا إذا ظهرت العملة في نفس دورة
-  `trending/verified` التي تُبنى منها الضابطة، مع حفظ `admission_source`؛ ولا
-  تُملأ الضابطة خارج دورة قبلت إشارة مقارنة، منعاً لاختلاف الزمن والكون.
-- تم إصلاح تسريبات مشتقة التدريب: الشمعة المفتوحة عند `t0` والماكرو الساعي
-  المفتوح لا يدخلان الميزات، و`token_static` مؤرخ بـ`recorded_at <= t0`، وكل
-  استعلامات الاجتماع والكثافة مؤهلة بالشبكة، والأحداث المتطابقة بين signal وactivity
-  تُحسب مرة واحدة في الكثافة.
-- `training_rows` يعاد بناؤه الآن بإصدار `feature_version=2`، وواجهة
-  `model_training_rows` تفرض `signal + live + meme + ok + independent`؛ لا يجوز
-  التدريب من الجدول الخام مباشرة.
+- `watch_windows` is an immutable log independent of the operational `watchlist`; promoting a control
+  to a signal or reactivating a token no longer erases the previous window.
+- Every new window carries `design_version=3` and a documented instantaneous acceptance price from feed or
+  trending/verified; that same price is the comparison entry for both sides, so neither side depends on
+  a later candle arriving more than the other.
+- A control candidate with no bounded positive price is rejected, and selection matches the network mix
+  of active signals cumulatively instead of drawing from available networks unadjusted.
+- The window is not deactivated or labeled before final candle pulls after `watch_until`; that way the labeler
+  no longer writes `no_entry` because of a transient race with the recorder.
+- The migration is guarded by a write lock, and an old window's pull state resets on reactivation.
+- The old control group was permanently deleted on 2026-08-02 by the owner's decision: its windows,
+  outcomes, and operational states, as well as data derived solely from the 194 control tokens that never
+  appeared as signals, were removed from the operating database. There is no local backup of this control
+  group after the operation. Signals and shared token data were not deleted.
+- The View named `phase1_watch_outcomes` remains as the safe interface and exposes only eligible rows; do not
+  query raw `outcomes` to produce a comparison.
+- A signal window enters the new comparison only if the token appeared in the same `trending/verified`
+  cycle the control group is built from, with `admission_source` preserved; and the control group is not
+  filled outside a cycle that admitted a comparison signal, to prevent time and universe differences.
+- Training-derived leaks were fixed: the candle open at `t0` and the open hourly macro do not enter
+  features, `token_static` is dated with `recorded_at <= t0`, all aggregate and density queries are
+  network-qualified, and events matched between signal and activity are counted once in density.
+- `training_rows` is now rebuilt with `feature_version=2`, and the `model_training_rows` view enforces
+  `signal + live + meme + ok + independent`; training must not run from the raw table directly.
 
-**الوضع الآن**: جمع v3 بدأ بعد تطبيق الترحيل في 2026-08-03. عند ≥100 ضابطة
-ناضجة و≥5 أيام يُشغّل **فحص سلامة أولي فقط** لا قرار. إعادة قرار المرحلة 1
-تنتظر ≥500 ضابطة v3 ناضجة و≥14 يوماً تقويمياً v3، مع حرس اختلال الشبكات وفقد
-الدخول والاستقرار الزمني أدناه. هذا انتظار لجمع صالح جديد، لا انتظاراً لكود.
+**Where things stand**: v3 collection started after the migration was applied on 2026-08-03. At ≥100 mature
+controls and ≥5 days, a **preliminary safety check only** runs — not a decision. The Phase 1 decision re-run
+waits for ≥500 mature v3 controls and ≥14 v3 calendar days, with the network-mismatch, missing-entry,
+and time-stability guards below. This is a wait for fresh valid data, not a wait for code.
 
-**هذا أهمّ اختبار في المشروع كلّه، ويسبق اعتماد أي نموذج.** نموذج v1 عند 100
-استكشافي فقط؛ إن كانت الإشارة لا تتفوّق على عملة عشوائية من نفس الكون، فاعتماد
-النموذج أو بناؤه للتداول الحقيقي سيكون بناءً على رمل.
+**This is the most important test in the entire project, and it precedes any model approval.** The v1 model
+at 100 is exploratory only; if the signal does not beat a random token from the same universe, then approving
+the model or building it for real trading would be building on sand.
 
-### الاختبار
+### The test
 
-قارن `kind='watch'` بين `is_control=0` و`is_control=1` على **نوافذ مكتملة**:
+Compare `kind='watch'` between `is_control=0` and `is_control=1` on **completed windows**:
 
 ```sql
 SELECT is_control,
@@ -191,572 +195,574 @@ WHERE kind = 'watch' AND status = 'ok'
 GROUP BY is_control;
 ```
 
-### كيف تقرأ النتيجة
+### How to read the result
 
-- استعمل **الوسيط** بجانب المتوسّط دائماً. رابح شاذّ واحد (+1092%) يقلب
-  المتوسّط وحده — رأينا ذلك فعلاً.
-- اختبار دلالة مناسب لتوزيع ملتوٍ بشدّة: **Mann–Whitney U** على `final_return_48h`
-  (لا t-test — التوزيع ليس طبيعياً إطلاقاً).
-- احسب **حجم الأثر** لا الدلالة فقط: فرق الوسيطين ونسبة الفوز.
-- **احسب القدرة مسبقاً** (محسوم 2026-07-28): بتوزيع بهذا الالتواء، 100 ضابطة
-  لا تكشف إلّا فرقاً كبيراً. حدِّد قبل التشغيل «أصغر فرق وسيط يستحق المتابعة»
-  (مثلاً 5 نقاط مئوية) واحسب حجم العيّنة اللازم له — وإلّا خرجت بنتيجة
-  «لا فرق» لا تُميّز بين «لا أثر» و«لا قدرة». إن كان n المتاح دون اللازم،
-  وثّق ذلك صراحة بدل حكم زائف بالسلب.
+- Always use the **median** alongside the mean. One anomalous winner (+1092%) flips
+  the mean by itself — we have seen it happen.
+- A significance test suited to a heavily skewed distribution: **Mann–Whitney U** on `final_return_48h`
+  (not a t-test — the distribution is not remotely normal).
+- Compute the **effect size**, not just significance: the median difference and the win rate.
+- **Compute power in advance** (settled 2026-07-28): with a distribution this skewed, 100 controls
+  can only detect a large difference. Fix before running "the smallest median difference worth pursuing"
+  (say 5 percentage points) and compute the sample size needed for it — otherwise you get a
+  "no difference" result that cannot distinguish "no effect" from "no power". If the available n is below
+  the requirement, document that explicitly instead of a false negative verdict.
 
-### قرار منهجي ملزم — حجم الضابطة ومقاومة القيم الشاذة
+### Binding methodological decision — control-group size and outlier resistance
 
-هذا القرار ثُبّت في 2026-08-02 قبل نضج تصميم الضابطة الجديد، ولا يُخفَّض بعد رؤية النتائج:
+This decision was fixed on 2026-08-02 before the new control-group design matured, and is not relaxed after seeing results:
 
-| ضوابط v3 ناضجة | ما يُسمح به |
+| Mature v3 controls | What is allowed |
 |---:|---|
-| <100 | لا تحليل ولا استنتاج |
-| 100–299 | فحص سلامة + نموذج استكشافي v1 وتداول ورقي استكشافي فقط |
-| 300–499 | تحليل جدي مؤقت، لكن لا قبول/رفض نهائي ولا تدريب معتمد |
-| **≥500** | الحد الأدنى لقرار بوابة المرحلة 1 |
-| ≥1000 | مفضّل إن كان الجمع التلقائي مستمراً بلا تكلفة تشغيلية مانعة |
+| <100 | No analysis, no inference |
+| 100–299 | Safety check + exploratory v1 model and exploratory paper trading only |
+| 300–499 | Serious interim analysis, but no final accept/reject and no approved training |
+| **≥500** | The minimum for a Phase 1 gate decision |
+| ≥1000 | Preferred if automated collection keeps running at no prohibitive operating cost |
 
-ولا يكفي العدد وحده. القرار الأساسي يشترط أيضاً:
+And count alone is not enough. The core decision also requires:
 
-- **≥14 يوماً تقويمياً v3** تغطي أكثر من نظام سوقيّ؛ قراءة اليوم الخامس تشخيصية
-  فقط. لا تُختزل المدة بسبب بلوغ العدد سريعاً.
-- المطابقة/الضبط بالشبكة والزمن، وبشرائح نوع الأصل والقيمة السوقية والسيولة قدر
-  الإمكان. فرق المصدر أو الشبكة لا يُنسب إلى الإشارة.
-- عدد آلاف الإشارات لا يعوّض نقص الضابطة: المجموعة الأصغر هي عنق الزجاجة.
-- القرار يعتمد على **الوسيط ونسبة الفوز وMann–Whitney وحجم الأثر وفواصل الثقة**؛
-  المتوسط يُعرض اقتصادياً لكنه لا يحكم وحده.
-- عملة +4000% لا تُحذف لأنها حقيقية، لكن يُعاد التقرير بعد استبعاد أكبر رابح
-  واحد ثم أعلى 1% كـ**تحليل حساسية معلن**. إذا انقلب القرار، فالنتيجة غير مستقرة
-  ولا تجتاز البوابة. التحليل الأساسي يبقى شاملاً ولا ننتقي الاستبعاد الذي يعجبنا.
-- أبلغ النتائج لكل يوم/أسبوع وشبكة، لا التجميع وحده. النجاح يجب أن يحافظ على
-  اتجاهه عبر غالبية الفترات، لا أن يحمله يوم صاعد أو عملة شاذة واحدة.
-- عند تكرار إشارات العملة، لا تُعامل آلاف الصفوف كعينات مستقلة. لا تعبر العملة
-  بين train/test، ويُعرض تقييم مجمّع على مستوى العملة بجانب تقييم الصفوف.
-- إن كانت النتيجة متقاربة أو فواصل الثقة واسعة عند 500، **استمر إلى 1000** ولا
-  تُصدر حكماً قسرياً. «غير حاسم» نتيجة صحيحة.
+- **≥14 v3 calendar days** spanning more than one market regime; a day-five read is diagnostic
+  only. The duration must not be shortened just because the count was reached quickly.
+- Matching/adjustment by network and time, and by asset-class, market-cap, and liquidity strata as much
+  as possible. A source or network difference must not be attributed to the signal.
+- Thousands of signals do not compensate for a control shortage: the smaller group is the bottleneck.
+- The decision rests on **median and win rate and Mann–Whitney and effect size and confidence intervals**;
+  the mean is shown for economics but does not decide on its own.
+- A +4000% token is not deleted because it is real, but the report is re-run after excluding the single
+  biggest winner and then the top 1% as a **declared sensitivity analysis**. If the verdict flips, the result
+  is unstable and does not pass the gate. The core analysis stays all-inclusive and we do not pick the exclusion
+  that suits us.
+- Report results per day/week and network, not just the aggregate. Success must hold its direction across
+  most periods, not be carried by one up day or one anomalous token.
+- With repeated signals for a token, thousands of rows are not treated as independent samples. A token does not
+  cross between train/test, and a token-level aggregate evaluation is shown alongside the row-level one.
+- If the result is close or the confidence intervals are wide at 500, **continue to 1000** and
+  do not issue a forced verdict. "Inconclusive" is a valid result.
 
-### القرار
+### The decision
 
-| النتيجة | ماذا تفعل |
+| Result | What to do |
 |---|---|
-| الإشارة تتفوّق بوضوح | امضِ إلى المرحلة 2 بثقة |
-| فرق ضئيل/معدوم | **توقّف**. النموذج لن يخلق أثراً غير موجود. ابحث عن تصنيف فرعيّ (حجم؟ قيمة سوقية؟) يتفوّق داخلياً، أو أعد التفكير في الأطروحة |
-| الإشارة أسوأ | نتيجة قيّمة بحدّ ذاتها — ربّما `large_buy` مؤشّر خروج لا دخول |
+| The signal clearly wins | Proceed to Phase 2 with confidence |
+| Minimal/no difference | **Stop.** The model will not conjure an effect that does not exist. Look for a sub-classification (volume? market cap?) that wins internally, or rethink the thesis |
+| The signal is worse | A valuable result in itself — maybe `large_buy` is an exit indicator, not an entry one |
 
-**اكتب النتيجة في ملفّ مؤرّخ مهما كانت.** النتيجة السلبية تمنعك من إهدار أسابيع.
+**Write the result in a dated file whatever it is.** A negative result saves you from wasting weeks.
 
 ---
 
-## المرحلة 2 — بناء مجموعة البيانات
+## Phase 2 — Building the dataset
 
-النموذج يتعلّم من **صفوف** لا من أحداث. هذه المرحلة تحوّل الأرشيف المبعثر إلى
-جدول تدريب واحد بانضباط صارم — خطأ واحد هنا يسمّم كل ما بعده بصمت.
+The model learns from **rows**, not events. This phase turns the scattered archive into
+a single training table with strict discipline — one mistake here silently poisons everything after it.
 
-### 2.0 المستخرج — قطعة واحدة للتدريب والحيّ معاً
+### 2.0 The extractor — one piece for training and live together
 
-**مبنيّ ومشغَّل (2026-07-30)**: `recorder/features.py` + `build_training_rows.py`
-→ جدول `training_rows` (**5,602 صفّاً**، منها **1,371 صفّاً صالحاً للتدريب**:
-ميم + `status='ok'` + مستقلّة · train 947 / val 108 / test 277).
+**Built and running (2026-07-30)**: `recorder/features.py` + `build_training_rows.py`
+→ the `training_rows` table (**5,602 rows**, of which **1,371 trainable rows**:
+meme + `status='ok'` + independent · train 947 / val 108 / test 277).
 
-**يُشغَّل يدوياً**: `py classify_tokens.py` ثمّ `py build_training_rows.py`.
-و**`--rebuild` إلزاميّ قبل أيّ تدريب** — الصفّ يُبنى مرّة، وأيّ استرجاع لاحق
-لبيانات عن الماضي (أطروحات، ثوابت، شموع، أعلام تشوّه) يغيّر قيم الميزات بلا
-إعادة بناء.
+**Run manually**: `py classify_tokens.py` then `py build_training_rows.py`.
+And **`--rebuild` is mandatory before any training** — a row is built once, and any later
+backfill of past data (theses, constants, candles, suspect flags) changes feature values without
+a rebuild.
 
-المستخرج يمشي على كلّ نتيجة موسومة ويسأل: «ماذا كان معروفاً **لحظتها** فقط؟»:
+The extractor walks every labeled outcome and asks: "what was known **at that moment** only?":
 
-- **صفّ لكل قرار**: `kind='signal'` (3,970) و`activity` (1,047) و`watch` (230)،
-  والجواب من `outcomes` ملصوقاً بالمفتاح نفسه. صفوف قرار النافذة (t0+Δ) بنوع
-  مستقلّ — انظر §2.3-ب (لم تُبنَ بعد).
-- **104 ميزة في 7 عائلات**، كلّها باستعلامات مقيَّدة زمنياً (`<= t0` حرفياً)،
-  والغائب NULL (FR-007: لا فبركة؛ LightGBM يتعلّم الغياب).
-- **الانضباط المزدوج**: نفس `build_features` تحسب صفّ التدريب التاريخي وصفّ
-  الإشارة الحيّة لاحقاً — اختلاف الحساب بينهما (train/serve skew) يهدم النموذج
-  بصمت، فالوحدة واحدة لا نسختين.
-- **اختبارات القفل الزمنيّ** (20 اختباراً): لكلّ عائلة اختبار يزرع بيانات بعد
-  t0 (أطروحة، شمعة، لقطة سوق، إشارة، عملة جديدة للمُنشئ) ويثبّت أنّ الصفّ لا
-  يتغيّر. + حرس بنيويّ: لا عمود ليبل يتسلّل إلى الميزات، ولا ميزة باسم likes.
+- **One row per decision**: `kind='signal'` (3,970) and `activity` (1,047) and `watch` (230),
+  with the answer from `outcomes` attached by the same key. Window-decision rows (t0+Δ) are a separate
+  kind — see §2.3-b (not built yet).
+- **104 features in 7 families**, all via time-bounded queries (literally `<= t0`),
+  with missing values as NULL (FR-007: no fabrication; LightGBM learns absence).
+- **Dual discipline**: the same `build_features` computes the historical training row and later the live
+  signal row — a computation difference between the two (train/serve skew) silently destroys the model,
+  so there is one unit, not two copies.
+- **Time-lock tests** (20 tests): each family has a test that plants data after
+  t0 (a thesis, a candle, a market snapshot, a signal, a new token for the creator) and asserts the row does
+  not change. Plus structural guards: no label column sneaks into features, and no feature named likes.
 
-**التغطية المقيسة على الصفوف الأمامية** (4,322 صفّاً) — تُقرأ قبل أيّ تدريب:
+**Coverage measured on forward rows** (4,322 rows) — read before any training:
 
-| مستوى | ميزات |
+| Level | Features |
 |---|---|
-| 100% | القيمة السوقية/السعر/fdv · الأطروحات وكتّابها · الماكرو (SOL/ETH) · الكثافة · **حجم الشموع 24س** · **نصّ الرمز** · **عدد المتصدّرين المعلَنين** · تاريخ الشموع وflat_ratio ودست-من-القمّة |
-| 91–99% | حجم الصفقة ونسبته · **متوسّط تكلفة المشتري ونسبة السعر إليه** · **نوافذ السوق القصيرة (1س/4س) ونسبة التعويم ودوران الحوض** · اسم العملة وdecimals · حجم الساعة الأخيرة |
-| 48–65% | **عائلة `token_social` الحقيقية**: `thesis_total` (العدد الفعليّ، بلغ 27,559) · `holder_authors` (كتّاب مالكون) · فروق الزخم بين لقطتين |
-| 1–9% ⚠️ | رتبة المتصدّر ونسبة المطابقة (نادرة أمامياً) · بصمة المُنشئ |
-| 0% ❌ | `mintable`/`freezable`/`top10_holders_pct` — **المنبع لا يعبّئها** (لا عطب عندنا) |
+| 100% | Market cap/price/fdv · theses and their authors · macro (SOL/ETH) · density · **24h candle volume** · **symbol text** · **declared leaderboard count** · candle history and flat_ratio and distance-from-peak |
+| 91–99% | Trade size and its ratio · **buyer average cost and price ratio to it** · **short market windows (1h/4h) and float ratio and pool turnover** · token name and decimals · last hour volume |
+| 48–65% | **the real `token_social` family**: `thesis_total` (the actual count, reached 27,559) · `holder_authors` (owner authors) · momentum deltas between snapshots |
+| 1–9% ⚠️ | leaderboard rank and match ratio (rare forward) · creator fingerprint |
+| 0% ❌ | `mintable`/`freezable`/`top10_holders_pct` — **the source does not populate them** (not a defect on our side) |
 
-**أربعة عيوب مقيسة أُصلحت في تدقيق 2026-07-30** (كلٌّ بمنعٍ اختباريّ):
+**Four measured defects fixed in the 2026-07-30 audit** (each with a regression test):
 
-1. **`dist_from_ath` مسمَّم**: القمّة كانت تُحسب من `h` بلا استبعاد `h_suspect`،
-   فأعطت −0.99999997 على 49 صفّاً (قمّة 96,311 بدل 0.0143). الآن صفر صفوف دون
-   −0.999، والأدنى −0.9957 (هبوط حقيقيّ).
-2. **صفر مقيس صار مجهولاً**: `size_usd or usd_amount` — والصفر falsy، و1,640
-   حدثاً حجمه 0.0 فعلاً (خروج كامل). صار الفحص صريحاً على None.
-3. **عمود يعني شيئين حسب نوع الصفّ**: كثافة الإشارات كانت من `signal_events`
-   وحده ⇒ 88% أصفار للرجعيّ مقابل 4% للأماميّ، فيستنتج النموذج «مصدر الصفّ» لا
-   نشاط العملة. صارت من المصدرين (أصفار الرجعيّ 921→363). **يبقى فرق حقبيّ
-   حقيقيّ** (أرشيفنا أكثف في 2026) ⇒ لا تُقارَن هذه الميزة عبر الحقب، وwalk-forward
-   يحدّ الأثر.
-4. **`thesis_before` مشبَّع عند 400**: `token_thesis` عيّنة لا حقيقة. الآن
-   `thesis_counted` + علم `thesis_counted_capped` (1,637 صفّاً مشبَّعاً)، ومعها
-   `social_thesis_total` الحقيقيّ من لقطة قبل t0 (2,949 صفّاً).
+1. **`dist_from_ath` poisoned**: the peak used to be computed from `h` without excluding `h_suspect`,
+   giving −0.99999997 on 49 rows (a peak of 96,311 instead of 0.0143). Now zero rows below
+   −0.999, and the minimum is −0.9957 (a real drawdown).
+2. **A measured zero became unknown**: `size_usd or usd_amount` — zero is falsy, and 1,640
+   events genuinely had a size of 0.0 (a full exit). The check is now explicit for None.
+3. **A column meaning two things depending on row kind**: signal density used to come from `signal_events`
+   alone ⇒ 88% zeros for retro versus 4% for forward, so the model inferred "row source" rather than
+   token activity. It now comes from both sources (retro zeros 921→363). **A real era gap remains**
+   (our archive is denser in 2026) ⇒ do not compare this feature across eras, and walk-forward
+   bounds the effect.
+4. **`thesis_before` saturated at 400**: `token_thesis` is a sample, not the truth. Now there is
+   `thesis_counted` + a `thesis_counted_capped` flag (1,637 capped rows), plus the real
+   `social_thesis_total` from a snapshot before t0 (2,949 rows).
 
-**درس مقيس**: تقرير التغطية كشف عطباً حقيقياً — `token_age_h` كان فارغاً 100%
-لأنّ fomo تخزّن `token_created_at` **epoch رقمياً** لا ISO، فسقط التحويل صامتاً.
-⇒ اقرأ تقرير التغطية بعد كل بناء؛ عمودٌ فارغ 100% إمّا فراغ منبع أو عطب عندنا،
-ولا يُعرف أيّهما بلا فحص. وثانٍ: **عمود ممتلئ قد يكون خاطئاً** — الأعمدة
-النادرة (buy/sell بـ24%) كانت مستعملة والكثيفة (change/volume بـ100%) مهملة.
+**A measured lesson**: the coverage report exposed a real defect — `token_age_h` was 100% empty
+because fomo stores `token_created_at` as a numeric **epoch**, not ISO, so the conversion failed silently.
+⇒ Read the coverage report after every build; a 100%-empty column is either a source gap or a defect on our side,
+and you cannot tell which without checking. And second: **a full column can still be wrong** — the rare
+columns (buy/sell at 24%) were in use while the dense ones (change/volume at 100%) were neglected.
 
-### 2.1 اختيار الصفوف
+### 2.1 Row selection
 
 ```sql
 SELECT o.* FROM outcomes o
   LEFT JOIN token_class t
     ON t.token_address = o.token_address AND t.network_id = o.network_id
  WHERE o.kind = 'signal' AND o.status = 'ok' AND o.is_independent = 1
-   AND COALESCE(t.asset_class, 'meme') = 'meme';   -- إلزاميّ، انظر أدناه
+   AND COALESCE(t.asset_class, 'meme') = 'meme';   -- mandatory, see below
 ```
 
-- **`asset_class = 'meme'` شرط إلزاميّ** (محسوم 2026-07-30): الأرشيف يحوي BTC
-  وETH وSOL وذهباً وأسهماً مرمّزة (AAPL/MSTR/HOOD/INTC/META/SNDK/MU) — 62 نتيجة
-  موسومة غير ميمية. سهم آبل لا يسلك سلوك عملة عمرها ساعتان، وخلطهما يجعل
-  النموذج يتعلّم «نوع الأصل» بدل الإشارة. الأصناف الأخرى تبقى مسجَّلة للتحليل
-  المنفصل لا للحذف. (الأثر المقيس على أرقام الرجعيّ: لا شيء تقريباً — 5 صفوف
-  من 487؛ لكنّ الأماميّ ملوَّث أكثر: SOL وحده 22 نتيجة.)
-- `kind='signal'` — صفّ لكل إشارة (`watch` للمقارنة لا للتدريب).
-- `status='ok'` — استبعد `no_entry` من **التدريب** (فجوة جمع، لا نتيجة)، لكن
-  **احتفظ بها في التقرير**: نسبتها مقياس جودة جمع.
-- **`no_bars` ليست استبعاداً** (محسوم 2026-07-28): العملة ماتت خلال دقائق من
-  الدخول — أسوأ نتيجة ممكنة. استبعادها يدرّب النموذج على عالمٍ «الكل فيه نجا»
-  (انحياز بقاء خفيّ). القاعدة: لأهداف الصعود (`up_2x_24h` ونحوها) تدخل
-  `no_bars` بقيمة **0 قاطعة**؛ لـ`is_rug` تُبلَّغ منفصلة (موت السيولة شبه
-  مؤكَّد −100% لكنه غير مثبت سعرياً) ولا تُحسب rug إلّا بـ`final_return ≤ −90%`
-  الفعليّ. `no_entry` وحدها تُستبعد: لا شمعة دخول أصلاً = لا صفقة.
-- **`suspect_bars > 0` ليس استبعاداً بل تحذيراً** (محسوم 2026-07-30): الحساب
-  استبعد القيم المستحيلة أصلاً، لكن الصفّ قد يكون فقد قمّته الحقيقية (أو تكون
-  `max_gain` غائبة كليّاً). أدرجه في التدريب وأدرج العمود نفسه ميزةَ جودة، ولا
-  تبنِ عليه ادّعاءً فردياً («هذه العملة صعدت X%») بلا فحص شموعها.
-- `is_independent=1` — استبعد التكرار الزائف (69% متباعد <5 دقائق). الصفوف
-  المستبعَدة تبقى في القاعدة، لا تُحذف.
+- **`asset_class = 'meme'` is a mandatory condition** (settled 2026-07-30): the archive contains BTC
+  and ETH and SOL and gold and tokenized stocks (AAPL/MSTR/HOOD/INTC/META/SNDK/MU) — 62 labeled non-meme
+  outcomes. An Apple share does not behave like a two-hour-old coin, and mixing them makes the model learn
+  "asset class" instead of the signal. The other classes stay recorded for separate analysis, not for deletion.
+  (The measured effect on retro numbers: almost none — 5 rows out of 487; but the forward set is more
+  contaminated: SOL alone has 22 outcomes.)
+- `kind='signal'` — one row per signal (`watch` is for comparison, not training).
+- `status='ok'` — exclude `no_entry` from **training** (a collection gap, not an outcome), but
+  **keep it in the report**: its ratio is a collection-quality metric.
+- **`no_bars` is not an exclusion** (settled 2026-07-28): the token died within minutes of
+  entry — the worst possible outcome. Excluding it trains the model on a world where "everyone survived"
+  (hidden survivorship bias). The rule: for upside targets (`up_2x_24h` and the like), `no_bars` enters
+  with a hard **0**; for `is_rug` it is reported separately (liquidity death is all but a confirmed −100%
+  but not price-proven) and rug is only counted with an actual `final_return ≤ −90%`.
+  Only `no_entry` is excluded: no entry candle at all = no trade.
+- **`suspect_bars > 0` is a warning, not an exclusion** (settled 2026-07-30): the computation already
+  excluded impossible values, but the row may have lost its true peak (or `max_gain` may be missing entirely).
+  Include it in training and include the very column as a quality feature, and do not
+  build an individual claim on it ("this token rose X%") without checking its candles.
+- `is_independent=1` — exclude pseudo-duplication (69% of repeats <5 minutes apart). Excluded
+  rows stay in the database; they are not deleted.
 
-### 2.2 الهدف (target) — اختر واحداً وثبّته
+### 2.2 The target — pick one and fix it
 
-| الهدف | التعريف | متى يناسب |
+| Target | Definition | When it fits |
 |---|---|---|
-| **`up_2x_24h`** (مُقترَح للبداية) | `max_gain_24h ≥ 1.0` | تصنيف ثنائيّ واضح، يطابق سلوك التداول الفعليّ (بيع عند هدف) |
-| `up_50pct_24h` | `max_gain_24h ≥ 0.5` | صنف موجب أكبر ⇒ تعلّم أسهل |
-| `final_return_48h` | انحدار | أصدق اقتصادياً لكن أصعب وأضجّ |
-| `is_rug` | تصنيف | نموذج «تجنّب الكارثة» — قد يكون أنفع تجارياً |
+| **`up_2x_24h`** (proposed to start) | `max_gain_24h ≥ 1.0` | Clear binary classification, matches real trading behavior (sell at target) |
+| `up_50pct_24h` | `max_gain_24h ≥ 0.5` | Larger positive class ⇒ easier learning |
+| `final_return_48h` | Regression | Most economically honest but harder and noisier |
+| `is_rug` | Classification | An "avoid the disaster" model — may be more commercially useful |
 
-**ابدأ بـ`up_2x_24h`**. راقب توازن الأصناف: إن نزل الصنف الموجب دون 5% استعمل
-عتبة أدنى بدل أوزان صنفية معقّدة.
+**Start with `up_2x_24h`.** Watch class balance: if the positive class drops below 5%, use a
+lower threshold instead of complicated class weights.
 
-⚠️ **لا تستعمل `max_gain` كهدف وحيد وتظنّه ربحاً**: القمّة لا تُحقَّق إلّا ببيع
-في لحظتها. أضف `final_return_48h` في التقرير دائماً.
+⚠️ **Do not use `max_gain` as the sole target and treat it as profit**: the peak is only realized by
+selling at that exact moment. Always add `final_return_48h` to the report.
 
-### 2.3 المميّزات — كلّها من `signal_events` وقت t=0 فقط
+### 2.3 Features — all from `signal_events` at t=0 only
 
-**قاعدة صارمة: لا ميزة من بعد لحظة الإشارة.** كل ميزة أدناه متاحة لحظتها.
+**Strict rule: no feature from after the signal moment.** Every feature below was available at that moment.
 
-**أ. حجم الصفقة والمشتري** (كانت مفقودة، استُرجعت):
-`size_usd` · `in_amount` · `size_usd - in_amount` (مركز سابق؟) ·
+**A. Trade size and buyer** (was missing, recovered):
+`size_usd` · `in_amount` · `size_usd - in_amount` (prior position?) ·
 `log(size_usd)` · `num_swaps` · `is_first_buy` · `buyer_pnl_pct` ·
 `avg_cost` · `realized_pnl_usd`
 
-**ب. جودة المشتري (الأطروحة الأصلية)**:
+**B. Buyer quality (the original thesis)**:
 `buyers_best_rank` · `top_trader_match_count` · `are_top_traders` ·
-`rank ≤ 10 / ≤ 50` كأعلام ثنائية
+`rank ≤ 10 / ≤ 50` as binary flags
 
-**ج. سوق العملة لحظتها** (أقوى إشارة مقيسة حتى الآن):
-`market_cap` · `fdv` · `log(market_cap)` · شرائح القيمة السوقية ·
-`price_usd` · `size_usd / market_cap` ← **نسبة الأثر، مرشّحة قويّة**
+**C. The token's market at that moment** (strongest measured signal so far):
+`market_cap` · `fdv` · `log(market_cap)` · market-cap buckets ·
+`price_usd` · `size_usd / market_cap` ← **the impact ratio, a strong candidate**
 
-⚠️ **قيود مقيسة 2026-07-30 على هذه العائلة تحديداً**:
-- **لوغاريتم أو شرائح إلزاميّ**: المدى المقيس $10⁵ → $10¹³ (تسعة أسس) — الخام
-  يجعل صفّاً واحداً يطغى على التقسيم.
-- **`liquidity` مرشّح أصدق** من القيمة السوقية: الأخيرة = سعر × معروض فقط،
-  فعملة بـ7.8×10¹⁴ رمزاً تُقرأ «$69 تريليون» (SMILE) بلا أن يكون فيها دولار
-  حقيقيّ. (ليس تشوّهاً — المشاهدات متّسقة؛ المصيدة #19.)
-- **علم `is_major` إلزاميّ**: 116 إشارة في الأرشيف على BTC/ETH/SOL/USDT/XRP/BNB
-  وسهم مرمّز، منها 21 نتيجة موسومة (المصيدة #18). استثنِها أو افصلها — وإلّا
-  فقد يكون «القيمة السوقية أقوى مؤشّر» أثرَ خلط أصولٍ لا أثرَ حجم.
-  **حُلَّت**: `token_class.asset_class` (انظر §2.1) — والفحص أثبت أنّ التدرّج
-  حقيقيّ داخل الميمات وحدها، فالنمط نجا من الضبط لا سقط به.
+⚠️ **Measured constraints 2026-07-30 on this family specifically**:
+- **Log or buckets mandatory**: the measured range is $10⁵ → $10¹³ (nine orders) — raw values let
+  a single row dominate the split.
+- **`liquidity` is a more honest candidate** than market cap: the latter is just price × supply,
+  so a token with 7.8×10¹⁴ tokens reads as "$69 trillion" (SMILE) without a single real dollar in it.
+  (Not corruption — the observations are consistent; trap #19.)
+- **The `is_major` flag is mandatory**: 116 signals in the archive on BTC/ETH/SOL/USDT/XRP/BNB
+  and a tokenized stock, of which 21 labeled outcomes (trap #18). Exclude or separate them — otherwise
+  "market cap is the strongest indicator" might be an asset-mix effect, not a size effect.
+  **Resolved**: `token_class.asset_class` (see §2.1) — and the check proved the gradient is
+  real within memes alone, so the pattern survived the adjustment rather than falling to it.
 
-**د. زخم الإشارة** (لـ`multi_user_buy`):
+**D. Signal momentum** (for `multi_user_buy`):
 `unique_traders` · `num_trades` · `minutes` · `price_change_pct` · `total_volume`
 
-**هـ. ثوابت العملة** من `token_static`:
+**E. Token constants** from `token_static`:
 `mintable` · `freezable` · `is_scam` · `launchpad_name` · `migrated` ·
-`graduation_percent` · عدد الروابط الاجتماعية · عمر العملة عند الإشارة
+`graduation_percent` · number of social links · token age at signal time
 
-**و. الزخم الاجتماعي** — من `token_thesis` بختم `created_at` فقط:
+**F. Social momentum** — from `token_thesis` stamped with `created_at` only:
 ```sql
--- عدد الأطروحات قبل الإشارة
+-- number of theses before the signal
 SELECT COUNT(*) FROM token_thesis
 WHERE token_address = :tok AND created_at <= :entry_iso;
--- وتسارعها: نسبة آخر ساعة إلى آخر 24 ساعة
+-- and its acceleration: the last hour's ratio to the last 24 hours
 ```
-⚠️ **لا تستعمل `num_likes` كميزة تاريخية** — قيمتها وقت السحب لا وقت الكتابة
-(ضائعة نهائياً للماضي، انظر README §9). للمستقبل استعمل فروق `token_social`.
+⚠️ **Do not use `num_likes` as a historical feature** — its value is from pull time, not write time
+(permanently lost for the past, see README §9). For the future, use `token_social` deltas.
 
-**و-ب. تصنيف نصوص الأطروحات (محسوم 2026-07-28)**: النصّ ثابت منذ الكتابة ⇒
-تحليله لاحقاً ميزة t=0 **صالحة رجعياً بلا تسرّب** — الإغناء الرجعيّ الوحيد
-الممكن. نموذج محليّ صغير مفتوح (Qwen 2.5 3B / Gemma 2 2B عبر Ollama،
-zero-shot بمخطّط JSON صارم — لا تدريب، لا كلفة، لا بيانات تخرج). **التصنيف
-نوعٌ لا قطبية**: على fomo الكاتب مالكٌ (equity) ⇒ القطبية منحازة صعوداً
-بنيوياً وعديمة التمييز؛ الأصناف: {جوهريّ بأرقام، شيلّ/حماس فارغ، محفّز خبريّ،
-تردّد}. كثافة الشيلّ مرشّحة **مؤشّراً معكوساً** (حماس الحشد = قمّة). العملية:
-تحقّق يدويّ على 50-100 أطروحة لقياس اتفاق النموذج قبل دفعة الـ30 ألفاً،
-ثمّ تزايدياً مع الوارد. مرفوض صراحةً: «البحث في الإنترنت عن سبب الصعود» —
-تسرّب (الإجابة بعد الحدث) + كلفة API/امتثال + بطء (وسيط الهدف 0.2س)؛
-أقصاه أداة سرد للوحة لاحقاً، ليست ميزة أبداً.
+**F-b. Thesis text classification (settled 2026-07-28)**: the text is fixed from the moment it is written ⇒
+analyzing it later is a t=0 feature **valid retroactively with no leakage** — the only possible
+retroactive enrichment. A small open local model (Qwen 2.5 3B / Gemma 2 2B via Ollama,
+zero-shot with a strict JSON schema — no training, no cost, no data leaving). **Classification is
+a type, not a polarity**: on fomo the writer is an owner (equity) ⇒ polarity is structurally
+biased upward and uninformative; the classes: {substantive with numbers, empty shill/hype, news
+catalyst, hesitation}. Shill density is a candidate **inverse indicator** (crowd hype = the top).
+The process: manual validation on 50–100 theses to measure model agreement before the 30k batch,
+then incrementally with inflow. Explicitly rejected: "searching the internet for the reason it pumped" —
+leakage (the answer comes after the event) + API cost/compliance + latency (target median 0.2s);
+at most a narrative tool for the dashboard later, never a feature.
 
-**و-ج. بصمة «اكتُشفت متأخّرة» (فرضية مدعومة الاتجاه 2026-07-28)**: سيناريو
-«مشروع له تاريخ اكتشفه الناس متأخّراً فبدأ عليه FOMO» يتفكّك لميزات:
-عمر النقاش قبل الإشارة (أقدم أطروحة مقابل t0) · صمت اجتماعيّ ثمّ اشتعال ·
-سعر مسطّح طويل قبل الإقلاع (§2.3-ز) · روابط `token_static` (أماميّ) ·
-محور المصنّف الثاني {ادّعاء جوهر / حماس ميم} — يقيس **جودة السرد لا صدق
-المشروع** (كلّ محتال يدّعي utility؛ ولأفق 48س السرد المُصدَّق هو المحرّك).
-أوّل قِطع (تغطية 20%، n هزيلة): هوس طازج فوز 20.8%/وسيط −50% مقابل
-«30+ يوماً» فوز 33%/وسيط −34% وrug صفر — **اتجاه لا حكم**. التمكين:
-تمديد `backfill_thesis` لعملات الرجعيّ الـ408 ثمّ إعادة القِطع بحجم كافٍ.
+**F-c. The "discovered late" fingerprint (direction-supported hypothesis 2026-07-28)**: the scenario
+"a project with history that people discovered late, so FOMO started on it" breaks down into features:
+age of the discussion before the signal (oldest thesis versus t0) · social silence then ignition ·
+a long flat price before liftoff (§2.3-g) · `token_static` links (forward only) ·
+the second classifier's axis {substance claim / meme hype} — it measures **narrative quality, not project
+legitimacy** (every huckster claims utility; on a 48h horizon the credible narrative is the engine).
+First cut (20% coverage, thin n): fresh mania win 20.8%/median −50% versus
+"30+ days" win 33%/median −34% and zero rugs — **a direction, not a verdict**. To enable it:
+extend `backfill_thesis` to the retro 408 tokens then re-cut at sufficient volume.
 
-**ز. مسار السعر قبل الإشارة** — من `token_bars` (تعود لأشهر قبل t=0، مجانية):
-عائد 1س/4س/24س **قبل** الإشارة · تذبذب محقّق · البعد عن قمّة السلسلة ·
-عدد الارتدادات. عملة +300% قبل وصول الإشارة ليست كعملة ممسوحة — وقد يكون
-أثمن ما في الميزات كلّها: «الزخم قبل أن يدخل المتصدّر» مقابل «الزخم الذي جاء
-به المتصدّر نفسه». يُشتقّ من الشموع بختم ≤ t=0 فقط (القاعدة الصارمة نفسها).
+**G. Price path before the signal** — from `token_bars` (goes back months before t=0, free):
+1h/4h/24h returns **before** the signal · realized volatility · distance from the all-time high ·
+number of pullbacks. A token up +300% before the signal arrives is not a wiped-out token — and this may be
+the most valuable thing in all the features: "momentum before the leaderboard trader entered" versus
+"the momentum the leaderboard trader himself brought". Derived from candles stamped ≤ t=0 only
+(the same strict rule).
 
-**ح. بصمة المنشئ** — من `token_static.creator_address` بربط داخلي:
-كم عملة أخرى في بياناتك لنفس المنشئ؟ عمر أوّل عملة له؟ منشئ متسلسل (عدّة
-إطلاقات في أيام) نمط rug كلاسيكي.
+**H. Creator fingerprint** — from `token_static.creator_address` with an internal join:
+how many other tokens in your data have the same creator? Age of their first token? A serial creator
+(several launches within days) is the classic rug pattern.
 
-**ط. سياق السوق** (يمنع النموذج من حفظ «يوم صاعد»):
-شموع **SOL/WETH/WBTC الساعية** مسجَّلة في `token_bars` (resolution='60') منذ
-2026-07-28 — عائد المرجع في 4س/24س قبل الإشارة هو السياق النظيف. يكملها:
-عدد الإشارات في الساعة السابقة · متوسّط عائد العملات المراقَبة في نفس الساعة ·
-ساعة اليوم UTC.
+**I. Market context** (keeps the model from memorizing "an up day"):
+hourly **SOL/WETH/WBTC candles** recorded in `token_bars` (resolution='60') since
+2026-07-28 — the reference return over 4h/24h before the signal is the clean context. Complemented by:
+number of signals in the previous hour · average return of watched tokens in the same hour ·
+hour of day UTC.
 
-**ي. مسار المتصدّر** — من أرشيف الصدارة الساعيّ (`snapshots` بمصدر
-`leaderboard`، يبدأ 2026-07-28): صعود/هبوط رتبة المشتري خلال الأسبوع السابق
-(«متصدّر صاعد» مقابل «محترق»). **للماضي قبل هذا التاريخ لا يوجد أرشيف** —
-لا تختلقه.
+**J. Leaderboard trader trajectory** — from the hourly leaderboard archive
+(`snapshots` with source `leaderboard`, starting 2026-07-28): the buyer's rank rise/fall over the
+previous week ("a rising leaderboard trader" versus "a burned one"). **For the past before that date
+there is no archive** — do not fabricate it.
 
-**ك. جانب البيع** (لنموذج الخروج داخل النافذة لا لنموذج الدخول — راجع §4):
-أحداث `multi_user_sell` و`large_sell` (يُسجَّل منذ 2026-07-28) تُوسَم كغيرها
-متى توفّرت الشموع: «حوت/متصدّر صرّف → ماذا حدث للسعر». داخل النافذة:
-سلسلة `sell_count_*`/`unique_sells_*` من `market_ticks`، ومسار `thesis_total`
-من `token_social` (انطفاء الزخم). كلّها مستقبلٌ بالنسبة إلى t=0 — **ممنوعة
-كنموذج دخول**، مشروعة لنموذج خروج بزمن منزلق.
+**K. The sell side** (for an exit model inside the window, not an entry model — see §4):
+`multi_user_sell` and `large_sell` events (recorded since 2026-07-28) are labeled like the others
+once candles are available: "a whale/leaderboard trader dumped → what happened to the price". Inside the
+window: the `sell_count_*`/`unique_sells_*` series from `market_ticks`, and the `thesis_total`
+path from `token_social` (momentum dying out). All of it is the future relative to t=0 — **forbidden
+as an entry model**, legitimate for an exit model with a sliding time.
 
-### 2.3-ب نافذة التأكيد — قرار الدخول المرحليّ (مقيس 2026-07-28)
+### 2.3-b The confirmation window — the staged entry decision (measured 2026-07-28)
 
-**الفكرة**: القاعدة ليست «قرّر عند t=0» بل «لا ترَ ما بعد لحظة قرارك». قرار
-الدخول يجوز أن ينزاح إلى t=+Δ: حينها كلّ ما في [t0, t0+Δ] ماضٍ مشروع —
-**لا تسرّب**، بل نموذج مرحلتين: الإشارة ترشّح، والنافذة تصدّق أو تكذّب.
+**The idea**: the rule is not "decide at t=0" but "do not see past the moment of your decision". The
+entry decision may shift to t=+Δ: at that point everything in [t0, t0+Δ] is legitimate history —
+**no leakage**, rather a two-stage model: the signal filters, and the window confirms or refutes.
 
-**الدليل المقيس على الرجعيّ (453 صفقة مستقلّة)**:
+**Measured evidence on the retro set (453 independent trades)**:
 
-| | وسيط انجراف السعر في أول 30 دقيقة |
+| | Median price drift in the first 30 minutes |
 |---|---|
-| الرابحة (عائد 48س > 0) | **+3.6%** (p75 +33.2%) |
-| الخاسرة | **−9.1%** (p25 −33.2%) |
+| Winners (48h return > 0) | **+3.6%** (p75 +33.2%) |
+| Losers | **−9.1%** (p25 −33.2%) |
 
-فجوة 12.7 نقطة ⇒ حركة السعر المبكّرة ميزة تأكيد حقيقية. وكلفة الانتظار على
-الوسيط **سالبة** (−6.7%): تدخل أرخص لأنّ الوسيط ينزف فور الإشارة — الثمن
-يتركّز في ذيل الفائزين السريعين (+33%). تحفّظ: التوزيعان يتداخلان (ربع
-الرابحين يتعثّر أولاً) ⇒ لا عتبة صمّاء؛ النسخة الناعمة عمل النموذج.
+A 12.7-point gap ⇒ early price movement is a real confirmation feature. And the median cost of waiting is
+**negative** (−6.7%): you enter cheaper because the median bleeds right after the signal — the cost
+concentrates in the fast winners' tail (+33%). Caveat: the two distributions overlap (a quarter of
+winners stumble first) ⇒ no blind threshold; the soft version is the model's job.
 
-**كتلة ميزات النافذة** (للقرار عند t0+Δ — لا تُخلط مع كتلة t=0):
+**The window feature block** (for the decision at t0+Δ — do not mix with the t=0 block):
 
-- انجراف السعر عند 15/30/60 دقيقة (من `token_bars`)
-- عدد الإشارات اللاحقة على نفس العملة في النافذة وأنواعها (`signal_events`)
-- نشاط المتصدّرين داخلها: شراء/بيع جديد (`buyers_best_rank` للأحداث اللاحقة)
-- تسارع الأطروحات (مسار `token_social`) — **أماميّ فقط**: لا سلسلة رجعية
-- مسار السيولة/الحائزين (`market_ticks` داخل النافذة) — أماميّ فقط
+- Price drift at 15/30/60 minutes (from `token_bars`)
+- Number and types of subsequent signals on the same token within the window (`signal_events`)
+- Leaderboard trader activity inside it: new buys/sells (`buyers_best_rank` for later events)
+- Thesis acceleration (the `token_social` path) — **forward only**: no retro series
+- The liquidity/holders path (`market_ticks` inside the window) — forward only
 
-**الانضباط**: صفّان للقرار لا صفّ واحد — قرار t=0 يُبنى بكتلة t=0 وحدها،
-وقرار t0+Δ يُبنى بالكتلتين. خلطهما في صفّ واحد = تسرّب مقنَّع. ونفس
-المستخرج يعمل حيّاً: إشارة تصل ⇒ صفّ t0؛ بعد Δ ⇒ صفّ النافذة بمنطقٍ مماثل
-حرفاً (لا train/serve skew).
+**The discipline**: two rows per decision, not one — the t=0 decision is built from the t=0 block alone,
+and the t0+Δ decision is built from both blocks. Mixing them into one row = disguised leakage. And the same
+extractor works live: a signal arrives ⇒ a t0 row; after Δ ⇒ a window row by literally the same
+logic (no train/serve skew).
 
-**جواب لكلّ قرار من سعره هو (شرط المقارنة العادلة)**: سؤال «فوريّ أم
-مؤكَّد؟» لا يُتعلَّم إلّا إذا كان لكلّ صفٍّ جوابُه الخاصّ المحسوب من سعر
-دخوله هو: جواب القرار الفوريّ = `compute_labels(bars, entry_ts=t0)`، وجواب
-قرار التأكيد = `compute_labels(bars, entry_ts=t0+Δ)` على نفس أفق التقييم.
-مقارنة قرار التأكيد بجوابٍ محسوب من سعر t0 تتجاهل أنّ السعر تحرّك خلال Δ —
-وهي كلفة الانتظار نفسها (ذيل +33% على الفائز السريع). `compute_labels`
-يقبل entry_ts أيّاً كان ⇒ البنية جاهزة، والمطلوب صفّ outcomes ثانٍ بمفتاح
-قرار مميّز (`key = id + ":d30"` مثلاً). عندها يتعلّم النموذج المقارنة لكلّ
-إشارة على حدة — لا حكم عامّ: «فوريّ» لإشارات توقيعها سريع (حجم ضخم + رتبة
-عالية + زخم مشتعل أصلاً)، «مؤكَّد» لما دونها، «تخطٍّ» حين القيمتان سالبتان.
+**Each decision gets its answer from its own price (the fair-comparison condition)**: the question
+"immediate or confirmed?" can only be learned if each row has its own answer computed from its own entry
+price: the immediate decision's answer = `compute_labels(bars, entry_ts=t0)`, and the confirmation
+decision's answer = `compute_labels(bars, entry_ts=t0+Δ)` over the same evaluation horizon.
+Comparing the confirmation decision to an answer computed from the t0 price ignores that the price moved
+during Δ — which is the very cost of waiting (the +33% tail on the fast winner). `compute_labels`
+accepts entry_ts of any kind ⇒ the structure is ready, and what is needed is a second outcomes row with a
+distinct decision key (`key = id + ":d30"` for example). Then the model learns the comparison per
+individual signal — not a blanket verdict: "immediate" for signals whose signature is fast (huge size + high
+rank + already-burning momentum), "confirmed" for the rest, "skip" when both values are negative.
 
-**قياس عتبة النضج للقرار المرحليّ**: عيناته الأمامية فقط (لا رجعيّ للاجتماعيّ
-داخل النافذة) ⇒ يتأخّر عن نموذج t=0؛ يُبنى المستخرج بالكتلتين من اليوم حتى
-تتراكم العيّنات تلقائياً.
+**Measuring the maturity threshold for the staged decision**: its samples are forward only (no retro for
+in-window social) ⇒ it lags behind the t=0 model; build the extractor with both blocks from day one so
+samples accumulate automatically.
 
-**سلّم نقاط القرار (محسوم 2026-07-28 بالمنحنى المقيس، 466 صفقة)**:
-**t0 / +10د / +30د** — ثلاث درجات لا أكثر:
+**The decision-point ladder (settled 2026-07-28 on the measured curve, 466 trades)**:
+**t0 / +10m / +30m** — three rungs and no more:
 
-- +5د ضجيج (شمعة واحدة؛ فجوة +2.7 بلا معنى).
-- +10د تأكيد سريع: فجوة +7.8 (64% فائزين موجبين / 39% خاسرين) بكلفة −1.7%.
-- +15د لا تضيف على +10د شيئاً (+6.8) — حُذفت.
-- +30د أقوى فصل مقيس: فجوة **+18.0** (64%/34%) وكلفة وسيط سالبة (−7.7%).
-- +60د مؤجّلة: لم تُقس بدقّة بعد؛ تُضاف درجة رابعة **بدليل** لا توسّعاً
-  بالحدس. المنع منهجيّ: نقاط كثيرة = قرارات مترابطة شبه مكرّرة (فرط تخصيص
-  على التوقيت) + مصيدة «أفضل Δ في العيّنة» (نفس طراد test-shopping).
+- +5m is noise (a single candle; a meaningless +2.7 gap).
+- +10m is quick confirmation: a +7.8 gap (64% of winners positive / 39% of losers) at a −1.7% cost.
+- +15m adds nothing over +10m (+6.8) — dropped.
+- +30m is the strongest measured separation: a **+18.0** gap (64%/34%) and a negative median cost (−7.7%).
+- +60m is deferred: not yet measured precisely; a fourth rung is added **with evidence**, not expanded
+  by intuition. The prohibition is methodological: many points = near-duplicate correlated decisions
+  (overfitting on timing) + the "best Δ in the sample" trap (the same test-shopping boat).
 
-### 2.4 التقسيم — لا تلمسه
+### 2.4 The split — do not touch it
 
-`outcomes.split` محسوب **بتجزئة عنوان العملة** (70/10/20) وهو ملزم:
+`outcomes.split` is computed **by token-address hashing** (70/10/20) and is binding:
 
-- **لماذا بالعملة**: 14.2 إشارة لكل عملة. تقسيم عشوائيّ يضع نفس العملة في
-  التدريب والاختبار ⇒ النموذج يحفظ العملات ويعطي دقّة وهمية عالية.
-- **الحاجز الزمنيّ إلزاميّ لا اختياريّ** (محسوم 2026-07-28): التقسيم بالعملة
-  يمنع تسرّب الحفظ لكنّه **لا يمنع خلط الأنظمة السوقية** — 1000 عيّنة تتراكم
-  عبر أسابيع بينما ميتا الميم ينقلب خلال أيام، فيكون train وtest من النظام
-  نفسه وتصير الدقّة متفائلة بنيوياً. القاعدة: التقييم النهائيّ **walk-forward**:
-  درّب على الفترة الأقدم، اختبر على الأحدث، وكرّر بتدحرج النافذة. `split`
-  بالعملة يبقى طبقة منع التسرّب داخل كل نافذة زمنية.
-- **لا تعِد التقسيم عشوائياً أبداً** ولا تجرّب عدّة تقسيمات وتختر الأفضل.
+- **Why by token**: 14.2 signals per token. A random split puts the same token in
+  training and test ⇒ the model memorizes tokens and gives spuriously high accuracy.
+- **The time barrier is mandatory, not optional** (settled 2026-07-28): splitting by token
+  prevents memorization leakage but **does not prevent mixing market regimes** — 1,000 samples accumulate
+  over weeks while the meme meta flips within days, so train and test come from the same regime and the
+  accuracy is structurally optimistic. The rule: final evaluation is **walk-forward**:
+  train on the earliest period, test on the latest, and repeat with a rolling window. The by-token
+  `split` stays as an anti-leakage layer inside each time window.
+- **Never re-split randomly**, and do not try several splits and pick the best one.
 
 ---
 
-## المرحلة 3 — نموذج الأساس (baseline)
+## Phase 3 — Baseline model
 
-> **قبل أيّ تدريب استكشافي أو معتمد — خطوتان إلزاميّتان، بهذا الترتيب**:
+> **Before any exploratory or approved training — two mandatory steps, in this order**:
 > ```powershell
 > cd recorder
-> py classify_tokens.py            # تحديث asset_class (فلتر التدريب الإلزاميّ §2.1)
-> py build_training_rows.py --rebuild   # ~6 دقائق
+> py classify_tokens.py            # update asset_class (the mandatory training filter, §2.1)
+> py build_training_rows.py --rebuild   # ~6 minutes
 > ```
-> **لماذا `--rebuild` لا البناء التزايديّ**: الصفّ يُبنى مرّة واحدة (idempotent
-> بالمفتاح)، وميزاته مشتقّة من جداول تستقبل بيانات **عن الماضي** بعد بنائه —
-> استرجاع أطروحات، ثوابت عملة، شموع رجعية، إعادة حساب أعلام التشوّه، تصنيف
-> أصول جديد. تدريبٌ على صفوف قديمة = تدريب على ميزات أفقر مما تملك فعلاً،
-> وأسوأ منه: عدم اتّساق بين صفوف بُنيت في أوقات مختلفة (نفس الميزة محسوبة
-> بمعلومات مختلفة) — وهو تشويش لا يظهر في أيّ مقياس.
+> **Why `--rebuild` and not incremental build**: a row is built once (idempotent
+> by key), and its features derive from tables that keep receiving data **about the past** after it is built —
+> thesis backfill, token constants, retro candles, suspect-flag recomputation, new asset
+> classification. Training on stale rows = training on features poorer than what you actually have, and
+> worse: inconsistency between rows built at different times (the same feature computed with different
+> information) — noise that shows up in no metric.
 
-### 3.1 الأسس التي يجب هزمها أوّلاً
+### 3.1 The baselines you must beat first
 
-**لا تقارن نموذجك بالصفر، قارنه بهذه.** نموذج لا يهزمها بلا قيمة:
+**Do not compare your model to zero; compare it to these.** A model that does not beat them has no value:
 
-1. **الصدفة**: توقّع الصنف الأغلب دائماً.
-2. **القيمة السوقية وحدها**: قاعدة من متغيّر واحد (`market_cap > 10M`) — أقوى
-   نمط مقيس حتى الآن، ومن السهل أن يفشل نموذج معقّد في هزمها. **مقيس داخل
-   الميمات وحدها 2026-07-30** (481 عيّنة رجعية، تدرّج أحاديّ نظيف):
-   <$1M فوز 10.4%/rug 33.3% · $1–10M فوز 17.9% · $10–100M فوز 24.7% ·
-   >$100M فوز **39.1%**/rug **0%**. النموذج الذي لا يهزم هذا التدرّج بلا قيمة.
-3. **الحجم وحده**: `size_usd > عتبة`.
-4. **المجموعة الضابطة**: هل نموذجك على الإشارات يتفوّق على اختيار عشوائيّ؟
-5. **اللعب العمياء (مقيس 2026-07-28 على الرجعيّ)**: «العب كلّ إشارة
-   `multi_user_buy» = وسيط −58.7% احتفاظاً / وسيط +8% بجني +10% لكن متوسّط
-   −3.7% وتعادل تكلفة ~0%. **هذا هو الأرضية الرقمية**: نموذج يفلتر الإشارات
-   يجب أن يرفع المتوسّط فوق الصفر بعد التكلفة، لا أن «يحسّن الوسيط» فحسب —
-   الفشل الكارثيّ النادر هو ما يأكل المتوسّط، فالفلترة الحقيقيّة هي تجنّب
-   الصفقات الميّتة لا صيد القمم.
+1. **Chance**: always predict the majority class.
+2. **Market cap alone**: a one-variable rule (`market_cap > 10M`) — the strongest
+   measured pattern so far, and it is easy for a sophisticated model to fail to beat it. **Measured within
+   memes alone 2026-07-30** (481 retro samples, a clean monotonic gradient):
+   <$1M win 10.4%/rug 33.3% · $1–10M win 17.9% · $10–100M win 24.7% ·
+   >$100M win **39.1%**/rug **0%**. A model that does not beat this gradient has no value.
+3. **Volume alone**: `size_usd > threshold`.
+4. **The control group**: does your model on signals beat random selection?
+5. **Playing blind (measured 2026-07-28 on the retro set)**: "play every
+   `multi_user_buy` signal" = median −58.7% holding / median +8% with a +10% take-profit but a mean
+   of −3.7% and roughly 0% net cost. **This is the numeric floor**: a model that filters signals
+   must lift the mean above zero after costs, not merely "improve the median" — the rare catastrophic
+   failure is what eats the mean, so real filtering is avoiding dead trades, not catching peaks.
 
-### 3.2 النموذج
+### 3.2 The model
 
-- **ابدأ بـ Gradient Boosting** (LightGBM/XGBoost): يناسب الجداول، يبتلع القيم
-  الغائبة (وهي كثيرة عندك عمداً)، ولا يحتاج تطبيعاً.
-- **انحدار لوجستيّ** كمرجع مفسَّر بجانبه.
-- **لا شبكات عصبية** عند n≈1000 — لا فائدة، ومبالغة تخفي الأخطاء.
-- ضبط المعاملات على **`val` حصراً**. `test` يُفتح **مرّة واحدة** في النهاية.
+- **Start with Gradient Boosting** (LightGBM/XGBoost): suited to tabular data, swallows missing
+  values (you have many, deliberately), and needs no normalization.
+- **Logistic regression** as an interpretable reference alongside it.
+- **No neural networks** at n≈1000 — no benefit, and overfitting hides errors.
+- Tune parameters on **`val` only**. `test` is opened **once**, at the end.
 
-### 3.2-ب المعمار حول الخوارزمية (محسوم 2026-07-29)
+### 3.2-b The architecture around the algorithm (settled 2026-07-29)
 
-اسم الخوارزمية قرار ~5%؛ الـ95% فيما حولها:
+The algorithm's name is a ~5% decision; the other 95% is what surrounds it:
 
-1. **منافسة walk-forward موحّدة**: LightGBM مقابل CatBoost (الفئويات:
-   launchpad/الشبكة) مقابل Logistic (كاشف — لا يهزمه GBDT بفارق = ميزات
-   مكسورة). نفس التقسيم والمقاييس، الفائز يُعتمد، والمتعادلان: الأسرع.
-2. **نموذجان لا واحد**: `P(rug)` لتجنّب الكارثة + نموذج الفرصة (تصنيف/انحدار)
-   — بنية الخسارة غير متماثلة (rug −100% مقابل ربح مقطوع عند الهدف).
-3. **هدف مقاوم للذيل**: كمّيّ (median/quantile) أو Huber — رابح شاذّ واحد
-   لا يقود التدريب. يُقاس ضدّ الهدف العاديّ في المنافسة نفسها.
-4. **LambdaRank اختياريّ** ضدّ التصنيف — يوافق الاستعمال الفعليّ (اختيار أعلى K).
-5. **SHAP كلّ جولة** — تفسير القرار + كشف تسرّب خفيّ (ميزة تتصدّر فجأة؟).
-6. **مرفوض بسبب مسجَّل**: شبكات عميقة ونماذج تسلسل (n صغيرة = حفظ)،
-   ARIMA/Prophet (مشكلة أخرى: نرتّب أحداثاً لا نتنبّأ بسلسلة)، stacking
-   (الميتا-نموذج يفرّط عند n صغيرة — متوسّط متغيّرات بسيط أأمن).
-   مصنّف الأطروحات (§2.3-و-ب) **منتج ميزات** يغذّي GBDT لا منافس لها.
+1. **Unified walk-forward bake-off**: LightGBM versus CatBoost (categoricals:
+   launchpad/network) versus Logistic (a detector — if GBDT does not beat it by a margin, the features
+   are broken). Same split and metrics, the winner is adopted, and for ties: the faster one.
+2. **Two models, not one**: `P(rug)` for disaster avoidance + the opportunity model (classification/regression)
+   — the loss structure is asymmetric (rug −100% versus a profit cut at target).
+3. **A tail-resistant objective**: quantile (median/quantile) or Huber — a single anomalous winner
+   does not drive training. Measured against the plain objective in the same bake-off.
+4. **LambdaRank optional** versus classification — it matches the actual use (pick top K).
+5. **SHAP every round** — decision interpretation + hidden-leak detection (a feature suddenly topping?).
+6. **Rejected for recorded reasons**: deep networks and sequence models (small n = memorization),
+   ARIMA/Prophet (a different problem: we are ranking events, not forecasting a series), stacking
+   (the meta-model overfits at small n — a simple average of variables is safer).
+   The thesis classifier (§2.3-f-b) is a **feature producer** feeding GBDT, not a rival to it.
 
-### 3.3 المقاييس
+### 3.3 Metrics
 
-| المقياس | لماذا |
+| Metric | Why |
 |---|---|
-| **PR-AUC** | الصنف غير متوازن — ROC-AUC متفائل مضلِّل |
-| **Precision@K** | ما يهمّ فعلاً: أفضل 10 توصيات، كم منها صحّ |
-| **معايرة (calibration)** | «احتمال 70%» يجب أن يعني 70% فعلاً |
-| العائد المتوسّط والوسيط للمختارة | ترجمة اقتصادية |
-| نسبة `is_rug` في المختارة | تجنّب الكارثة |
+| **PR-AUC** | The class is imbalanced — ROC-AUC is misleadingly optimistic |
+| **Precision@K** | What actually matters: of the top 10 recommendations, how many are right |
+| **Calibration** | "70% probability" must actually mean 70% |
+| Mean and median return of the selected | Economic translation |
+| `is_rug` rate among the selected | Disaster avoidance |
 
 ---
 
-## المرحلة 4 — التداول الورقي (paper trading)
+## Phase 4 — Paper trading
 
-نموذج جيّد إحصائياً قد يخسر مالاً. هذه المرحلة تكتشف ذلك **بلا مال**.
+A statistically good model can still lose money. This phase finds that out **without money**.
 
-### 4.1 ما يجب محاكاته صراحةً
+### 4.1 What must be simulated explicitly
 
-هذه الفجوة بين «دقّة النموذج» و«الربح»، وتجاهلها هو الخطأ الأشيع:
+This is the gap between "model accuracy" and "profit", and ignoring it is the most common mistake:
 
-| العامل | لماذا يهمّ |
+| Factor | Why it matters |
 |---|---|
-| **الانزلاق (slippage)** | عملة بقيمة سوقية <1M: شراء $5k يحرّك السعر بنسبة معتبرة |
-| **الرسوم** | رسوم fomo + الشبكة لكل صفقة |
-| **تأخّر التنفيذ** | `entry_lag_s` مسجَّل — استعمله لا افتراضاً مثالياً |
-| **السيولة** | `liquidity` من `market_ticks`؛ لا تفترض تنفيذ أي حجم |
-| **قاعدة الخروج** | القمّة غير معروفة سلفاً — عرّف قاعدة صريحة |
+| **Slippage** | A token with market cap <1M: buying $5k moves the price by a meaningful percentage |
+| **Fees** | fomo fees + network fees per trade |
+| **Execution delay** | `entry_lag_s` is recorded — use it, not an idealized assumption |
+| **Liquidity** | `liquidity` from `market_ticks`; do not assume any size is executable |
+| **Exit rule** | The peak is not known in advance — define an explicit rule |
 
-### 4.2 قواعد الخروج — سؤال مفتوح، والأداة جاهزة
+### 4.2 Exit rules — an open question, and the tool is ready
 
-**الأداة** مبنيّة ومختبَرة (`recorder/exit_sim.py` + `run_exit_sim.py`، 18
-اختباراً) فلا تكتب محاكاة جديدة. **القواعد نفسها لم تُحسم بعد** — لا قاعدة
-مُوصى بها هنا، والاختيار بينها جزء من هذه المرحلة لا مدخلٌ لها.
+**The tool** is built and tested (`recorder/exit_sim.py` + `run_exit_sim.py`, 18
+tests) so do not write a new simulator. **The rules themselves are not settled yet** — no rule is
+recommended here, and choosing among them is part of this phase, not an input to it.
 
-**مرشّح جديد موثَّق (2026-07-28) — الخروج الزخميّ**: الدليل المقيس على
-MarsCoin (+1962% قمّة) أنّ القواعد الثابتة تسحق الذيل الأيمن (جني+10% خرج
-بعد 24 دقيقة وفاته +1900%؛ متحرّك 25% خرج −21.8% بذيل شمعة ثمّ صعدت 20×).
-بينما سلسلة `token_social` (8→393 أطروحة) وبيع المتصدّرين (`large_sell` منذ
-2026-07-28) مسجَّلان لحظياً. **الفرضية**: الخروج بموت الزخم (انطفاء الأطروحات/
-تسارعها، أو بيع متصدّرٍ داخل النافذة) يتفوّق على الأرقام الثابتة لأنّه يبقى في
-الذيل ويخرج من الوسيط. تُختبر على الرجعيّ بنفس المحاكي: أضِف قواعد «زمن منذ
-آخر أطروحة/بيع متصدٍّ» وقارن — بشرط أن تُبنى ميزاتها من متاحٍ لحظتها فقط
-(لا تسرّب: `token_social` أثناء النافذة مشروع للخروج الزمنيّ المنزلق، ممنوع
-لنموذج الدخول).
+**Newly documented candidate (2026-07-28) — momentum exit**: the measured evidence on
+MarsCoin (+1962% peak) is that fixed rules crush the right tail (a +10% take-profit exited after
+24 minutes and missed +1900%; a 25% trailing stop exited at −21.8% on a candle wick and then it rose 20×).
+Meanwhile the `token_social` series (8→393 theses) and leaderboard selling (`large_sell` since
+2026-07-28) are recorded live. **The hypothesis**: exiting on momentum death (theses dying out /
+accelerating, or a leaderboard sell inside the window) beats fixed numbers because it stays in
+the tail and exits the median. Test it on the retro set with the same simulator: add "time since last
+thesis/leaderboard sell" rules and compare — on the condition that their features are built only from what
+was available at the moment (no leakage: `token_social` during the window is legitimate for the
+sliding-time exit, forbidden for the entry model).
 
 ```powershell
 py run_exit_sim.py --cost 0.02
 ```
 
-**سؤال مفتوح، لا نتيجة**: هل يهمّ الخروج أكثر من اختيار العملات؟
+**An open question, not a result**: does the exit matter more than token selection?
 
-تشغيل استطلاعيّ مبكّر (عشرات الصفقات، متابعة مبتورة، **بلا نافذة واحدة مكتملة
-وبلا مقارنة ضابطة**) أشار إلى أنّ الجني الثابت يتفوّق على الاحتفاظ.
-**هذه إشارة أوّلية لا نتيجة**، ولا تُبنى عليها قرارات: العيّنة دون عتبة النضج،
-والنوافذ مبتورة فالأهداف البعيدة مُبخَّسة بنيوياً، والفرق قد يكون خاصية سوق
-تلك الساعات لا خاصية الاستراتيجية.
+An early exploratory run (a few dozen trades, truncated follow-through, **not a single completed
+window and no control comparison**) suggested fixed take-profit beats holding.
+**This is a preliminary signal, not a result**, and no decisions are built on it: the sample is below the
+maturity threshold, the windows are truncated so far targets are structurally understated, and the
+difference might be a property of those hours' market rather than of the strategy.
 
-**متى يصير سؤالاً قابلاً للإجابة**: بعد المرحلة 0 (نوافذ مكتملة) والمرحلة 1
-(ضابطة ناضجة). عندها شغّل المحاكي على المجموعتين وقارن — إن تفوّق الجني الثابت
-على الضابطة أيضاً فالأثر حقيقيّ، وإلّا فهو خاصية سوق.
+**When it becomes answerable**: after Phase 0 (completed windows) and Phase 1
+(a mature control group). Then run the simulator on both groups and compare — if fixed take-profit also
+beats the control group, the effect is real; otherwise it is a market property.
 
-مرجع مقيس يستحقّ الانتباه عند التصميم: الوسيط الحقيقي للمدّة حتى القمّة **11.4
-ساعة** و**47% تبلغ قمّتها بعد 12 ساعة** — فأي حدّ زمنيّ دون ذلك يقطع نصف
-المكاسب، ويتفادى نصف الانهيارات. المحصّلة غير معروفة سلفاً.
+A measured reference worth attention when designing: the true median time to peak is **11.4
+hours** and **47% peak after 12 hours** — so any time limit below that cuts off half
+the gains, and dodges half the collapses. The net is not known in advance.
 
-#### الاختبار الحاسم: نقطة التعادل
+#### The decisive test: the breakeven point
 
-`breakeven_cost` يحسب أقصى تكلفة دورة تبقى معها القاعدة رابحة. النتيجة الحالية
-**1.9% – 3.2%** فقط، و**ثلث العملات سيولتها دون 50 ألف دولار**. أي قاعدة تعادلها
-دون ~3% ليست قابلة للتنفيذ عملياً مهما بدت جميلة.
+`breakeven_cost` computes the maximum round-trip cost at which the rule still stays profitable. The current
+result is only **1.9% – 3.2%**, and **a third of tokens have liquidity under $50k**. Any rule whose
+breakeven is below ~3% is not practically executable however pretty it looks.
 
-**هذا الرقم — لا الدقّة ولا PR-AUC — هو ما يقرّر جدوى المشروع.**
+**This number — not accuracy and not PR-AUC — is what decides the project's viability.**
 
-#### ما يجب أن تعرفه قبل الاعتماد على الأرقام
+#### What you must know before trusting the numbers
 
-- **المسار هو النتيجة**: `max_gain` و`max_drawdown` لا يحملان ترتيبهما، فلا يمكن
-  الاكتفاء بأعمدة `outcomes` — المحاكي يمشي على الشموع لهذا السبب.
-- **الافتراض داخل الشمعة متحفّظ**: عند لمس الهدف والوقف معاً نفترض الوقف أوّلاً.
-- **النوافذ لم تكتمل بعد** ⇒ الأهداف البعيدة مُبخَّسة. أعِد التشغيل بعد المرحلة 0.
-- **لا مقارنة ضابطة بعد** — قد تعطي عملة عشوائية النتيجة نفسها (المرحلة 1).
+- **The path is the result**: `max_gain` and `max_drawdown` carry no ordering, so the `outcomes` columns
+  are not enough — that is why the simulator walks the candles.
+- **The intra-candle assumption is conservative**: when target and stop are touched together, we assume the stop first.
+- **The windows are not complete yet** ⇒ far targets are understated. Re-run after Phase 0.
+- **No control comparison yet** — a random token might give the same result (Phase 1).
 
-### 4.3 مقاييس المحفظة
+### 4.3 Portfolio metrics
 
-عائد تراكميّ · **أقصى تراجع (max drawdown)** · Sharpe/Sortino ·
-نسبة الفوز · متوسّط الرابح ÷ متوسّط الخاسر · أطول سلسلة خسائر ·
-حساسية النتيجة لحجم الصفقة
+Cumulative return · **max drawdown** · Sharpe/Sortino ·
+win rate · average winner ÷ average loser · longest losing streak ·
+result sensitivity to trade size
 
-### 4.4 التشغيل الحيّ الصامت
+### 4.4 Silent live operation
 
-بعد نجاح المحاكاة التاريخية: شغّل النموذج **حيّاً بلا مال** أسبوعين على الأقلّ،
-وسجّل قراراته لحظياً. هذا يكشف تسرّباً خفياً لا تكشفه المحاكاة التاريخية أبداً.
-
----
-
-## المرحلة 5 — إعادة التدريب والمراقبة
-
-السوق يتغيّر؛ نموذج مدرَّب على أسبوع واحد يتقادم.
-
-- **انحراف البيانات**: راقب توزيع المميّزات شهرياً مقابل التدريب.
-- **انحراف الأداء**: راقب PR-AUC على البيانات الجديدة.
-- **إعادة التدريب**: دورياً (شهرياً) أو عند تجاوز عتبة انحراف.
-- **حفظ إصدارات**: كل نموذج مع بيانات تدريبه ونتائجه. بلا ذلك لا يمكن معرفة
-  سبب تدهور الأداء.
-- **الاحتفاظ بالأرشيف**: `SNAPSHOT_RETENTION_DAYS = 0` (بلا حذف). لا تفعّل
-  التقليم إلّا عند ضيق القرص فعلاً — البيانات القديمة هي ما يتيح إعادة التقييم.
+After the historical simulation succeeds: run the model **live without money** for at least two weeks,
+and log its decisions in real time. This exposes hidden leakage that a historical simulation never can.
 
 ---
 
-## قائمة المصائد — راجعها عند كل خطوة
+## Phase 5 — Retraining and monitoring
 
-مرتّبة حسب الضرر المحتمل.
+The market changes; a model trained on one week goes stale.
 
-| # | المصيدة | الوقاية |
+- **Data drift**: monitor the feature distribution monthly against training.
+- **Performance drift**: monitor PR-AUC on new data.
+- **Retraining**: periodically (monthly) or when a drift threshold is crossed.
+- **Version keeping**: every model with its training data and results. Without that, there is no way to know
+  why performance degraded.
+- **Keeping the archive**: `SNAPSHOT_RETENTION_DAYS = 0` (no deletion). Do not enable
+  pruning until the disk is genuinely tight — old data is what allows re-evaluation.
+
+---
+
+## Trap list — review it at every step
+
+Ordered by potential damage.
+
+| # | Trap | Prevention |
 |---|---|---|
-| 1 | **تسرّب المستقبل** | لا ميزة من بعد t=0. الموسِّم منفصل ولا يعمل قبل النضج |
-| 2 | **تسرّب عبر العملة** | التزم `outcomes.split` (بتجزئة العملة) — لا تقسيم عشوائيّ |
-| 3 | **التكرار الزائف** | درّب على `is_independent=1` فقط |
-| 4 | **انحياز البقاء** | `bars_truncated=1` **إشارة لا نقص**؛ لا تستبعد `is_rug` |
-| 5 | **الاقتطاع اليمينيّ** | لا تستنتج عن نوافذ لم تكتمل (كلّفنا استنتاجاً باطلاً) |
-| 6 | **المتوسّط المضلِّل** | اعرض الوسيط دائماً؛ رابح شاذّ يقلب المتوسّط وحده |
-| 7 | **القمّة ≠ ربح** | `max_gain` لا يُحقَّق إلّا ببيع في لحظته |
-| 8 | **حفظ القيمة السوقية** | اضبطها أو صنّف داخلها — أقوى نمط مقيس |
-| 9 | **التسوّق في الاختبار** | `test` يُفتح مرّة واحدة. الضبط على `val` |
-| 10 | **تجاهل الانزلاق** | حاكِ التكلفة صراحةً — تبتلع الأرباح الصغيرة |
-| 11 | **يوم واحد ≠ سوق** | ≥5 أيام تقويمية قبل أي استنتاج |
-| 12 | **`num_likes` تاريخياً** | قيمتها وقت السحب لا الكتابة — ممنوعة كميزة للماضي |
-| 13 | **تجمّد المصدر** | افحص `last_feed_event_at`؛ مصدر متجمّد يبدو سوقاً هادئاً |
-| 14 | **استبعاد `no_bars` من التدريب** | انحياز بقاء خفيّ — تدخل بقيمة 0 لأهداف الصعود (§2.1) |
-| 15 | **train/test من نفس النظام السوقي** | التقسيم بالعملة لا يكفي — walk-forward إلزاميّ (§2.4) |
-| 16 | **«لا فرق» بلا قدرة إحصائية** | حدّد أصغر أثر واحسب n اللازم قبل المرحلة 1 |
-| 17 | **قيم منبع مستحيلة** | `h/l/c_suspect` تُستبعد من كل حساب؛ صفّ بـ`suspect_bars>0` يُقرأ بحذر (README §9-22) |
-| 18 | **الكون ليس عملات ميم فقط** | مقيس 2026-07-30: **116 إشارة على 8 أصول كبرى** (BTC $1.27T · ETH · SOL 103 إشارة · USDT · XRP · BNB · HYPE · سهم SNDK المرمّز) دخلت منها **21 نتيجة موسومة**. أصل بتريليون لا يسلك سلوك عملة بـ$500k ⇒ إمّا استثناؤها صريحاً أو شريحة قيمة سوقية إلزامية في التقييم. **تحذير**: نمط «القيمة السوقية أقوى مؤشّر» قد يكون جزئياً أثر هذا الخلط لا أثر الحجم داخل الميمات |
-| 19 | **`market_cap` مقياس مضلِّل في الذيل** | مقيس: هو حاصل السعر × المعروض فحسب، فعملة بـ7.8×10¹⁴ رمزاً تُقرأ **$69 تريليون** (SMILE). **ليس تشوّهاً**: مشاهدات نفس العملة متّسقة عبر المصادر (الفحص: لا عملة تتفاوت >×50 إلّا بحركة سعر حقيقية — BONK وMarsCoin). العلاج ميزاتيّ لا وسم: لوغاريتم أو شرائح رُتب، وتفضيل `liquidity` (مال حقيقيّ في الحوض) على القيمة السوقية الاسمية |
+| 1 | **Future leakage** | No feature from after t=0. The labeler is separate and does not run before maturity |
+| 2 | **Leakage through the token** | Respect `outcomes.split` (hashed by token) — no random split |
+| 3 | **Pseudo-duplication** | Train on `is_independent=1` only |
+| 4 | **Survivorship bias** | `bars_truncated=1` is **a signal, not a gap**; do not exclude `is_rug` |
+| 5 | **Right truncation** | Do not infer from incomplete windows (it cost us a false inference) |
+| 6 | **The misleading mean** | Always show the median; one anomalous winner flips the mean by itself |
+| 7 | **Peak ≠ profit** | `max_gain` is only realized by selling at that moment |
+| 8 | **Memorizing market cap** | Adjust for it or stratify within it — the strongest measured pattern |
+| 9 | **Test shopping** | `test` is opened once. Tuning on `val` |
+| 10 | **Ignoring slippage** | Simulate cost explicitly — it eats small profits |
+| 11 | **One day ≠ the market** | ≥5 calendar days before any inference |
+| 12 | **`num_likes` historically** | Its value is from pull time, not write time — forbidden as a past feature |
+| 13 | **A frozen source** | Check `last_feed_event_at`; a frozen source looks like a quiet market |
+| 14 | **Excluding `no_bars` from training** | Hidden survivorship bias — enters with a 0 for upside targets (§2.1) |
+| 15 | **train/test from the same market regime** | Splitting by token is not enough — walk-forward is mandatory (§2.4) |
+| 16 | **"No difference" without statistical power** | Fix the smallest effect and compute the needed n before Phase 1 |
+| 17 | **Impossible source values** | `h/l/c_suspect` are excluded from every computation; a row with `suspect_bars>0` is read with care (README §9-22) |
+| 18 | **The universe is not memes only** | Measured 2026-07-30: **116 signals on 8 major assets** (BTC $1.27T · ETH · SOL 103 signals · USDT · XRP · BNB · HYPE · the tokenized SNDK stock), of which **21 labeled outcomes**. A trillion-dollar asset does not behave like a $500k token ⇒ either exclude them explicitly or make a market-cap stratum mandatory in evaluation. **Warning**: the "market cap is the strongest indicator" pattern may be partly an effect of this mix, not a size effect within memes |
+| 19 | **`market_cap` is a misleading measure in the tail** | Measured: it is merely price × supply, so a token with 7.8×10¹⁴ tokens reads as **$69 trillion** (SMILE). **Not corruption**: the same token's observations are consistent across sources (the check: no token varies >×50 except with real price movement — BONK and MarsCoin). The fix is featural, not labeling: log or rank buckets, and preferring `liquidity` (real money in the pool) over nominal market cap |
 
 ---
 
-## معايير النجاح والتوقّف
+## Success and stopping criteria
 
-### نجاح المرحلة 1
-بعد ≥500 ضابطة v3 ناضجة و≥14 يوماً: الإشارة تتفوّق بفارق ذي معنى في الوسيط
-ونسبة الفوز، بفاصل ثقة وحجم أثر مقبولين، ولا ينقلب الحكم في تحليل القيم الشاذة
-أو عبر الفترات والشبكات. بلوغ 100 ضابطة لا يحقق هذا النجاح.
+### Phase 1 success
+After ≥500 mature v3 controls and ≥14 days: the signal wins by a meaningful margin in median
+and win rate, with acceptable confidence intervals and effect size, and the verdict does not flip in the outlier
+analysis or across periods and networks. Reaching 100 controls does not achieve this success.
 
-### نجاح المرحلة 3
-النموذج يهزم **كل** الأسس الأربعة على `test` المفتوح مرّة واحدة.
+### Phase 3 success
+The model beats **all four** baselines on `test` opened once.
 
-### نجاح المرحلة 4
-ربح موجب بعد الانزلاق والرسوم، بتراجع أقصى محتمَل، ومستقرّ عبر قواعد خروج
-متعدّدة (لا يعتمد على قاعدة واحدة مضبوطة بإفراط).
+### Phase 4 success
+Positive profit after slippage and fees, with a tolerable max drawdown, and stable across multiple
+exit rules (not dependent on one over-tuned rule).
 
-### متى تتوقّف
-- المرحلة 1 لا تُظهر أي تفوّق ⇒ الأطروحة مرفوضة كما هي.
-- النموذج لا يهزم «القيمة السوقية وحدها» ⇒ لا قيمة مضافة للتعقيد.
-- الربح موجب قبل التكاليف وسالب بعدها ⇒ الأثر حقيقيّ لكن غير قابل للاستثمار
-  بهذا الحجم.
+### When to stop
+- Phase 1 shows no edge ⇒ the thesis is rejected as is.
+- The model does not beat "market cap alone" ⇒ no added value for the complexity.
+- Profit is positive before costs and negative after ⇒ the effect is real but not investable
+  at this size.
 
-**النتيجة السلبية الموثّقة نجاحٌ للمشروع** — كلّفتك أسابيع بدل أموال.
+**A documented negative result is a project success** — it cost you weeks instead of money.
 
 ---
 
-## ملخّص الترتيب
+## Order summary
 
 ```
-0. بوّابة النضج        ✅ مكتملة
-2. بناء المجموعة        ✅ مبنيّ ومشغَّل: training_rows (5,602 صفّاً · 104 ميزة)
-1. الإشارة ضدّ الضابطة  ⏳ جمع v2؛ فحص أولي ونموذج v1 عند 100، قرار اعتماد عند 500 و14 يوماً
-3. نموذج الأساس         ⏳ v1 استكشافي عند 100؛ v2 معتمد بعد بوابة المرحلة 1
-4. التداول الورقي       ⏳ v1 استكشافي ثم v2 منفصل بعد القرار
-5. المراقبة والتدريب    ← الانحراف حتميّ
+0. Maturity gate          ⏳ Signals complete; the control group 426/500
+2. Dataset build          ✅ Built and running: training_rows · fv16 · 171 features
+1. Signal vs control      ⏳ v3 collection; the preliminary check is open, the admission decision at 500
+3. Baseline model         ⏳ exploratory v1 at 100; approved v2 after the Phase 1 gate
+4. Paper trading          ⏳ exploratory v1, then a separate v2 after the decision
+5. Monitoring & training  ← drift is inevitable
 ```
 
-**لماذا سبقت المرحلة 2 المرحلة 1**: المستخرج لا ينتظر بيانات (كود خالص على
-أرشيف موجود)، والضابطة تنضج بالزمن وحده — فبناؤه أثناء الانتظار وفّر أياماً
-ولم يخلّ بالترتيب المنهجيّ: المرحلة 1 تبقى **بوّابة الاعتماد** لما بعدها. يجوز
-v1 الاستكشافي والورقي عند 100 وفق القيود أعلاه، ولا يُعتمد v2 قبل اجتيازها.
+**Why Phase 2 ran before Phase 1**: the extractor does not wait on data (pure code over an
+existing archive), and the control group matures by time alone — so building it during the wait saved days
+and did not violate the methodological order: Phase 1 remains the **admission gate** for everything after it.
+The exploratory v1 and the paper run at 100 are allowed under the constraints above, and v2 is not approved
+before passing it.

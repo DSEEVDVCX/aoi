@@ -1,24 +1,30 @@
-"""دورة طبقة السلسلة: تركّز الملكية مقيساً من البلوك تشين لا من FOMO.
+"""Chain-layer cycle: ownership concentration measured from the blockchain, not from FOMO.
 
-منفصلة عن `recorder.py` عمداً ولسببين مقيسين:
+Deliberately separate from `recorder.py`, for two measured reasons:
 
-1. **ميزانية الدورة ممتلئة.** دورة المسجّل 60 ثانية، والتمهّل «لُطفاً بالمصدر»
-   كان يأكل 27.5ث منها. مصدر خارجيّ ثانٍ داخلها يجعل بطأه يؤخّر جمع FOMO نفسه.
-2. **الانفصال هو ما يجعل إيقاع 5 دقائق ممكناً.** 73 عملة سولانا نشطة ÷ 5 دقائق
-   = 15 نداءً في الدقيقة. الدورة كلّها تتحمّل 13 نداءً لكل شيء — أمّا هنا
-   فالمقيس على المفتاح **224 نداءً في الدقيقة بلا فشل واحد** (توازٍ 3، وسيط
-   216ms)، فحاجتنا 7% من الطاقة المريحة.
+1. **The cycle's budget is full.** The recorder cycle is 60 seconds, and
+   politeness pacing toward the source was eating 27.5s of it. A second
+   external source inside it means its slowness delays FOMO collection
+   itself.
+2. **The separation is what makes a 5-minute cadence possible.** 73 active
+   Solana tokens ÷ 5 minutes = 15 calls per minute. The whole cycle can
+   afford 13 calls for everything — whereas here the measured rate on the
+   key is **224 calls per minute without a single failure** (concurrency 3,
+   median 216ms), so we need only 7% of the comfortable capacity.
 
-ولماذا هذه الطبقة أصلاً وعندنا `token_holders`؟ لأنّ FOMO يعطي `top10` وحده
-وكل ~25 دقيقة (وسيط الفجوة المقيس 25.0 على 19,440 زوجاً)، فلا top1 — أي لا
-جواب عن «حوت مفرد أم عشرة موزّعين؟» وهما خطران مختلفان — ولا إيقاع يلحق حركة
-تصريفٍ تجري في دقائق. نداء السلسلة الواحد يعطي top1/5/10/20 معاً (مقيس 230ms).
+And why this layer at all when we have `token_holders`? Because FOMO gives
+`top10` alone and only every ~25 minutes (measured gap median 25.0 over
+19,440 pairs), so there is no top1 — i.e. no answer to "one whale or ten
+distributed holders?", two different dangers — and no cadence that can keep
+up with a dump unfolding in minutes. A single on-chain call yields
+top1/5/10/20 together (measured 230ms).
 
-**سولانا وحدها، وليس تقصيراً**: معيار ERC-20 لا يحمل قائمة حائزين على السلسلة،
-فلا نداء عقدة يعطي أكبر الحائزين على EVM إطلاقاً — لا هنا ولا بمزوّد آخر بلا
-مفهرس مدفوع لكل شبكة. سولانا = 45.2% من إشاراتنا (30,931 من 68,491).
+**Solana only, not an oversight**: the ERC-20 standard carries no on-chain
+holder list, so no node call can return the largest holders on EVM at all —
+not here, and not from another provider without a paid per-network indexer.
+Solana = 45.2% of our signals (30,931 of 68,491).
 
-قراءة فقط (FR-012)، ولا يُطبع المفتاح ولا يُسجَّل (FR-013).
+Read-only (FR-012), and the key is never printed nor logged (FR-013).
 """
 from __future__ import annotations
 
@@ -35,17 +41,21 @@ from solana_rpc import ChainKeyMissing
 async def run_chain_cycle(
     rpc: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """دورة واحدة: أقدم المراقَبات المستحقّة، نداء واحد لكلٍّ، صفّ تركّز لكلٍّ.
+    """One cycle: the oldest due watches, one call each, one concentration row each.
 
-    ثلاث حالات لا حالتان، وهذا مقصود:
-      - `ok`    — قياس وصل وصفّ كُتب ⇒ التحديث التالي بعد `CHAIN_REFRESH_SECONDS`.
-      - `empty` — المصدر ردّ بلا قياس (عنوان ليس عملةً، أو بلا حسابات) ⇒ إيقاع
-        عاديّ لا سريع: إعادةٌ كل دقيقتين لعنوان لا قياس له أبداً تحرق الميزانية.
-      - `error` — فشل نداء ⇒ إعادة سريعة (`CHAIN_ERROR_RETRY_SECONDS`)، فالمجهول
-        ليس آمناً.
+    Three states, not two — and that is deliberate:
+      - `ok`    — a measurement arrived and a row was written ⇒ next refresh
+        after `CHAIN_REFRESH_SECONDS`.
+      - `empty` — the source replied with no measurement (an address that is
+        not a token, or has no accounts) ⇒ a normal cadence, not a fast one:
+        retrying every two minutes an address that will never have a
+        measurement burns the budget.
+      - `error` — a call failed ⇒ fast retry (`CHAIN_ERROR_RETRY_SECONDS`),
+        because the unknown is not safe.
 
-    `ChainKeyMissing` **يُرفع خارج الدورة** ولا يُعلَّم على العملات: العيب فينا لا
-    فيها، ووسمُ الطابور كلّه `error` بسبب ملفّ مفاتيح غائب يفسد جدولة صحيحة.
+    `ChainKeyMissing` **is raised outside the cycle** and is never stamped on
+    the tokens: the fault is ours, not theirs, and marking the whole queue
+    `error` over a missing key file would wreck correct scheduling.
     """
     stats = {
         "chain_due": 0, "chain_rows": 0, "chain_empty": 0,
@@ -97,20 +107,21 @@ async def run_chain_cycle(
                     top1 = row["top1_pct"]
                     stats["chain_rows"] += 1
         except ChainKeyMissing:
-            raise  # عيب إعداد لا عيب عملة — لا يُوسَم عليها
-        except Exception as exc:  # noqa: BLE001 — عملة واحدة لا تُسقط الدورة
+            raise  # a setup fault, not a token fault — never stamped on the token
+        except Exception as exc:  # noqa: BLE001 — one token must not sink the cycle
             stats["chain_errors"] += 1
-            # الرسالة مشطوبة من المفتاح داخل `solana_rpc` قبل أن تصل هنا
-            # (FR-013)، وهذا الحقل تعرضه لوحة القيادة.
-            # و`note_error` لا `set_meta`: قفلُ القاعدة أثناء **معالجة** خطأ عملةٍ
-            # كان سيخرج من هذا الحرس فيُسقط بقيّة الطابور في هذه الدورة كلَّها.
+            # The message is scrubbed of the key inside `solana_rpc` before it
+            # reaches here (FR-013), and this field is displayed by the
+            # dashboard. And `note_error`, not `set_meta`: taking the DB lock
+            # while **handling** one token's error would escape this guard and
+            # sink the rest of the queue for the entire cycle.
             db.note_error(
                 "last_error_chain",
                 f"{recorded_at}: {addr}: {type(exc).__name__}: {exc}",
             )
 
         db.set_chain_state(addr, net, status, top1, recorded_at)
-        # فاصل **بين** النداءات لا بعد آخرها (نفس حرس بقيّة الدورات).
+        # A pause **between** calls, not after the last one (same guard as the other cycles).
         if i + 1 < len(due):
             await sleep(config.CHAIN_PACING_SECONDS)
     return stats
@@ -119,16 +130,18 @@ async def run_chain_cycle(
 async def run_chain_auth_cycle(
     rpc: Any, db: RecorderDB, recorded_at: str, sleep=asyncio.sleep
 ) -> dict[str, int]:
-    """الطبقة البطيئة: صلاحيات المِنت وقابليّة التعديل وحيازة المطوّر.
+    """The slow layer: mint authority, mutability, and developer holdings.
 
-    إيقاع ساعيّ لا خمس‑دقائقيّ: صلاحية السكّ تُشطب مرّة واحدة في عمر العملة إن
-    شُطبت، فسؤالها 12 مرّة في الساعة إهدارُ ميزانيةٍ نحتاجها للتركّز المتحرّك.
-    وطابور مستقلّ (`chain_auth_state`) فلا يُخفي تحديثُ إحدى الطبقتين تأخّرَ
-    الأخرى.
+    An hourly cadence, not a five-minute one: mint authority is revoked once
+    in a token's lifetime if it is ever revoked, so asking about it 12 times
+    an hour wastes budget we need for moving concentration. And a separate
+    queue (`chain_auth_state`), so one layer's refresh cannot hide the
+    other's delay.
 
-    نداءان لا واحد، والثاني **مشروط**: عنوان المطوّر لا يُعرف إلّا من ردّ الأصل،
-    فلا يمكن ضمّه إلى نفس الدفعة. وإن فشل النداء الثاني وحده يُكتب الصفّ بلا
-    `dev_holding_pct` — خسارة عمود لا خسارة قياس.
+    Two calls, not one, and the second is **conditional**: the developer's
+    address is known only from the first call's reply, so it cannot be folded
+    into the same batch. If the second call alone fails, the row is written
+    without `dev_holding_pct` — losing a column, not a measurement.
     """
     stats = {"auth_due": 0, "auth_rows": 0, "auth_empty": 0, "auth_errors": 0,
              "auth_dev": 0}
@@ -170,8 +183,9 @@ async def run_chain_auth_cycle(
                 except ChainKeyMissing:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    # عمود واحد يسقط، والصفّ ينجو: `dev_owner` يبقى محفوظاً
-                    # فنعرف لِمن كنّا نقيس حين نقرأ الخطأ.
+                    # One column falls, the row survives: `dev_owner` stays
+                    # saved, so we know whom we were measuring when we read
+                    # the error.
                     raw["owner_accounts"] = None
                     raw["dev_error"] = f"{type(exc).__name__}: {exc}"
             row = extract.extract_chain_authority(

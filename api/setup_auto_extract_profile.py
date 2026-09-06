@@ -45,8 +45,8 @@ def _copy_profile() -> str:
     src_profile = os.path.join(_CHROME_USER_DATA, _CHROME_PROFILE)
     if not os.path.isdir(src_profile):
         raise SystemExit(
-            f"لم أجد ملف تعريف Chrome: {src_profile}\n"
-            f"عيّن CHROME_PROFILE / CHROME_USER_DATA_DIR بالمسار الصحيح."
+            f"Chrome profile not found: {src_profile}\n"
+            f"Set CHROME_PROFILE / CHROME_USER_DATA_DIR to the correct path."
         )
     # Chrome needs the profile folder named 'Default' inside the fresh user-data dir.
     dst_profile = os.path.join(dst_root, "Default")
@@ -97,7 +97,7 @@ async def main() -> None:
     from fomo_api.auth.credential_store import CredentialStore, StoredCredentials
     from fomo_api.config import settings
 
-    print(">>> أنسخ ملف تعريف Chrome الخاص بك (لن يُلمَس متصفحك الأصلي)...", flush=True)
+    print(">>> Copying your Chrome profile (your real browser is never touched)...", flush=True)
     user_data = _copy_profile()
 
     async with async_playwright() as pw:
@@ -112,8 +112,8 @@ async def main() -> None:
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(APP, wait_until="domcontentloaded")
         print("=" * 70, flush=True)
-        print(">>> إن لم تكن مسجّلاً في fomo.family، اضغط Login — حساب Google ظاهر بالفعل.", flush=True)
-        print(">>> إن كنت مسجّلاً من قبل، سيُلتقط تلقائياً خلال ثوانٍ.", flush=True)
+        print(">>> If you are not signed in to fomo.family, press Login — your Google account is already there.", flush=True)
+        print(">>> If you were already signed in, it will be captured automatically within seconds.", flush=True)
         print("=" * 70, flush=True)
         s = await _harvest(page)
         try:
@@ -127,7 +127,7 @@ async def main() -> None:
         pass
 
     if not s:
-        print(">>> لم يُلتقط تسجيل دخول ضمن المهلة.", flush=True)
+        print(">>> No sign-in token captured within the timeout.", flush=True)
         return
 
     def _c(v):
@@ -140,7 +140,7 @@ async def main() -> None:
     )
     store = CredentialStore(settings.credential_state_file)
     store.save(creds)
-    print(f">>> حُفظت بيانات الاعتماد في {store.path} | قابلة للتجديد: {creds.is_refreshable()}", flush=True)
+    print(f">>> Credentials saved to {store.path} | refreshable: {creds.is_refreshable()}", flush=True)
 
     from fomo_api.auth.token_refresher import _call_privy_refresh
 
@@ -152,9 +152,9 @@ async def main() -> None:
         )
         store.save(StoredCredentials(access_token=r.get("access"), refresh_token=r.get("refresh"), pat=r.get("pat")))
         access = r.get("access")
-        print(">>> [OK] تجديد بلا متصفح نجح — النظام سيجدّد نفسه تلقائياً من الآن.", flush=True)
+        print(">>> [OK] Browserless refresh succeeded — the system renews itself automatically from now on.", flush=True)
     except Exception as exc:
-        print(f">>> تحذير: التجديد الفوري فشل ({exc})؛ سيُستخدم الرمز الملتقط.", flush=True)
+        print(f">>> Warning: the immediate refresh failed ({exc}); the captured token will be used.", flush=True)
         access = creds.access_token
 
     from fomo_api.clients.fomo_client import FomoClient
@@ -164,10 +164,10 @@ async def main() -> None:
         lb = await client.get_leaderboard(page=1, page_size=5, period="all")
         traders = lb["traders"] if isinstance(lb, dict) else lb.traders
         total = lb["total_items"] if isinstance(lb, dict) else lb.total_items
-        print(f">>> بيانات حيّة: {total} متداولاً في المتصدّرين", flush=True)
+        print(f">>> Live data: {total} traders on the leaderboard", flush=True)
         for t in (traders[:3] if isinstance(traders, list) else traders):
             print(f"      @{t['handle'] if isinstance(t, dict) else t.handle}", flush=True)
-        print(">>> اكتمل الإعداد. شغّل الخادم وسيعمل الاستخراج تلقائياً بلا تدخّل.", flush=True)
+        print(">>> Setup complete. Start the server and extraction runs automatically with no intervention.", flush=True)
     finally:
         await client.aclose()
 

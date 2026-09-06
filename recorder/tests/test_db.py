@@ -1,14 +1,14 @@
-"""اختبارات طبقة قاعدة البيانات على قاعدة مؤقّتة (بلا شبكة).
+"""Database-layer tests on a temporary database (no network).
 
-يغطّي: إنشاء المخطّط، idempotency للإشارات/الـ ticks/الثوابت، منطق watchlist
-(إضافة، حدّ، انتهاء 48 ساعة)، وعدّادات meta.
+Covers: schema creation, idempotency of signals/ticks/statics, watchlist
+logic (add, cap, 48h expiry), and meta counters.
 """
 import json
 import os
 import sqlite3
 
 import pytest
-from db import RecorderDB, decode_raw, encode_raw
+from db import RecorderDB, StaleEVMState, decode_raw, encode_raw
 
 SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "schema.sql")
 
@@ -78,7 +78,7 @@ def test_evm_snapshot_due_filters_completed_ledgers_before_limit(db):
 
 def test_insert_signal_idempotent(db):
     assert db.insert_signal(_signal()) is True
-    assert db.insert_signal(_signal()) is False   # نفس id → يُتجاهل
+    assert db.insert_signal(_signal()) is False   # same id → ignored
     n = db._conn.execute("SELECT COUNT(*) c FROM signal_events").fetchone()["c"]
     assert n == 1
 
@@ -93,8 +93,8 @@ def test_insert_signal_rejects_semantic_duplicate_with_new_id(db):
 
 def test_insert_tick_idempotent_by_composite_key(db):
     assert db.insert_tick(_tick()) is True
-    assert db.insert_tick(_tick()) is False           # نفس المفتاح المركّب
-    assert db.insert_tick(_tick(ts="2026-07-25T00:01:00Z")) is True  # ختم مختلف
+    assert db.insert_tick(_tick()) is False           # same composite key
+    assert db.insert_tick(_tick(ts="2026-07-25T00:01:00Z")) is True  # different timestamp
     n = db._conn.execute("SELECT COUNT(*) c FROM market_ticks").fetchone()["c"]
     assert n == 2
 
@@ -113,7 +113,7 @@ def test_upsert_static_written_once(db):
     db.upsert_static(st)
     assert db.static_exists("tok1", "56") is True
     st2 = dict(st, symbol="BBB")
-    db.upsert_static(st2)  # INSERT OR IGNORE → يبقى الأصل
+    db.upsert_static(st2)  # INSERT OR IGNORE → the original stays
     row = db._conn.execute("SELECT symbol FROM token_static WHERE token_address='tok1'").fetchone()
     assert row["symbol"] == "AAA"
 
@@ -121,12 +121,12 @@ def test_upsert_static_written_once(db):
 def test_watchlist_add_and_count(db):
     now = "2026-07-25T00:00:00+00:00"
     assert db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, now) is True
-    assert db.upsert_watch("tok1", "56", "large_buy", "s2", 48, now) is False  # موجودة ونشطة
+    assert db.upsert_watch("tok1", "56", "large_buy", "s2", 48, now) is False  # already present and active
     assert db.active_watch_count() == 1
 
 
 def test_active_watch_is_not_extended_by_new_signal(db):
-    """عملة نشطة: إشارة جديدة لا تمدّد نافذتها (أوّل ظهور يبقى المرجع)."""
+    """An active coin: a new signal does not extend its window (first appearance stays the reference)."""
     db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, "2026-07-25T00:00:00+00:00")
     db.upsert_watch("tok1", "56", "large_buy", "s2", 48, "2026-07-25T12:00:00+00:00")
     row = db._conn.execute(
@@ -139,10 +139,11 @@ def test_active_watch_is_not_extended_by_new_signal(db):
 
 
 def test_expired_watch_is_readmitted_by_a_new_signal(db):
-    """العملة المعطّلة تعود بنافذة جديدة.
+    """A deactivated coin returns with a new window.
 
-    الانحدار المقصود: مع INSERT OR IGNORE كان الصفّ المعطّل يبتلع كل إشارة
-    لاحقة إلى الأبد، فتنزف قائمة المراقبة حتى الصفر وتتوقّف الـ ticks.
+    The intended regression: with INSERT OR IGNORE, the deactivated row used
+    to swallow every later signal forever, so the watchlist bled to zero and
+    the ticks stopped.
     """
     db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, "2026-07-25T00:00:00+00:00")
     db.set_bars_state("tok1", "56", "ok", 3, "2026-07-27T00:00:00+00:00")
@@ -161,7 +162,7 @@ def test_expired_watch_is_readmitted_by_a_new_signal(db):
     assert row["watch_until"].startswith("2026-07-30T00:00:00")
     assert row["source"] == "large_buy"
     assert row["entry_signal_id"] == "s9"
-    # لا صفّ مكرّر — المفتاح الأساسي ما يزال محترماً.
+    # No duplicate row — the primary key is still respected.
     assert db._conn.execute("SELECT COUNT(*) c FROM watchlist").fetchone()["c"] == 1
 
 
@@ -181,6 +182,15 @@ def test_readmission_clears_terminal_no_data_fetch_state(db):
 
 
 def test_evm_readmission_invalidates_stale_ledger_and_replay_state(db):
+    """Reactivation after a long gap (> the retention cap) rebuilds from genesis.
+
+    Update 2026-08-29: reactivation now keeps the ledger on a short gap
+    (≤ `EVM_REACTIVATION_KEEP_LEDGER_SECONDS`) and deletes it only on a long
+    one — deletion used to be unconditional, zeroing all backfill progress so
+    the queues were forever rebuilt from scratch. The gap here is one day,
+    under the default 48h cap, so keeping is expected; the long-gap case is
+    tested in test_evm_admission_gate_fix.
+    """
     token = "0xaaaa000000000000000000000000000000000001"
     network = "4663"
     holder = "0x1111111111111111111111111111111111111111"
@@ -200,9 +210,113 @@ def test_evm_readmission_invalidates_stale_ledger_and_replay_state(db):
         token, network, "large_buy", "s2", 48, "2026-07-28T00:00:00+00:00"
     )
 
-    assert db.evm_backfill_state(network, token) is None
+    # A one-day gap ≤ 48h: the ledger stays and backfill returns partial to catch up the gap
+    state = db.evm_backfill_state(network, token)
+    assert state is not None
+    assert state["status"] == "partial"
+    assert db.evm_ledger_stats(network, token)["holder_count"] == 1
+
+
+def test_a_new_window_stales_the_verdict_and_keeps_the_walk(db):
+    """A new window invalidates the verdict, not the walk — this used to delete the whole row.
+
+    A hot coin is referenced every few minutes (one on Base has 522 windows),
+    so its state row was deleted faster than it could be written: read as
+    "never attempted", it was walked from genesis and never reached a first
+    snapshot. That is why 51 coins on Base sat `partial` with revision = 1
+    and range = −1 — one attempt with no progress after every deletion.
+    """
+    token, network = "0xaaaa000000000000000000000000000000000009", "8453"
+    now = "2026-07-25T00:00:00+00:00"
+    db.upsert_watch(token, network, "large_buy", "s1", 48, now)
+    db.set_evm_replay_state(
+        token, network, "partial", now, from_block=1_000, to_block=9_999,
+        transfers=4_242, snapshots=17, calls=6_000, balance_check="ok",
+        checkpoint={"balances": {"0x1": "5"}},
+    )
+    before = db.evm_replay_state(token, network)
+
+    assert db.add_signal_comparison_window(
+        token, network, "large_buy", "s2", 48,
+        "2026-07-25T02:00:00+00:00", 1.5, 1,
+    )
+    after = db.evm_replay_state(token, network)
+
+    assert after is not None, "the row was deleted — the coin went back to walking from genesis"
+    assert after["status"] == "window"
+    for field in ("from_block", "to_block", "transfers", "snapshots", "calls"):
+        assert after[field] == before[field], field
+    assert decode_raw(after["checkpoint_json"]) == {"balances": {"0x1": "5"}}
+    # The revision is bumped: a run holding an older snapshot falls into
+    # StaleEVMState instead of overwriting a window it never saw.
+    assert after["revision"] == before["revision"] + 1
+    with pytest.raises(StaleEVMState):
+        db.assert_evm_replay_state(
+            token, network, before["status"], before["from_block"],
+            before["checkpoint_json"], before["revision"],
+        )
+
+
+def test_a_budget_retired_token_is_not_re_woken_by_a_new_window(db):
+    """`budget` is a spending-stop decision, not a coverage verdict — a window must not void it.
+
+    If it did: the coin returns to the queue, is picked, walks a stretch,
+    then the cap puts it back in `budget` — a full re-selection per window.
+    And the coin that hits the cap is the hot one with hundreds of windows,
+    so that would void the cap again in installments.
+    """
+    token, network = "0xcafe000000000000000000000000000000000004", "8453"
+    now = "2026-07-25T00:00:00+00:00"
+    db.upsert_watch(token, network, "trending", "s1", 48, now)
+    db.set_evm_replay_state(
+        token, network, "budget", now, from_block=5_000, to_block=9_999,
+        transfers=11, snapshots=0, calls=8_040, balance_check="ok",
+        checkpoint={"balances": {"0x1": "7"}},
+    )
+    before = db.evm_replay_state(token, network)
+
+    assert db.add_signal_comparison_window(
+        token, network, "large_buy", "s2", 48, "2026-07-25T02:00:00+00:00", 1.5, 1,
+    )
+
+    after = db.evm_replay_state(token, network)
+    assert after["status"] == "budget", "the cap was voided by a window — spending resumes in installments"
+    assert after["revision"] == before["revision"], "a spurious revision kills a running job for no reason"
+    assert after["calls"] == 8_040
+
+
+def test_the_per_token_call_cap_is_not_reset_by_a_new_window(db):
+    """The guard that deletion used to void: the cap is accumulated from `calls` in the row.
+
+    `EVM_REPLAY_TOKEN_CALL_CAP` stops a coin that never completes at 8,000
+    calls. Deleting the row zeroed the counter, so a coin referenced every
+    few minutes never reached its cap and ate the cycle's budget away from
+    the coins that finish.
+    """
+    token, network = "0xaaaa00000000000000000000000000000000000a", "8453"
+    now = "2026-07-25T00:00:00+00:00"
+    db.upsert_watch(token, network, "large_buy", "s1", 48, now)
+    db.set_evm_replay_state(token, network, "partial", now, calls=7_900)
+
+    for index in range(3):
+        db.add_signal_comparison_window(
+            token, network, "large_buy", f"s{index}", 48,
+            f"2026-07-25T0{index + 1}:00:00+00:00", 1.0, 1,
+        )
+
+    assert db.evm_replay_state(token, network)["calls"] == 7_900
+
+
+def test_a_new_window_on_a_token_with_no_replay_state_writes_none(db):
+    """The update creates no row: a row without a walk must not claim coverage it does not have."""
+    token, network = "0xaaaa00000000000000000000000000000000000b", "8453"
+    db.upsert_watch(token, network, "large_buy", "s1", 48, "2026-07-25T00:00:00+00:00")
+
+    db.add_signal_comparison_window(
+        token, network, "large_buy", "s2", 48, "2026-07-25T03:00:00+00:00", 1.0, 1,
+    )
+
     assert db.evm_replay_state(token, network) is None
-    assert db.evm_ledger_stats(network, token) == {"holder_count": 0, "supply": 0}
 
 
 def test_watchlist_watch_until_is_48h(db):
@@ -215,10 +329,10 @@ def test_watchlist_watch_until_is_48h(db):
 def test_deactivate_expired(db):
     entry = "2026-07-25T00:00:00+00:00"
     db.upsert_watch("tok1", "56", "multi_user_buy", "s1", 48, entry)
-    # قبل الانتهاء لا شيء يُعطّل
+    # Before expiry nothing is deactivated
     assert db.deactivate_expired("2026-07-26T00:00:00+00:00") == 0
     assert db.active_watch_count() == 1
-    # بعد 48 ساعة يُعطّل
+    # After 48 hours it is deactivated
     db.set_bars_state("tok1", "56", "ok", 3, "2026-07-27T00:00:00+00:00")
     assert db.deactivate_expired("2026-07-27T00:00:01+00:00") == 1
     assert db.active_watch_count() == 0
@@ -237,18 +351,24 @@ def test_meta_counter(db):
     assert db.get_meta("cycles_total") == "2"
 
 
+def test_model_view_tracks_current_feature_version(db):
+    import features
+
+    assert db.get_meta("current_feature_version") == str(features.FEATURE_VERSION)
+
+
 def test_snapshot_insert(db):
     db.insert_snapshot("trending", {"a": 1}, "2026-07-25T00:00:00Z")
     row = db._conn.execute("SELECT id, source, raw_json FROM snapshots").fetchone()
     assert row["source"] == "trending"
-    # يُخزَّن مضغوطاً (BLOB) لا نصّاً — لكنّه يعود كاملاً عبر decode_raw.
+    # Stored compressed (BLOB), not as text — but it comes back whole via decode_raw.
     assert isinstance(row["raw_json"], bytes)
     assert decode_raw(row["raw_json"]) == {"a": 1}
     assert db.read_snapshot(row["id"]) == {"a": 1}
 
 
 def test_compression_is_lossless_and_smaller(db):
-    """ضغط الخام بلا خسارة — بايت واحد لا يُفقد من الأرشيف."""
+    """Lossless raw compression — not one byte of the archive is lost."""
     payload = {"tokens": [{"address": f"0x{i:040x}", "priceUSD": i * 1.5} for i in range(200)]}
     plain = json.dumps(payload, ensure_ascii=False).encode()
     assert decode_raw(encode_raw(payload)) == payload
@@ -256,7 +376,7 @@ def test_compression_is_lossless_and_smaller(db):
 
 
 def test_raw_encoding_preserves_lone_unicode_surrogate_as_json_escape():
-    raw_text = '{"comment":"broken \\ud83d emoji","normal":"مرحبا"}'
+    raw_text = '{"comment":"broken \\ud83d emoji","normal":"hello"}'
 
     encoded = encode_raw(raw_text)
 
@@ -264,7 +384,7 @@ def test_raw_encoding_preserves_lone_unicode_surrogate_as_json_escape():
 
 
 def test_decode_raw_reads_legacy_plaintext_rows(db):
-    """الصفوف المكتوبة نصّاً قبل تفعيل الضغط تبقى مقروءة."""
+    """Rows written as text before compression was enabled stay readable."""
     db._conn.execute(
         "INSERT INTO snapshots(recorded_at, source, raw_json) VALUES(?, ?, ?)",
         ("2026-07-25T00:00:00Z", "trending", '{"legacy": true}'),
@@ -292,7 +412,7 @@ def test_batch_commits_once_and_rolls_back_on_error(db):
     with pytest.raises(RuntimeError), db.batch():
         db.insert_tick(_tick(ts="2026-07-25T00:12:00Z"))
         raise RuntimeError("boom")
-    # الدفعة الفاشلة تُرجَع كاملة
+    # The failed batch is rolled back entirely
     assert db._conn.execute("SELECT COUNT(*) c FROM market_ticks").fetchone()["c"] == 2
 
 
@@ -343,7 +463,7 @@ def test_prune_snapshots_removes_only_old_rows(db):
     assert db.read_snapshot(rows[0]["id"]) == {"n": 2}
 
 
-# --- token_bars + جدولة السحب الدوّارة ---
+# --- token_bars + the rotating fetch schedule ---
 def _bar(ts, c=1.0, token="tok1", net="56"):
     return {"token_address": token, "network_id": net, "resolution": "5", "ts": ts,
             "o": 1.0, "h": 2.0, "l": 0.5, "c": c, "v": 10.0, "fetched_at": "t0"}
@@ -356,16 +476,16 @@ def test_insert_bars_writes_rows(db):
 
 
 def test_insert_bars_replaces_in_progress_candle(db):
-    """الشمعة الأخيرة تكون قيد التكوّن وقت السحب — القيمة الأحدث هي الصحيحة."""
+    """The last bar is still forming at fetch time — the newer value is the correct one."""
     db.insert_bars([_bar(100, c=1.0)])
-    db.insert_bars([_bar(100, c=1.7)])          # نفس الختم، مُراجَع
+    db.insert_bars([_bar(100, c=1.7)])          # same timestamp, revised
     assert db.bars_count("tok1", "56") == 1
     row = db._conn.execute("SELECT c FROM token_bars WHERE ts=100").fetchone()
     assert row["c"] == 1.7
 
 
 def test_bars_fetch_due_prefers_never_fetched(db):
-    """العملة التي لم تُسحب قطّ تسبق الجميع (backfill الدخول أولاً)."""
+    """A coin never fetched goes ahead of everyone (entry backfill first)."""
     db.upsert_watch("old", "56", "large_buy", "s1", 48, "2026-07-26T00:00:00+00:00")
     db.upsert_watch("new", "56", "large_buy", "s2", 48, "2026-07-26T00:00:00+00:00")
     db.set_bars_state("old", "56", "ok", 10, "2026-07-26T01:00:00+00:00")
@@ -378,19 +498,19 @@ def test_bars_fetch_due_respects_refresh_window_and_limit(db):
     for t in ("a", "b", "c"):
         db.upsert_watch(t, "56", "large_buy", "s", 48, "2026-07-26T00:00:00+00:00")
         db.set_bars_state(t, "56", "ok", 5, "2026-07-26T11:00:00+00:00")
-    # كلّها سُحبت بعد عتبة القِدم → لا شيء مستحقّ
+    # All fetched after the staleness threshold → nothing due
     assert db.bars_fetch_due(10, "2026-07-26T10:00:00+00:00", 3) == []
-    # عتبة أحدث → كلّها مستحقّة، لكنّ الشريحة محدودة
+    # A newer threshold → all due, but the slice is capped
     assert len(db.bars_fetch_due(2, "2026-07-26T12:00:00+00:00", 3)) == 2
 
 
 def test_bars_fetch_due_drops_tokens_with_repeated_no_data(db):
-    """عملة بلا سلسلة سعرية تُستبعد بدل إهدار محاولات عليها كل دورة."""
+    """A coin with no price series is excluded instead of wasting attempts on it every cycle."""
     db.upsert_watch("dead", "56", "large_buy", "s", 48, "2026-07-26T00:00:00+00:00")
     for _ in range(3):
         db.set_bars_state("dead", "56", "no_data", 0, "2026-07-26T01:00:00+00:00")
     assert db.bars_fetch_due(10, "2026-07-26T12:00:00+00:00", 3) == []
-    # لكن خطأ عابر لا يُستبعد — قد يتعافى
+    # But a transient error is not excluded — it may recover
     db.set_bars_state("dead", "56", "error", 0, "2026-07-26T01:00:00+00:00")
     assert len(db.bars_fetch_due(10, "2026-07-26T12:00:00+00:00", 3)) == 1
 
@@ -423,12 +543,13 @@ def test_set_bars_state_accumulates_attempts(db):
     assert row["last_fetch_at"] == "t2"
 
 
-# --- ترحيل الأعمدة على قاعدة قائمة ---
+# --- Column migration on a preexisting database ---
 def test_migration_adds_is_control_to_a_preexisting_watchlist(tmp_path):
-    """CREATE TABLE IF NOT EXISTS لا يمسّ جدولاً موجوداً.
+    """CREATE TABLE IF NOT EXISTS does not touch an existing table.
 
-    بلا الترحيل، عمود يُضاف إلى schema.sql لا يظهر أبداً في قاعدة أُنشئت قبله
-    فتعطب الاستعلامات في الإنتاج بينما تمرّ على قاعدة اختبار جديدة.
+    Without the migration, a column added to schema.sql never appears in a
+    database created before it, so queries break in production while passing
+    on a fresh test database.
     """
     p = str(tmp_path / "old.db")
     old = sqlite3.connect(p)
@@ -449,8 +570,8 @@ def test_migration_adds_is_control_to_a_preexisting_watchlist(tmp_path):
         cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(watchlist)")}
         assert "is_control" in cols
         row = db._conn.execute("SELECT * FROM watchlist").fetchone()
-        assert row["token_address"] == "legacy"      # الصفّ القديم سليم
-        assert row["is_control"] == 0                # وافتراضه "مُشار إليها"
+        assert row["token_address"] == "legacy"      # the legacy row is intact
+        assert row["is_control"] == 0                # and its default is "referenced"
         assert db.active_watch_count(is_control=0) == 1
     finally:
         db.close()
@@ -517,7 +638,7 @@ def test_migration_quarantines_legacy_watch_outcomes(tmp_path):
         migrated.close()
 
 
-# --- إعادة بناء العدد التاريخي للأطروحات ---
+# --- Reconstructing the historical thesis count ---
 def _th(tid, created, token="tok1"):
     return {"id": tid, "token_address": token, "network_id": "56",
             "created_at": created, "user_handle": "u", "user_id": "uid",
@@ -532,7 +653,7 @@ def test_insert_thesis_items_is_idempotent_by_id(db):
 
 
 def test_thesis_count_before_reconstructs_history(db):
-    """السؤال الذي وُجد الجدول لأجله: كم أطروحة كانت لحظة الإشارة؟"""
+    """The question the table exists for: how many theses were there at signal time?"""
     db.insert_thesis_items([
         _th("a", "2026-07-25T10:00:00Z"),
         _th("b", "2026-07-25T12:00:00Z"),
@@ -545,14 +666,15 @@ def test_thesis_count_before_reconstructs_history(db):
     assert db.thesis_count_before("other", "2026-07-27T00:00:00Z") == 0
 
 
-# --- تسابق العرض عند الإقلاع المتزامن ---
-# `DROP VIEW IF EXISTS v; CREATE VIEW v` غير ذرّي بين عمليّتين، وقد أوقف
-# FomoBuildRows 13 ساعة (2026-08-13). الاختبار يحرس إعادة المحاولة.
+# --- View race on concurrent startup ---
+# `DROP VIEW IF EXISTS v; CREATE VIEW v` is not atomic across two processes,
+# and it stalled FomoBuildRows for 13 hours (2026-08-13). The tests guard
+# the retry.
 class _FlakyConn:
-    """اتّصال حقيقيّ يفشل `executescript` أوّل `fail_times` مرّة.
+    """A real connection whose `executescript` fails the first `fail_times` times.
 
-    `sqlite3.Connection` نوع غير قابل للتعديل فلا يُرقَّع مباشرة؛ وكيل يفوّض
-    كل شيء آخر إلى الاتّصال الحقيقيّ.
+    `sqlite3.Connection` is an unmodifiable type so it cannot be patched
+    directly; a proxy delegating everything else to the real connection.
     """
 
     def __init__(self, conn, message, fail_times):
@@ -572,7 +694,7 @@ class _FlakyConn:
         return getattr(self._c, name)
 
     def __setattr__(self, name, value):
-        if name in ("_c", "_message", "_left", "scripts"):
+        if name in ("_c", "_message", "_left", "scripts", "begins"):
             object.__setattr__(self, name, value)
         else:
             setattr(self._c, name, value)
@@ -592,13 +714,75 @@ def _flaky_connect(monkeypatch, message, fail_times):
     return made
 
 
+def test_schema_retries_a_temporary_startup_write_lock(tmp_path, monkeypatch):
+    path = str(tmp_path / "startup-lock.db")
+    RecorderDB(path, SCHEMA).close()
+    made = []
+    real = sqlite3.connect
+
+    class StartupLockConn(_FlakyConn):
+        def __init__(self, conn):
+            super().__init__(conn, "", 0)
+            self.begins = 0
+
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                self.begins += 1
+                if self.begins < 3:
+                    raise sqlite3.OperationalError("database is locked")
+            return self._c.execute(sql, *args)
+
+    def fake(*args, **kwargs):
+        conn = StartupLockConn(real(*args, **kwargs))
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr("db.sqlite3.connect", fake)
+    monkeypatch.setattr("db.time.sleep", lambda _seconds: None)
+
+    db = RecorderDB(path, SCHEMA)
+    try:
+        assert made[0].begins == 3
+        assert db.get_meta("current_feature_version") is not None
+    finally:
+        db.close()
+
+
+def test_schema_does_not_retry_a_non_lock_begin_error(tmp_path, monkeypatch):
+    real = sqlite3.connect
+    made = []
+
+    class BrokenBeginConn(_FlakyConn):
+        def __init__(self, conn):
+            super().__init__(conn, "", 0)
+            self.begins = 0
+
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                self.begins += 1
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._c.execute(sql, *args)
+
+    def fake(*args, **kwargs):
+        conn = BrokenBeginConn(real(*args, **kwargs))
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr("db.sqlite3.connect", fake)
+    monkeypatch.setattr("db.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        RecorderDB(str(tmp_path / "broken-begin.db"), SCHEMA)
+    assert made[0].begins == 1
+
+
 def test_schema_retries_when_a_neighbour_created_the_view_first(tmp_path, monkeypatch):
     path = str(tmp_path / "race.db")
-    RecorderDB(path, SCHEMA).close()          # قاعدة كاملة كما لو أكملها الجارّ
+    RecorderDB(path, SCHEMA).close()          # a full database as if the neighbour finished it
 
     made = _flaky_connect(monkeypatch, "view phase1_watch_outcomes already exists", 1)
 
-    d = RecorderDB(path, SCHEMA)              # لا يرمي: يعيد المحاولة فينجح
+    d = RecorderDB(path, SCHEMA)              # does not raise: retries and succeeds
     try:
         assert made[0].scripts == 2
         assert d._conn.execute(
@@ -610,11 +794,11 @@ def test_schema_retries_when_a_neighbour_created_the_view_first(tmp_path, monkey
 
 
 def test_schema_error_that_is_not_a_race_still_raises(tmp_path, monkeypatch):
-    """درع التسابق ضيّق: خطأ مخطّط حقيقيّ يجب أن يُفشل الإقلاع بصوت عالٍ."""
+    """The race shield is narrow: a genuine schema error must fail startup loudly."""
     made = _flaky_connect(monkeypatch, "no such column: whatever", 1)
     with pytest.raises(sqlite3.OperationalError):
         RecorderDB(str(tmp_path / "bad.db"), SCHEMA)
-    assert made[0].scripts == 1               # بلا إعادة محاولة
+    assert made[0].scripts == 1               # no retry
 
 
 def test_schema_gives_up_after_three_races(tmp_path, monkeypatch):
@@ -624,11 +808,11 @@ def test_schema_gives_up_after_three_races(tmp_path, monkeypatch):
     made = _flaky_connect(monkeypatch, "view model_training_rows already exists", 99)
     with pytest.raises(sqlite3.OperationalError):
         RecorderDB(path, SCHEMA)
-    assert made[0].scripts == 3               # لا حلقة لا نهائية
+    assert made[0].scripts == 3               # no infinite loop
 
 
 # ---------------------------------------------------------------------------
-# note_error: ختمٌ دفتريّ لا يُسقط مَن يكتبه (قِيس 2026-08-17)
+# note_error: a bookkeeping stamp that does not take down its writer (measured 2026-08-17)
 # ---------------------------------------------------------------------------
 def test_note_error_writes_like_set_meta_when_the_database_is_healthy(db):
     assert db.note_error("last_error_x", "2026-08-17: boom") is True
@@ -636,7 +820,7 @@ def test_note_error_writes_like_set_meta_when_the_database_is_healthy(db):
 
 
 def test_note_error_returns_false_instead_of_raising_on_a_locked_database(db, monkeypatch):
-    """`set_meta` ترفع فتُسقط معالجَ الخطأ؛ `note_error` تُبلّغ بالقيمة لا بالرفع."""
+    """`set_meta` raises and so kills the error handler; `note_error` reports by value instead of raising."""
     def _locked(_key, _value):
         raise sqlite3.OperationalError("database is locked")
 
@@ -645,10 +829,102 @@ def test_note_error_returns_false_instead_of_raising_on_a_locked_database(db, mo
 
 
 def test_note_error_swallows_any_write_failure_not_only_locks(db, monkeypatch):
-    """القاعدة قد تفشل بغير القفل (قرص ممتلئ، اتصال مُغلق) — نفس الحكم."""
+    """The database can fail for reasons other than a lock (full disk, closed connection) — same verdict."""
     def _closed(_key, _value):
         raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
 
     monkeypatch.setattr(db, "set_meta", _closed)
     assert db.note_error("last_error_x", "boom") is False
 
+
+# ---------------------------------------------------------------------------
+# english_note: error notes stay ASCII English even when the answer embedded in
+# the exception was not (measured 2026-09-06: 10 backfill retries, 7 replay
+# rows and 1 dashboard line stored unreadable, unshowable Arabic)
+# ---------------------------------------------------------------------------
+def test_error_notes_mask_non_english_text_at_every_write_site(db):
+    """The Arabic rides inside exception text from upstream answers, so the
+    mask lives in the database's own write methods, not in each caller."""
+    # Written as escapes on purpose: this file stays pure ASCII.
+    arabic = "\u0633\u0627\u0644\u0628"          # one four-letter Arabic word, as escapes
+    now = "2026-09-06T19:40:00+00:00"
+    tok, net = "0x" + "a" * 40, "8453"
+
+    db.note_error("last_error_x", f"{now}: probe rejected: {arabic}")
+    assert db.get_meta("last_error_x") == f"{now}: probe rejected: [non-english 4]"
+
+    db.note_error("last_error_z", f"{arabic} / {arabic}")
+    assert db.get_meta("last_error_z") == "[non-english 4] / [non-english 4]"
+
+    db.set_evm_cursor(net, 1000, now, "error", 3, last_error=f"ValueError: {arabic}")
+    assert db.evm_cursor(net)["last_error"] == "ValueError: [non-english 4]"
+
+    db.set_evm_backfill_state(net, tok, "retry", now, last_error=f"ValueError: {arabic}")
+    assert db.evm_backfill_state(net, tok)["last_error"] == "ValueError: [non-english 4]"
+
+    db.set_evm_replay_state(tok, net, "error", now, last_error=arabic)
+    assert db.evm_replay_state(tok, net)["last_error"] == "[non-english 4]"
+
+    db.mark_evm_replay_error(tok, net, now, f"walk failed: {arabic}")
+    assert db.evm_replay_state(tok, net)["last_error"] == "walk failed: [non-english 4]"
+
+
+def test_english_error_notes_pass_through_untouched(db):
+    """Masking is identity for the ASCII English every other test and the
+    dashboard expect, and None stays None — no fabricated `[non-english 0]`."""
+    now = "2026-09-06T19:40:00+00:00"
+    tok, net = "0x" + "b" * 40, "8453"
+
+    db.note_error("last_error_y", "2026-08-17: boom 429")
+    assert db.get_meta("last_error_y") == "2026-08-17: boom 429"
+
+    db.set_evm_backfill_state(net, tok, "done", now)
+    assert db.evm_backfill_state(net, tok)["last_error"] is None
+
+def test_a_wedged_open_transaction_is_rolled_back_so_writes_resume(db):
+    """A wedged-open transaction is the most common cause of a stuck
+    connection: left open, it locks itself.
+
+    The shield in `recorder.main_loop` used to log the crash and continue,
+    so a connection that left a cycle with an unclosed transaction stayed
+    that way until restart — which cost 22 minutes 40 seconds of recording
+    on 2026-08-19.
+    """
+    db._conn.execute("BEGIN IMMEDIATE")
+    assert db._conn.in_transaction
+
+    said = db.recover_connection()
+
+    assert "rollback" in said
+    assert not db._conn.in_transaction
+    db.set_meta("after", "1")                     # and writes truly resumed
+    assert db.get_meta("after") == "1"
+
+
+def test_a_dead_connection_is_replaced_so_writes_resume(db):
+    """The last resort: what a rollback cannot heal, a new connection heals.
+
+    And no `_apply_schema` on the way: migration and schema are heavy startup
+    work, and rerunning them on every crash buys itself cycle budget. The
+    database stands with its schema intact.
+    """
+    db.set_meta("before", "1")
+    db._conn.close()                              # a dead connection: every call raises
+
+    said = db.recover_connection()
+
+    assert "reconnected" in said
+    assert db.get_meta("before") == "1"            # the same database, not a new one
+    db.set_meta("after", "2")
+    assert db.get_meta("after") == "2"
+
+
+def test_recovery_returns_a_line_instead_of_raising_when_nothing_helps(db, tmp_path):
+    """The rescue hand is called from a crash path — raising would kill the very loop it came to save."""
+    db._conn.close()
+    db._db_path = str(tmp_path / "no_such_dir" / "x.db")   # the open itself fails
+
+    said = db.recover_connection()
+
+    assert isinstance(said, str) and said                  # a report for the log, not an exception
+    assert "failed" in said

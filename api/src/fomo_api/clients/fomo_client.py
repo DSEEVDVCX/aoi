@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -10,6 +11,16 @@ from fomo_api.config import settings
 logger = logging.getLogger(__name__)
 
 _TRADER_ID_RE = __import__("re").compile(r"^[A-Za-z0-9_-]+$")
+# The global alert feed's confirmed buy variants. `swap_buy` belongs to the
+# separate activity backfill stream and is not accepted here until the alert
+# endpoint is observed returning it; unknown types must fail closed.
+_QUALIFYING_ALERT_TYPES = frozenset({"buy", "large_buy", "multi_user_buy"})
+# Stricter than _TRADER_ID_RE on purpose: the batch endpoint rejects the WHOLE
+# call when one element is not a uuid, so what goes into a batch is filtered by
+# the upstream rule itself ("userId must be a uuid"), not by our looser one.
+_UUID_RE = __import__("re").compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _HANDLE_RE = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -149,16 +160,67 @@ class FomoClient:
         start = (max(1, page) - 1) * max(1, page_size)
         return {"traders": all_traders[start : start + max(1, page_size)], "total_items": total}
 
+    async def get_trader_profiles(
+        self, trader_ids: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """CONFIRMED 2026-08-20: GET /v2/users?userIds=<uuid>&userIds=<uuid> -> 200
+        {"responseObject": {"users": [...]}}, the same user objects the old
+        per-id path returned.
+
+        This replaces `/v2/users/{id}`, which answers 404 "User not found" for
+        every well-formed uuid since ~2026-08-19T14:53Z — proven not to be our
+        ids and not our account: ids taken straight out of a 200 from
+        `/v2/leaderboard` 404 here too.
+
+        Three measured rules the caller depends on:
+          * **Repeated params only.** `userIds=a,b` and a JSON array both 400.
+          * **At most 100 per call** (upstream states the cap in the error), so
+            longer lists are split across calls.
+          * **A malformed id 400s the whole batch**, while an unknown but
+            well-formed one is silently omitted from `users`. So ids are filtered
+            to real uuids first — one junk id must not cost the other 99 — and
+            absence from the reply is the answer "no such user", not an error.
+
+        Returns {trader_id: mapped profile} holding only the ids that came back.
+        """
+        wanted = [t for t in dict.fromkeys(trader_ids) if _UUID_RE.match(t or "")]
+        out: dict[str, dict[str, Any]] = {}
+        cap = max(1, settings.upstream_traders_batch_max)
+        for start in range(0, len(wanted), cap):
+            chunk = wanted[start : start + cap]
+            data = await self._get(
+                settings.upstream_traders_batch_path, {"userIds": chunk}
+            )
+            if data is None:
+                continue
+            # Explicitly, NOT via `_unwrap_list`: that helper returns [] both for
+            # "users is empty" and for "there is no users key", and those two must
+            # not be one answer here. An empty list is legitimate (every id
+            # unknown); a missing key means the shape moved and the honest reply is
+            # to raise. Collapsing them is what let `/v2/users/{id}` report "no
+            # such trader" for 21 hours instead of "this endpoint is gone".
+            users = _unwrap_obj(data).get("users")
+            if not isinstance(users, list):
+                raise UpstreamChangedError()
+            for raw in users:
+                mapped = _map_trader(raw)
+                if mapped is None:
+                    raise UpstreamChangedError()
+                out[str(mapped["id"])] = mapped
+        return out
+
     async def get_trader_profile(self, trader_id: str) -> dict[str, Any] | None:
-        """CONFIRMED: /v2/users/{id} -> responseObject is the user object."""
+        """One trader, via the batch path — see `get_trader_profiles`.
+
+        A batch of one, deliberately: the old dedicated path is dead upstream, and
+        keeping one code path for both means the next upstream change is found and
+        fixed in one place instead of two.
+        """
         _validate_trader_id(trader_id)
-        data = await self._get(settings.upstream_trader_path.format(trader_id=trader_id))
-        if data is None:
-            return None
-        mapped = _map_trader(_unwrap_obj(data))
-        if mapped is None:
-            raise UpstreamChangedError()
-        return mapped
+        found = await self.get_trader_profiles([trader_id])
+        # Upstream keys the reply by its own `id`. We asked for exactly one, so a
+        # non-empty reply IS that trader even if the two strings differ in case.
+        return next(iter(found.values()), None)
 
     async def get_trader_profile_by_handle(self, handle: str) -> dict[str, Any] | None:
         """CONFIRMED: /v2/users/userHandle/{handle} -> same user object shape."""
@@ -205,10 +267,22 @@ class FomoClient:
         actions = mapped["actions"]
         if chain:
             actions = [a for a in actions if a.get("chain") == chain]
+        from_dt = _parse_timestamp(from_ts)
+        to_dt = _parse_timestamp(to_ts)
         if from_ts:
-            actions = [a for a in actions if a.get("timestamp") and a["timestamp"] >= from_ts]
+            actions = [
+                a for a in actions
+                if (timestamp := _parse_timestamp(a.get("timestamp"))) is not None
+                and from_dt is not None
+                and timestamp >= from_dt
+            ]
         if to_ts:
-            actions = [a for a in actions if a.get("timestamp") and a["timestamp"] <= to_ts]
+            actions = [
+                a for a in actions
+                if (timestamp := _parse_timestamp(a.get("timestamp"))) is not None
+                and to_dt is not None
+                and timestamp <= to_dt
+            ]
         total = len(actions)
         start = (max(1, page) - 1) * max(1, page_size)
         actions = actions[start : start + max(1, page_size)]
@@ -500,6 +574,11 @@ class FomoClient:
         raw = _unwrap_list(data, ("feed", "tradingActivity"))
         alerts: list[dict[str, Any]] = []
         for item in raw:
+            if not isinstance(item, dict):
+                continue
+            event_type = _pick(item, ("type", "action"), cast=str)
+            if event_type not in _QUALIFYING_ALERT_TYPES:
+                continue
             mapped = _map_alert(item)
             if mapped is None:
                 continue
@@ -514,6 +593,18 @@ class FomoClient:
 def _dict_or_empty(value: Any) -> dict[str, Any]:
     """Narrow an untyped upstream JSON value to a string-keyed object."""
     return cast(dict[str, Any], value) if isinstance(value, dict) else {}
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 def _map_balance_position(d: Any) -> dict[str, Any] | None:

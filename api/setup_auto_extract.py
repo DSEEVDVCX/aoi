@@ -70,7 +70,7 @@ async def main() -> None:
         page = await (await browser.new_context()).new_page()
         await page.goto(APP, wait_until="domcontentloaded")
         print("=" * 70, flush=True)
-        print(">>> سجّل دخولك مرة واحدة فقط في نافذة المتصفح. هذه آخر مرة تسجّل فيها يدوياً.", flush=True)
+        print(">>> Sign in just once in the browser window. This is the last time you log in manually.", flush=True)
         print("=" * 70, flush=True)
         s = await _harvest(page)
         try:
@@ -79,7 +79,7 @@ async def main() -> None:
             pass
 
     if not s:
-        print(">>> لم يُلتقط تسجيل دخول ضمن المهلة.", flush=True)
+        print(">>> No sign-in token captured within the timeout.", flush=True)
         return
 
     def _c(v):
@@ -95,8 +95,8 @@ async def main() -> None:
     )
     store = CredentialStore(settings.credential_state_file)
     store.save(creds)
-    print(f">>> حُفظت بيانات الاعتماد في {store.path}", flush=True)
-    print(f">>> قابلة للتجديد تلقائياً: {creds.is_refreshable()}", flush=True)
+    print(f">>> Credentials saved to {store.path}", flush=True)
+    print(f">>> Refreshable: {creds.is_refreshable()}", flush=True)
 
     # Prove the browserless refresh + live read work right now.
     from fomo_api.auth.token_refresher import _call_privy_refresh
@@ -111,9 +111,9 @@ async def main() -> None:
         )
         store.save(StoredCredentials(access_token=r.get("access"), refresh_token=r.get("refresh"), pat=r.get("pat")))
         access = r.get("access")
-        print(">>> [OK] تجديد بلا متصفح نجح - النظام سيجدّد نفسه تلقائياً من الآن.", flush=True)
+        print(">>> [OK] Browserless refresh succeeded — the system renews itself automatically from now on.", flush=True)
     except Exception as exc:
-        print(f">>> تحذير: التجديد الفوري فشل ({exc}); سيُستخدم الرمز الملتقط.", flush=True)
+        print(f">>> Warning: the immediate refresh failed ({exc}); the captured token will be used.", flush=True)
         access = creds.access_token
 
     from fomo_api.clients.fomo_client import FomoClient
@@ -123,11 +123,11 @@ async def main() -> None:
         lb = await client.get_leaderboard(page=1, page_size=5, period="all")
         traders = lb["traders"] if isinstance(lb, dict) else lb.traders
         total = lb["total_items"] if isinstance(lb, dict) else lb.total_items
-        print(f">>> بيانات حيّة: {total} متداولاً في المتصدّرين", flush=True)
+        print(f">>> Live data: {total} traders on the leaderboard", flush=True)
         for t in (traders[:3] if isinstance(traders, list) else traders):
             h = t["handle"] if isinstance(t, dict) else t.handle
             print(f"      @{h}", flush=True)
-        print(">>> اكتمل الإعداد. شغّل الخادم وسيعمل الاستخراج تلقائياً بلا تدخّل.", flush=True)
+        print(">>> Setup complete. Start the server and extraction runs automatically with no intervention.", flush=True)
     finally:
         await client.aclose()
 
