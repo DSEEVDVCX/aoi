@@ -836,6 +836,51 @@ def test_note_error_swallows_any_write_failure_not_only_locks(db, monkeypatch):
     monkeypatch.setattr(db, "set_meta", _closed)
     assert db.note_error("last_error_x", "boom") is False
 
+
+# ---------------------------------------------------------------------------
+# english_note: error notes stay ASCII English even when the answer embedded in
+# the exception was not (measured 2026-09-06: 10 backfill retries, 7 replay
+# rows and 1 dashboard line stored unreadable, unshowable Arabic)
+# ---------------------------------------------------------------------------
+def test_error_notes_mask_non_english_text_at_every_write_site(db):
+    """The Arabic rides inside exception text from upstream answers, so the
+    mask lives in the database's own write methods, not in each caller."""
+    # Written as escapes on purpose: this file stays pure ASCII.
+    arabic = "\u0633\u0627\u0644\u0628"          # one four-letter Arabic word, as escapes
+    now = "2026-09-06T19:40:00+00:00"
+    tok, net = "0x" + "a" * 40, "8453"
+
+    db.note_error("last_error_x", f"{now}: probe rejected: {arabic}")
+    assert db.get_meta("last_error_x") == f"{now}: probe rejected: [non-english 4]"
+
+    db.note_error("last_error_z", f"{arabic} / {arabic}")
+    assert db.get_meta("last_error_z") == "[non-english 4] / [non-english 4]"
+
+    db.set_evm_cursor(net, 1000, now, "error", 3, last_error=f"ValueError: {arabic}")
+    assert db.evm_cursor(net)["last_error"] == "ValueError: [non-english 4]"
+
+    db.set_evm_backfill_state(net, tok, "retry", now, last_error=f"ValueError: {arabic}")
+    assert db.evm_backfill_state(net, tok)["last_error"] == "ValueError: [non-english 4]"
+
+    db.set_evm_replay_state(tok, net, "error", now, last_error=arabic)
+    assert db.evm_replay_state(tok, net)["last_error"] == "[non-english 4]"
+
+    db.mark_evm_replay_error(tok, net, now, f"walk failed: {arabic}")
+    assert db.evm_replay_state(tok, net)["last_error"] == "walk failed: [non-english 4]"
+
+
+def test_english_error_notes_pass_through_untouched(db):
+    """Masking is identity for the ASCII English every other test and the
+    dashboard expect, and None stays None — no fabricated `[non-english 0]`."""
+    now = "2026-09-06T19:40:00+00:00"
+    tok, net = "0x" + "b" * 40, "8453"
+
+    db.note_error("last_error_y", "2026-08-17: boom 429")
+    assert db.get_meta("last_error_y") == "2026-08-17: boom 429"
+
+    db.set_evm_backfill_state(net, tok, "done", now)
+    assert db.evm_backfill_state(net, tok)["last_error"] is None
+
 def test_a_wedged_open_transaction_is_rolled_back_so_writes_resume(db):
     """A wedged-open transaction is the most common cause of a stuck
     connection: left open, it locks itself.

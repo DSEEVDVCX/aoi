@@ -16,6 +16,7 @@ reading. Old rows written as text remain readable (decode_raw accepts both types
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import zlib
@@ -61,6 +62,26 @@ def decode_raw(value: Any) -> Any:
             data = zlib.decompress(data)
         return json.loads(data.decode("utf-8"))
     return json.loads(value)
+
+
+_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
+
+
+def english_note(text: str | None) -> str | None:
+    """An error note with every non-ASCII run masked: `boom [non-english 17]`.
+
+    Upstream answers sometimes arrive in Arabic, and an exception carrying one
+    used to store it verbatim. Measured 2026-09-06: ten backfill retry rows,
+    seven replay rows and one dashboard `last_error_*` line were unreadable —
+    and unshowable, since every tool around this database is ASCII English.
+    The mask keeps the readable part and records the length of what was
+    dropped, so a masked note still says what happened and how much was lost.
+    """
+    if text is None:
+        return None
+    return _NON_ASCII_RUN.sub(
+        lambda run: f"[non-english {len(run.group(0))}]", text,
+    )
 
 
 class RecorderDB:
@@ -370,7 +391,7 @@ class RecorderDB:
         path exited the recorder with code 1, leaving the task `Ready` for three silent hours. Losing a descriptive line is cheaper than losing the cycle, and measurements are not written this way.
         """
         try:
-            self.set_meta(key, value)
+            self.set_meta(key, english_note(value))
             return True
         except Exception:  # noqa: BLE001 — bookkeeping, not a measurement
             return False
@@ -1260,7 +1281,7 @@ class RecorderDB:
                    logs_applied = evm_block_cursor.logs_applied + excluded.logs_applied,
                    last_error   = excluded.last_error""",
             (str(network_id), int(last_block), now_iso, status,
-             int(logs_applied), last_error),
+             int(logs_applied), english_note(last_error)),
         )
         self._commit()
 
@@ -1462,7 +1483,7 @@ class RecorderDB:
                    last_try_at = excluded.last_try_at,
                    last_error  = excluded.last_error""",
             (str(network_id), token_address.lower(), status, from_block, to_block,
-             transfers, calls, now_iso, last_error),
+             transfers, calls, now_iso, english_note(last_error)),
         )
         self._commit()
 
@@ -1712,7 +1733,8 @@ class RecorderDB:
                    checkpoint_json = excluded.checkpoint_json,
                    revision = evm_replay_state.revision + 1""",
             (token_address.lower(), str(network_id), status, from_block, to_block,
-             transfers, snapshots, calls, balance_check, now_iso, last_error,
+             transfers, snapshots, calls, balance_check, now_iso,
+             english_note(last_error),
              encode_raw(checkpoint) if checkpoint is not None else None),
         )
         self._commit()
@@ -1729,7 +1751,7 @@ class RecorderDB:
                    status='error', last_try_at=excluded.last_try_at,
                    last_error=excluded.last_error,
                    revision=evm_replay_state.revision + 1""",
-            (token_address.lower(), str(network_id), now_iso, error),
+            (token_address.lower(), str(network_id), now_iso, english_note(error)),
         )
         self._commit()
 
