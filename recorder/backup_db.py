@@ -166,7 +166,6 @@ def backup_database(
 
     final_path = destination_path / _backup_name()
     temp_path = destination_path / f".{final_path.name}.tmp"
-    source_uri = source_path.as_uri().replace("file:///", "file:/") + "?mode=ro"
 
     try:
         # OneDrive/network destinations can be much slower than the live WAL
@@ -175,7 +174,15 @@ def backup_database(
         with tempfile.TemporaryDirectory(prefix=STAGING_PREFIX) as staging_dir:
             staged_path = Path(staging_dir) / "recorder.db"
             emit("creating consistent local snapshot with VACUUM INTO")
-            with closing(sqlite3.connect(source_uri, uri=True, timeout=60)) as source:
+            # Read-write on purpose, not `?mode=ro`: a read-only connection
+            # cannot rebuild the WAL shared-memory index, and minutes after a
+            # hard service restart that index is stale — measured 2026-09-06,
+            # the read-only VACUUM then sat at zero output bytes while every
+            # writer in the system was stuck on "database is locked" for 20
+            # minutes, until the backup process itself was killed. A
+            # read-write connection recovers the index on open, and VACUUM
+            # INTO still never writes a single row of the source.
+            with closing(sqlite3.connect(source_path, timeout=60)) as source:
                 source.execute("PRAGMA busy_timeout=60000")
                 source.execute("VACUUM INTO ?", (str(staged_path),))
             if verify:
