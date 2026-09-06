@@ -576,6 +576,25 @@ async def run_evm_cycle(
         0 if str(w["network_id"]) in covered else 1,
         w.get("backfill_last_try_at") or "",
     ))
+    # Fairness reservation (2026-09-06): covered-first cleared the fast queue,
+    # but with a covered network holding enough partials it monopolized every
+    # slot of `EVM_BACKFILL_TOKENS_PER_CYCLE` — measured live: Base's 17
+    # partials sat untouched for 74+ minutes while Robinhood churned all
+    # cycles. The last slot is reserved for an uncovered network's oldest
+    # token when one exists, so the lanes drain in parallel instead of
+    # strictly sequentially. Covered networks keep every other slot: their
+    # tokens still exit in one or two cycles — and with a single slot there
+    # is no "other" slot to keep, so the reservation stays out of its way.
+    slots = pending[: config.EVM_BACKFILL_TOKENS_PER_CYCLE]
+    if (
+        len(pending) > config.EVM_BACKFILL_TOKENS_PER_CYCLE
+        and config.EVM_BACKFILL_TOKENS_PER_CYCLE >= 2
+    ):
+        uncovered = [
+            w for w in pending if str(w["network_id"]) not in covered
+        ]
+        if uncovered and all(str(w["network_id"]) in covered for w in slots):
+            slots[-1] = uncovered[0]
     stats["evm_backfill_due"] = len(pending)
     # A time budget for the whole step: backfill is the only one that may be cut
     # off (it resumes from its point with no lost logs), while everything after
@@ -586,7 +605,7 @@ async def run_evm_cycle(
     # is a separate process — corrected 08-22, details at
     # `EVM_BACKFILL_BUDGET_SECONDS` in config.)
     deadline = time.monotonic() + config.EVM_BACKFILL_BUDGET_SECONDS
-    for i, w in enumerate(pending[: config.EVM_BACKFILL_TOKENS_PER_CYCLE]):
+    for i, w in enumerate(slots):
         if i and time.monotonic() >= deadline:
             stats["evm_backfill_skipped"] += 1
             continue
@@ -617,7 +636,7 @@ async def run_evm_cycle(
                 "last_error_evm",
                 f"{recorded_at}: {w['token_address']}: {type(exc).__name__}: {exc}",
             )
-        if i + 1 < min(len(pending), config.EVM_BACKFILL_TOKENS_PER_CYCLE):
+        if i + 1 < len(slots):
             await sleep(config.EVM_PACING_SECONDS)
 
     # 3) Snapshot — for the fully backfilled only. A snapshot of a

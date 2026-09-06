@@ -719,3 +719,110 @@ async def test_a_covered_partial_beats_an_older_public_one(db, monkeypatch):
     assert picked == [("8453", TOKEN)]
     assert stats["evm_backfilled"] == 1
     assert db.evm_backfill_state("8453", TOKEN)["status"] == "done"
+
+
+async def test_an_uncovered_network_gets_one_reserved_slot(db, monkeypatch):
+    """A covered network with enough partials must not take every slot.
+
+    Measured live 2026-09-06: Robinhood's 60+ covered partials monopolized
+    all of `EVM_BACKFILL_TOKENS_PER_CYCLE`, leaving Base's 17 partials
+    untouched for 74+ minutes. The last slot is reserved for the oldest
+    uncovered token, so the lanes drain in parallel."""
+    import config
+    import evm_layer
+
+    ZERO = "0x" + "0" * 40
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("4663", "8453"))
+    monkeypatch.setattr(config, "EVM_BACKFILL_TOKENS_PER_CYCLE", 3)
+    covered_tokens = [f"0x{index + 100:040x}" for index in range(4)]
+    for token in covered_tokens:                           # all on covered 4663
+        _watch(db, token=token, network="4663")
+        db.set_evm_backfill_state(
+            "4663", token, "partial", NOW, from_block=100, to_block=300,
+        )
+    base_token = "0xcccc000000000000000000000000000000000003"
+    _watch(db, token=base_token, network="8453")           # uncovered 8453
+    db.set_evm_backfill_state(
+        "8453", base_token, "partial", NOW, from_block=100, to_block=300,
+    )
+    for net in ("4663", "8453"):
+        db.set_evm_cursor(net, 300, NOW, "ok")
+
+    picked = []
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return str(network_id) == "4663"
+
+        def covers(self, network_id):
+            return str(network_id) == "4663"
+
+        async def first_mint_block(self, *_a):
+            return None
+
+        async def get_logs_paged(self, network_id, addresses, *_a, **_k):
+            picked.append((str(network_id), addresses[0]))
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    class _BaseRPC(_CycleRPC):
+        # 8453 is a creation-scan network: the public path asks for the
+        # contract's birth block before walking. `None` = unknown ⇒ the walk
+        # keeps the partial's saved resume point, as at genesis.
+        async def contract_creation_block(self, *_args):
+            return None
+
+    rpc = _BaseRPC(head=400, logs=[_log(ZERO, A, 700, 150)])
+    await evm_layer.run_evm_cycle(
+        rpc, db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    nets = [net for net, _ in picked]
+    # Three slots: two covered through HyperSync, and the reserved third
+    # running through the public RPC — 8453 is not covered, so its pick
+    # shows up in the RPC's backfill ranges, not in the HyperSync log.
+    assert nets.count("4663") == 2
+    assert [net for net, _a, _f, _t in rpc.ranges] == ["8453"]
+
+
+async def test_no_reservation_when_every_pending_token_is_covered(
+    db, monkeypatch,
+):
+    """No uncovered work ⇒ the reservation changes nothing: all slots stay
+    covered-first, and a full covered queue keeps its pace."""
+    import config
+    import evm_layer
+
+    ZERO = "0x" + "0" * 40
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("4663",))
+    monkeypatch.setattr(config, "EVM_BACKFILL_TOKENS_PER_CYCLE", 2)
+    for index in range(3):
+        token = f"0x{index + 200:040x}"
+        _watch(db, token=token, network="4663")
+        db.set_evm_backfill_state(
+            "4663", token, "partial", NOW, from_block=100, to_block=300,
+        )
+    db.set_evm_cursor("4663", 300, NOW, "ok")
+
+    picked = []
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return True
+
+        def covers(self, network_id):
+            return True
+
+        async def first_mint_block(self, *_a):
+            return None
+
+        async def get_logs_paged(self, network_id, addresses, *_a, **_k):
+            picked.append((str(network_id), addresses[0]))
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)]),
+        db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    assert len(picked) == 2
+    assert all(net == "4663" for net, _ in picked)
