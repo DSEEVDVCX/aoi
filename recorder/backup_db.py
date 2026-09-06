@@ -3,7 +3,8 @@
 SQLite ``VACUUM INTO`` reads a fixed snapshot even while WAL writes continue.
 Backups go outside the repository (AOI_BACKUP_DIR, or OneDrive/aoi-backups), are
 published atomically after verification, and old snapshots are pruned only from
-that dedicated directory.
+that dedicated directory. Staging directories left behind by interrupted runs
+are swept by the next backup before it checks free space.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
@@ -22,7 +24,15 @@ import config
 
 BACKUP_PREFIX = "recorder-"
 BACKUP_SUFFIX = ".db"
-DEFAULT_KEEP = 3
+STAGING_PREFIX = "aoi-backup-"
+# A real backup rewrites its staging continuously, so its mtime stays fresh;
+# the daily task interval is 24 h and the longest measured run ~1 h, so six
+# hours separates "abandoned" from "in flight" with room on both sides.
+STALE_STAGING_SECONDS = 6 * 3600
+# Two verified copies, not three: each is a full ~27 GB database, and at three
+# the OneDrive folder alone was 86 GB of the C: drive that ran out of space
+# (measured 2026-09-06). One previous copy still survives a corrupt newest.
+DEFAULT_KEEP = 2
 MIN_FREE_MULTIPLIER = 1.10
 
 
@@ -78,6 +88,39 @@ def _clean_partials(destination: Path) -> None:
                 path.unlink(missing_ok=True)
 
 
+def _purge_stale_staging(
+    base: Path, *, max_age_seconds: float = STALE_STAGING_SECONDS,
+    now: float | None = None, emit: Callable[[str], None] | None = None,
+) -> list[Path]:
+    """Remove staging directories abandoned by interrupted backups.
+
+    A backup killed mid-run — task stop, reboot, crash — never executes its
+    ``TemporaryDirectory`` cleanup. Measured 2026-09-06: two such leftovers,
+    23.4 GB and 12 GB, sat in Temp for up to a week while the C: drive filled,
+    and being on the same drive as the destination they could also fail the
+    next backup's own free-space check — the tool rotting its own runway.
+
+    Only directories older than ``max_age_seconds`` are touched, so a backup
+    running in parallel (its staging rewritten continuously) is never
+    disturbed. A removal failure is reported, not raised: cleanup must not
+    fail a backup that would otherwise succeed.
+    """
+    say = emit or (lambda _message: None)
+    moment = time.time() if now is None else float(now)
+    removed: list[Path] = []
+    for path in base.glob(f"{STAGING_PREFIX}*"):
+        if not path.is_dir():
+            continue
+        try:
+            if moment - path.stat().st_mtime <= max_age_seconds:
+                continue
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError as exc:
+            say(f"stale staging removal failed path={path} error={exc}")
+    return removed
+
+
 def backup_database(
     db_path: str | os.PathLike[str],
     destination: str | os.PathLike[str],
@@ -91,11 +134,20 @@ def backup_database(
         raise FileNotFoundError(source_path)
     if keep < 1:
         raise ValueError("keep must be at least 1")
+    emit = log or (lambda _message: None)
 
     destination_path = validate_destination(Path(destination))
     destination_path.mkdir(parents=True, exist_ok=True)
     source_bytes = source_path.stat().st_size
     staging_root = Path(tempfile.gettempdir()).resolve()
+    # Before any space math: an interrupted run's staging is itself disk use,
+    # and on the same drive it can be the very reason the check fails.
+    purged = _purge_stale_staging(staging_root, emit=emit)
+    if purged:
+        emit(
+            f"removed {len(purged)} stale staging dir(s) from interrupted"
+            f" backups: {', '.join(path.name for path in purged)}"
+        )
     same_drive = os.path.splitdrive(staging_root)[0].lower() == os.path.splitdrive(
         destination_path
     )[0].lower()
@@ -120,9 +172,8 @@ def backup_database(
         # OneDrive/network destinations can be much slower than the live WAL
         # update cadence. Snapshot to a local unmanaged temp directory first so
         # source changes cannot repeatedly restart a multi-gigabyte cloud write.
-        with tempfile.TemporaryDirectory(prefix="aoi-backup-") as staging_dir:
+        with tempfile.TemporaryDirectory(prefix=STAGING_PREFIX) as staging_dir:
             staged_path = Path(staging_dir) / "recorder.db"
-            emit = log or (lambda _message: None)
             emit("creating consistent local snapshot with VACUUM INTO")
             with closing(sqlite3.connect(source_uri, uri=True, timeout=60)) as source:
                 source.execute("PRAGMA busy_timeout=60000")
