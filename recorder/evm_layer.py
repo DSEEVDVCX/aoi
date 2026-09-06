@@ -504,13 +504,26 @@ async def run_evm_cycle(
     if not networks:
         return stats
 
-    # Which networks the HyperSync route actually covers **this cycle** —
-    # routing is a fact about the key pool right now, not a config hope. The
-    # admission gate in the recorder process reads this stamp to apply the fast
-    # lane's numbers, and its freshness window (`EVM_HYPERSYNC_STAMP_FRESH_SECONDS`)
-    # is what turns a dead worker or a removed key back into the public-node
-    # math without anyone touching anything. `note_error`, not `set_meta`: this
-    # is bookkeeping that must survive a locked database.
+    # Which networks the HyperSync route will actually serve **this cycle** —
+    # routing capability (key present, URL configured), not just last cycle's
+    # proven success. The distinction is the bootstrap fix (66f2eb8): after a
+    # worker restart the admission stamp was empty, the gate fell back to the
+    # public-node math, and the network re-paused while the worker below was
+    # perfectly able to route through HyperSync — the stamp only caught up once
+    # some token had *already* been backfilled. The stamp is therefore the
+    # routing intent; the admission gate's freshness window
+    # (`EVM_HYPERSYNC_STAMP_FRESH_SECONDS`) is what turns a dead worker or a
+    # removed key back into the public-node math without anyone touching
+    # anything. `note_error`, not `set_meta`: this is bookkeeping that must
+    # survive a locked database.
+    routed = [
+        net for net in networks
+        if hyper is not None and getattr(
+            hyper, "can_attempt", getattr(hyper, "covers", lambda _n: False)
+        )(net)
+    ]
+    # Queue priority still uses proven coverage: an attempted-but-failing
+    # route must not jump ahead of working public-path tokens.
     covered = [
         net for net in networks
         if hyper is not None and getattr(hyper, "covers", lambda _n: False)(net)
@@ -518,7 +531,7 @@ async def run_evm_cycle(
     if hyper is not None:
         db.note_error(
             "evm_hypersync_covered",
-            json.dumps({"at": recorded_at, "networks": covered}, sort_keys=True),
+            json.dumps({"at": recorded_at, "networks": routed}, sort_keys=True),
         )
 
     # 1) Periodic apply — one call per address batch, per network.

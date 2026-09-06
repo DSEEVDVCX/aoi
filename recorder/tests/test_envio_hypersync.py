@@ -575,7 +575,10 @@ async def test_pages_wait_the_fast_lane_pacing_not_the_public_one(monkeypatch):
 # ---------------------------------------------------------------------------
 # The coverage stamp: the admission gate's only truth about the fast lane
 # ---------------------------------------------------------------------------
-async def test_cycle_stamps_what_hypersync_actually_covers(db, monkeypatch):
+async def test_cycle_stamps_what_hypersync_will_route(db, monkeypatch):
+    """The stamp is routing intent (can_attempt), not proven coverage — the
+    bootstrap fix: after a restart a routed network must not sit paused under
+    the public-node admission math while the worker is able to use HyperSync."""
     import config
     import evm_layer
 
@@ -587,8 +590,11 @@ async def test_cycle_stamps_what_hypersync_actually_covers(db, monkeypatch):
     ZERO = "0x" + "0" * 40
 
     class _Hyper:
-        def covers(self, network_id):
+        def can_attempt(self, network_id):
             return str(network_id) == NET
+
+        def covers(self, network_id):
+            return False                       # nothing proven yet this cycle
 
         async def first_mint_block(self, *_a):
             return 100
@@ -603,6 +609,49 @@ async def test_cycle_stamps_what_hypersync_actually_covers(db, monkeypatch):
     assert json.loads(db.get_meta("evm_hypersync_covered")) == {
         "at": NOW, "networks": [NET],
     }
+
+
+async def test_queue_priority_uses_proven_coverage_not_routing(db, monkeypatch):
+    """A routed-but-failing network must not jump the backfill queue ahead of
+    working public-path tokens — priority stays on proven `covers()` only."""
+    import config
+    import evm_layer
+
+    ZERO = "0x" + "0" * 40
+    SLOW = "0xbbbb000000000000000000000000000000000002"      # public path
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("8453", "4663"))
+    monkeypatch.setattr(config, "EVM_BACKFILL_TOKENS_PER_CYCLE", 1)
+    for net, token in (("4663", SLOW), ("8453", TOKEN)):
+        _watch(db, token=token, network=net)
+        db.set_evm_cursor(net, 300, NOW, "ok")
+        db.set_evm_backfill_state(
+            net, token, "partial", NOW, from_block=100, to_block=300,
+        )
+
+    picked = []
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return True                         # routed everywhere...
+
+        def covers(self, network_id):
+            return str(network_id) == "4663"    # ...but proven only on 4663
+
+        async def first_mint_block(self, *_a):
+            return None
+
+        async def get_logs_paged(self, network_id, addresses, *_a, **_k):
+            picked.append((str(network_id), addresses[0]))
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)]),
+        db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    # The proven-covered 4663 token went first despite being second in the
+    # watchlist; the 8453 token (routed but unproven) waited its normal turn.
+    assert picked[0] == ("4663", SLOW)
 
 
 async def test_a_cycle_without_the_adapter_writes_no_stamp(db, monkeypatch):

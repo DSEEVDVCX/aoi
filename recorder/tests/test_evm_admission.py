@@ -324,10 +324,11 @@ def test_a_fresh_stamp_opens_the_gate_on_the_same_backlog(db, monkeypatch):
     state = recorder.evm_admission_policy(db).network("8453")
 
     assert state.paused is False
-    # ~684 fast pages against a 300-page capacity: reduced, not paused —
-    # the gate still throttles a burst, it just stops shutting the door.
-    assert state.percent == 50
-    assert state.reason == "rpc_work_budget_reduced"
+    # ~684 fast pages against a 300-page capacity — under the dedicated-
+    # provider exemption (2026-09-06) a routed network admits fully; the
+    # historical lane is not spending the public node's budget at all.
+    assert state.percent == 100
+    assert state.reason == "hypersync_routed"
 
 
 def test_a_stale_stamp_is_the_public_math_again(db, monkeypatch):
@@ -394,3 +395,104 @@ def test_the_stamp_does_not_leak_between_networks(db, monkeypatch):
     assert policy.network("4663").capacity_units < policy.network(
         "8453"
     ).capacity_units
+
+
+# ---------------------------------------------------------------------------
+# The dedicated-provider exemption: a routed network does not inherit the
+# public-node pause (2026-09-06) — the stamp certifies the historical lane
+# is not spending the public node's budget at all
+# ---------------------------------------------------------------------------
+def test_a_routed_network_with_huge_backlog_still_admits(db, monkeypatch):
+    """The Monad shape (2026-09-06): one inherited token = 46,561 public-lane
+    work units against a capacity of 1,920 — utilization ~24× — while the same
+    history is routed through HyperSync. Admission opens."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("143",))
+    db.set_evm_cursor("143", 50_000_000, NOW, "ok")
+    token = "0x" + "1" * 40
+    db.upsert_watch(token, "143", "large_buy", "m-1", 48, NOW)
+    db.set_evm_backfill_state(
+        "143", token, "partial", NOW, from_block=0, to_block=50_000_000,
+    )
+    _stamp(db, ["143"], utcnow_iso())
+    db.set_meta(
+        "evm_admission_network_state", json.dumps({"143": {"paused": True}}),
+    )
+
+    state = recorder.evm_admission_policy(db).network("143")
+
+    assert state.paused is False
+    assert state.reason == "hypersync_routed"
+    assert state.percent == 100
+
+
+def test_the_routed_exemption_holds_through_hysteresis_state(db, monkeypatch):
+    """The exemption is checked before the hysteresis branch: a previously
+    paused network un-pauses the moment the routing stamp is fresh, rather
+    than waiting for utilization to drop below the high-water mark."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("4663",))
+    db.set_evm_cursor("4663", 50_000_000, NOW, "ok")
+    token = "0x" + "2" * 40
+    db.upsert_watch(token, "4663", "large_buy", "r-1", 48, NOW)
+    db.set_evm_backfill_state(
+        "4663", token, "partial", NOW, from_block=0, to_block=50_000_000,
+    )
+    _stamp(db, ["4663"], utcnow_iso())
+    db.set_meta(
+        "evm_admission_network_state", json.dumps({"4663": {"paused": True}}),
+    )
+
+    state = recorder.evm_admission_policy(db).network("4663")
+
+    assert state.paused is False
+    assert state.reason == "hypersync_routed"
+
+
+def test_the_routed_exemption_never_clears_a_retry_or_unhealthy_network(
+    db, monkeypatch,
+):
+    """A routing stamp is a fact about the historical lane, not about the node:
+    an active retry or an unhealthy cursor still pauses admission regardless."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("4663",))
+    db.set_evm_cursor("4663", 50_000_000, NOW, "error")
+    for token, status in (
+        ("0x" + "3" * 40, "retry"),
+        ("0x" + "4" * 40, "partial"),
+    ):
+        db.upsert_watch(token, "4663", "large_buy", "r-2", 48, NOW)
+        db.set_evm_backfill_state(
+            "4663", token, status, NOW, from_block=0, to_block=1_000_000,
+        )
+    _stamp(db, ["4663"], utcnow_iso())
+
+    state = recorder.evm_admission_policy(db).network("4663")
+
+    assert state.paused is True
+    assert state.reason == "active_retry"
+
+
+def test_a_stale_stamp_keeps_the_full_public_math(db, monkeypatch):
+    """The exemption dies with the stamp: a dead worker or a removed key must
+    return the network to the old pause semantics on its own."""
+    monkeypatch.setattr(config, "EVM_NETWORKS", ("143",))
+    db.set_evm_cursor("143", 50_000_000, NOW, "ok")
+    # Enough pending range for utilization > 0.5 on the public math, so the
+    # inherited paused state keeps its grip through hysteresis.
+    for index in range(6):
+        token = f"0x{index + 30:040x}"
+        db.upsert_watch(token, "143", "large_buy", f"m-{index}", 48, NOW)
+        db.set_evm_backfill_state(
+            "143", token, "partial", NOW, from_block=0, to_block=5_000_000,
+        )
+    two_hours_ago = (
+        datetime.fromisoformat(utcnow_iso()) - timedelta(hours=2)
+    ).isoformat()
+    _stamp(db, ["143"], two_hours_ago)
+    db.set_meta(
+        "evm_admission_network_state", json.dumps({"143": {"paused": True}}),
+    )
+
+    state = recorder.evm_admission_policy(db).network("143")
+
+    assert state.paused is True
+    assert state.reason == "hysteresis_high_water"
+

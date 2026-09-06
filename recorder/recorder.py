@@ -261,7 +261,22 @@ def evm_admission_policy(db: RecorderDB) -> EVMAdmissionPolicy:
 
         utilization = work_units / capacity_units
         old_paused = bool((previous.get(network) or {}).get("paused"))
-        if not rpc_healthy or retry_count:
+        # The dedicated-provider exemption (2026-09-06): a network whose
+        # historical backfill runs through HyperSync (fresh routing stamp)
+        # is not spending the public node's budget on that backlog at all.
+        # Inheriting the public-node pause math there re-paused Monad for a
+        # ~24× "utilization" computed entirely from a HyperSync lane the
+        # stamp had just certified — the mechanism was built before the
+        # dedicated provider existed. The exemption opens **admission**
+        # only; it never clears an `active_retry` or an unhealthy cursor,
+        # and a stale stamp (dead worker / removed key) returns the network
+        # to the full public-node math on its own.
+        routed = fast
+        if routed and rpc_healthy and not retry_count:
+            paused = False
+            fraction = (1, 1)
+            reason = "hypersync_routed"
+        elif not rpc_healthy or retry_count:
             paused = True
             fraction = (0, 1)
         elif old_paused and utilization > 0.5:
