@@ -38,6 +38,7 @@ from typing import Any, Sequence
 import config
 import evm_rpc
 from db import RecorderDB, StaleEVMState, utcnow_iso
+from envio_hypersync import EnvioUnavailable
 from evm_rpc import EVMLogLimit
 
 _CHAIN_TIERS = ((1, "top1_pct"), (5, "top5_pct"), (10, "top10_pct"), (20, "top20_pct"))
@@ -390,6 +391,21 @@ async def _backfill_token(
             )
         stats["evm_backfill_errors"] += 1
         return
+    except EnvioUnavailable:
+        # The paid route went away mid-walk (all keys rejected / no key on
+        # disk). Same policy as the replay path (evm_replay's hyper
+        # fallback): nothing was applied yet — `get_logs_paged` hands back
+        # its logs only on success — so the public node reads the range
+        # exactly once, never twice. Counted in its own stat, not as a
+        # token error: the token did nothing wrong and must not burn its
+        # retry budget on a route problem.
+        stats["evm_hyper_fallbacks"] += 1
+        logs, calls, complete, resume = await rpc.get_logs_paged(
+            net, [token], from_block, to_block,
+            max_calls=(max_calls if max_calls is not None
+                       else config.EVM_BACKFILL_MAX_CALLS),
+            sleep=sleep, deadline=deadline,
+        )
 
     # If the network cursor advanced while this token was being backfilled,
     # finishing the old range is not enough: the token was excluded from live
@@ -496,6 +512,9 @@ async def run_evm_cycle(
         "evm_backfill_retry": 0, "evm_backfill_errors": 0,
         # Tokens deferred because the time budget ran out — not a failure: the next cycle takes them.
         "evm_backfill_skipped": 0,
+        # History reads rerouted to the public node because the paid route
+        # went away mid-walk — a route event, not a token error.
+        "evm_hyper_fallbacks": 0,
         "evm_snapshots": 0, "evm_snap_empty": 0,
         "evm_errors": 0,
     }
@@ -695,6 +714,7 @@ async def run_evm_backfill_assist(
         "evm_backfill_due": 0, "evm_backfilled": 0, "evm_backfill_partial": 0,
         "evm_backfill_calls": 0, "evm_backfill_retry": 0,
         "evm_backfill_errors": 0, "evm_backfill_skipped": 0,
+        "evm_hyper_fallbacks": 0,
     }
     watched = db.evm_watched([str(n) for n in networks])
     pending = [

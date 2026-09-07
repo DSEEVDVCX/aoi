@@ -504,10 +504,119 @@ async def test_first_mint_block_is_the_lowest_mint_page_block():
         await rpc.aclose()
 
 
+async def test_first_mint_block_follows_pagination_until_the_mint():
+    """A first page without a mint is not proof none exists later (plan 4.5):
+    the scan follows `next_block` and answers with the later page's mint —
+    where the old single-page read returned None and silently started the
+    walk at a wrong (too-recent) block."""
+    pages = {
+        0: _page([], next_block=400_000),       # empty early history, more to read
+        400_000: _page([{"block_number": 512_345}], next_block=None),
+    }
+
+    def handler(request):
+        return pages[json.loads(request.content)["from_block"]]
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 600_000) == 512_345
+    finally:
+        await rpc.aclose()
+
+
+async def test_first_mint_block_none_only_when_the_range_is_exhausted():
+    """None is the honest "no mint found" only after the walk reached the
+    range's end — an exhausted page without next_block, not an empty first page."""
+    pages = {
+        0: _page([], next_block=300),
+        300: _page([], next_block=None),
+    }
+
+    def handler(request):
+        return pages[json.loads(request.content)["from_block"]]
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_first_mint_block_budget_stop_is_unknown_not_no_mint():
+    """The request cap stopped the scan mid-range: the honest answer is None
+    (unknown ⇒ the caller keeps its conservative walk), and no further page
+    is asked for."""
+    asked = []
+
+    def handler(request):
+        asked.append(json.loads(request.content)["from_block"])
+        return _page([], next_block=body_next(asked))
+
+    def body_next(asked):
+        return (asked[-1] + 100) if asked else 100
+
+    rpc = _client(handler)
+    try:
+        result = await rpc.first_mint_block(BASE, TOKEN, 10_000, max_calls=2)
+    finally:
+        await rpc.aclose()
+    assert result is None
+    assert len(asked) == 2
+
+
+async def test_first_mint_block_non_advancing_cursor_is_a_loud_error():
+    def handler(_request):
+        return _page([], next_block=5)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.first_mint_block(BASE, TOKEN, 10_000)
+    finally:
+        await rpc.aclose()
+
+
 async def test_first_mint_block_none_when_no_rows():
     rpc = _client(lambda _r: _page([], next_block=None))
     try:
         assert await rpc.first_mint_block(BASE, TOKEN, 10_000_000) is None
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed pagination (plan 4.2): an unreadable row quarantines the range
+# ---------------------------------------------------------------------------
+async def test_an_undecodable_row_raises_instead_of_vanishing():
+    """A log row that cannot be decoded might carry a balance change; the old
+    code skipped it and still declared the range complete — a silent hole in
+    the ledger. It must be a loud error the caller can retry, never a gap."""
+
+    def handler(_request):
+        return _page([{"block_number": "not-a-number"}], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_non_object_row_raises_instead_of_vanishing():
+    def handler(_request):
+        return httpx.Response(200, json={"data": [{"logs": ["raw-string"]}]})
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
     finally:
         await rpc.aclose()
 
@@ -674,6 +783,50 @@ async def test_pages_wait_the_fast_lane_pacing_not_the_public_one(monkeypatch):
     finally:
         await rpc.aclose()
     assert waited == [0.123, 0.123]          # between pages only, never before the first
+
+
+# ---------------------------------------------------------------------------
+# Route loss mid-backfill: the public node answers once, never twice
+# ---------------------------------------------------------------------------
+async def test_backfill_falls_back_when_the_route_goes_away(db, monkeypatch):
+    """Plan 4.4: an `EnvioUnavailable` from the history read must not burn the
+    token's error/retry budget — the public node reads the same range in the
+    same call and the backfill still completes, counted in its own stat."""
+    import config
+    import evm_layer
+    from envio_hypersync import EnvioUnavailable
+
+    NET = "8453"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    ZERO = "0x" + "0" * 40
+    rpc = _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)])
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return str(network_id) == NET
+
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, *_a):
+            return None                     # unknown ⇒ from-zero walk
+
+        async def get_logs_paged(self, *_a, **_k):
+            raise EnvioUnavailable("hypersync [8453] HTTP 401")
+
+    stats = await evm_layer.run_evm_cycle(
+        rpc, db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+
+    assert stats["evm_hyper_fallbacks"] == 1        # the route event is its own counter
+    assert stats["evm_backfill_errors"] == 0        # the token did nothing wrong
+    assert stats["evm_backfill_retry"] == 0
+    assert stats["evm_backfilled"] == 1             # and it still completed, once
+    assert db.evm_top_balances(NET, TOKEN, 10) == [(A, 700)]   # applied exactly once
+    assert [net for net, _a, _f, _t in rpc.ranges] == [NET]    # by the public node
 
 
 # ---------------------------------------------------------------------------

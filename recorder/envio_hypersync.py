@@ -380,10 +380,25 @@ class EnvioHyperSync:
                 )
             for row in rows:
                 if not isinstance(row, dict):
-                    continue
+                    # Fail closed (plan 4.2): a row we cannot even type-check
+                    # could carry a balance change, and dropping it while
+                    # declaring the range complete writes a silent hole.
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: non-object log row in response",
+                    )
                 converted = self._to_rpc_log(row)
-                if converted is not None:
-                    out.append(converted)
+                if converted is None:
+                    # Same rule as a non-dict row: the event exists but cannot
+                    # be read, and an undecodable event that might affect
+                    # balances must quarantine the range, not vanish in it.
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: undecodable log row in response",
+                    )
+                out.append(converted)
             next_block = page.get("next_block")
             try:
                 nxt = int(next_block) if next_block is not None else None
@@ -417,6 +432,7 @@ class EnvioHyperSync:
 
     async def first_mint_block(
         self, network_id: str, address: str, head: int,
+        max_calls: int | None = None,
     ) -> int | None:
         """The token's first mint over the whole range — HyperSync's one-query answer.
 
@@ -425,40 +441,76 @@ class EnvioHyperSync:
         `EVM_CREATION_BLOCK_NETWORKS` doing ~20 binary-search `eth_getCode`
         calls per token). HyperSync answers the same question in one query
         with a two-topic filter, same trick as the Robinhood mint scan.
+
+        The service can still paginate a mint scan (the measured behavior of
+        `get_logs_paged` applies here too): the walk follows `next_block`
+        until a mint appears or the range is exhausted — a first page without
+        a mint is **not** proof none exists later, so a single-page read could
+        silently hand back a wrong starting block. A non-advancing cursor is
+        the same loud error here as in `get_logs_paged`, never a spin. `None`
+        stays the honest "unknown" — the caller keeps its conservative walk,
+        never a guessed recent block.
         """
         net = str(network_id)
         if net not in self._urls:
             raise EnvioUnavailable(f"hypersync does not serve network {net}")
         token = str(address).lower()
         zero_topic = "0x" + "0" * 64
-        body = {
-            "from_block": 0,
-            # Exclusive wire semantics, same as get_logs_paged: +1 or the
-            # head block's own mints never come back.
-            "to_block": int(head) + 1,
-            "logs": [{"address": [token], "topics": [[TRANSFER_TOPIC], [zero_topic]]}],
-            "field_selection": {"log": ["block_number"]},
-        }
-        page = await self._query(net, body)
-        data = page.get("data")
-        if isinstance(data, list):
-            rows = [
-                row
-                for entry in data if isinstance(entry, dict)
-                for row in (entry.get("logs") or [])
-            ]
-        elif isinstance(data, dict):
-            rows = data.get("logs") or []
-        else:
-            rows = []
-        if not rows:
-            return None
-        blocks = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
+        cap = max(1, max_calls) if max_calls is not None else 10 ** 9
+        lo = 0
+        hi = int(head)
+        requests = 0
+        while lo <= hi:
+            if requests >= cap:
+                # The budget stopped the scan before the range was proven
+                # mint-free: unknown, not "no mint".
+                return None
+            body = {
+                # Exclusive wire semantics, same as get_logs_paged: +1 or the
+                # head block's own mints never come back.
+                "from_block": lo,
+                "to_block": hi + 1,
+                "logs": [{"address": [token], "topics": [[TRANSFER_TOPIC], [zero_topic]]}],
+                "field_selection": {"log": ["block_number"]},
+            }
+            page = await self._query(net, body)
+            requests += 1
+            data = page.get("data")
+            if isinstance(data, list):
+                rows = [
+                    row
+                    for entry in data if isinstance(entry, dict)
+                    for row in (entry.get("logs") or [])
+                ]
+            elif isinstance(data, dict):
+                rows = data.get("logs") or []
+            else:
+                rows = []
+            blocks = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    blocks.append(int(row["block_number"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if blocks:
+                return min(blocks)   # ascending pages ⇒ the first mint found is the lowest
+            next_block = page.get("next_block")
             try:
-                blocks.append(int(row["block_number"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-        return min(blocks) if blocks else None
+                nxt = int(next_block) if next_block is not None else None
+            except (TypeError, ValueError):
+                nxt = None
+            if nxt is None:
+                # No next_block: the service says the range is complete and
+                # mint-free — that *is* proof, unlike an empty first page.
+                return None
+            if nxt <= lo:
+                from evm_rpc import EVMRPCError
+
+                raise EVMRPCError(
+                    f"hypersync [{net}]: next_block {nxt} did not advance "
+                    f"past from_block {lo} (mint scan)",
+                )
+            lo = nxt
+        return None
