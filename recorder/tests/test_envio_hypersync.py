@@ -259,6 +259,28 @@ async def test_a_429_on_every_key_raises_instead_of_rotating_forever():
     assert len(asked) == 2                                     # each key exactly once
 
 
+async def test_a_401_on_every_key_raises_instead_of_rotating_forever():
+    """401/403 rotation is bounded exactly like the 429 branch: each key at
+    most once per request. Two keys that both say 401 must raise
+    `EnvioUnavailable` after exactly two calls — the old unbounded recursion
+    spun forever (one key, two keys, any count)."""
+    second = "test-key-654321"
+    asked = []
+
+    def handler(request):
+        asked.append(request.headers["authorization"])
+        return httpx.Response(401, text="unauthorized")
+
+    rpc = _client(handler, keys=(KEY, second))
+    try:
+        with pytest.raises(envio_hypersync.EnvioUnavailable):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+    assert len(asked) == 2                             # each key exactly once, then the raise
+
+
 async def test_a_non_advancing_next_block_is_a_loud_error():
     """The GoldRush failure mode is silence; spinning forever is its cousin — both are refused."""
     def handler(_request):
@@ -317,6 +339,88 @@ async def test_single_address_is_enforced_not_assumed():
             await rpc.get_logs_paged(BASE, [TOKEN, B], 0, 10, sleep=_noop)
     finally:
         await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The exclusive wire boundary: the last block must actually be read
+# ---------------------------------------------------------------------------
+async def test_the_final_block_is_on_the_wire_and_its_logs_return():
+    """Measured live 2026-09-07 (net 4663): HyperSync's `to_block` is
+    **exclusive** — `[b, b]` answers 0 events, `[b, b+1]` answers the events
+    at block b. Sending the caller's inclusive `hi` as-is silently skipped the
+    final block of every backfill range. The wire body must carry `hi + 1`,
+    and the log at `hi` itself must come back."""
+    seen_body = {}
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen_body.update(body)
+        return _page([_entry(A, B, 10, 250)], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 250, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert seen_body["to_block"] == 251                 # hi + 1, exclusive wire
+    assert seen_body["from_block"] == 0
+    assert (complete, requests, resume) == (True, 1, 250)  # caller semantics unchanged
+    assert len(logs) == 1 and int(logs[0]["blockNumber"], 16) == 250
+
+
+async def test_a_one_block_range_reads_that_block():
+    """`[b, b]` is a legal inclusive request: one block, queried once, done."""
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return _page([_entry(A, B, 10, 5_018_120)], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 5_018_120, 5_018_120, sleep=_noop,
+        )
+    finally:
+        await rpc.aclose()
+
+    assert bodies[0]["from_block"] == 5_018_120
+    assert bodies[0]["to_block"] == 5_018_121
+    assert (complete, requests, resume, len(logs)) == (True, 1, 5_018_120, 1)
+
+
+async def test_adjacent_ranges_neither_overlap_nor_gap():
+    """`[0, 100]` then `[101, 200]` (inclusive caller semantics) must not
+    double-read block 100 or skip block 101 — the pagination seam the old
+    exclusive-wire bug sat on."""
+    def make_handler(pages):
+        def handler(request):
+            body = json.loads(request.content)
+            return pages[(body["from_block"], body["to_block"])]
+        return handler
+
+    # First walk [0,100]: page returns the log at block 100 itself and done.
+    first = make_handler({(0, 101): _page([_entry(A, B, 10, 100)], next_block=None)})
+    # Second walk [101,200]: page returns the log at block 101 and done.
+    second = make_handler({(101, 201): _page([_entry(A, B, 11, 101)], next_block=None)})
+
+    for handler, from_b, to_b, expected_block in (
+        (first, 0, 100, 100), (second, 101, 200, 101),
+    ):
+        rpc = _client(handler)
+        try:
+            logs, requests, complete, _resume = await rpc.get_logs_paged(
+                BASE, [TOKEN], from_b, to_b, sleep=_noop,
+            )
+        finally:
+            await rpc.aclose()
+        assert complete is True
+        assert requests == 1
+        assert len(logs) == 1
+        assert int(logs[0]["blockNumber"], 16) == expected_block
 
 
 # ---------------------------------------------------------------------------

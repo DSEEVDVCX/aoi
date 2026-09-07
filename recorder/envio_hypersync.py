@@ -181,11 +181,13 @@ class EnvioHyperSync:
                 f"hypersync [{network_id}] {type(exc).__name__}",
             ) from None
         if resp.status_code in (401, 403):
-            # The key is the problem: rotate once; if the next key also fails,
-            # unavailability is the honest verdict ⇒ the public node continues.
-            if len(self._keys.keys) > 1:
+            # The key is the problem: rotate to the next key; when every key
+            # has said no, unavailability is the honest verdict ⇒ the public
+            # node continues. Bounded exactly like the 429 branch — each key
+            # at most once per request, never an unbounded rotation.
+            if _retries < len(self._keys.keys) - 1:
                 self._keys.rotate(block_current=True)
-                return await self._query(network_id, body)
+                return await self._query(network_id, body, _retries=_retries + 1)
             self._successful_networks.discard(str(network_id))
             raise EnvioUnavailable(f"hypersync [{network_id}] HTTP {resp.status_code}")
         if resp.status_code == 429:
@@ -298,6 +300,14 @@ class EnvioHyperSync:
         `max_calls` counts **requests**, matching the RPC version's quota
         semantics. Hitting it exits short with the resume point — the next
         cycle continues from there.
+
+        The caller's `from_block`/`to_block` are inclusive (the RPC contract
+        this adapter mirrors), but HyperSync's wire `to_block` is **exclusive**
+        (measured live 2026-09-07, net 4663, token 0x2d8d6f4a…: `[b, b]`
+        answered 0 events, `[b, b+1]` answered 6 events at block b). Sending
+        the caller's `hi` as-is would silently skip the final block — benign
+        only while live apply happens to cover the seam from above — so the
+        wire range is always `[lo, hi + 1)`, invisible to callers.
         """
         net = str(network_id)
         if net not in self._urls:
@@ -330,8 +340,10 @@ class EnvioHyperSync:
             if requests:
                 await sleep(config.EVM_HYPERSYNC_PACING_SECONDS)
             body = {
+                # Wire semantics are exclusive on the top end — see the
+                # docstring. +1 makes the caller's inclusive `hi` land.
                 "from_block": lo,
-                "to_block": hi,
+                "to_block": hi + 1,
                 "logs": [{"address": [token], "topics": [[topic0]]}],
                 "field_selection": {"log": [
                     "transaction_hash", "block_number", "transaction_index",
@@ -421,7 +433,9 @@ class EnvioHyperSync:
         zero_topic = "0x" + "0" * 64
         body = {
             "from_block": 0,
-            "to_block": int(head),
+            # Exclusive wire semantics, same as get_logs_paged: +1 or the
+            # head block's own mints never come back.
+            "to_block": int(head) + 1,
             "logs": [{"address": [token], "topics": [[TRANSFER_TOPIC], [zero_topic]]}],
             "field_selection": {"log": ["block_number"]},
         }
