@@ -413,6 +413,12 @@ async def _backfill_token(
                 # error: the token did nothing wrong.
                 stats["evm_hyper_fallbacks"] += 1
                 continue
+        # `EVMBudgetExpired` never reaches here: `get_logs_paged` converts it
+        # into an honest partial return (its completed pages plus the first
+        # unread block), so a spent budget flows through the normal
+        # `partial`/`resume` save path below instead of the retry handler —
+        # and the public fallback above is unreachable for it, because the
+        # budget is spent, not the provider.
     except EVMLogLimit as exc:
         # A single block exceeds the cap — no split is possible. It is recorded, not retried every minute.
         with db.batch():

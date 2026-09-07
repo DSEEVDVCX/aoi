@@ -1719,3 +1719,205 @@ async def test_a_key_rotation_is_bounded_by_the_deadline():
         assert resume == 0
     finally:
         await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 4: expiry mid-walk preserves the pages already paid for
+# ---------------------------------------------------------------------------
+async def test_expiry_before_the_next_page_returns_partial_progress():
+    """Page success + timeout before the next request: the completed, verified
+    pages come back with complete=False and the first unread block — the token
+    resumes from the saved point next cycle instead of re-reading from the old
+    start. The pacing sleep between pages is where the budget dies (the walk
+    re-checks the deadline before each request), so page one stays saved."""
+    import asyncio
+    import time
+
+    asked = []
+
+    def handler(request):
+        asked.append(json.loads(request.content)["from_block"])
+        return _page([_entry(A, B, 10, 50)], next_block=60)
+
+    # The budget dies **during** the pacing sleep between pages: page one
+    # answers instantly (0.25s of budget is ample for an in-process mock),
+    # the real 0.5s pacing sleep outruns the budget, and the deadline gate
+    # after the sleep must refuse the second request — the "sequential parts,
+    # small scheduling margin" shape from the review.
+    deadline = time.monotonic() + 0.25
+
+    async def slow_pacing(_seconds):
+        await asyncio.sleep(0.5)
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=slow_pacing, deadline=deadline,
+        )
+    finally:
+        await rpc.aclose()
+    assert requests == 1                     # the interrupted page is not counted
+    assert complete is False
+    assert resume == 60                      # first unread block, not 0
+    assert len(logs) == 1 and logs[0]["blockNumber"] == hex(50)
+    assert len(asked) == 1
+
+
+async def test_expiry_during_the_next_request_cancels_and_keeps_prior_pages():
+    """Page success + timeout during the next request: httpx's read timeout is
+    per-chunk, so a slow trickle can outlive the budget — asyncio.wait_for
+    cancels the request at the deadline and the walk returns the previous
+    pages only, with no truncated page."""
+    import asyncio
+    import time
+
+    asked = []
+
+    async def slow(_request):
+        asked.append(1)
+        if len(asked) == 1:
+            return _page([_entry(A, B, 10, 50)], next_block=60)
+        await asyncio.sleep(5)               # a trickle that outlives any budget
+        return _page([_entry(A, B, 20, 60)], next_block=70)
+
+    rpc = _client(slow)
+    try:
+        deadline = time.monotonic() + 0.3
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop, deadline=deadline,
+        )
+    finally:
+        await rpc.aclose()
+    assert requests == 1                     # the cancelled page is not counted
+    assert complete is False
+    assert resume == 60
+    assert len(logs) == 1 and logs[0]["blockNumber"] == hex(50)
+    assert len(asked) == 2                   # the second request started (and was cancelled)
+
+
+async def test_a_401_with_the_budget_spent_makes_no_second_key_request():
+    """The review's named gap: a 401 answered on key 1 with the budget already
+    spent — no request with the second key and no RPC rollback: a spent budget
+    is not a retry reason. The expired deadline is caught before the first
+    request, so the rotation never even begins."""
+    import time
+
+    from envio_hypersync import EnvioUnavailable
+
+    asked = []
+
+    def handler(_request):
+        asked.append(1)
+        return httpx.Response(401)
+
+    rpc = _client(handler, keys=(KEY, "second-key-654321"))
+    try:
+        with pytest.raises(EnvioUnavailable):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 0, 100, sleep=_noop,
+                deadline=time.monotonic() + 60,
+            )
+        assert len(asked) == 2               # rotation itself is intact
+        # Now the same 401 with a budget that is already spent: the deadline
+        # must gate the rotation's re-ask, exactly as it gates a page request.
+        asked.clear()
+        _logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop,
+            deadline=time.monotonic() - 1,
+        )
+        assert asked == []                   # no request, no second key
+        assert requests == 0
+        assert complete is False
+        assert resume == 0
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 4: one row-extraction policy for both branches
+# ---------------------------------------------------------------------------
+async def test_a_non_list_logs_in_the_dict_branch_is_never_a_complete_page():
+    """`{"data": {"logs": {}}}` used to pass the dict branch as a complete
+    empty page — a page that could not be read was blessed as event-free. Both
+    branches now share one extraction policy: non-list logs is a rejection."""
+    def handler(_request):
+        return httpx.Response(200, json={"data": {"logs": {}}, "next_block": 101})
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_null_logs_in_a_block_group_is_an_empty_group_not_an_error():
+    """`{"data": [{"logs": null}, ...]}`: the list-branch policy treats a
+    missing field and an explicit null identically (an empty block group), so
+    the page still hands back its real rows — an explicit null is not the
+    measured corruption shape (false, {}) and does not quarantine the page."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": None}, {"logs": [_entry(A, B, 10, 50)]}],
+            "next_block": 101,
+        })
+
+    rpc = _client(handler)
+    try:
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop,
+        )
+        assert requests == 1
+        assert complete is True              # next_block 101 = hi+1 ⇒ range served
+        assert resume == 100
+        assert len(logs) == 1 and logs[0]["blockNumber"] == hex(50)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_dict_branch_without_logs_is_a_rejection_not_a_complete_page():
+    """`{"data": {...}}` with no logs key at all: the dict branch's missing
+    field stays an explicit refusal (round 3, kept in round 4) — the two
+    branches agree on *present but non-list*, and stay deliberately strict
+    about *missing* in the dict shape, which never carries a keyless empty
+    page in the measured wire format."""
+    def handler(_request):
+        return httpx.Response(200, json={"data": {"other": 1}, "next_block": 101})
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_corrupt_mint_dict_branch_is_unknown_not_an_empty_scan():
+    """The unified extractor in the mint scan: `{"data": {"logs": {}}}` cannot
+    be read, so no mint-free verdict may be built from it — unknown (None)."""
+    def handler(_request):
+        return httpx.Response(200, json={"data": {"logs": {}}, "next_block": 101})
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_corrupt_mint_list_branch_row_is_unknown_not_an_empty_scan():
+    """`{"data": [{"logs": {}}]}` in the mint scan: a non-list logs group is a
+    page that cannot be read; the scan converts the unified extractor's
+    rejection into unknown, never into "mint-free, walk from zero"."""
+    def handler(_request):
+        return httpx.Response(200, json={"data": [{"logs": {}}], "next_block": 101})
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
+    finally:
+        await rpc.aclose()

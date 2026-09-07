@@ -172,31 +172,47 @@ class EnvioHyperSync:
             # or a first page may not spend one more second of it. Checked
             # here, in the one place every request passes, so the walk's
             # between-page check is a second gate, not the only one.
-            from evm_rpc import EVMRPCError
+            from evm_rpc import EVMBudgetExpired
 
-            raise EVMRPCError(
+            raise EVMBudgetExpired(
                 f"hypersync [{network_id}]: budget expired before request",
             )
         url = self._urls[str(network_id)]
         key = self._keys.current()
-        # The request itself is bounded by the **remaining** budget, not the
-        # blanket 30s timeout: a call that starts slightly before the deadline
-        # must stop when the deadline says, not up to 30s after it.
-        request_timeout = self._timeout
+        # The request is bounded by the **remaining** budget twice over: the
+        # httpx timeout caps each individual read/write phase, and
+        # `asyncio.wait_for` cancels the whole request at the deadline —
+        # httpx's read timeout is per-chunk, so a slow trickle of response
+        # bytes could outlive the budget while every chunk stays "on time".
+        remaining = None
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                from evm_rpc import EVMRPCError
+                from evm_rpc import EVMBudgetExpired
 
-                raise EVMRPCError(
+                raise EVMBudgetExpired(
                     f"hypersync [{network_id}]: budget expired before request",
                 )
-            request_timeout = min(self._timeout, remaining)
+        request_timeout = (
+            self._timeout if remaining is None else min(self._timeout, remaining)
+        )
+        post = self._client.post(
+            url, json=body, headers={"authorization": f"Bearer {key}"},
+            timeout=request_timeout,
+        )
         try:
-            resp = await self._client.post(
-                url, json=body, headers={"authorization": f"Bearer {key}"},
-                timeout=request_timeout,
-            )
+            if remaining is None:
+                resp = await post
+            else:
+                resp = await asyncio.wait_for(post, timeout=remaining + 0.1)
+        except TimeoutError:
+            # The deadline arrived mid-request. Not a transport failure and
+            # not a retry: the same budget verdict as the pre-request check.
+            from evm_rpc import EVMBudgetExpired
+
+            raise EVMBudgetExpired(
+                f"hypersync [{network_id}]: budget expired during request",
+            ) from None
         except httpx.TransportError as exc:
             self._successful_networks.discard(str(network_id))
             # A wait, not a failure: raising rate-limit-shaped lets the caller's
@@ -349,6 +365,64 @@ class EnvioHyperSync:
             )
         return next_block
 
+    @staticmethod
+    def _page_rows(
+        page: dict[str, Any], net: str, *, where: str,
+    ) -> list[dict[str, Any]]:
+        """The page's log rows, extracted under **one** policy for every path.
+
+        The live shape (measured 2026-09-04) is `data` as a list of block
+        groups each carrying `logs`; the nested-dict `data: {"logs": [...]}`
+        shape is a tolerated variant from the first deployment. The policy,
+        identical in both branches and in the mint scan (round 4, review
+        item 3):
+
+        * `data` as a list ⇒ every entry must be an object; a missing `logs`
+          key is an empty group; anything **present** must be a genuine list —
+          `False`/`{}`/`"raw"` are corrupt shapes, not "no events here".
+        * `data` as a dict ⇒ same rule for its own `logs` key.
+        * `data` of any other type ⇒ an unrecognized shape, refused.
+
+        Raises `EVMRPCError` on a shape we cannot read — the caller decides
+        whether that is a loud error (the transfer walk) or an unknown start
+        (the mint scan).
+        """
+        from evm_rpc import EVMRPCError
+
+        data = page.get("data")
+        if isinstance(data, list):
+            for entry in data:
+                if not isinstance(entry, dict):
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: non-object block group ({where})",
+                    )
+                raw = entry.get("logs")
+                if raw is None:
+                    continue
+                if not isinstance(raw, list):
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: non-list logs in block group ({where})",
+                    )
+            return [
+                row
+                for entry in data
+                for row in (entry.get("logs") or [])
+            ]
+        if isinstance(data, dict):
+            raw = data.get("logs")
+            if raw is None:
+                raise EVMRPCError(
+                    f"hypersync [{net}]: response has no logs ({where})",
+                )
+            if not isinstance(raw, list):
+                raise EVMRPCError(
+                    f"hypersync [{net}]: non-list logs in response ({where})",
+                )
+            return raw
+        raise EVMRPCError(
+            f"hypersync [{net}]: unrecognized response shape ({where})",
+        )
+
     async def get_logs_paged(
         self,
         network_id: str,
@@ -403,12 +477,16 @@ class EnvioHyperSync:
         out: list[dict[str, Any]] = []
         requests = 0
         while lo <= hi:
+            if requests:
+                await sleep(config.EVM_HYPERSYNC_PACING_SECONDS)
+            # Checked **after** the pacing sleep, not before it: the sleep
+            # spends budget too, and a deadline that dies during pacing must
+            # not still buy the next page request (round 4: no request may
+            # start outside the budget, wherever the time went).
             spent = deadline is not None and time.monotonic() >= deadline
             if requests >= cap or spent:
                 # What is unread is everything from `lo` up ⇒ honest resume point.
                 return out, requests, False, lo
-            if requests:
-                await sleep(config.EVM_HYPERSYNC_PACING_SECONDS)
             body = {
                 # Wire semantics are exclusive on the top end — see the
                 # docstring. +1 makes the caller's inclusive `hi` land.
@@ -420,57 +498,23 @@ class EnvioHyperSync:
                     "log_index", "address", "data", "topic0", "topic1", "topic2",
                 ]},
             }
-            page = await self._query(net, body, deadline=deadline)
+            try:
+                page = await self._query(net, body, deadline=deadline)
+            except evm_rpc.EVMBudgetExpired:
+                # The budget ran out before this page: **not** a fault, and
+                # not a fallback reason. The pages already collected in `out`
+                # are fetched, verified and paid for — throwing them away
+                # here (the old shape: a generic raise ⇒ `retry` ⇒ re-read
+                # from the last *saved* point) is what wasted progress and
+                # re-read the same pages every cycle. The unread range
+                # starts at `lo`, the honest resume point.
+                return out, requests, False, lo
             requests += 1
-            # The live response shape (measured 2026-09-04, live query): `data`
-            # is a list of block groups, each carrying its own `logs`; a range
-            # with no logs answers `data: []`. The nested-dict reading is kept
-            # only as a tolerated variant — the first deployment shipped with
-            # it as the *only* reading and every page failed with "response has
-            # no data.logs", which is the cost of a fixture written from memory
-            # instead of from a captured response.
-            data = page.get("data")
-            if isinstance(data, list):
-                if any(not isinstance(entry, dict) for entry in data):
-                    # A non-object block group cannot be read, and unread
-                    # groups could carry the balance change a hole needs.
-                    from evm_rpc import EVMRPCError
-
-                    raise EVMRPCError(
-                        f"hypersync [{net}]: non-object block group in response",
-                    )
-                # `False` is not an empty page: `entry.get("logs") or []`
-                # would turn a corrupt value into "no events here" and bless
-                # an event-free read of a page that could not be read. The
-                # type is checked explicitly; only a genuine list (or a
-                # missing key) is data.
-                for entry in data:
-                    raw_logs = entry.get("logs")
-                    if raw_logs is None:
-                        continue
-                    if not isinstance(raw_logs, list):
-                        from evm_rpc import EVMRPCError
-
-                        raise EVMRPCError(
-                            f"hypersync [{net}]: non-list logs in block group",
-                        )
-                rows = [
-                    row
-                    for entry in data
-                    for row in entry.get("logs", [])
-                ]
-            elif isinstance(data, dict):
-                rows = data.get("logs")
-            else:
-                rows = None
-            if rows is None:
-                # The response is a shape we do not recognize: refusing beats
-                # guessing a resume point on a service whose contract we cannot read.
-                from evm_rpc import EVMRPCError
-
-                raise EVMRPCError(
-                    f"hypersync [{net}]: unrecognized response shape",
-                )
+            # One extraction policy for every path (round 4, review item 3):
+            # strict list typing in both the block-group shape and the
+            # nested-dict variant, `False`/`{}`/null refused rather than
+            # read as "no events here".
+            rows = self._page_rows(page, net, where="logs walk")
             nxt = self._parse_next_block(page, net)
             if nxt is None:
                 # Absent next_block is the **measured** completion signal
@@ -631,44 +675,22 @@ class EnvioHyperSync:
                 "logs": [{"address": [token], "topics": [[TRANSFER_TOPIC], [zero_topic]]}],
                 "field_selection": {"log": ["block_number"]},
             }
-            page = await self._query(net, body, deadline=deadline)
+            try:
+                page = await self._query(net, body, deadline=deadline)
+            except evm_rpc.EVMBudgetExpired:
+                # Budget out mid-scan: unknown start (None) — the caller
+                # keeps its conservative walk, and the next cycle's scan
+                # starts over. Not a raise, and never a fallback to the
+                # public scan: the budget is spent, not the provider.
+                return None
             requests += 1
-            data = page.get("data")
-            if isinstance(data, list):
-                if any(not isinstance(entry, dict) for entry in data):
-                    from evm_rpc import EVMRPCError
-
-                    raise EVMRPCError(
-                        f"hypersync [{net}]: non-object block group (mint scan)",
-                    )
-                # `False` is not an empty page: `entry.get("logs") or []`
-                # would convert a corrupt value into "nothing here" and bless
-                # a mint-free read of a page we could not read. The type is
-                # checked; only a genuine list (or a missing key) is data.
-                # A corrupt shape is the same verdict as every other
-                # unreadable mint page: unknown start (None), never a
-                # confirmed mint-free read and never a guessed start.
-                for entry in data:
-                    raw_logs = entry.get("logs")
-                    if raw_logs is None:
-                        continue
-                    if not isinstance(raw_logs, list):
-                        return None
-                rows = [
-                    row
-                    for entry in data
-                    for row in entry.get("logs", [])
-                ]
-            elif isinstance(data, dict):
-                raw_logs = data.get("logs")
-                if raw_logs is None:
-                    rows = []
-                elif not isinstance(raw_logs, list):
-                    return None
-                else:
-                    rows = raw_logs
-            else:
-                rows = []
+            # One extraction policy for every path (round 4, review item 3),
+            # with the mint scan's own verdict: an unreadable shape is an
+            # unknown start (None), never a mint-free "complete" read.
+            try:
+                rows = self._page_rows(page, net, where="mint scan")
+            except evm_rpc.EVMRPCError:
+                return None
             # The pointer is parsed **before** any block is trusted: a page
             # whose cursor is corrupt cannot tell us its own coverage, so a
             # block number it hands back is unverified (the exact gap the

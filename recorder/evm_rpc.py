@@ -98,6 +98,21 @@ class EVMRateLimit(EVMRPCError):
     """
 
 
+class EVMBudgetExpired(EVMRPCError):
+    """The wall-clock budget ran out **before or during** a request ⇒ the walk stops and returns its completed pages.
+
+    Separate from `EVMRPCError` because the remedy is entirely different: a
+    network error is retried on the next cycle from the last saved point, but
+    a budget expiry is **not a fault at all** — the pages already fetched are
+    valid, verified, and must be handed back as a partial result instead of
+    being thrown away. Raising the generic error here is what used to waste
+    the whole walk's progress: several pages were read, the budget expired on
+    the next one, and the token was recorded as a retry that re-read them all.
+    It is deliberately **not** a reason to fall back to another provider
+    either: the budget is spent, not the provider.
+    """
+
+
 def _num(value: Any) -> int | None:
     """Converts a hexadecimal (`0x…`) or decimal number to int, or None if that fails."""
     if value is None:
@@ -594,8 +609,10 @@ class EVMRPC:
         second live cycle: 72 calls in 118 seconds against a 60-second period.
         And stopping here is **not a loss**: exiting short with a resume point
         is the same path as the cap, so the next cycle continues from where we
-        stopped. And one request is always allowed even when the budget is
-        spent, so the token never spins with no progress at all.
+        stopped. An already-expired budget means **zero** requests (round 4):
+        the fetched pages in hand and the resume point are returned, and the
+        caller — not this walk — decides whether any provider may still spend
+        time on the range.
         """
         cap = config.EVM_BACKFILL_MAX_CALLS if max_calls is None else max_calls
         net = str(network_id)
@@ -616,11 +633,14 @@ class EVMRPC:
         # point.
         pending: list[tuple[int, int]] = [(int(from_block), int(to_block))]
         while pending:
-            spent = (
-                calls > 0 and deadline is not None and time.monotonic() >= deadline
-            )
+            spent = deadline is not None and time.monotonic() >= deadline
             if calls >= cap or spent:
                 # What is left on the stack is unread ⇒ the range is incomplete.
+                # The deadline no longer demands `calls > 0` (round 4): a
+                # budget consumed elsewhere (the mint scan, a HyperSync walk
+                # that fell back) must not start even one public request here
+                # — the completed pages in `out` and the stack's lowest block
+                # are the honest partial result.
                 return (
                     _in_block_order(out), calls, False,
                     min(lo for lo, _ in pending),
@@ -636,6 +656,18 @@ class EVMRPC:
                 await sleep(
                     config.EVM_BATCH_PACING_SECONDS if len(taken) > 1
                     else config.EVM_PACING_SECONDS
+                )
+            # Checked **after** the pacing sleep, not before it (round 4): the
+            # sleep spends budget too, and a deadline that dies during pacing
+            # must not still buy the next batch — the same rule as HyperSync's
+            # walk: no request may start outside the budget, wherever the time
+            # went.
+            spent = deadline is not None and time.monotonic() >= deadline
+            if spent:
+                pending.extend(reversed(taken))
+                return (
+                    _in_block_order(out), calls, False,
+                    min(lo for lo, _ in pending),
                 )
             calls += 1
             if len(taken) == 1:

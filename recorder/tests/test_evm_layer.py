@@ -323,12 +323,31 @@ async def test_paging_stops_at_time_budget_not_only_call_count():
         deadline=time.monotonic() - 1,          # the budget is already spent
     )
 
-    # Always one call even with the budget spent: without this the token
-    # would spin forever with no progress.
-    assert calls == 1
+    # Round 4: an already-expired budget means zero requests — the pages in
+    # hand (none here) and the resume point are returned; the caller, not the
+    # walk, decides whether any provider may still spend time on the range.
+    assert calls == 0
     assert complete is False
     assert resume == 0
     assert logs == []
+
+
+async def test_paging_expired_budget_preserves_completed_pages():
+    """Round 4: expiry after real progress returns the pages paid for, not a
+    retry from the old start — that is what makes the budget cheap to hit."""
+    import time
+
+    rpc = _PagingRPC(limit_above=10, per_block={5: [_log(A, B, 5, 5)]})
+
+    logs, calls, complete, resume = await rpc.get_logs_paged(
+        NET, [TOK], 0, 1000, max_calls=50, sleep=_noop,
+        deadline=time.monotonic() + 0.05,   # enough for the first page only
+    )
+
+    assert calls >= 1
+    assert complete is False
+    assert resume > 5                       # the unread range starts after the saved page
+    assert len(logs) == 1 and logs[0]["blockNumber"] == hex(5)   # the page paid for is kept
 
 
 async def test_paging_ignores_a_deadline_that_never_comes():

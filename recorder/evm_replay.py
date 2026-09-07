@@ -644,9 +644,18 @@ async def replay_token(
                         max_calls=config.EVM_HYPERSYNC_MAX_CALLS,
                         deadline=deadline,
                     )
+                except evm_rpc.EVMBudgetExpired:
+                    # The budget is spent, not the provider: falling back to
+                    # the public mint scan here would run a fresh scan
+                    # outside the budget — the exact shape round 4 closes.
+                    # Unknown start ⇒ the walk's own deadline checks take
+                    # over from here.
+                    minted = None
                 except Exception:  # noqa: BLE001 — the public mint scan is the fallback
                     hyper_mint = False
-            if not hyper_mint:
+            if not hyper_mint and minted is None and (
+                deadline is None or time.monotonic() < deadline
+            ):
                 minted = await rpc.first_mint_block(net, token, to_block)
             if minted is not None:
                 from_block = max(from_block, minted)
@@ -681,12 +690,22 @@ async def replay_token(
                 net, [token], attempt_from, to_block, max_calls=log_budget,
                 sleep=sleep, deadline=deadline,
             )
+        except evm_rpc.EVMBudgetExpired:
+            # The budget is spent, not the provider: the public fallback
+            # below must not start a fresh out-of-budget read. With no pages
+            # in hand there is nothing to save as a partial — the walk's
+            # saved checkpoint (from the previous cycle) already stands.
+            raise
         except Exception:  # the public node walks the same range instead
             if not use_hyper:
                 raise
             # The paid route refused (key, quota, transport) and nothing was
             # applied yet: `get_logs_paged` returns its logs only on success,
             # so the public retry reads the range exactly once, never twice.
+            # And only while the budget still has time in it — a spent
+            # budget is a stop, not a provider switch (round 4).
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
             out["hyper_fallbacks"] += 1
             logs, used, complete, resume = await rpc.get_logs_paged(
                 net, [token], attempt_from, to_block, max_calls=log_budget,
