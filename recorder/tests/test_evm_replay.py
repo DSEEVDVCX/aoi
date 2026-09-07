@@ -1244,8 +1244,10 @@ class _Hyper:
     def can_attempt(self, network_id):
         return str(network_id) == NET
 
-    async def first_mint_block(self, _net, address, head):
+    async def first_mint_block(self, _net, address, head,
+                              max_calls=None, deadline=None):
         self.mint_scans.append((address.lower(), int(head)))
+        self.mint_budget = (max_calls, deadline)
         if self.fail_mint:
             raise RuntimeError("key pool empty")
         return self.mint
@@ -1325,4 +1327,31 @@ async def test_a_mint_scan_refusal_uses_the_public_scan(db):
     assert rpc.mint_scans                                      # the public scan answered
     assert hyper.ranges[0][0] == mint                          # and the walk used its answer
     assert db.evm_replay_state(TOK, NET)["status"] == "done"
+
+
+async def test_the_replay_mint_scan_is_budgeted(db):
+    """The replay path's mint call carries the same request cap and wall-clock
+    deadline as the backfill's (round 3, review item 2C): an unbudgeted scan
+    here could spend the whole budget and then let the walk continue past the
+    deadline — the original complaint, on the archive path."""
+    _seed_watch(db, TOK, 3600, 1)
+    hyper = _Hyper(
+        logs=[
+            _hs_log(ZERO, A, 1000, _blk(3000)),
+            _hs_log(A, B, 200, _blk(1500)),
+        ],
+        mint=_blk(4000),
+    )
+    rpc = _rpc([])
+
+    stats = await evm_replay.run_replay(
+        rpc, db, networks=[NET], sleep=_noop, hyper=hyper, budget_seconds=120,
+    )
+
+    assert stats["done"] == 1
+    max_calls, deadline = hyper.mint_budget
+    import config
+
+    assert max_calls == config.EVM_HYPERSYNC_MAX_CALLS
+    assert deadline is not None                   # the run's monotonic budget
 

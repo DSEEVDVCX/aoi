@@ -158,6 +158,7 @@ class EnvioHyperSync:
 
     async def _query(
         self, network_id: str, body: dict[str, Any], *, _retries: int = 0,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         """One POST /query. Raises `EnvioUnavailable` on auth trouble (fallback, not error);
         a redacted `EVMRPCError`-compatible raise on anything the caller should treat as retry.
@@ -166,11 +167,35 @@ class EnvioHyperSync:
             self._keys.refresh(_read_keys())
         if not self._keys.keys:
             raise EnvioUnavailable("no envio key in chain_keys.json")
+        if deadline is not None and time.monotonic() >= deadline:
+            # The budget is over **before** the request starts: a key rotation
+            # or a first page may not spend one more second of it. Checked
+            # here, in the one place every request passes, so the walk's
+            # between-page check is a second gate, not the only one.
+            from evm_rpc import EVMRPCError
+
+            raise EVMRPCError(
+                f"hypersync [{network_id}]: budget expired before request",
+            )
         url = self._urls[str(network_id)]
         key = self._keys.current()
+        # The request itself is bounded by the **remaining** budget, not the
+        # blanket 30s timeout: a call that starts slightly before the deadline
+        # must stop when the deadline says, not up to 30s after it.
+        request_timeout = self._timeout
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                from evm_rpc import EVMRPCError
+
+                raise EVMRPCError(
+                    f"hypersync [{network_id}]: budget expired before request",
+                )
+            request_timeout = min(self._timeout, remaining)
         try:
             resp = await self._client.post(
                 url, json=body, headers={"authorization": f"Bearer {key}"},
+                timeout=request_timeout,
             )
         except httpx.TransportError as exc:
             self._successful_networks.discard(str(network_id))
@@ -188,7 +213,9 @@ class EnvioHyperSync:
             # at most once per request, never an unbounded rotation.
             if _retries < len(self._keys.keys) - 1:
                 self._keys.rotate(block_current=True)
-                return await self._query(network_id, body, _retries=_retries + 1)
+                return await self._query(
+                    network_id, body, _retries=_retries + 1, deadline=deadline,
+                )
             self._successful_networks.discard(str(network_id))
             raise EnvioUnavailable(f"hypersync [{network_id}] HTTP {resp.status_code}")
         if resp.status_code == 429:
@@ -200,7 +227,9 @@ class EnvioHyperSync:
             # raise, and the caller's backoff does the waiting.
             if _retries < len(self._keys.keys) - 1:
                 self._keys.rotate(block_current=True)
-                return await self._query(network_id, body, _retries=_retries + 1)
+                return await self._query(
+                    network_id, body, _retries=_retries + 1, deadline=deadline,
+                )
             self._successful_networks.discard(str(network_id))
             from evm_rpc import EVMRateLimit
 
@@ -244,6 +273,19 @@ class EnvioHyperSync:
         return parsed
 
     @staticmethod
+    def _strict_int(value: Any) -> int | None:
+        """A block/index field as a genuine integer — or None.
+
+        `int()` alone is a coercion, not a check: `int(101.9)` is 101 and
+        `int(True)` is 1, so a fractional or boolean block would be adopted
+        as a plausible number instead of refused. The pointer got this
+        strictness in round 2; the row fields get it here — same rule.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    @staticmethod
     def _to_rpc_log(entry: dict[str, Any]) -> dict[str, Any] | None:
         """A HyperSync log row → a JSON-RPC-shaped record `decode_transfer` can read.
 
@@ -251,11 +293,14 @@ class EnvioHyperSync:
         is the one place the translation belongs. `None` on a malformed row —
         ignored, never guessed at, the same rule as `decode_transfer` itself.
         """
-        try:
-            block = int(entry["block_number"])
-            log_index = int(entry.get("log_index") or 0)
-            tx_index = int(entry.get("transaction_index") or 0)
-        except (KeyError, TypeError, ValueError):
+        block = EnvioHyperSync._strict_int(entry.get("block_number"))
+        if block is None:
+            return None
+        log_index = EnvioHyperSync._strict_int(entry.get("log_index"))
+        if log_index is None:
+            return None
+        tx_index = EnvioHyperSync._strict_int(entry.get("transaction_index"))
+        if tx_index is None:
             return None
         topics = []
         for field in ("topic0", "topic1", "topic2", "topic3"):
@@ -358,9 +403,7 @@ class EnvioHyperSync:
         out: list[dict[str, Any]] = []
         requests = 0
         while lo <= hi:
-            spent = (
-                requests > 0 and deadline is not None and time.monotonic() >= deadline
-            )
+            spent = deadline is not None and time.monotonic() >= deadline
             if requests >= cap or spent:
                 # What is unread is everything from `lo` up ⇒ honest resume point.
                 return out, requests, False, lo
@@ -377,7 +420,7 @@ class EnvioHyperSync:
                     "log_index", "address", "data", "topic0", "topic1", "topic2",
                 ]},
             }
-            page = await self._query(net, body)
+            page = await self._query(net, body, deadline=deadline)
             requests += 1
             # The live response shape (measured 2026-09-04, live query): `data`
             # is a list of block groups, each carrying its own `logs`; a range
@@ -396,10 +439,25 @@ class EnvioHyperSync:
                     raise EVMRPCError(
                         f"hypersync [{net}]: non-object block group in response",
                     )
+                # `False` is not an empty page: `entry.get("logs") or []`
+                # would turn a corrupt value into "no events here" and bless
+                # an event-free read of a page that could not be read. The
+                # type is checked explicitly; only a genuine list (or a
+                # missing key) is data.
+                for entry in data:
+                    raw_logs = entry.get("logs")
+                    if raw_logs is None:
+                        continue
+                    if not isinstance(raw_logs, list):
+                        from evm_rpc import EVMRPCError
+
+                        raise EVMRPCError(
+                            f"hypersync [{net}]: non-list logs in block group",
+                        )
                 rows = [
                     row
                     for entry in data
-                    for row in (entry.get("logs") or [])
+                    for row in entry.get("logs", [])
                 ]
             elif isinstance(data, dict):
                 rows = data.get("logs")
@@ -573,7 +631,7 @@ class EnvioHyperSync:
                 "logs": [{"address": [token], "topics": [[TRANSFER_TOPIC], [zero_topic]]}],
                 "field_selection": {"log": ["block_number"]},
             }
-            page = await self._query(net, body)
+            page = await self._query(net, body, deadline=deadline)
             requests += 1
             data = page.get("data")
             if isinstance(data, list):
@@ -583,15 +641,69 @@ class EnvioHyperSync:
                     raise EVMRPCError(
                         f"hypersync [{net}]: non-object block group (mint scan)",
                     )
+                # `False` is not an empty page: `entry.get("logs") or []`
+                # would convert a corrupt value into "nothing here" and bless
+                # a mint-free read of a page we could not read. The type is
+                # checked; only a genuine list (or a missing key) is data.
+                # A corrupt shape is the same verdict as every other
+                # unreadable mint page: unknown start (None), never a
+                # confirmed mint-free read and never a guessed start.
+                for entry in data:
+                    raw_logs = entry.get("logs")
+                    if raw_logs is None:
+                        continue
+                    if not isinstance(raw_logs, list):
+                        return None
                 rows = [
                     row
                     for entry in data
-                    for row in (entry.get("logs") or [])
+                    for row in entry.get("logs", [])
                 ]
             elif isinstance(data, dict):
-                rows = data.get("logs") or []
+                raw_logs = data.get("logs")
+                if raw_logs is None:
+                    rows = []
+                elif not isinstance(raw_logs, list):
+                    return None
+                else:
+                    rows = raw_logs
             else:
                 rows = []
+            # The pointer is parsed **before** any block is trusted: a page
+            # whose cursor is corrupt cannot tell us its own coverage, so a
+            # block number it hands back is unverified (the exact gap the
+            # get_logs_paged walk closed — same rule, same order). A present
+            # but corrupt pointer (null/float/bool) is the same verdict here
+            # as a corrupt row: unknown start, never a raise — the from-zero
+            # walk is the safe direction, and a raise would retry the same
+            # broken page every cycle.
+            try:
+                nxt = self._parse_next_block(page, net)
+            except evm_rpc.EVMRPCError:
+                return None
+            if nxt is not None:
+                if nxt < lo:
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: next_block {nxt} behind "
+                        f"from_block {lo} (mint scan)",
+                    )
+                if nxt == lo:
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: next_block {nxt} did not advance "
+                        f"past from_block {lo} (mint scan)",
+                    )
+                if nxt > hi + 1:
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: next_block {nxt} exceeds "
+                        f"to_block {hi + 1} (mint scan)",
+                    )
+            page_cover = (nxt if nxt is not None else int(hi) + 1)
             blocks = []
             for row in rows:
                 if not isinstance(row, dict):
@@ -607,20 +719,27 @@ class EnvioHyperSync:
                     # starting block would be a guess. Unknown, not a min()
                     # over the rows that happened to parse.
                     return None
+                if raw < 0:
+                    # Blocks are unsigned; a negative "block" is a contract
+                    # break, and an unplaceable mint is unknown, never a
+                    # confirmed start.
+                    return None
+                if not lo <= raw < page_cover:
+                    # A mint outside the page's own claimed coverage (or above
+                    # the head we asked for): the page is unreliable, and its
+                    # block numbers cannot be trusted either. Unknown, not a
+                    # guessed start — the same never-broken contract the
+                    # transfer walk enforces with a hard raise; here `None`
+                    # keeps the conservative from-zero walk, which is the
+                    # safe direction for a *start* (a raise would retry the
+                    # same broken page every cycle).
+                    return None
                 blocks.append(raw)
             if blocks:
                 return min(blocks)   # ascending pages ⇒ the first mint found is the lowest
-            nxt = self._parse_next_block(page, net)
             if nxt is None:
                 # No next_block: the service says the range is complete and
                 # mint-free — that *is* proof, unlike an empty first page.
                 return None
-            if nxt <= lo:
-                from evm_rpc import EVMRPCError
-
-                raise EVMRPCError(
-                    f"hypersync [{net}]: next_block {nxt} did not advance "
-                    f"past from_block {lo} (mint scan)",
-                )
             lo = nxt
         return None

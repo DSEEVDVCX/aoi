@@ -649,6 +649,10 @@ async def test_a_non_object_row_raises_instead_of_vanishing():
 # The deadline: a time cap is a short exit, not a failure
 # ---------------------------------------------------------------------------
 async def test_deadline_exits_short_after_the_first_page():
+    """The budget gates the **first** request too (round 3, review item 2B):
+    a walk whose budget was already consumed by the mint scan must not start
+    one more page read — the deadline is checked before every request, and an
+    expired one means zero requests plus an honest resume point."""
     def handler(request):
         body = json.loads(request.content)
         return _page([], next_block=body["from_block"] + 100)
@@ -661,9 +665,9 @@ async def test_deadline_exits_short_after_the_first_page():
         )
     finally:
         await rpc.aclose()
-    assert requests == 1                           # one request is always allowed
+    assert requests == 0                           # expired ⇒ zero, not a courtesy call
     assert complete is False
-    assert resume == 100
+    assert resume == 0                             # nothing read ⇒ resume at the start
 
 
 def time_deadline_in_the_past():
@@ -1485,3 +1489,233 @@ async def test_the_mint_scan_has_no_unlimited_legacy_path(db, monkeypatch):
     assert called["count"] == 0
     assert stats["evm_backfilled"] == 1
     assert db.evm_backfill_state(NET, TOKEN)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Round 3: the mint page's own pointer gates the blocks it hands back
+# ---------------------------------------------------------------------------
+async def test_a_mint_block_above_the_head_is_not_a_confirmed_start():
+    """The exact gap the review named: a mint row with block_number 500 against
+    head=100 — a valid-looking integer that the old code returned before ever
+    reading the pointer. A start above the walk's end is unverified data from
+    an unreliable page, so the answer is unknown (None), never 500."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": [{"block_number": 500}]}],
+            "next_block": 101,
+        })
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 100) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_mint_block_outside_the_pages_own_coverage_is_unknown():
+    """Same never-broken contract as the transfer walk, applied to the scan: a
+    mint row at 150 on a page whose pointer claims coverage only to 100 is a
+    page that contradicts itself — unknown, not a confirmed start."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": [{"block_number": 150}]}],
+            "next_block": 100,
+        })
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_negative_mint_block_is_unknown():
+    """Blocks are unsigned; a negative block_number is a contract break, and a
+    confirmed start cannot be built from it."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": [{"block_number": -5}]}],
+            "next_block": None,
+        })
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_valid_mint_still_passes_through_the_pointer_gate():
+    """The gate must not refuse honest pages: a mint inside the page's own
+    coverage, on a page with a sane pointer, still returns its block."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": [{"block_number": 80}]}],
+            "next_block": 101,
+        })
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 100) == 80
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_corrupt_pointer_on_a_mint_page_with_rows_is_unknown():
+    """The pointer is parsed before any block is trusted: a page with mints
+    present and a pointer that contradicts itself cannot establish coverage,
+    so no block it returns may be confirmed. Unknown, never min(rows)."""
+    for bad in (101.9, True):
+        def handler(_request, _bad=bad):
+            return httpx.Response(200, json={
+                "data": [{"logs": [{"block_number": 80}]}],
+                "next_block": _bad,
+            })
+
+        rpc = _client(handler)
+        try:
+            assert await rpc.first_mint_block(BASE, TOKEN, 100) is None
+        finally:
+            await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 3: false is not an empty page, and int() is not a type check
+# ---------------------------------------------------------------------------
+async def test_a_falsy_logs_value_is_not_an_empty_page():
+    """`entry.get("logs") or []` converts `false` (and any corrupt falsy
+    value) into "no events here" — blessing an event-free read of a page that
+    could not be read. A non-list logs value quarantines the page instead."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": False}], "next_block": 101,
+        })
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_falsy_logs_value_in_a_mint_page_is_not_an_empty_page():
+    """The same `or []` conversion in the mint scan: a page whose logs are
+    `false` cannot be read, and a mint-free verdict on it would be invented.
+    Unknown (None), not a completed mint-free scan."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": False}], "next_block": 101,
+        })
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_fractional_block_number_is_not_a_plausible_number():
+    """int(101.9) is 101: a fractional block_number used to be silently
+    truncated into a real-looking block. The row is undecodable instead —
+    and an undecodable row in a declared-complete page is a raise."""
+    def handler(_request):
+        entry = _entry(A, B, 10, 101.9)
+        return _page([entry], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 200, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_boolean_log_index_is_not_a_plausible_number():
+    """int(True) is 1: the same coercion on the row's own indexes. A boolean
+    log_index is a corrupt row, refused before conversion."""
+    def handler(_request):
+        entry = _entry(A, B, 10, 50)
+        entry["log_index"] = True
+        return _page([entry], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 200, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 3: the deadline gates the request, not only the page loop
+# ---------------------------------------------------------------------------
+async def test_an_expired_get_logs_deadline_makes_zero_http_requests():
+    """The walk's own guard used to demand `requests > 0`, letting a walk
+    whose budget was already consumed by a mint scan start one more page read.
+    An expired deadline at entry means zero requests and an honest resume
+    point, exactly like the mint scan."""
+    asked = []
+
+    def handler(request):
+        asked.append(json.loads(request.content)["from_block"])
+        return _page([], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        import time
+
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop,
+            deadline=time.monotonic() - 1,
+        )
+    finally:
+        await rpc.aclose()
+    assert logs == []
+    assert requests == 0
+    assert complete is False
+    assert resume == 0                     # nothing read ⇒ resume at the start
+    assert asked == []                     # zero requests, not one
+
+
+async def test_a_key_rotation_is_bounded_by_the_deadline():
+    """Rotation inherits the deadline: a 401 answer that arrives with the
+    budget expired must not rotate and re-ask on the next key — the request
+    is refused, not retried outside the budget."""
+    import time
+
+    from envio_hypersync import EnvioUnavailable
+
+    asked = []
+
+    def handler(_request):
+        asked.append(1)
+        return httpx.Response(401)
+
+    rpc = _client(handler, keys=(KEY, "second-key-654321"))
+    try:
+        with pytest.raises(EnvioUnavailable):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 0, 100, sleep=_noop,
+                deadline=time.monotonic() + 60,
+            )
+        assert len(asked) == 2              # both keys, bounded rotation
+        # The expired budget is caught by the walk's own pre-request gate:
+        # zero further requests and an honest resume point — the rotation
+        # never gets the chance to re-ask outside the budget.
+        _logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop,
+            deadline=time.monotonic() - 1,
+        )
+        assert len(asked) == 2              # expired ⇒ no request at all
+        assert requests == 0
+        assert complete is False
+        assert resume == 0
+    finally:
+        await rpc.aclose()

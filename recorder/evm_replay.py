@@ -635,8 +635,15 @@ async def replay_token(
             if hyper_mint:
                 # One query instead of a public mint filter; a refusal here is
                 # not a token failure — the public scan answers in its place.
+                # The same request cap and wall-clock deadline as the backfill
+                # (plan 4.5): the mint scan may not spend the replay budget
+                # outside it and then let the walk continue past the deadline.
                 try:
-                    minted = await hyper.first_mint_block(net, token, to_block)
+                    minted = await hyper.first_mint_block(
+                        net, token, to_block,
+                        max_calls=config.EVM_HYPERSYNC_MAX_CALLS,
+                        deadline=deadline,
+                    )
                 except Exception:  # noqa: BLE001 — the public mint scan is the fallback
                     hyper_mint = False
             if not hyper_mint:
