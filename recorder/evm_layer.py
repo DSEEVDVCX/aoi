@@ -240,7 +240,10 @@ async def _apply_network(
         stats["evm_lagging"] += 1
 
 
-async def _first_mint_block(hyper: Any, net: str, token: str, head: int) -> int | None:
+async def _first_mint_block(
+    hyper: Any, net: str, token: str, head: int,
+    deadline: float | None = None,
+) -> int | None:
     """HyperSync's mint scan, with unavailability falling back to `None` (unknown).
 
     `None` is the honest "do not know": the caller keeps the from-zero walk,
@@ -248,7 +251,28 @@ async def _first_mint_block(hyper: Any, net: str, token: str, head: int) -> int 
     pre-existing holder as a negative balance ⇒ the whole token is rejected).
     Unavailability here must not kill the backfill — the history read that
     follows falls back to the public node on its own.
+
+    The scan is bounded by the same request cap and wall-clock deadline as
+    the transfer walk it precedes: an unbounded mint hunt would hold the
+    worker long before the budgeted history read even starts. Budget spent
+    here returns unknown, never a guessed block.
     """
+    try:
+        return await hyper.first_mint_block(
+            net, token, head,
+            max_calls=config.EVM_HYPERSYNC_MAX_CALLS, deadline=deadline,
+        )
+    except TypeError:
+        # An adapter without the budgeted signature (any test double or an
+        # older deploy): call it plain rather than lose the scan.
+        return await _first_mint_block_unbudgeted(hyper, net, token, head)
+    except Exception:  # noqa: BLE001 — a broken probe must not stop the backfill
+        return None
+
+
+async def _first_mint_block_unbudgeted(
+    hyper: Any, net: str, token: str, head: int,
+) -> int | None:
     try:
         return await hyper.first_mint_block(net, token, head)
     except Exception:  # noqa: BLE001 — a broken probe must not stop the backfill
@@ -337,7 +361,7 @@ async def _backfill_token(
         # HyperSync answers "first mint" in one query; on Base the alternatives
         # are a ~20-call `eth_getCode` binary search (public) or nothing.
         # `None` keeps the from-zero walk, the same honest-unknown rule as below.
-        minted = await _first_mint_block(hyper, net, token, to_block)
+        minted = await _first_mint_block(hyper, net, token, to_block, deadline)
         if minted is not None:
             from_block = max(from_block, minted)
     elif creation_due and net in config.EVM_MINT_SCAN_NETWORKS:
@@ -365,19 +389,43 @@ async def _backfill_token(
     # again, and everything above it is the true unread.
     if frontier is not None and from_block <= frontier:
         from_block = frontier + 1
-    source = hyper if use_hyper else rpc
-    # The fast lane's own call cap: 24 is a public-node ration, and on HyperSync
-    # the coin's real limit is the shared time budget below, not a request quota.
-    default_cap = (
-        config.EVM_HYPERSYNC_MAX_CALLS if use_hyper
-        else config.EVM_BACKFILL_MAX_CALLS
-    )
+    # The fast lane's own call cap (set inside the read loop below): 24 is a
+    # public-node ration, and on HyperSync the coin's real limit is the shared
+    # time budget, not a request quota.
     try:
-        logs, calls, complete, resume = await source.get_logs_paged(
-            net, [token], from_block, to_block,
-            max_calls=(default_cap if max_calls is None else max_calls),
-            sleep=sleep, deadline=deadline,
-        )
+        # Two reads of the same range, both through the same error handling
+        # (a fallback that raised EVMLogLimit used to escape to the generic
+        # retry handler instead of this terminal branch — a pointless
+        # every-minute repeat of a range no split can save). The loop is the
+        # *primary* source first, then the public node once, only if the paid
+        # route became unavailable. Anything both sources say loudly enough
+        # to raise (EVMLogLimit, rate limit, transport) leaves this try block
+        # and lands in one shared except — same verdict for either route.
+        for attempt, source in enumerate((hyper, rpc) if use_hyper else (rpc,)):
+            try:
+                logs, calls, complete, resume = await source.get_logs_paged(
+                    net, [token], from_block, to_block,
+                    max_calls=(
+                        (max_calls if max_calls is not None
+                         else config.EVM_HYPERSYNC_MAX_CALLS)
+                        if (use_hyper and attempt == 0)
+                        else (max_calls if max_calls is not None
+                              else config.EVM_BACKFILL_MAX_CALLS)
+                    ),
+                    sleep=sleep, deadline=deadline,
+                )
+                break
+            except EnvioUnavailable:
+                if attempt > 0 or not use_hyper:
+                    raise  # the public node's own unavailability is not a fallback
+                # The paid route went away mid-walk (all keys rejected / no
+                # key on disk). Same policy as the replay path: nothing was
+                # applied yet — `get_logs_paged` hands back its logs only on
+                # success — so the public node reads the range exactly once,
+                # never twice. Counted in its own stat, not as a token
+                # error: the token did nothing wrong.
+                stats["evm_hyper_fallbacks"] += 1
+                continue
     except EVMLogLimit as exc:
         # A single block exceeds the cap — no split is possible. It is recorded, not retried every minute.
         with db.batch():
@@ -391,21 +439,6 @@ async def _backfill_token(
             )
         stats["evm_backfill_errors"] += 1
         return
-    except EnvioUnavailable:
-        # The paid route went away mid-walk (all keys rejected / no key on
-        # disk). Same policy as the replay path (evm_replay's hyper
-        # fallback): nothing was applied yet — `get_logs_paged` hands back
-        # its logs only on success — so the public node reads the range
-        # exactly once, never twice. Counted in its own stat, not as a
-        # token error: the token did nothing wrong and must not burn its
-        # retry budget on a route problem.
-        stats["evm_hyper_fallbacks"] += 1
-        logs, calls, complete, resume = await rpc.get_logs_paged(
-            net, [token], from_block, to_block,
-            max_calls=(max_calls if max_calls is not None
-                       else config.EVM_BACKFILL_MAX_CALLS),
-            sleep=sleep, deadline=deadline,
-        )
 
     # If the network cursor advanced while this token was being backfilled,
     # finishing the old range is not enough: the token was excluded from live

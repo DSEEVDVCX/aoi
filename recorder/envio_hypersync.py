@@ -44,6 +44,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import config
+import evm_rpc
 import httpx
 from evm_rpc import TRANSFER_TOPIC
 from provider_keys import KeyPool, read_keys
@@ -399,15 +400,39 @@ class EnvioHyperSync:
                         f"hypersync [{net}]: undecodable log row in response",
                     )
                 out.append(converted)
+                # Full transfer validation, not just "readable row" (plan 4.2,
+                # second pass): a row that converts to JSON-RPC shape but is not
+                # a decodable Transfer (wrong topic count, missing value, a
+                # topic0 that is not the Transfer signature) would be dropped
+                # silently by `_deltas_by_token` later, while this range is
+                # still declared complete. The filter asked for Transfers, so a
+                # row that answers it and cannot decode is a contract break —
+                # quarantine the range, never bless a hole.
+                if evm_rpc.decode_transfer(converted) is None:
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: log row failed transfer validation",
+                    )
             next_block = page.get("next_block")
-            try:
-                nxt = int(next_block) if next_block is not None else None
-            except (TypeError, ValueError):
-                nxt = None
-            if nxt is None:
-                # No next_block means the service believes the range is
-                # complete — the measured behavior at the range's end.
+            if next_block is None:
+                # Absent next_block is the **measured** completion signal
+                # (2026-09-04, live): the service omits the field exactly when
+                # the range is fully served. Only that absence counts — a
+                # present-but-corrupt value is a contract break below, never
+                # silently equated with "complete".
                 return out, requests, True, int(hi)
+            # A next_block that is present but not an integer is a corrupt
+            # pagination pointer: treating it as completion moves the progress
+            # cursor without any evidence the range was served (plan 4.2).
+            try:
+                nxt = int(next_block)
+            except (TypeError, ValueError):
+                from evm_rpc import EVMRPCError
+
+                raise EVMRPCError(
+                    f"hypersync [{net}]: non-integer next_block {next_block!r}",
+                ) from None
             if nxt <= lo:
                 if lo >= hi and not rows:
                     # The exhausted tail (measured live 2026-09-04, token
@@ -427,12 +452,21 @@ class EnvioHyperSync:
                     f"hypersync [{net}]: next_block {nxt} did not advance "
                     f"past from_block {lo}",
                 )
+            if nxt > hi + 1:
+                # The service's cursor claims coverage beyond the exclusive
+                # ceiling we asked for: a corrupt pointer that would mark
+                # unserved blocks as read. Refused, not adopted.
+                from evm_rpc import EVMRPCError
+
+                raise EVMRPCError(
+                    f"hypersync [{net}]: next_block {nxt} exceeds to_block {hi + 1}",
+                )
             lo = nxt
         return out, requests, True, int(hi)
 
     async def first_mint_block(
         self, network_id: str, address: str, head: int,
-        max_calls: int | None = None,
+        max_calls: int | None = None, deadline: float | None = None,
     ) -> int | None:
         """The token's first mint over the whole range — HyperSync's one-query answer.
 
@@ -464,6 +498,10 @@ class EnvioHyperSync:
             if requests >= cap:
                 # The budget stopped the scan before the range was proven
                 # mint-free: unknown, not "no mint".
+                return None
+            if requests and deadline is not None and time.monotonic() >= deadline:
+                # Same honest answer as the request cap: the scan stopped on
+                # time, so the starting block is unknown, never guessed.
                 return None
             body = {
                 # Exclusive wire semantics, same as get_logs_paged: +1 or the

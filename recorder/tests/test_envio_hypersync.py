@@ -303,7 +303,15 @@ async def test_the_exhausted_tail_pins_next_block_at_from_block():
     on the final single-block range and the service answers an empty page with
     `next_block` pinned at `from_block` instead of omitting it. That is
     "complete", not a spin — but only when the page is empty and the range is
-    exhausted; the row-bearing variant below stays a loud error."""
+    exhausted; the row-bearing variant below stays a loud error.
+
+    Re-verified 2026-09-07 for the exclusive wire range: the request now asks
+    [b, b+1) on the wire for the caller's [b, b], so the pinned-cursor answer
+    still describes "the single block was queried and held nothing" — the
+    condition `lo >= hi and not rows` fires only on that exact final-page
+    shape, and nothing about the +1 changes which page the walk ends on. The
+    pre-+1 live capture pinned next_block at from_block on the **last** page
+    of a walk; an early page pinning the cursor is still a loud error."""
     def handler(_request):
         return _page([], next_block=5_018_120)
 
@@ -326,6 +334,22 @@ async def test_the_exhausted_tail_pins_next_block_at_from_block():
         with pytest.raises(evm_rpc.EVMRPCError):
             await rpc.get_logs_paged(
                 BASE, [TOKEN], 5_018_120, 5_018_120, sleep=_noop,
+            )
+    finally:
+        await rpc.aclose()
+
+    # And a pinned cursor on a **mid-range** page (range still remaining) is
+    # a loud error, not completion — the tail shape is final-page-only.
+    def handler_mid_range(_request):
+        return _page([], next_block=50)
+
+    rpc = _client(handler_mid_range)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 50, 100, sleep=_noop,
             )
     finally:
         await rpc.aclose()
@@ -830,8 +854,172 @@ async def test_backfill_falls_back_when_the_route_goes_away(db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The coverage stamp: the admission gate's only truth about the fast lane
+# Corrupt pagination pointers: presence without validity is a contract break
 # ---------------------------------------------------------------------------
+async def test_a_corrupt_next_block_raises_not_completes():
+    """A present-but-unparseable next_block ("invalid") must raise, not be
+    silently equated with "range complete" — the old code mapped a failed
+    int() onto None onto completion, moving the progress cursor with zero
+    evidence the range was served."""
+    def handler(_request):
+        return httpx.Response(200, json={"data": [], "next_block": "invalid"})
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_next_block_past_the_requested_ceiling_raises():
+    """The service's cursor claims coverage beyond the blocks asked for —
+    adopting it would mark unserved blocks as read. Refused."""
+    def handler(_request):
+        return _page([], next_block=999_999)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Full transfer validation: a convertible-but-undecodable row quarantines too
+# ---------------------------------------------------------------------------
+async def test_a_transfer_row_that_fails_decode_raises():
+    """A row converts to JSON-RPC shape but is not a decodable Transfer (no
+    topics, no value — e.g. {"block_number": 10}): the old chain dropped it
+    silently in `_deltas_by_token` while the range was declared complete. The
+    filter asked for Transfers, so a row answering it that cannot decode is a
+    contract break — quarantine, never a silent hole."""
+    def handler(_request):
+        # Well-formed page carrying a topic-less, data-less row.
+        return httpx.Response(200, json={
+            "data": [{"logs": [{
+                "block_number": 10, "log_index": 0, "transaction_index": 0,
+                "address": TOKEN, "data": "", "topic0": None,
+            }]}],
+            "next_block": None,
+        })
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The mint scan's budget must reach the production call, not exist in theory
+# ---------------------------------------------------------------------------
+async def test_the_mint_scan_deadline_stops_at_unknown(db, monkeypatch):
+    """The wall-clock deadline that bounds the transfer walk must bound the
+    mint scan too — the production wrapper (_first_mint_block) passes it, and
+    expiry means unknown (None), never a guessed block."""
+    rpc = _client(lambda _r: _page([], next_block=5_000))
+    try:
+        import time
+
+        assert await rpc.first_mint_block(
+            BASE, TOKEN, 10_000, deadline=time.monotonic() - 1,
+        ) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_the_layer_passes_the_budget_into_the_mint_scan(db, monkeypatch):
+    """Plan 4.5's production path: `_backfill_token` must call HyperSync's
+    mint scan with the real request cap and deadline, not the adapter's
+    effectively-infinite defaults."""
+    import config
+    import evm_layer
+
+    NET = "8453"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    ZERO = "0x" + "0" * 40
+    seen = {}
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return str(network_id) == NET
+
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, network_id, address, head,
+                                   max_calls=None, deadline=None):
+            seen["max_calls"] = max_calls
+            seen["deadline"] = deadline
+            return None
+
+        async def get_logs_paged(self, *_a, **_k):
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)]),
+        db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+    assert seen["max_calls"] == config.EVM_HYPERSYNC_MAX_CALLS
+    assert seen["deadline"] is not None
+
+
+# ---------------------------------------------------------------------------
+# The fallback read fails too: one shared verdict, not a silent escape
+# ---------------------------------------------------------------------------
+async def test_a_fallback_that_also_raises_evmloglimit_is_terminal(db, monkeypatch):
+    """The public node takes over after the paid route dies, and its read
+    raises EVMLogLimit: the verdict must be the terminal `error` state (the
+    same as a primary-source EVMLogLimit), not an escape to the generic
+    handler that would mark the token `retry` and repeat the impossible
+    range every minute."""
+    import config
+    import evm_layer
+    import evm_rpc
+    from envio_hypersync import EnvioUnavailable
+
+    NET = "4663"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    monkeypatch.setattr(config, "EVM_MINT_SCAN_NETWORKS", ())
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return str(network_id) == NET
+
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, *_a, **_k):
+            return None
+
+        async def get_logs_paged(self, *_a, **_k):
+            raise EnvioUnavailable("hypersync [4663] HTTP 401")
+
+    class _LimitRPC(_CycleRPC):
+        async def get_logs_paged(self, *_a, **_k):
+            raise evm_rpc.EVMLogLimit("backend response too large")
+
+    stats = await evm_layer.run_evm_cycle(
+        _LimitRPC(head=400, logs=[]), db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+    assert stats["evm_hyper_fallbacks"] == 1      # the route change happened
+    assert stats["evm_backfill_errors"] == 1     # and the terminal verdict won
+    assert db.evm_backfill_state(NET, TOKEN)["status"] == "error"
+    assert "EVMLogLimit" in (db.evm_backfill_state(NET, TOKEN).get("last_error") or "")
 async def test_cycle_stamps_what_hypersync_will_route(db, monkeypatch):
     """The stamp is routing intent (can_attempt), not proven coverage — the
     bootstrap fix: after a restart a routed network must not sit paused under
