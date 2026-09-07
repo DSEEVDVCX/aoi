@@ -213,6 +213,30 @@ class EnvioHyperSync:
             raise EVMBudgetExpired(
                 f"hypersync [{network_id}]: budget expired during request",
             ) from None
+        except httpx.TimeoutException as exc:
+            # The httpx timer can fire **before** wait_for's: it is capped to
+            # the remaining budget (`min(self._timeout, remaining)`), so a
+            # ReadTimeout raised at the deadline is the budget expiring — and
+            # without this branch it would fall into the TransportError
+            # handler below, be classified as a network failure, drop the
+            # network from `_successful_networks`, and destroy the partial
+            # return the walk already paid for. Decided by the clock, not by
+            # which timer happened to fire first.
+            if deadline is not None and time.monotonic() >= deadline:
+                from evm_rpc import EVMBudgetExpired
+
+                raise EVMBudgetExpired(
+                    f"hypersync [{network_id}]: budget expired during request "
+                    f"(httpx {type(exc).__name__})",
+                ) from None
+            # A timeout with budget still on the clock is a genuine network
+            # failure: the server is slow past its own guard, not budget-bound.
+            self._successful_networks.discard(str(network_id))
+            from evm_rpc import EVMRateLimit
+
+            raise EVMRateLimit(
+                f"hypersync [{network_id}] {type(exc).__name__}",
+            ) from None
         except httpx.TransportError as exc:
             self._successful_networks.discard(str(network_id))
             # A wait, not a failure: raising rate-limit-shaped lets the caller's

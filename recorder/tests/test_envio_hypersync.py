@@ -1921,3 +1921,178 @@ async def test_a_corrupt_mint_list_branch_row_is_unknown_not_an_empty_scan():
         assert await rpc.first_mint_block(BASE, TOKEN, 1_000) is None
     finally:
         await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 5: the httpx timer can fire before wait_for's
+# ---------------------------------------------------------------------------
+async def test_an_httpx_read_timeout_at_the_deadline_is_a_budget_expiry():
+    """`httpx.ReadTimeout` is a `TransportError`, not the builtin `TimeoutError`
+    the wait_for branch catches — and the httpx timer is capped to the
+    remaining budget, so it can fire first. Without the TimeoutException
+    branch the expiry was classified EVMRateLimit: the paid-for pages went to
+    the retry handler and the network lost its coverage stamp. At the deadline
+    it is the budget, decided by the clock, not by which timer fired."""
+    import asyncio
+    import time
+
+    asked = []
+
+    async def handler(request):
+        asked.append(1)
+        if len(asked) == 1:
+            return _page([_entry(A, B, 10, 50)], next_block=60)
+        # Past the deadline, but inside wait_for's +0.1 slack: httpx's own
+        # read timer fires here, not the wait_for cancellation.
+        await asyncio.sleep(0.35)
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    rpc = _client(handler)
+    try:
+        deadline = time.monotonic() + 0.3
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop, deadline=deadline,
+        )
+    finally:
+        await rpc.aclose()
+    assert requests == 1                     # the timed-out page is not counted
+    assert complete is False
+    assert resume == 60                      # the first unread block
+    assert len(logs) == 1 and logs[0]["blockNumber"] == hex(50)
+    # The server is not down: coverage survives a budget expiry.
+    assert BASE in rpc._successful_networks
+
+
+async def test_an_httpx_read_timeout_with_budget_left_is_a_network_failure():
+    """The other half of the rule: a read timeout while budget remains is the
+    server slow past its own guard — a genuine network failure, EVMRateLimit,
+    and the coverage stamp is revoked. Not every transport error is a budget
+    expiry."""
+    import time
+
+    asked = []
+
+    async def handler(request):
+        asked.append(1)
+        if len(asked) == 1:
+            return _page([_entry(A, B, 10, 50)], next_block=60)
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRateLimit):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 0, 100, sleep=_noop,
+                deadline=time.monotonic() + 60,
+            )
+    finally:
+        await rpc.aclose()
+    assert len(asked) == 2                   # the walk itself went ahead
+    # Page one proved coverage; the timeout with budget left revokes it.
+    assert BASE not in rpc._successful_networks
+
+
+async def test_a_401_whose_response_consumes_the_budget_makes_no_second_key_request():
+    """The round-5 review's refinement of the key-swap test: the first key's
+    401 answer itself consumes the budget — the rotation is entered, the
+    re-ask is not. One request in total, and the walk's partial return, not
+    an EnvioUnavailable raise and not a second-key request."""
+    import asyncio
+    import time
+
+    from envio_hypersync import EnvioUnavailable
+
+    asked = []
+
+    def handler(_request):
+        asked.append(1)
+        return httpx.Response(401)
+
+    # Phase one, wide budget: rotation itself is intact — both keys, then
+    # the honest unavailability.
+    rpc = _client(handler, keys=(KEY, "second-key-654321"))
+    try:
+        with pytest.raises(EnvioUnavailable):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 0, 100, sleep=_noop,
+                deadline=time.monotonic() + 60,
+            )
+        assert len(asked) == 2
+    finally:
+        await rpc.aclose()
+
+    # Phase two, the named gap: the 401 lands just as the budget dies.
+    asked.clear()
+
+    async def slow_401(_request):
+        asked.append(1)
+        await asyncio.sleep(0.35)            # the budget dies at 0.3, in-flight
+        return httpx.Response(401)
+
+    rpc = _client(slow_401, keys=(KEY, "second-key-654321"))
+    try:
+        deadline = time.monotonic() + 0.3
+        logs, requests, complete, resume = await rpc.get_logs_paged(
+            BASE, [TOKEN], 0, 100, sleep=_noop, deadline=deadline,
+        )
+    finally:
+        await rpc.aclose()
+    assert len(asked) == 1                   # the second key was never asked
+    assert requests == 0                     # the interrupted request is not counted
+    assert complete is False
+    assert resume == 0
+    assert logs == []
+
+
+async def test_a_budget_partial_progresses_the_checkpoint_across_cycles(db, monkeypatch):
+    """The final-verdict scenario: a multi-page token whose walk hits the
+    budget in cycle one returns a partial; cycle two must resume from the
+    checkpoint — not from zero — so the saved page is neither re-read nor
+    re-applied, and the balances are exactly the union of both pages."""
+    import config
+    import evm_layer
+
+    NET = "4663"
+    ZERO = "0x" + "0" * 40
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 1_000, NOW, "ok")
+
+    calls = []
+
+    class _Hyper:
+        def can_attempt(self, network_id):
+            return str(network_id) == NET
+
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, *_a, **_k):
+            return None                      # unknown ⇒ the from-zero walk
+
+        async def get_logs_paged(self, network_id, addresses, from_block,
+                                 to_block, topics=None, max_calls=None,
+                                 sleep=None, deadline=None):
+            calls.append(from_block)
+            if len(calls) == 1:
+                # The budget died mid-walk after page one: a partial return
+                # keeping the page and the first unread block.
+                return ([_log(ZERO, A, 700, 5)], 1, False, 60)
+            return ([_log(ZERO, B, 300, 70)], 1, True, to_block)
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=1_000), db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+    state = db.evm_backfill_state(NET, TOKEN)
+    assert (state["status"], state["from_block"]) == ("partial", 60)
+    assert db.evm_top_balances(NET, TOKEN, 10) == [(A, 700)]
+
+    await evm_layer.run_evm_cycle(
+        _CycleRPC(head=1_000), db, NOW, sleep=_noop, hyper=_Hyper(),
+    )
+    assert calls == [0, 60]                  # checkpoint progressed, not reverted
+    assert db.evm_backfill_state(NET, TOKEN)["status"] == "done"
+    # A reverted checkpoint would re-apply page one and double A to 1400.
+    assert db.evm_top_balances(NET, TOKEN, 10) == [(A, 700), (B, 300)]
