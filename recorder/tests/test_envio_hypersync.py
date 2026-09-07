@@ -693,7 +693,8 @@ async def test_backfill_uses_hypersync_when_covered(db, monkeypatch):
         def covers(self, network_id):
             return str(network_id) == NET
 
-        async def first_mint_block(self, network_id, address, head):
+        async def first_mint_block(self, network_id, address, head,
+                                   max_calls=None, deadline=None):
             return 100
 
         async def get_logs_paged(self, network_id, addresses, from_block,
@@ -1271,3 +1272,216 @@ async def test_no_reservation_when_every_pending_token_is_covered(
 
     assert len(picked) == 2
     assert all(net == "4663" for net, _ in picked)
+
+
+# ---------------------------------------------------------------------------
+# Round 2: the pointer must never go backward, and never be almost a number
+# ---------------------------------------------------------------------------
+async def test_a_backward_pointer_is_an_error_even_on_a_single_block_range():
+    """[50, 50] answered with next_block=49 used to fall into the exhausted-tail
+    shape (nxt <= lo, empty page, lo >= hi) and be blessed as complete — a
+    pointer *behind* from_block is a contract break in every shape; the
+    measured tail pins the cursor at from_block, never behind it."""
+    def handler(_request):
+        return _page([], next_block=49)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 50, 50, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_fractional_or_boolean_pointer_is_outright_rejected():
+    """int() is not a type check: int(101.9) is 101 and int(True) is 1, so a
+    float or a bool in next_block would be adopted as a plausible cursor.
+    Both are contract breaks, refused before any comparison."""
+    for bad in (101.9, True):
+        def handler(_request, _bad=bad):
+            return httpx.Response(
+                200, json={"data": [], "next_block": _bad},
+            )
+
+        rpc = _client(handler)
+        try:
+            import evm_rpc
+
+            with pytest.raises(evm_rpc.EVMRPCError):
+                await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+        finally:
+            await rpc.aclose()
+
+
+async def test_a_null_next_block_is_not_the_measured_absence():
+    """The measured completion signal is the field's **absence**; a JSON null
+    is a present field with no value — indistinguishable from a service bug,
+    so it is refused rather than mapped onto completion."""
+    def handler(_request):
+        return httpx.Response(
+            200, json={"data": [], "next_block": None},
+        )
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 2: the event must belong to the page it arrived on
+# ---------------------------------------------------------------------------
+async def test_a_transfer_for_another_token_is_a_page_rejection():
+    """A perfectly valid Transfer — for a token we did not ask about. The
+    filter is single-address, so the response is untrustworthy; adopting the
+    row would write another token's movement into this walk."""
+    other = "0x" + "d" * 40
+
+    def handler(_request):
+        entry = _entry(A, B, 10, 50)
+        entry["address"] = other
+        return _page([entry], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_transfer_outside_the_requested_range_is_a_page_rejection():
+    """The pointing-back double-apply: request [0, 200], receive a valid
+    Transfer at block 150 with next_block=100 — the row sits above the page
+    the pointer claims, and under a request cap the walk would return the
+    event AND a resume point of 100, so block 150 gets applied now and read
+    again after the resume ⇒ a doubled balance. Rows outside the page's own
+    coverage quarantine the page instead."""
+    def handler(_request):
+        return _page([_entry(A, B, 10, 150)], next_block=100)
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(
+                BASE, [TOKEN], 0, 200, max_calls=1, sleep=_noop,
+            )
+    finally:
+        await rpc.aclose()
+
+
+async def test_a_non_object_block_group_is_a_page_rejection():
+    """`data` is a list of block groups; a non-object group used to be
+    silently skipped while its rows (if any) could never be read."""
+    def handler(_request):
+        return httpx.Response(200, json={"data": ["raw"], "next_block": None})
+
+    rpc = _client(handler)
+    try:
+        import evm_rpc
+
+        with pytest.raises(evm_rpc.EVMRPCError):
+            await rpc.get_logs_paged(BASE, [TOKEN], 0, 100, sleep=_noop)
+    finally:
+        await rpc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Round 2: the mint scan's budget is real before the first request
+# ---------------------------------------------------------------------------
+async def test_an_expired_mint_deadline_makes_zero_http_requests():
+    """The deadline is checked before the **first** request, not only between
+    pages: an already-expired budget must mean zero HTTP calls, never one
+    courtesy request past the deadline."""
+    asked = []
+
+    def handler(request):
+        asked.append(json.loads(request.content)["from_block"])
+        return _page([], next_block=None)
+
+    rpc = _client(handler)
+    try:
+        import time
+
+        result = await rpc.first_mint_block(
+            BASE, TOKEN, 10_000, deadline=time.monotonic() - 1,
+        )
+    finally:
+        await rpc.aclose()
+    assert result is None
+    assert asked == []                          # zero requests, not one
+
+
+async def test_a_corrupt_mint_row_next_to_a_valid_one_is_unknown():
+    """A page carrying a valid mint block and an unreadable one: min() over
+    the rows that happened to parse would confirm a start the page does not
+    actually establish. The honest answer is unknown (None)."""
+    def handler(_request):
+        return httpx.Response(200, json={
+            "data": [{"logs": [
+                {"block_number": 5_000},
+                {"block_number": "corrupt"},
+            ]}],
+            "next_block": None,
+        })
+
+    rpc = _client(handler)
+    try:
+        assert await rpc.first_mint_block(BASE, TOKEN, 10_000) is None
+    finally:
+        await rpc.aclose()
+
+
+async def test_the_mint_scan_has_no_unlimited_legacy_path(db, monkeypatch):
+    """A _Hyper double with the old 3-arg signature (no max_calls/deadline)
+    must surface as unknown, not silently re-route to an unbudgeted call —
+    the production wrapper no longer has a TypeError escape hatch. The
+    TypeError fires on the budgeted call before the double's body runs, the
+    broad except turns it into unknown, and exactly one call to the double
+    happens — a legacy re-route would make it two."""
+    import config
+    import evm_layer
+
+    NET = "8453"
+    monkeypatch.setattr(config, "EVM_NETWORKS", (NET,))
+    _watch(db, token=TOKEN, network=NET)
+    db.set_evm_cursor(NET, 300, NOW, "ok")
+
+    ZERO = "0x" + "0" * 40
+    called = {"count": 0}
+
+    class _LegacyHyper:
+        def can_attempt(self, network_id):
+            return str(network_id) == NET
+
+        def covers(self, network_id):
+            return str(network_id) == NET
+
+        async def first_mint_block(self, network_id, address, head):
+            # Old signature: the budgeted call raises TypeError before this
+            # body can run — which is exactly what the test pins down.
+            called["count"] += 1
+            return 100
+
+        async def get_logs_paged(self, *_a, **_k):
+            return ([_log(ZERO, B, 500, 150)], 1, True, 388)
+
+    stats = await evm_layer.run_evm_cycle(
+        _CycleRPC(head=400, logs=[_log(ZERO, A, 700, 150)]),
+        db, NOW, sleep=_noop, hyper=_LegacyHyper(),
+    )
+    # One budgeted call, TypeError → unknown (from-zero walk): no retry, no
+    # unbudgeted second attempt, and the cycle still completed.
+    assert called["count"] == 0
+    assert stats["evm_backfilled"] == 1
+    assert db.evm_backfill_state(NET, TOKEN)["status"] == "done"

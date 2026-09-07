@@ -278,6 +278,32 @@ class EnvioHyperSync:
             "logIndex": hex(log_index),
         }
 
+    @staticmethod
+    def _parse_next_block(
+        page: dict[str, Any], net: str,
+    ) -> int | None:
+        """The pagination pointer, parsed strictly — or None for "range complete".
+
+        Completion is only the field's **measured absence** (the service omits
+        `next_block` exactly when the range is fully served). A JSON `null` is
+        a *present* field with no value — kept distinct from absence via the
+        sentinel below, and refused, because we cannot tell a service bug from
+        an intentional end signal and the honest answer is the raise. Anything
+        present must be a genuine integer: `int()` alone accepts floats
+        (`int(101.9)`) and booleans, so those are contract breaks, not numbers.
+        """
+        sentinel = object()
+        next_block = page.get("next_block", sentinel)
+        if next_block is sentinel:
+            return None
+        if isinstance(next_block, bool) or not isinstance(next_block, int):
+            from evm_rpc import EVMRPCError
+
+            raise EVMRPCError(
+                f"hypersync [{net}]: non-integer next_block {next_block!r}",
+            )
+        return next_block
+
     async def get_logs_paged(
         self,
         network_id: str,
@@ -362,9 +388,17 @@ class EnvioHyperSync:
             # instead of from a captured response.
             data = page.get("data")
             if isinstance(data, list):
+                if any(not isinstance(entry, dict) for entry in data):
+                    # A non-object block group cannot be read, and unread
+                    # groups could carry the balance change a hole needs.
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: non-object block group in response",
+                    )
                 rows = [
                     row
-                    for entry in data if isinstance(entry, dict)
+                    for entry in data
                     for row in (entry.get("logs") or [])
                 ]
             elif isinstance(data, dict):
@@ -379,6 +413,61 @@ class EnvioHyperSync:
                 raise EVMRPCError(
                     f"hypersync [{net}]: unrecognized response shape",
                 )
+            nxt = self._parse_next_block(page, net)
+            if nxt is None:
+                # Absent next_block is the **measured** completion signal
+                # (2026-09-04, live): the service omits the field exactly when
+                # the range is fully served. Only that absence counts — every
+                # present-but-corrupt shape is refused below, never silently
+                # equated with "complete". The page's coverage is the whole
+                # requested range, so the rows below validate against hi.
+                nxt = int(hi) + 1
+            else:
+                if nxt < lo:
+                    # A pointer that went **backward** is a contract break in
+                    # every shape, including the single-block range: the
+                    # measured tail pins the cursor *at* from_block, never
+                    # behind it.
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: next_block {nxt} behind from_block {lo}",
+                    )
+                if nxt == lo:
+                    if lo >= hi and not rows:
+                        # The exhausted tail (measured live 2026-09-04, token
+                        # 0xc52aedec…): when the walk's last page lands exactly
+                        # on the final single-block range, the service answers
+                        # an empty page with `next_block` pinned at
+                        # `from_block` instead of omitting it. The block was
+                        # queried and held nothing, so the range is complete —
+                        # but only in this exact shape: a non-advancing cursor
+                        # with rows present, or with range still remaining,
+                        # stays a loud error.
+                        return out, requests, True, int(hi)
+                    # A service bug or a shape change: a non-advancing cursor
+                    # would spin forever, so it is treated as a hard, loud error.
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: next_block {nxt} did not advance "
+                        f"past from_block {lo}",
+                    )
+                if nxt > hi + 1:
+                    # The service's cursor claims coverage beyond the exclusive
+                    # ceiling we asked for: a corrupt pointer that would mark
+                    # unserved blocks as read. Refused, not adopted.
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: next_block {nxt} exceeds to_block {hi + 1}",
+                    )
+            # The never-broken contract, now enforced against the page's own
+            # pointer instead of assumed: every returned log's block is below
+            # the resume point. A row above the pointer (the pointing-back
+            # shape: event at 150, next_block 100, cap hit) would be applied
+            # now and read again after the resume ⇒ a doubled balance.
+            page_cover = nxt  # exclusive ceiling of what this page delivered
             for row in rows:
                 if not isinstance(row, dict):
                     # Fail closed (plan 4.2): a row we cannot even type-check
@@ -399,68 +488,40 @@ class EnvioHyperSync:
                     raise EVMRPCError(
                         f"hypersync [{net}]: undecodable log row in response",
                     )
-                out.append(converted)
-                # Full transfer validation, not just "readable row" (plan 4.2,
-                # second pass): a row that converts to JSON-RPC shape but is not
-                # a decodable Transfer (wrong topic count, missing value, a
-                # topic0 that is not the Transfer signature) would be dropped
-                # silently by `_deltas_by_token` later, while this range is
-                # still declared complete. The filter asked for Transfers, so a
-                # row that answers it and cannot decode is a contract break —
-                # quarantine the range, never bless a hole.
-                if evm_rpc.decode_transfer(converted) is None:
+                decoded = evm_rpc.decode_transfer(converted)
+                if decoded is None:
+                    # Full transfer validation, not just "readable row" (plan
+                    # 4.2, second pass): the filter asked for Transfers, so a
+                    # row that answers it and cannot decode is a contract
+                    # break — quarantine the range, never bless a hole.
                     from evm_rpc import EVMRPCError
 
                     raise EVMRPCError(
                         f"hypersync [{net}]: log row failed transfer validation",
                     )
-            next_block = page.get("next_block")
-            if next_block is None:
-                # Absent next_block is the **measured** completion signal
-                # (2026-09-04, live): the service omits the field exactly when
-                # the range is fully served. Only that absence counts — a
-                # present-but-corrupt value is a contract break below, never
-                # silently equated with "complete".
+                # And the event must belong to **this** page: the address we
+                # filtered on, and the block coverage the pointer claims.
+                # A valid Transfer for another token, or a block at/above the
+                # resume point, is a response we cannot trust — the latter is
+                # the doubled-balance shape, not noise.
+                if decoded["token_address"] != token:
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: log row for unrequested token",
+                    )
+                if not lo <= decoded["block"] < page_cover:
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: log row block {decoded['block']} "
+                        f"outside page coverage [{lo}, {page_cover})",
+                    )
+                out.append(converted)
+            if nxt > int(hi):
+                # The pointer reached (or passed) the exclusive ceiling: the
+                # range is complete and every row was validated against it.
                 return out, requests, True, int(hi)
-            # A next_block that is present but not an integer is a corrupt
-            # pagination pointer: treating it as completion moves the progress
-            # cursor without any evidence the range was served (plan 4.2).
-            try:
-                nxt = int(next_block)
-            except (TypeError, ValueError):
-                from evm_rpc import EVMRPCError
-
-                raise EVMRPCError(
-                    f"hypersync [{net}]: non-integer next_block {next_block!r}",
-                ) from None
-            if nxt <= lo:
-                if lo >= hi and not rows:
-                    # The exhausted tail (measured live 2026-09-04, token
-                    # 0xc52aedec…): when the walk's last page lands exactly on
-                    # the final single-block range, the service answers an
-                    # empty page with `next_block` pinned at `from_block`
-                    # instead of omitting it. The block was queried and held
-                    # nothing, so the range is complete — but only in this
-                    # exact shape: a non-advancing cursor with rows present,
-                    # or with range still remaining, stays a loud error.
-                    return out, requests, True, int(hi)
-                # A service bug or a shape change: a non-advancing cursor would
-                # spin forever, so it is treated as a hard, loud error.
-                from evm_rpc import EVMRPCError
-
-                raise EVMRPCError(
-                    f"hypersync [{net}]: next_block {nxt} did not advance "
-                    f"past from_block {lo}",
-                )
-            if nxt > hi + 1:
-                # The service's cursor claims coverage beyond the exclusive
-                # ceiling we asked for: a corrupt pointer that would mark
-                # unserved blocks as read. Refused, not adopted.
-                from evm_rpc import EVMRPCError
-
-                raise EVMRPCError(
-                    f"hypersync [{net}]: next_block {nxt} exceeds to_block {hi + 1}",
-                )
             lo = nxt
         return out, requests, True, int(hi)
 
@@ -499,9 +560,10 @@ class EnvioHyperSync:
                 # The budget stopped the scan before the range was proven
                 # mint-free: unknown, not "no mint".
                 return None
-            if requests and deadline is not None and time.monotonic() >= deadline:
-                # Same honest answer as the request cap: the scan stopped on
-                # time, so the starting block is unknown, never guessed.
+            if deadline is not None and time.monotonic() >= deadline:
+                # Checked before the **first** request too, not only between
+                # pages: an already-expired budget must mean zero HTTP calls,
+                # never one courtesy request past the deadline.
                 return None
             body = {
                 # Exclusive wire semantics, same as get_logs_paged: +1 or the
@@ -515,9 +577,15 @@ class EnvioHyperSync:
             requests += 1
             data = page.get("data")
             if isinstance(data, list):
+                if any(not isinstance(entry, dict) for entry in data):
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: non-object block group (mint scan)",
+                    )
                 rows = [
                     row
-                    for entry in data if isinstance(entry, dict)
+                    for entry in data
                     for row in (entry.get("logs") or [])
                 ]
             elif isinstance(data, dict):
@@ -527,18 +595,22 @@ class EnvioHyperSync:
             blocks = []
             for row in rows:
                 if not isinstance(row, dict):
-                    continue
-                try:
-                    blocks.append(int(row["block_number"]))
-                except (KeyError, TypeError, ValueError):
-                    continue
+                    from evm_rpc import EVMRPCError
+
+                    raise EVMRPCError(
+                        f"hypersync [{net}]: non-object mint row in response",
+                    )
+                raw = row.get("block_number")
+                if isinstance(raw, bool) or not isinstance(raw, int):
+                    # A corrupt mint record next to a valid one: the page says
+                    # mints exist but one cannot be placed, so a "confirmed"
+                    # starting block would be a guess. Unknown, not a min()
+                    # over the rows that happened to parse.
+                    return None
+                blocks.append(raw)
             if blocks:
                 return min(blocks)   # ascending pages ⇒ the first mint found is the lowest
-            next_block = page.get("next_block")
-            try:
-                nxt = int(next_block) if next_block is not None else None
-            except (TypeError, ValueError):
-                nxt = None
+            nxt = self._parse_next_block(page, net)
             if nxt is None:
                 # No next_block: the service says the range is complete and
                 # mint-free — that *is* proof, unlike an empty first page.

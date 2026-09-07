@@ -886,7 +886,8 @@ class _CycleRPC:
         self.heads = []
         self.mint_scans = []
 
-    async def first_mint_block(self, network_id, address, head):
+    async def first_mint_block(self, network_id, address, head,
+                               max_calls=None, deadline=None):
         """`None` is the default here: "unknown" ⇒ a walk from genesis.
 
         And that is what the remaining tests must stay on, because their data
@@ -1664,7 +1665,8 @@ async def test_an_empty_ledger_discards_the_resume_point_and_rewalks_from_the_mi
         def covers(self, network_id):
             return str(network_id) == NET
 
-        async def first_mint_block(self, network_id, address, head):
+        async def first_mint_block(self, network_id, address, head,
+                                   max_calls=None, deadline=None):
             mint_queries.append((str(network_id), int(head)))
             return 250
 

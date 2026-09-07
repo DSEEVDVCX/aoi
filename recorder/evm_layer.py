@@ -262,19 +262,6 @@ async def _first_mint_block(
             net, token, head,
             max_calls=config.EVM_HYPERSYNC_MAX_CALLS, deadline=deadline,
         )
-    except TypeError:
-        # An adapter without the budgeted signature (any test double or an
-        # older deploy): call it plain rather than lose the scan.
-        return await _first_mint_block_unbudgeted(hyper, net, token, head)
-    except Exception:  # noqa: BLE001 — a broken probe must not stop the backfill
-        return None
-
-
-async def _first_mint_block_unbudgeted(
-    hyper: Any, net: str, token: str, head: int,
-) -> int | None:
-    try:
-        return await hyper.first_mint_block(net, token, head)
     except Exception:  # noqa: BLE001 — a broken probe must not stop the backfill
         return None
 
